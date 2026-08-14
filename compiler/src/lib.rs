@@ -9,6 +9,7 @@ pub mod cli;
 pub mod diagnostics;
 pub mod driver;
 pub mod hir;
+pub mod interpreter;
 pub mod lexer;
 pub mod nir;
 pub mod resolve;

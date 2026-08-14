@@ -21,6 +21,7 @@ use crate::syntax::ast;
 mod codes {
     pub const DUPLICATE_DEFINITION: &str = "R0001";
     pub const UNRESOLVED_NAME: &str = "R0002";
+    pub const DUPLICATE_PARAMETER: &str = "R0003";
 }
 
 pub fn lower_module(
@@ -150,10 +151,26 @@ impl<'a> Lowering<'a> {
 
     fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
         let mut scopes = Scopes::new();
+        let mut seen_params: HashMap<Symbol, Span> = HashMap::new();
         let params = f
             .params
             .iter()
             .map(|p| {
+                if let Some(&first_span) = seen_params.get(&p.name.symbol) {
+                    let text = self.interner.resolve(p.name.symbol);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::DUPLICATE_PARAMETER,
+                            self.source,
+                            p.name.span,
+                            format!("parameter `{text}` is declared more than once"),
+                        )
+                        .with_primary_label("duplicate parameter")
+                        .with_label(first_span, "first declared here"),
+                    );
+                } else {
+                    seen_params.insert(p.name.symbol, p.name.span);
+                }
                 let local = self.fresh_local();
                 scopes.define(p.name.symbol, local);
                 HirParam {
@@ -539,6 +556,21 @@ mod tests {
         let (_, diags) = lower("func Point() -> i64 { return 0 } record Point { x: i64 }");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "R0001");
+    }
+
+    #[test]
+    fn duplicate_parameter_name_is_a_diagnostic_not_silent_shadowing() {
+        let (hir, diags) = lower("func f(x: i64, x: i64) -> i64 { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0003");
+        // Both parameters still get their own distinct local -- the
+        // diagnostic doesn't stop lowering from otherwise producing a
+        // normal function.
+        assert_eq!(hir.functions[0].params.len(), 2);
+        assert_ne!(
+            hir.functions[0].params[0].local,
+            hir.functions[0].params[1].local
+        );
     }
 
     #[test]

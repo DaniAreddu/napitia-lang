@@ -15,8 +15,22 @@ fn ends_with_brace(expr: &Expr) -> bool {
 }
 
 impl<'a> Parser<'a> {
+    /// Consumes a leading `public` or `private` visibility modifier, if
+    /// present. `private` is npt's default visibility -- writing it
+    /// explicitly is accepted (and consumed) rather than left as an
+    /// unparsed, reserved-but-useless keyword that would otherwise choke
+    /// the parser the moment a program actually used it.
+    fn parse_visibility(&mut self) -> bool {
+        if self.eat(&TokenKind::Public) {
+            true
+        } else {
+            self.eat(&TokenKind::Private);
+            false
+        }
+    }
+
     pub(super) fn parse_item(&mut self) -> Option<Item> {
-        let public = self.eat(&TokenKind::Public);
+        let public = self.parse_visibility();
         match self.current() {
             TokenKind::Func => self.parse_function(public).map(Item::Function),
             TokenKind::Record => self.parse_record(public).map(Item::Record),
@@ -155,7 +169,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
-            let field_public = self.eat(&TokenKind::Public);
+            let field_public = self.parse_visibility();
             let Some(fname) = self.expect_ident("a field name") else {
                 recovery::synchronize_to_stmt(self);
                 continue;
@@ -484,6 +498,30 @@ mod tests {
             panic!("expected function")
         };
         assert!(f.public);
+    }
+
+    #[test]
+    fn parses_private_function() {
+        // `private` is reserved but was never actually consumed by the
+        // parser; a program using it explicitly (rather than just
+        // omitting `public`) must not fail to parse.
+        let (module, diags) = parse("private func main() -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert!(!f.public);
+    }
+
+    #[test]
+    fn parses_private_record_field() {
+        let (module, diags) = parse("record Point { private x: i64, y: i64 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Record(r) = &module.items[0] else {
+            panic!("expected record")
+        };
+        assert!(!r.fields[0].public);
+        assert!(!r.fields[1].public);
     }
 
     #[test]

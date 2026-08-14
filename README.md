@@ -65,7 +65,10 @@ native backend exists.
   performing Hindley-Milner-style unification for integer/float literal
   inference, argument/return checking, and assignment compatibility.
 - A typed Napitia IR (`nir/`): explicit control-flow graphs of basic blocks,
-  with a textual printer for debugging.
+  with a textual printer for debugging. `match` and field access are parsed,
+  resolved, and type-checked, but not yet lowered to NIR — a function using
+  either is reported back by name and skipped rather than silently
+  producing incorrect IR.
 - A tree-walking interpreter over NIR, used to execute the supported
   language subset without a native backend.
 - A CLI (`napitia lex|parse|check|ir|run`) exposing every stage.

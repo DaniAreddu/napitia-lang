@@ -23,9 +23,10 @@ use super::{BasicBlock, Const, Function, Module, Param, Terminator, ValueId, Val
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId,
+    OtherItemKind,
 };
-use crate::source::SourceId;
-use crate::symbol::Interner;
+use crate::source::{SourceId, Span};
+use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, is_numeric, primitive_from_name};
 
@@ -62,17 +63,31 @@ pub fn lower_module(
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
+    // The same module-level type namespace typeck itself builds
+    // (`typeck::check_module`): primitives plus every declared
+    // `record`/`variant` name. Without this, a legitimately-declared
+    // named type would have no way to resolve to anything here and
+    // would silently fall back to `Ty::Error` -- exactly the kind of
+    // "unknown type becomes Error with no diagnostic" bug this whole
+    // pass exists to close.
+    let type_names: HashMap<Symbol, ItemId> = hir
+        .other_items
+        .iter()
+        .filter(|item| matches!(item.kind, OtherItemKind::Record | OtherItemKind::Variant))
+        .map(|item| (item.name, item.id))
+        .collect();
+
     let mut function_sigs = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
             .iter()
-            .map(|p| resolve_named_type(interner, &p.ty))
+            .map(|p| resolve_named_type(interner, &type_names, &p.ty))
             .collect();
         let ret = f
             .return_type
             .as_ref()
-            .map(|t| resolve_named_type(interner, t))
+            .map(|t| resolve_named_type(interner, &type_names, t))
             .unwrap_or(Ty::Unit);
         function_sigs.insert(f.id, (params, ret));
     }
@@ -82,6 +97,7 @@ pub fn lower_module(
         expr_types,
         interner,
         source,
+        type_names,
         function_sigs,
     };
     let mut functions = Vec::new();
@@ -100,8 +116,27 @@ pub fn lower_module(
     }
 }
 
-fn resolve_named_type(interner: &Interner, ty: &ast::Type) -> Ty {
-    primitive_from_name(interner.resolve(ty.name.symbol)).unwrap_or(Ty::Error)
+/// Resolves a written type name the same way `typeck::resolve_named_type`
+/// does: primitives first, then declared `record`/`variant` names,
+/// nominally by `ItemId`. Unlike typeck, an unknown name here is never
+/// reachable in the ordinary pipeline (typeck already rejected it with
+/// its own diagnostic before lowering ever ran), so falling back to
+/// `Ty::Error` is only ever exercised by a direct caller that bypasses
+/// that gate -- the same defense-in-depth posture as the rest of this
+/// module.
+fn resolve_named_type(
+    interner: &Interner,
+    type_names: &HashMap<Symbol, ItemId>,
+    ty: &ast::Type,
+) -> Ty {
+    let text = interner.resolve(ty.name.symbol);
+    if let Some(prim) = primitive_from_name(text) {
+        return prim;
+    }
+    if let Some(&item) = type_names.get(&ty.name.symbol) {
+        return Ty::Named(item, ty.name.symbol);
+    }
+    Ty::Error
 }
 
 struct Lowering<'a> {
@@ -109,6 +144,7 @@ struct Lowering<'a> {
     expr_types: &'a HashMap<ExprId, Ty>,
     interner: &'a Interner,
     source: SourceId,
+    type_names: HashMap<Symbol, ItemId>,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
 }
 
@@ -264,10 +300,21 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|t| self.resolve_named_type(t))
             .unwrap_or(Ty::Unit);
+        // A declared `record`/`variant` name resolves and nominally
+        // compares fine in typeck (`spec/0003`), but Alpha 0.1 NIR has
+        // no aggregate runtime representation at all -- no instruction
+        // constructs one, no `Value` variant holds one. Silently
+        // treating it as `Ty::Error` here (the previous behavior) would
+        // reach the verifier as an unexplained error type; explicitly
+        // rejecting it here, with a diagnostic naming the actual type
+        // and where it appears, is what keeps that failure at the right
+        // layer instead.
+        self.reject_named_type(&return_type, f.name_span, "a function's return type")?;
         let mut fb = FnBuilder::new(return_type.clone());
         let mut params = Vec::new();
         for p in &f.params {
             let ty = self.local_types.get(&p.local).cloned().unwrap_or(Ty::Error);
+            self.reject_named_type(&ty, p.span, "a function parameter's type")?;
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
@@ -314,7 +361,23 @@ impl<'a> Lowering<'a> {
     }
 
     fn resolve_named_type(&self, ty: &ast::Type) -> Ty {
-        resolve_named_type(self.interner, ty)
+        resolve_named_type(self.interner, &self.type_names, ty)
+    }
+
+    fn reject_named_type(&self, ty: &Ty, span: Span, position: &str) -> LowerResult<()> {
+        if let Ty::Named(_, name) = ty {
+            return Err(Box::new(Diagnostic::error(
+                codes::UNSUPPORTED_IN_NIR,
+                self.source,
+                span,
+                format!(
+                    "{position} uses the named type `{}`, which has no aggregate runtime \
+                     representation in Alpha 0.1 NIR",
+                    self.interner.resolve(*name)
+                ),
+            )));
+        }
+        Ok(())
     }
 
     // ---- reading typeck's already-resolved types ----
@@ -335,7 +398,7 @@ impl<'a> Lowering<'a> {
     /// Builds the diagnostic for a construct that reached lowering
     /// without the checker having already rejected it -- see
     /// `codes::UNSUPPORTED_IN_NIR`.
-    fn unsupported(&self, span: crate::source::Span, feature: &str) -> Box<Diagnostic> {
+    fn unsupported(&self, span: Span, feature: &str) -> Box<Diagnostic> {
         Box::new(Diagnostic::error(
             codes::UNSUPPORTED_IN_NIR,
             self.source,
@@ -976,6 +1039,32 @@ mod tests {
             .expect("expected lowering to succeed")
     }
 
+    /// Like `lower`, but for a program that type-checks cleanly and is
+    /// expected to *fail* lowering (e.g. a named aggregate type in an
+    /// executable signature) -- returns whatever `lower_module` actually
+    /// produces instead of asserting success.
+    fn lower_result(text: &str) -> Result<Module, Vec<Diagnostic>> {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+    }
+
     /// Like `lower`, but also runs the module through the NIR verifier
     /// (using the same interner/source lowering itself used, unlike a
     /// fresh throwaway one) and returns its diagnostics -- for tests
@@ -1002,6 +1091,68 @@ mod tests {
         let module = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
             .expect("expected lowering to succeed");
         crate::nir::verify_module(&module, id, &interner)
+    }
+
+    #[test]
+    fn a_named_return_type_fails_lowering_with_i0001_not_v0013() {
+        // `check` accepts this (nominal resolution/comparison of a
+        // declared record name is real, spec/0003), but lowering has no
+        // aggregate runtime representation for it. This must surface as
+        // I0001 at the point lowering actually gives up, not filter
+        // through as a silent Ty::Error caught later by the verifier as
+        // V0013.
+        let text = "record Point { x: i64 } func identity(p: Point) -> Point { p } \
+                    func main() -> i64 { 42 }";
+        let Err(diagnostics) = lower_result(text) else {
+            panic!("expected lowering to fail for a named aggregate type");
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0001"),
+            "expected an I0001 diagnostic, got {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|d| d.code == "V0013"),
+            "a named type must never fall through to the verifier as an \
+             unexplained error type: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_parameter_type_fails_lowering_with_i0001() {
+        let text = "record Point { x: i64 } func describe(p: Point) -> i64 { 0 } \
+                    func main() -> i64 { 42 }";
+        let Err(diagnostics) = lower_result(text) else {
+            panic!("expected lowering to fail for a named parameter type");
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0001"),
+            "expected an I0001 diagnostic, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn main_coexisting_with_a_named_type_function_fails_the_whole_module() {
+        // `main` itself never touches the named type, but lowering is
+        // atomic: the module must fail as a whole, not silently produce
+        // a `Module` containing just `main`.
+        let text = "record Point { x: i64 } \
+                    func identity(p: Point) -> Point { p } \
+                    func main() -> i64 { return 42 }";
+        assert!(
+            lower_result(text).is_err(),
+            "expected the whole module to fail lowering"
+        );
+    }
+
+    #[test]
+    fn variant_names_also_resolve_and_are_rejected_in_nir() {
+        let text = "variant Shape { Circle } \
+                    func describe(s: Shape) -> i64 { 0 } \
+                    func main() -> i64 { 42 }";
+        let Err(diagnostics) = lower_result(text) else {
+            panic!("expected lowering to fail for a named variant type");
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0001"));
     }
 
     #[test]

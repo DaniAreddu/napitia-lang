@@ -13,7 +13,13 @@ pub struct TyVar(pub(crate) u32);
 /// The checker's internal type representation. Distinct from
 /// [`crate::syntax::ast::Type`] (a named-identifier surface type): `Ty`
 /// is what unification actually operates over.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `PartialEq`/`Eq`/`Hash` are hand-written, not derived, because
+/// `Named`'s nominal-identity contract (see its own doc comment) can't
+/// be expressed by a derive: two `Named` types must compare equal, and
+/// hash equally, based on their `ItemId` alone, ignoring the `Symbol`
+/// they also carry.
+#[derive(Clone, Debug)]
 pub enum Ty {
     I8,
     I16,
@@ -54,6 +60,57 @@ pub enum Ty {
     /// anything so that already-reported problem doesn't cascade into
     /// unrelated diagnostics.
     Error,
+}
+
+impl PartialEq for Ty {
+    fn eq(&self, other: &Self) -> bool {
+        use Ty::*;
+        match (self, other) {
+            (I8, I8)
+            | (I16, I16)
+            | (I32, I32)
+            | (I64, I64)
+            | (Isize, Isize)
+            | (U8, U8)
+            | (U16, U16)
+            | (U32, U32)
+            | (U64, U64)
+            | (Usize, Usize)
+            | (F32, F32)
+            | (F64, F64)
+            | (Bool, Bool)
+            | (Char, Char)
+            | (Str, Str)
+            | (Unit, Unit)
+            | (Never, Never)
+            | (Error, Error) => true,
+            (Var(a), Var(b)) => a == b,
+            // Nominal identity: two `Named` types are the same type iff
+            // they carry the same `ItemId`. The `Symbol` is display-only
+            // (see the variant's own doc comment) and deliberately
+            // excluded here.
+            (Named(a, _), Named(b, _)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Ty {}
+
+impl std::hash::Hash for Ty {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Ty::Var(v) => v.hash(state),
+            // Only the `ItemId` participates in the hash, matching
+            // `PartialEq`'s nominal-by-`ItemId` comparison: hashing the
+            // `Symbol` too would risk two types that compare equal
+            // hashing unequally, which silently breaks any
+            // `HashMap`/`HashSet` keyed on `Ty`.
+            Ty::Named(item, _) => item.hash(state),
+            _ => {}
+        }
+    }
 }
 
 pub fn primitive_from_name(name: &str) -> Option<Ty> {
@@ -168,5 +225,56 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("Point");
         assert_eq!(display_ty(&Ty::Named(ItemId(0), name), &interner), "Point");
+    }
+
+    #[test]
+    fn named_types_compare_equal_by_item_id_alone() {
+        let mut interner = Interner::new();
+        let point = interner.intern("Point");
+        // Same `ItemId`, same `Symbol`: the ordinary case (the same
+        // declaration resolved at two different use sites).
+        assert_eq!(Ty::Named(ItemId(0), point), Ty::Named(ItemId(0), point));
+    }
+
+    #[test]
+    fn named_types_with_different_item_ids_are_distinct_even_with_identical_fields() {
+        // Two records that happen to be declared with the exact same
+        // shape must still be different types -- Napitia rejects
+        // structural typing (RFC 0001), so identity has to come from
+        // *which declaration* a name resolved to, not what it looks
+        // like.
+        let mut interner = Interner::new();
+        let point = interner.intern("Point");
+        let vector = interner.intern("Vector");
+        assert_ne!(Ty::Named(ItemId(0), point), Ty::Named(ItemId(1), vector));
+    }
+
+    #[test]
+    fn named_type_identity_ignores_the_symbol_not_just_by_construction() {
+        // Directly exercises the documented contract: even if two
+        // `Named` values somehow carried different symbols for the same
+        // `ItemId` (which never happens through normal resolution, but
+        // the type itself makes no such guarantee), they must still
+        // compare -- and hash -- as the same type.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut interner = Interner::new();
+        let a_name = interner.intern("Point");
+        let b_name = interner.intern("NotPoint");
+        let a = Ty::Named(ItemId(0), a_name);
+        let b = Ty::Named(ItemId(0), b_name);
+        assert_eq!(a, b, "identity must be ItemId-only, ignoring the symbol");
+
+        let hash_of = |ty: &Ty| {
+            let mut hasher = DefaultHasher::new();
+            ty.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&b),
+            "equal Ty values must hash equally, or HashMap/HashSet keyed on Ty breaks"
+        );
     }
 }

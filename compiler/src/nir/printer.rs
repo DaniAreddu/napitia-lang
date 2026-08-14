@@ -11,13 +11,14 @@
 //! Output is deterministic (no pointer- or hash-derived identifiers),
 //! which is what makes it usable as golden-output in tests.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use super::block::{BasicBlock, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
 use super::{Function, Module};
 use crate::symbol::Interner;
-use crate::types::display_ty;
+use crate::types::{Ty, display_ty};
 
 pub fn print_module(module: &Module, interner: &Interner) -> String {
     let mut out = String::new();
@@ -43,30 +44,61 @@ fn print_function(out: &mut String, function: &Function, interner: &Interner) {
         interner.resolve(function.name),
         display_ty(&function.return_type)
     );
+    // Comparisons produce `bool` but are tagged with their *operand*
+    // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
+    // printer look that operand type up from the value that produced
+    // it, since a comparison instruction's own declared `ty` is `bool`.
+    let value_types = collect_value_types(function);
     for block in &function.blocks {
-        print_block(out, block);
+        print_block(out, block, &value_types);
     }
     out.push_str("}\n");
 }
 
-fn print_block(out: &mut String, block: &BasicBlock) {
+fn collect_value_types(function: &Function) -> HashMap<ValueId, Ty> {
+    let mut types = HashMap::new();
+    for param in &function.params {
+        types.insert(param.value, param.ty.clone());
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value { result, ty, .. } = instruction {
+                types.insert(*result, ty.clone());
+            }
+        }
+    }
+    types
+}
+
+fn print_block(out: &mut String, block: &BasicBlock, value_types: &HashMap<ValueId, Ty>) {
     let _ = writeln!(out, "bb{}:", block.id.0);
     for instruction in &block.instructions {
-        let _ = writeln!(out, "    {}", format_instruction(instruction));
+        let _ = writeln!(out, "    {}", format_instruction(instruction, value_types));
     }
     let _ = writeln!(out, "    {}", format_terminator(&block.terminator));
 }
 
-fn format_instruction(instruction: &Instruction) -> String {
+fn format_instruction(instruction: &Instruction, value_types: &HashMap<ValueId, Ty>) -> String {
     match instruction {
         Instruction::Value { result, ty, kind } => {
-            format!("%{} = {}", result.0, format_value_kind(kind, ty))
+            format!(
+                "%{} = {}",
+                result.0,
+                format_value_kind(kind, ty, value_types)
+            )
         }
         Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
     }
 }
 
-fn format_value_kind(kind: &ValueKind, ty: &crate::types::Ty) -> String {
+/// The operand type for a comparison instruction (looked up from
+/// whichever operand's producing instruction is known), falling back to
+/// the instruction's own declared type if that lookup fails.
+fn operand_ty<'a>(a: ValueId, ty: &'a Ty, value_types: &'a HashMap<ValueId, Ty>) -> &'a Ty {
+    value_types.get(&a).unwrap_or(ty)
+}
+
+fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, Ty>) -> String {
     let ty_name = display_ty(ty);
     match kind {
         ValueKind::Alloc => format!("alloc.{ty_name}"),
@@ -84,12 +116,54 @@ fn format_value_kind(kind: &ValueKind, ty: &crate::types::Ty) -> String {
         ValueKind::Xor(a, b) => format!("xor.{ty_name} %{}, %{}", a.0, b.0),
         ValueKind::Shl(a, b) => format!("shl.{ty_name} %{}, %{}", a.0, b.0),
         ValueKind::Shr(a, b) => format!("shr.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Eq(a, b) => format!("eq.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Ne(a, b) => format!("ne.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Lt(a, b) => format!("lt.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Le(a, b) => format!("le.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Gt(a, b) => format!("gt.{ty_name} %{}, %{}", a.0, b.0),
-        ValueKind::Ge(a, b) => format!("ge.{ty_name} %{}, %{}", a.0, b.0),
+        ValueKind::Eq(a, b) => {
+            format!(
+                "eq.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
+        ValueKind::Ne(a, b) => {
+            format!(
+                "ne.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
+        ValueKind::Lt(a, b) => {
+            format!(
+                "lt.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
+        ValueKind::Le(a, b) => {
+            format!(
+                "le.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
+        ValueKind::Gt(a, b) => {
+            format!(
+                "gt.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
+        ValueKind::Ge(a, b) => {
+            format!(
+                "ge.{} %{}, %{}",
+                display_ty(operand_ty(*a, ty, value_types)),
+                a.0,
+                b.0
+            )
+        }
         ValueKind::Call(function, args) => {
             let args = args
                 .iter()

@@ -397,17 +397,28 @@ impl<'a> Lowering<'a> {
         body: &HirBlock,
     ) -> LowerResult<()> {
         let header = fb.new_block();
-        let loop_body = fb.new_block();
-        let after = fb.new_block();
         fb.terminate(Terminator::Branch(header));
 
+        // `loop_body`/`after` are deliberately not created until the
+        // condition is known to produce a real value: creating them
+        // upfront and then hitting the early `Diverged` return below
+        // would leave them permanently unterminated (nothing branches
+        // to them, and nothing ever will), which is exactly the
+        // "internal invariant: every NIR block must have a terminator"
+        // panic this is guarding against. Lowering them lazily means
+        // there is simply nothing left dangling on this path.
         fb.switch_to(header);
         let cond_value = match self.lower_expr(fb, condition)? {
             LoweredExpr::Value(v) => v,
-            // The condition itself diverged; the header block is
-            // already terminated and the loop is never entered.
+            // The condition itself diverged and already gave `header`
+            // a real terminator (whatever `return`/`break`/`continue`
+            // it lowered to); the loop body and exit block are never
+            // reachable, so they are never created at all.
             LoweredExpr::Diverged => return Ok(()),
         };
+
+        let loop_body = fb.new_block();
+        let after = fb.new_block();
         fb.terminate(Terminator::CondBranch {
             condition: cond_value,
             then_block: loop_body,
@@ -841,9 +852,24 @@ impl<'a> Lowering<'a> {
         fb.switch_to(then_block);
         let mut reached_after = false;
         if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
-            fb.push_store(result_slot, then_value);
-            fb.terminate(Terminator::Branch(after_block));
             reached_after = true;
+            if else_branch.is_none() {
+                // No `else`: typeck gives the whole expression type
+                // `unit` regardless of what the then-branch's own tail
+                // expression resolves to (spec/0002 -- an `if` without
+                // `else` is never used for its value), so the
+                // then-branch's real value (whatever type it has) is
+                // evaluated for its side effects and then discarded.
+                // Storing it into `result_slot` here -- which is always
+                // declared `unit` on this path -- would store a value
+                // of the wrong type into it.
+                let _ = then_value;
+                let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                fb.push_store(result_slot, unit_value);
+            } else {
+                fb.push_store(result_slot, then_value);
+            }
+            fb.terminate(Terminator::Branch(after_block));
         }
 
         fb.switch_to(else_block);
@@ -919,6 +945,34 @@ mod tests {
         );
         lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
             .expect("expected lowering to succeed")
+    }
+
+    /// Like `lower`, but also runs the module through the NIR verifier
+    /// (using the same interner/source lowering itself used, unlike a
+    /// fresh throwaway one) and returns its diagnostics -- for tests
+    /// that need to assert the *verifier* accepts what was produced.
+    fn lower_and_verify(text: &str) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let module = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+            .expect("expected lowering to succeed");
+        crate::nir::verify_module(&module, id, &interner)
     }
 
     #[test]
@@ -1004,6 +1058,63 @@ mod tests {
         let module =
             lower("func f() -> i64 { mutable x = 0; while x < 10 { x = x + 1; } return x }");
         assert!(module.functions[0].blocks.len() >= 3);
+    }
+
+    #[test]
+    fn while_with_a_diverging_condition_lowers_without_orphaned_blocks() {
+        // The condition itself always diverges (`return;`), so the loop
+        // body and exit blocks are never reachable at all -- lowering
+        // must not create them and then leave them without a
+        // terminator. `lower()` panics if `finish_blocks` ever finds an
+        // untermined block, so simply succeeding is most of this test;
+        // the block-count and verifier checks pin down that this
+        // particular CFG shape (one block, no dangling successors) is
+        // what actually gets produced.
+        let module = lower("func main() { while { return; } {} }");
+        // bb0 (entry, branches straight to the header) + bb1 (header,
+        // terminated by the diverging `return;`) -- and nothing else:
+        // the loop body/exit blocks must never be created at all, not
+        // created and then left orphaned.
+        assert_eq!(
+            module.functions[0].blocks.len(),
+            2,
+            "unexpected block set: {:?}",
+            module.functions[0].blocks
+        );
+        let diagnostics = lower_and_verify("func main() { while { return; } {} }");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn if_without_else_discards_the_then_value_and_stores_unit() {
+        // The then-branch produces an `i64`, but an `if` without `else`
+        // is always `unit`-typed (spec/0002); storing the then-branch's
+        // real value into the unit-declared merge slot would be a type
+        // mismatch the verifier must never see in valid NIR.
+        let diagnostics = lower_and_verify("func main() { if true { 1 } }");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn choose_never_join_is_symmetric_regardless_of_which_branch_diverges() {
+        for text in [
+            "func choose(flag: bool) -> i64 { if flag { return 1 } else { 2 } } \
+             func main() -> i64 { return choose(false) }",
+            "func choose(flag: bool) -> i64 { if flag { 2 } else { return 1 } } \
+             func main() -> i64 { return choose(true) }",
+        ] {
+            let diagnostics = lower_and_verify(text);
+            assert!(
+                diagnostics.is_empty(),
+                "unexpected diagnostics for {text:?}: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

@@ -572,6 +572,53 @@ mod tests {
     }
 
     #[test]
+    fn diverging_while_condition_runs_and_returns_unit() {
+        // The condition always returns before the loop can ever run;
+        // the whole statement -- and the function -- must simply
+        // complete with `unit`, not panic or hang.
+        let text = "func main() { while { return; } {} }";
+        assert_eq!(run(text), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn if_without_else_evaluates_the_branch_but_returns_unit() {
+        let text = "func main() { if true { 1 } }";
+        assert_eq!(run(text), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn if_else_join_returns_the_non_diverging_value_when_then_diverges() {
+        let text = "func choose(flag: bool) -> i64 { if flag { return 1 } else { 2 } } \
+                    func main() -> i64 { return choose(false) }";
+        assert_eq!(run(text), Ok(Value::Int(2)));
+    }
+
+    #[test]
+    fn if_else_join_returns_the_non_diverging_value_when_else_diverges() {
+        let text = "func choose(flag: bool) -> i64 { if flag { 2 } else { return 1 } } \
+                    func main() -> i64 { return choose(true) }";
+        assert_eq!(run(text), Ok(Value::Int(2)));
+    }
+
+    #[test]
+    fn unary_not_on_a_diverging_operand_returns_the_divergent_value() {
+        let text = "func main() -> i64 { !{ return 7 } }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn comparison_with_a_diverging_right_operand_returns_the_divergent_value() {
+        let text = "func main() -> i64 { 1 == { return 7 } }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn assignment_with_a_diverging_right_hand_side_returns_the_divergent_value() {
+        let text = "func main() -> i64 { mutable x = 0; x = { return 7 }; }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
     fn calling_an_unknown_function_is_an_error_not_a_panic() {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", "func main() -> i64 { return 0 }");

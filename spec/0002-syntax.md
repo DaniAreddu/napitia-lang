@@ -2,6 +2,12 @@
 
 - Status: Partially implemented (Alpha 0.1)
 
+The grammar below uses the provisional vocabulary accepted in
+`rfcs/0004-language-independence.md`. It replaces an earlier version of
+this spec that used Rust's own declaration keywords (`fn`, `let`/`var`,
+`struct`, `enum`, `trait`, `impl`, `use`, `pub`) — see RFC 0004 for why
+that was a mistake and not merely a style choice.
+
 ## Implemented features
 
 Grammar below uses EBNF-style notation: `|` alternation, `[...]` optional,
@@ -15,53 +21,79 @@ lexical categories from `spec/0001-lexical-grammar.md` (`IDENT`, `INT`,
 Module = { Item } ;
 
 Item = FunctionDecl
-     | StructDecl
-     | EnumDecl
-     | UseDecl
+     | RecordDecl
+     | VariantDecl
+     | ProtocolDecl
+     | ExtendDecl
+     | ImportDecl
      ;
 ```
 
 A source file is one module. Multi-file modules (`module` declarations
 spanning files, visibility enforcement across files) are not implemented
-in this milestone; `pub`/`private` are parsed but only checked as
+in this milestone; `public`/`private` are parsed but only checked as
 placeholders (see `spec/0003`).
 
 ### Imports
 
 ```text
-UseDecl = "use" Path ";" ;
-Path    = IDENT { "::" IDENT } ;
+ImportDecl = "import" Path ";" ;
+Path       = IDENT { "." IDENT } ;
 ```
 
-`use` is parsed but does not yet resolve to real module contents in this
-milestone — there is only ever one module (the file being compiled).
+`import` is parsed but does not yet resolve to real module contents in
+this milestone — there is only ever one module (the file being compiled).
+Paths are dotted (`a.b.c`), not double-colon-separated, matching the
+dotted capability paths used by `uses` (see below) rather than Rust's
+`::` path syntax.
 
 ### Functions
 
 ```text
-FunctionDecl = [ "pub" ] "fn" IDENT "(" [ ParamList ] ")" [ "->" Type ] Block ;
+FunctionDecl = [ "public" ] "func" IDENT "(" [ ParamList ] ")"
+               [ "->" Type ] [ UsesClause ] [ RaisesClause ] Block ;
 ParamList    = Param { "," Param } [ "," ] ;
 Param        = IDENT ":" Type ;
+
+UsesClause   = "uses" EffectPath { "," EffectPath } ;
+RaisesClause = "raises" IDENT { "," IDENT } ;
+EffectPath   = IDENT { "." IDENT } ;
 ```
 
-A function with no `-> Type` has return type `unit`.
+A function with no `-> Type` has return type `unit`. `uses`/`raises` are
+parsed and attached to the function's AST/HIR node in this milestone, but
+are not yet enforced by the type checker (see `spec/0005`,
+`rfcs/0003-extensible-effects.md`) — a function's declared effects and
+errors are not faked as checked; they are simply not checked yet.
 
-### Structs and enums
+### Records, variants, and protocols
 
 ```text
-StructDecl = [ "pub" ] "struct" IDENT "{" [ FieldList ] "}" ;
+RecordDecl = [ "public" ] "record" IDENT "{" [ FieldList ] "}" ;
 FieldList  = Field { "," Field } [ "," ] ;
-Field      = [ "pub" ] IDENT ":" Type ;
+Field      = [ "public" ] IDENT ":" Type ;
 
-EnumDecl   = [ "pub" ] "enum" IDENT "{" [ VariantList ] "}" ;
-VariantList = Variant { "," Variant } [ "," ] ;
-Variant    = IDENT [ "(" Type { "," Type } ")" ] ;
+VariantDecl  = [ "public" ] "variant" IDENT "{" [ CaseList ] "}" ;
+CaseList     = Case { "," Case } [ "," ] ;
+Case         = IDENT [ "(" Type { "," Type } ")" ] ;
+
+ProtocolDecl = [ "public" ] "protocol" IDENT "{" { ProtocolMember } "}" ;
+ProtocolMember = "func" IDENT "(" [ ParamList ] ")" [ "->" Type ] ";" ;
+
+ExtendDecl = "extend" IDENT [ "with" Path ] "{" { FunctionDecl } "}" ;
 ```
 
-Structs and enums are parsed and lowered into HIR items in this milestone.
-Full type-checking of their construction, field access, and pattern
-matching beyond the primitive-typed subset is accepted direction, not
-implemented (see `spec/0003-type-system.md`).
+`record` is a product type (fields); `variant` is a sum type (a closed set
+of cases, optionally carrying payload types). `protocol` declares a
+behavioral contract as a set of function signatures with no bodies.
+`extend` attaches function bodies to a type, either as a protocol
+implementation (`extend Point with Printable { ... }`) or as inherent
+functions with no protocol (`extend Point { ... }`).
+
+All four are parsed and lowered into HIR items in this milestone. Full
+type-checking of record/variant construction, field access, protocol
+conformance, and pattern matching beyond the primitive-typed subset is
+accepted direction, not implemented (see `spec/0003-type-system.md`).
 
 ### Types
 
@@ -70,8 +102,9 @@ Type = IDENT ;
 ```
 
 Only named primitive types (`i8`..`usize`, `f32`, `f64`, `bool`, `char`,
-`str`, plus user struct/enum names by identifier) are accepted in this
-milestone. Generic type arguments, references, and pointer types are not
+`str`, plus user record/variant names by identifier) are accepted in this
+milestone. Generic type arguments and any reference/pointer/ownership
+annotation types (`owned`, `borrow`, `shared` — see `spec/0004`) are not
 part of the grammar yet; see "Accepted design direction".
 
 ### Statements and blocks
@@ -79,7 +112,7 @@ part of the grammar yet; see "Accepted design direction".
 ```text
 Block = "{" { Statement } [ Expression ] "}" ;
 
-Statement = LetStmt
+Statement = BindingStmt
           | ExprStmt
           | "return" [ Expression ] ";"
           | "break" [ Expression ] ";"
@@ -87,14 +120,14 @@ Statement = LetStmt
           | "defer" Expression ";"
           ;
 
-LetStmt  = ("let" | "var") IDENT [ ":" Type ] "=" Expression ";" ;
-ExprStmt = Expression ";" ;
+BindingStmt = ("value" | "mutable") IDENT [ ":" Type ] "=" Expression ";" ;
+ExprStmt    = Expression ";" ;
 ```
 
 A block's final expression, if present without a trailing `;`, is the
 block's value (tail expression), matching how `if`/`match` produce values.
-`let` introduces an immutable binding; `var` introduces a mutable one.
-`const` (module-level compile-time constants) is reserved but not
+`value` introduces an immutable binding; `mutable` introduces a mutable
+one. `const` (module-level compile-time constants) is reserved but not
 implemented in this milestone.
 
 `defer` is parsed and lowered but not yet executed by the interpreter in
@@ -118,7 +151,8 @@ Precedence, lowest to highest (Pratt parser binding powers):
 11. additive                + -
 12. multiplicative           * / %
 13. unary (prefix)          - ! ~
-14. postfix                 call `f(...)`, field access `.field`, `as Type`
+14. postfix                 call `f(...)`, field access `.field`, `as Type`,
+                            error-propagation `expr?`
 15. primary                 literals, identifiers, `( Expression )`
 ```
 
@@ -134,10 +168,11 @@ BinaryExpr(level) = generated from the precedence table above,
 
 UnaryExpr  = ( "-" | "!" | "~" ) UnaryExpr | PostfixExpr ;
 
-PostfixExpr = PrimaryExpr { Call | FieldAccess | AsCast } ;
-Call        = "(" [ Expression { "," Expression } [ "," ] ] ")" ;
-FieldAccess = "." IDENT ;
-AsCast      = "as" Type ;
+PostfixExpr = PrimaryExpr { Call | FieldAccess | AsCast | TryPropagate } ;
+Call         = "(" [ Expression { "," Expression } [ "," ] ] ")" ;
+FieldAccess  = "." IDENT ;
+AsCast       = "as" Type ;
+TryPropagate = "?" ;
 
 PrimaryExpr = INT | FLOAT | STRING | CHAR | "true" | "false"
             | IDENT
@@ -150,6 +185,14 @@ PrimaryExpr = INT | FLOAT | STRING | CHAR | "true" | "false"
 BlockExpr = Block ;
 ```
 
+`?` (`TryPropagate`) is parsed as a postfix operator in this milestone.
+It is not yet lowered to any behavior — a function's `raises` clause is
+not enforced yet (see "Functions" above), so `?` currently parses but the
+checker does not yet give it early-return-on-failure semantics. This is
+recorded here, not implemented, matching `rfcs/0004`'s note that
+`raises`/`?` is the intended primary failure-propagation path but is not
+frozen design.
+
 ### Control flow
 
 ```text
@@ -160,18 +203,19 @@ LoopStmt  = "loop" Block ;
 
 `if`/`else` is an expression (it can produce a value, both arms must agree
 on type when used as a value; see `spec/0003`). `while` and `loop` are
-statements in this milestone; `loop` supports `break <expr>` producing a
-value is accepted direction but not implemented yet — `break` in this
-milestone accepts an optional expression syntactically but the checker
-requires it to be `unit` until loop-as-expression is implemented.
+statements in this milestone; `loop` supporting `break <expr>` as a
+value-producing expression is accepted direction but not implemented
+yet — `break` in this milestone accepts an optional expression
+syntactically but the checker requires it to be `unit` until
+loop-as-expression is implemented.
 
 ### Match
 
 ```text
 MatchExpr = "match" Expression "{" { MatchArm } "}" ;
 MatchArm  = Pattern "=>" (Expression "," | Block) ;
-Pattern   = IDENT                      (* binds or matches a unit variant *)
-          | IDENT "(" PatternList ")"  (* enum variant with payload *)
+Pattern   = IDENT                      (* binds, or matches a payload-less case *)
+          | IDENT "(" PatternList ")"  (* variant case with payload *)
           | INT | STRING | CHAR | "true" | "false"
           | "_"                        (* wildcard *)
           ;
@@ -179,20 +223,20 @@ PatternList = Pattern { "," Pattern } [ "," ] ;
 ```
 
 `match` is parsed and lowered into HIR/NIR as a chain of equality
-comparisons for literal and unit-variant patterns; payload-carrying enum
-patterns are parsed but exhaustiveness checking and payload binding are
-accepted direction, not implemented in this milestone (see
+comparisons for literal and payload-less-case patterns; payload-carrying
+variant-case patterns are parsed but exhaustiveness checking and payload
+binding are accepted direction, not implemented in this milestone (see
 `spec/0003-type-system.md`).
 
 ## Example
 
 ```napitia
-fn add(left: i64, right: i64) -> i64 {
+func add(left: i64, right: i64) -> i64 {
     return left + right
 }
 
-fn main() -> i64 {
-    let answer = add(40, 2)
+func main() -> i64 {
+    value answer = add(40, 2)
 
     if answer == 42 {
         return answer
@@ -214,23 +258,31 @@ without treating a missing node as a silent success.
 
 ## Accepted design direction
 
-- Generic type parameters on functions, structs, enums, and traits
-  (`fn identity<T>(x: T) -> T`).
-- Reference and pointer types, and ownership/borrow annotations, once
-  `rfcs/0002-ownership-and-regions.md` is implemented.
-- `impl` blocks and `trait` bodies (currently only reserved as keywords).
+- Generic type parameters on functions, records, variants, and protocols
+  (`func identity<T>(x: T) -> T`).
+- `owned`/`borrow`/`shared` type-position annotations at API boundaries,
+  once `rfcs/0002-ownership-and-regions.md` is implemented — never
+  pervasive lifetime parameters (`rfcs/0004`).
+- `uses`/`raises` clauses actually checked against a real effect/error
+  system (`spec/0005`, `rfcs/0003`), rather than parsed-and-ignored as in
+  this milestone.
 - `async`/`await` and structured-concurrency syntax.
 - `loop { ... break value }` as a value-producing expression.
-- Full pattern matching with exhaustiveness checking and variant payload
-  binding.
+- Full pattern matching with exhaustiveness checking and variant-case
+  payload binding.
 
 ## Unresolved research questions
 
 - Whether `match` arms need explicit braces always, or the current
   "block or comma-terminated expression" split is the right long-term
   shape.
-- The precise surface syntax for effects (`spec/0005`) has not been
-  designed; `spec/0005` describes the type-level model only.
+- The precise surface syntax for a fully checked effect/error system has
+  not been designed; `uses`/`raises` clauses exist syntactically, but
+  `spec/0005`/`rfcs/0003` describe the type-level model as still open, not
+  settled.
+- Whether `?` needs any additional surface form (e.g. distinguishing
+  "propagate the error" from "propagate and also apply a capability")
+  once `raises` is actually checked.
 
 ## Non-goals
 

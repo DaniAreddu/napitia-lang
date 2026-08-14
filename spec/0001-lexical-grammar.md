@@ -49,20 +49,34 @@ is planned; see "Unresolved research questions".
 The following are reserved and cannot be used as identifiers:
 
 ```text
-fn let var const return
+func value mutable const return
 if else while for in loop break continue
 true false
-struct enum match impl trait
-use module pub private
+record variant match protocol extend
+import module public private
+uses raises
 as is
 unsafe
 async await
-move
 region
 defer
 ```
 
 `true` and `false` are boolean literal keywords, not general identifiers.
+
+This vocabulary is provisional (`rfcs/0004-language-independence.md`): it
+replaces an earlier keyword table that was a near-verbatim copy of Rust's
+declaration keywords (`fn`, `let`/`var`, `struct`, `enum`, `trait`,
+`impl`, `use`, `pub`). `func` declares a function, `value` an immutable
+binding, `mutable` a mutable binding, `record` a product type, `variant`
+a sum type, `protocol` a behavioral contract, `extend` a protocol
+implementation (or inherent methods), `import` brings a path into scope,
+and `uses`/`raises` declare a function's effects/capabilities and typed
+errors respectively (see `spec/0002`, `spec/0005`). The reserved `move`
+keyword from the earlier table was dropped: with ownership transfer
+inferred by default (`spec/0004`), an explicit move marker is not
+currently needed, and reserving one anyway would imply a feature that has
+not been designed.
 
 ### Integer literals
 

@@ -563,6 +563,18 @@ mod tests {
     }
 
     #[test]
+    fn diverging_initializer_short_circuits_the_rest_of_the_block() {
+        // The initializer of `x` diverges before the binding ever
+        // completes, so `x` never exists; the rest of the block (`x =
+        // 99; return x`) is unreachable and must never run -- if NIR
+        // lowering had appended instructions after the diverging
+        // `return 1`'s terminator (the bug this guards against), this
+        // would either panic or return 99 instead of 1.
+        let text = "func main() -> i64 { mutable x = return 1; x = 99; return x }";
+        assert_eq!(run(text), Ok(Value::Int(1)));
+    }
+
+    #[test]
     fn calling_an_unknown_function_is_an_error_not_a_panic() {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", "func main() -> i64 { return 0 }");

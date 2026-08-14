@@ -104,6 +104,23 @@ enum LocalBinding {
     Slot(ValueId),
 }
 
+/// The result of lowering one expression: either a real value the
+/// current (still-open) block can keep building on, or proof that
+/// control already left this block. `return`/`break`/`continue` lower
+/// straight to a real NIR terminator rather than a synthetic "unit"
+/// instruction, so once one of them fires there is no value left to
+/// store, pass as an operand, or branch on -- every caller that
+/// receives `Diverged` must stop emitting into the current block and
+/// propagate `Diverged` upward immediately, instead of inventing a
+/// placeholder value to keep going. This is what makes "no instruction
+/// is ever appended after a block's terminator" a property the type
+/// system enforces, rather than something callers have to remember to
+/// check with `current_terminated()`.
+enum LoweredExpr {
+    Value(ValueId),
+    Diverged,
+}
+
 /// Per-function mutable lowering state: value numbering, the
 /// in-progress block list, and the active loop's break/continue targets.
 struct FnBuilder {
@@ -217,8 +234,16 @@ impl<'a> Lowering<'a> {
             params.push(Param { value, ty });
         }
 
-        let body_value = self.lower_block_value(&mut fb, &f.body)?;
+        let body_result = self.lower_block_value(&mut fb, &f.body)?;
         if !fb.current_terminated() {
+            // `Diverged` always means the block that produced it is
+            // already terminated (see `LoweredExpr`), so reaching here
+            // means the body itself did produce a real value.
+            let LoweredExpr::Value(body_value) = body_result else {
+                unreachable!(
+                    "internal invariant: a Diverged result always already terminated its block"
+                );
+            };
             if matches!(return_type, Ty::Unit) {
                 fb.terminate(Terminator::Return(None));
             } else {
@@ -269,16 +294,25 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    fn lower_block_value(&mut self, fb: &mut FnBuilder, block: &HirBlock) -> LowerResult<ValueId> {
+    fn lower_block_value(
+        &mut self,
+        fb: &mut FnBuilder,
+        block: &HirBlock,
+    ) -> LowerResult<LoweredExpr> {
         for stmt in &block.statements {
             self.lower_stmt(fb, stmt)?;
             if fb.current_terminated() {
-                return Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)));
+                // A statement already diverged the block; there is
+                // nothing left to lower and nowhere left to put another
+                // instruction.
+                return Ok(LoweredExpr::Diverged);
             }
         }
         match &block.tail {
             Some(tail) => self.lower_expr(fb, tail),
-            None => Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit))),
+            None => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
+            )),
         }
     }
 
@@ -286,7 +320,14 @@ impl<'a> Lowering<'a> {
         match stmt {
             HirStmt::Binding(b) => {
                 let ty = self.local_types.get(&b.local).cloned().unwrap_or(Ty::Error);
-                let value = self.lower_expr_hinted(fb, &b.value, &ty)?;
+                let value = match self.lower_expr_hinted(fb, &b.value, &ty)? {
+                    LoweredExpr::Value(v) => v,
+                    // The initializer itself diverged (e.g. `value x =
+                    // return 1;`): the binding is never actually
+                    // created, and the block is already terminated, so
+                    // there is nothing left to allocate or store into.
+                    LoweredExpr::Diverged => return Ok(()),
+                };
                 let binding = if b.mutable {
                     let slot = fb.alloc_slot(ty);
                     fb.push_store(slot, value);
@@ -325,7 +366,12 @@ impl<'a> Lowering<'a> {
         fb.terminate(Terminator::Branch(header));
 
         fb.switch_to(header);
-        let cond_value = self.lower_expr(fb, condition)?;
+        let cond_value = match self.lower_expr(fb, condition)? {
+            LoweredExpr::Value(v) => v,
+            // The condition itself diverged; the header block is
+            // already terminated and the loop is never entered.
+            LoweredExpr::Diverged => return Ok(()),
+        };
         fb.terminate(Terminator::CondBranch {
             condition: cond_value,
             then_block: loop_body,
@@ -369,36 +415,38 @@ impl<'a> Lowering<'a> {
 
     // ---- expression lowering ----
 
-    fn lower_expr(&mut self, fb: &mut FnBuilder, expr: &HirExpr) -> LowerResult<ValueId> {
+    fn lower_expr(&mut self, fb: &mut FnBuilder, expr: &HirExpr) -> LowerResult<LoweredExpr> {
         match expr {
-            HirExpr::Int { value, .. } => {
-                Ok(fb.push_value(Ty::I64, ValueKind::Const(Const::Int(*value))))
-            }
-            HirExpr::Float { value, .. } => {
-                Ok(fb.push_value(Ty::F64, ValueKind::Const(Const::Float(*value))))
-            }
-            HirExpr::Str { value, .. } => {
-                Ok(fb.push_value(Ty::Str, ValueKind::Const(Const::Str(value.clone()))))
-            }
-            HirExpr::Char { value, .. } => {
-                Ok(fb.push_value(Ty::Char, ValueKind::Const(Const::Char(*value))))
-            }
-            HirExpr::Bool { value, .. } => {
-                Ok(fb.push_value(Ty::Bool, ValueKind::Const(Const::Bool(*value))))
-            }
+            HirExpr::Int { value, .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::I64, ValueKind::Const(Const::Int(*value))),
+            )),
+            HirExpr::Float { value, .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::F64, ValueKind::Const(Const::Float(*value))),
+            )),
+            HirExpr::Str { value, .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Str, ValueKind::Const(Const::Str(value.clone()))),
+            )),
+            HirExpr::Char { value, .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Char, ValueKind::Const(Const::Char(*value))),
+            )),
+            HirExpr::Bool { value, .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Bool, ValueKind::Const(Const::Bool(*value))),
+            )),
             HirExpr::Local { local, .. } => {
                 let binding = *fb.local_bindings.get(local).expect(
                     "internal invariant: a resolved local is always bound by the time it's read",
                 );
                 match binding {
-                    LocalBinding::Direct(value) => Ok(value),
+                    LocalBinding::Direct(value) => Ok(LoweredExpr::Value(value)),
                     LocalBinding::Slot(slot) => {
                         let ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
-                        Ok(fb.push_value(ty, ValueKind::Load(slot)))
+                        Ok(LoweredExpr::Value(fb.push_value(ty, ValueKind::Load(slot))))
                     }
                 }
             }
-            HirExpr::Function { .. } => Ok(fb.push_value(Ty::Error, ValueKind::Const(Const::Unit))),
+            HirExpr::Function { .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
+            )),
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
                 op, left, right, ..
@@ -424,15 +472,24 @@ impl<'a> Lowering<'a> {
             HirExpr::Return { value, .. } => {
                 let ret_ty = fb.return_ty.clone();
                 let v = match value {
-                    Some(v) => Some(self.lower_expr_hinted(fb, v, &ret_ty)?),
+                    Some(v) => match self.lower_expr_hinted(fb, v, &ret_ty)? {
+                        LoweredExpr::Value(val) => Some(val),
+                        // The value being returned already diverged
+                        // (e.g. `return return 1`); this outer `return`
+                        // never actually executes, and the block is
+                        // already terminated by the inner one.
+                        LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                    },
                     None => None,
                 };
                 fb.terminate(Terminator::Return(v));
-                Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)))
+                Ok(LoweredExpr::Diverged)
             }
             HirExpr::Break { value, .. } => {
-                if let Some(v) = value {
-                    self.lower_expr(fb, v)?;
+                if let Some(v) = value
+                    && matches!(self.lower_expr(fb, v)?, LoweredExpr::Diverged)
+                {
+                    return Ok(LoweredExpr::Diverged);
                 }
                 let target = fb
                     .loop_stack
@@ -440,7 +497,7 @@ impl<'a> Lowering<'a> {
                     .map(|c| c.break_target)
                     .ok_or_else(|| "break outside a loop".to_string())?;
                 fb.terminate(Terminator::Branch(target));
-                Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)))
+                Ok(LoweredExpr::Diverged)
             }
             HirExpr::Continue { .. } => {
                 let target = fb
@@ -449,9 +506,11 @@ impl<'a> Lowering<'a> {
                     .map(|c| c.continue_target)
                     .ok_or_else(|| "continue outside a loop".to_string())?;
                 fb.terminate(Terminator::Branch(target));
-                Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)))
+                Ok(LoweredExpr::Diverged)
             }
-            HirExpr::Error { .. } => Ok(fb.push_value(Ty::Error, ValueKind::Const(Const::Unit))),
+            HirExpr::Error { .. } => Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
+            )),
         }
     }
 
@@ -463,14 +522,14 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         expr: &HirExpr,
         hint: &Ty,
-    ) -> LowerResult<ValueId> {
+    ) -> LowerResult<LoweredExpr> {
         match expr {
-            HirExpr::Int { value, .. } if is_numeric(hint) => {
-                Ok(fb.push_value(hint.clone(), ValueKind::Const(Const::Int(*value))))
-            }
-            HirExpr::Float { value, .. } if is_numeric(hint) => {
-                Ok(fb.push_value(hint.clone(), ValueKind::Const(Const::Float(*value))))
-            }
+            HirExpr::Int { value, .. } if is_numeric(hint) => Ok(LoweredExpr::Value(
+                fb.push_value(hint.clone(), ValueKind::Const(Const::Int(*value))),
+            )),
+            HirExpr::Float { value, .. } if is_numeric(hint) => Ok(LoweredExpr::Value(
+                fb.push_value(hint.clone(), ValueKind::Const(Const::Float(*value))),
+            )),
             _ => self.lower_expr(fb, expr),
         }
     }
@@ -480,13 +539,16 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         op: UnaryOp,
         operand: &HirExpr,
-    ) -> LowerResult<ValueId> {
+    ) -> LowerResult<LoweredExpr> {
         let ty = self.expr_ty(operand);
-        let v = self.lower_expr_hinted(fb, operand, &ty)?;
-        Ok(match op {
+        let v = match self.lower_expr_hinted(fb, operand, &ty)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        Ok(LoweredExpr::Value(match op {
             UnaryOp::Neg => fb.push_value(ty, ValueKind::Neg(v)),
             UnaryOp::Not | UnaryOp::BitNot => fb.push_value(ty, ValueKind::Not(v)),
-        })
+        }))
     }
 
     fn lower_binary(
@@ -495,7 +557,7 @@ impl<'a> Lowering<'a> {
         op: BinaryOp,
         left: &HirExpr,
         right: &HirExpr,
-    ) -> LowerResult<ValueId> {
+    ) -> LowerResult<LoweredExpr> {
         match op {
             BinaryOp::And => return self.lower_short_circuit(fb, left, right, false),
             BinaryOp::Or => return self.lower_short_circuit(fb, left, right, true),
@@ -503,9 +565,14 @@ impl<'a> Lowering<'a> {
                 // Ranges are not lowered further in this milestone (no
                 // range value/iteration support yet); evaluate the
                 // endpoints for side effects and yield the start value.
-                let lv = self.lower_expr(fb, left)?;
-                self.lower_expr(fb, right)?;
-                return Ok(lv);
+                let lv = match self.lower_expr(fb, left)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                if matches!(self.lower_expr(fb, right)?, LoweredExpr::Diverged) {
+                    return Ok(LoweredExpr::Diverged);
+                }
+                return Ok(LoweredExpr::Value(lv));
             }
             _ => {}
         }
@@ -516,8 +583,14 @@ impl<'a> Lowering<'a> {
         // which side "actually" carries it based on which is a literal.
         let operand_ty = self.expr_ty(left);
 
-        let lv = self.lower_expr_hinted(fb, left, &operand_ty)?;
-        let rv = self.lower_expr_hinted(fb, right, &operand_ty)?;
+        let lv = match self.lower_expr_hinted(fb, left, &operand_ty)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let rv = match self.lower_expr_hinted(fb, right, &operand_ty)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
 
         let kind = match op {
             BinaryOp::Add => ValueKind::Add(lv, rv),
@@ -549,7 +622,7 @@ impl<'a> Lowering<'a> {
             | BinaryOp::Ge => Ty::Bool,
             _ => operand_ty,
         };
-        Ok(fb.push_value(result_ty, kind))
+        Ok(LoweredExpr::Value(fb.push_value(result_ty, kind)))
     }
 
     /// Lowers `&&`/`||` with short-circuit evaluation: the right operand
@@ -563,8 +636,11 @@ impl<'a> Lowering<'a> {
         left: &HirExpr,
         right: &HirExpr,
         short_on_true: bool,
-    ) -> LowerResult<ValueId> {
-        let left_value = self.lower_expr(fb, left)?;
+    ) -> LowerResult<LoweredExpr> {
+        let left_value = match self.lower_expr(fb, left)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
         let right_block = fb.new_block();
         let after_block = fb.new_block();
         let result_slot = fb.alloc_slot(Ty::Bool);
@@ -582,14 +658,19 @@ impl<'a> Lowering<'a> {
         });
 
         fb.switch_to(right_block);
-        let right_value = self.lower_expr(fb, right)?;
-        if !fb.current_terminated() {
+        // A Diverged right side already terminated `right_block` itself
+        // (via whatever return/break/continue it lowered to); there is
+        // no value to store and no `after_block` branch to add on top
+        // of that.
+        if let LoweredExpr::Value(right_value) = self.lower_expr(fb, right)? {
             fb.push_store(result_slot, right_value);
             fb.terminate(Terminator::Branch(after_block));
         }
 
         fb.switch_to(after_block);
-        Ok(fb.push_value(Ty::Bool, ValueKind::Load(result_slot)))
+        Ok(LoweredExpr::Value(
+            fb.push_value(Ty::Bool, ValueKind::Load(result_slot)),
+        ))
     }
 
     fn lower_assign(
@@ -598,11 +679,17 @@ impl<'a> Lowering<'a> {
         target: &HirExpr,
         op: AssignOp,
         value: &HirExpr,
-    ) -> LowerResult<ValueId> {
+    ) -> LowerResult<LoweredExpr> {
         let HirExpr::Local { local, .. } = target else {
-            self.lower_expr(fb, target)?;
-            self.lower_expr(fb, value)?;
-            return Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)));
+            if matches!(self.lower_expr(fb, target)?, LoweredExpr::Diverged) {
+                return Ok(LoweredExpr::Diverged);
+            }
+            if matches!(self.lower_expr(fb, value)?, LoweredExpr::Diverged) {
+                return Ok(LoweredExpr::Diverged);
+            }
+            return Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
+            ));
         };
         // typeck rejects assigning to a binding that isn't `mutable`
         // before NIR lowering ever runs, so a well-typed program's
@@ -614,7 +701,10 @@ impl<'a> Lowering<'a> {
             ),
         };
         let target_ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
-        let value_value = self.lower_expr_hinted(fb, value, &target_ty)?;
+        let value_value = match self.lower_expr_hinted(fb, value, &target_ty)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
 
         let final_value = match op {
             AssignOp::Assign => value_value,
@@ -637,7 +727,9 @@ impl<'a> Lowering<'a> {
             }
         };
         fb.push_store(slot, final_value);
-        Ok(fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)))
+        Ok(LoweredExpr::Value(
+            fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
+        ))
     }
 
     fn lower_call(
@@ -645,13 +737,19 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         callee: &HirExpr,
         args: &[HirExpr],
-    ) -> LowerResult<ValueId> {
+    ) -> LowerResult<LoweredExpr> {
         let HirExpr::Function { item, .. } = callee else {
-            self.lower_expr(fb, callee)?;
-            for arg in args {
-                self.lower_expr(fb, arg)?;
+            if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
+                return Ok(LoweredExpr::Diverged);
             }
-            return Ok(fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)));
+            for arg in args {
+                if matches!(self.lower_expr(fb, arg)?, LoweredExpr::Diverged) {
+                    return Ok(LoweredExpr::Diverged);
+                }
+            }
+            return Ok(LoweredExpr::Value(
+                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
+            ));
         };
         let (param_tys, ret_ty) = self
             .function_sigs
@@ -661,9 +759,14 @@ impl<'a> Lowering<'a> {
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
-            arg_values.push(self.lower_expr_hinted(fb, arg, &hint)?);
+            match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => arg_values.push(v),
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
         }
-        Ok(fb.push_value(ret_ty, ValueKind::Call(*item, arg_values)))
+        Ok(LoweredExpr::Value(
+            fb.push_value(ret_ty, ValueKind::Call(*item, arg_values)),
+        ))
     }
 
     fn lower_if(
@@ -673,8 +776,11 @@ impl<'a> Lowering<'a> {
         then_branch: &HirBlock,
         else_branch: &Option<HirElse>,
         result_ty: Ty,
-    ) -> LowerResult<ValueId> {
-        let cond_value = self.lower_expr(fb, condition)?;
+    ) -> LowerResult<LoweredExpr> {
+        let cond_value = match self.lower_expr(fb, condition)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
 
         let then_block = fb.new_block();
         let else_block = fb.new_block();
@@ -687,9 +793,12 @@ impl<'a> Lowering<'a> {
 
         let result_slot = fb.alloc_slot(result_ty.clone());
 
+        // A `Diverged` branch has already terminated its own block (via
+        // whatever return/break/continue it lowered to); there is no
+        // value to store into `result_slot` and no `after_block` branch
+        // to add on top of that terminator.
         fb.switch_to(then_block);
-        let then_value = self.lower_block_value(fb, then_branch)?;
-        if !fb.current_terminated() {
+        if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
             fb.push_store(result_slot, then_value);
             fb.terminate(Terminator::Branch(after_block));
         }
@@ -697,15 +806,13 @@ impl<'a> Lowering<'a> {
         fb.switch_to(else_block);
         match else_branch {
             Some(HirElse::Block(b)) => {
-                let else_value = self.lower_block_value(fb, b)?;
-                if !fb.current_terminated() {
+                if let LoweredExpr::Value(else_value) = self.lower_block_value(fb, b)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             Some(HirElse::If(inner)) => {
-                let else_value = self.lower_expr(fb, inner)?;
-                if !fb.current_terminated() {
+                if let LoweredExpr::Value(else_value) = self.lower_expr(fb, inner)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
                 }
@@ -718,7 +825,9 @@ impl<'a> Lowering<'a> {
         }
 
         fb.switch_to(after_block);
-        Ok(fb.push_value(result_ty, ValueKind::Load(result_slot)))
+        Ok(LoweredExpr::Value(
+            fb.push_value(result_ty, ValueKind::Load(result_slot)),
+        ))
     }
 }
 
@@ -815,6 +924,30 @@ mod tests {
             lower("func f() -> i64 { mutable x = 0; while x < 10 { x = x + 1; } return x }");
         assert!(skipped.is_empty());
         assert!(module.functions[0].blocks.len() >= 3);
+    }
+
+    #[test]
+    fn a_binding_whose_initializer_diverges_never_gets_a_slot_or_store() {
+        // `x`'s initializer diverges before the binding ever completes,
+        // so lowering must never allocate a slot for it or store into
+        // one -- and the unreachable `x = 2; return x;` after it must
+        // never be lowered either.
+        let (module, skipped) = lower("func f() -> i64 { mutable x = return 1; x = 2; return x }");
+        assert!(skipped.is_empty());
+        let has_alloc_or_store = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Alloc,
+                        ..
+                    } | Instruction::Store { .. }
+                )
+            });
+        assert!(!has_alloc_or_store);
     }
 
     #[test]

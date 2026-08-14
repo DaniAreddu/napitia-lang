@@ -73,10 +73,16 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
     }
     checker.finalize_defaults();
 
-    let local_types =
-        checker.locals.iter().map(|(id, info)| (*id, checker.ctx.resolve(&info.ty))).collect();
+    let local_types = checker
+        .locals
+        .iter()
+        .map(|(id, info)| (*id, checker.ctx.resolve(&info.ty)))
+        .collect();
 
-    TypeckResult { diagnostics: checker.diagnostics, local_types }
+    TypeckResult {
+        diagnostics: checker.diagnostics,
+        local_types,
+    }
 }
 
 struct Checker<'a> {
@@ -141,8 +147,8 @@ impl<'a> Checker<'a> {
         self.current_return_type = sig.ret.clone();
         let body_ty = self.check_block(&f.body);
         self.unify_report(
-            &body_ty,
             &sig.ret,
+            &body_ty,
             f.body.span,
             "the function's body does not match its declared return type",
         );
@@ -257,8 +263,8 @@ impl<'a> Checker<'a> {
                     .unwrap_or(Ty::Unit);
                 let ret = self.current_return_type.clone();
                 self.unify_report(
-                    &value_ty,
                     &ret,
+                    &value_ty,
                     *span,
                     "the returned value does not match the function's declared return type",
                 );
@@ -426,8 +432,8 @@ impl<'a> Checker<'a> {
         } else {
             for (arg_ty, param_ty) in arg_tys.iter().zip(sig.params.iter()) {
                 self.unify_report(
-                    arg_ty,
                     param_ty,
+                    arg_ty,
                     span,
                     "argument type does not match the parameter's declared type",
                 );
@@ -534,7 +540,17 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn unify_report(&mut self, a: &Ty, b: &Ty, span: Span, message: &str) {
+    /// Unifies `expected` against `actual`, reporting a type-mismatch
+    /// diagnostic naming both sides in that order on failure. Callers
+    /// with a genuine expected/actual distinction (a declared return
+    /// type vs. a returned expression's type, a parameter type vs. an
+    /// argument's type) must pass them in that order — reversing it
+    /// produces a correct unification but a backwards "expected X,
+    /// found Y" message. Callers comparing two peer values with no
+    /// canonical direction (binary operator operands, if/else branches,
+    /// match arms) may pass either order.
+    fn unify_report(&mut self, expected: &Ty, actual: &Ty, span: Span, message: &str) {
+        let (a, b) = (expected, actual);
         if let Err((ra, rb)) = unify(&mut self.ctx, a, b) {
             self.diagnostics.push(Diagnostic::error(
                 codes::TYPE_MISMATCH,
@@ -550,7 +566,7 @@ impl<'a> Checker<'a> {
     }
 
     fn expect_bool(&mut self, ty: &Ty, span: Span) {
-        self.unify_report(ty, &Ty::Bool, span, "expected a boolean expression");
+        self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
     fn require_numeric(&mut self, ty: &Ty, span: Span) {

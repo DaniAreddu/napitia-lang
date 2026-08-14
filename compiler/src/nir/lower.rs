@@ -924,7 +924,24 @@ mod tests {
 
     #[test]
     fn match_expression_is_skipped_not_silently_wrong() {
-        let (module, skipped) = lower("func f(x: i64) -> i64 { return match x { _ => 0 } }");
+        // `match` is now rejected by the type checker itself (T0007)
+        // before a program ever reaches NIR lowering, so this bypasses
+        // check_module's diagnostics gate to exercise NIR's own
+        // defense-in-depth: lowering must still refuse to guess at NIR
+        // for a construct it cannot represent, rather than silently
+        // emitting something wrong, if it is ever handed one directly.
+        let text = "func f(x: i64) -> i64 { return match x { _ => 0 } }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty());
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty());
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(diags.is_empty());
+        let result = check_module(&hir, id, &interner);
+        let (module, skipped) = lower_module(&hir, &result.local_types, &interner);
         assert!(module.functions.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].contains("match"));

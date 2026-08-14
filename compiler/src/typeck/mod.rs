@@ -25,6 +25,7 @@ mod codes {
     pub const EXPECTED_NUMERIC: &str = "T0004";
     pub const EXPECTED_INTEGER: &str = "T0005";
     pub const UNKNOWN_TYPE: &str = "T0006";
+    pub const UNSUPPORTED_FEATURE: &str = "T0007";
 }
 
 #[derive(Clone)]
@@ -183,6 +184,9 @@ impl<'a> Checker<'a> {
             );
         }
         self.current_return_type = sig.ret.clone();
+        if !f.uses.is_empty() || !f.raises.is_empty() {
+            self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
+        }
         let body_ty = self.check_block(&f.body);
         self.unify_report(
             &sig.ret,
@@ -255,7 +259,11 @@ impl<'a> Checker<'a> {
                 value_ty
             }
             HirStmt::Expr(e) => self.check_expr(e),
-            HirStmt::Defer { expr, .. } => self.check_expr(expr),
+            HirStmt::Defer { expr, span } => {
+                self.check_expr(expr);
+                self.push_unsupported(*span, "`defer`");
+                Ty::Unit
+            }
             HirStmt::While {
                 condition, body, ..
             } => {
@@ -300,15 +308,26 @@ impl<'a> Checker<'a> {
                 span,
             } => self.check_assign(target, *op, value, *span),
             HirExpr::Call { callee, args, span } => self.check_call(callee, args, *span),
-            HirExpr::Field { base, .. } => {
+            HirExpr::Field { base, span, .. } => {
                 self.check_expr(base);
+                self.push_unsupported(*span, "field access");
                 Ty::Error
             }
-            HirExpr::Cast { expr, ty, .. } => {
+            HirExpr::Cast { expr, ty, span } => {
                 self.check_expr(expr);
-                self.resolve_named_type(ty)
+                // Still resolve the target type name, so an unknown
+                // type in a cast gets its own T0006 diagnostic rather
+                // than being silently swallowed by the unsupported-cast
+                // diagnostic below.
+                self.resolve_named_type(ty);
+                self.push_unsupported(*span, "casts (`as`)");
+                Ty::Error
             }
-            HirExpr::Try { expr, .. } => self.check_expr(expr),
+            HirExpr::Try { expr, span } => {
+                self.check_expr(expr);
+                self.push_unsupported(*span, "postfix `?`");
+                Ty::Error
+            }
             HirExpr::If {
                 condition,
                 then_branch,
@@ -316,8 +335,10 @@ impl<'a> Checker<'a> {
                 ..
             } => self.check_if(condition, then_branch, else_branch),
             HirExpr::Match {
-                scrutinee, arms, ..
-            } => self.check_match(scrutinee, arms),
+                scrutinee,
+                arms,
+                span,
+            } => self.check_match(scrutinee, arms, *span),
             HirExpr::Block(block) => self.check_block(block),
             HirExpr::Return { value, span } => {
                 let value_ty = value
@@ -417,9 +438,8 @@ impl<'a> Checker<'a> {
                 Ty::Bool
             }
             BinaryOp::Range | BinaryOp::RangeInclusive => {
-                self.unify_report(&lt, &rt, span, "range endpoints must have the same type");
-                self.require_integer(&lt, span);
-                lt
+                self.push_unsupported(span, "range expressions (`..`/`..=`)");
+                Ty::Error
             }
         }
     }
@@ -542,23 +562,35 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_match(&mut self, scrutinee: &HirExpr, arms: &[HirMatchArm]) -> Ty {
-        let scrutinee_ty = self.check_expr(scrutinee);
-        let mut result: Option<Ty> = None;
+    /// `match` is parsed and its pieces are walked so nested expressions
+    /// still get their own diagnostics (unresolved names and the like),
+    /// but it is not otherwise type-checked: pattern-to-scrutinee
+    /// compatibility and exhaustiveness are not implemented, so claiming
+    /// arms "agree in type" would overstate how much is actually
+    /// verified. Every `match` is therefore reported as an unsupported
+    /// feature, unconditionally.
+    fn check_match(&mut self, scrutinee: &HirExpr, arms: &[HirMatchArm], span: Span) -> Ty {
+        self.check_expr(scrutinee);
         for arm in arms {
-            self.bind_pattern(&arm.pattern, &scrutinee_ty);
-            let body_ty = match &arm.body {
-                HirMatchArmBody::Expr(e) => self.check_expr(e),
-                HirMatchArmBody::Block(b) => self.check_block(b),
-            };
-            match &result {
-                Some(r) => {
-                    self.unify_report(r, &body_ty, arm.span, "match arms must have the same type")
+            // Pattern-bound names get Ty::Error (not the scrutinee's
+            // type): match isn't semantically checked, so this checker
+            // does not claim to know what type a pattern binding
+            // actually carries.
+            self.bind_pattern(&arm.pattern, &Ty::Error);
+            match &arm.body {
+                HirMatchArmBody::Expr(e) => {
+                    self.check_expr(e);
                 }
-                None => result = Some(body_ty),
+                HirMatchArmBody::Block(b) => {
+                    self.check_block(b);
+                }
             }
         }
-        result.unwrap_or(Ty::Unit)
+        self.push_unsupported(
+            span,
+            "match (pattern compatibility and exhaustiveness are not checked)",
+        );
+        Ty::Error
     }
 
     fn bind_pattern(&mut self, pattern: &HirPattern, scrutinee_ty: &Ty) {
@@ -687,6 +719,24 @@ impl<'a> Checker<'a> {
                 display_ty(&resolved, self.interner)
             ),
         ));
+    }
+
+    /// Reports a construct that is parsed (and, where relevant, still
+    /// walked for cascading diagnostics) but has no implemented
+    /// semantics in Alpha 0.1. This is how the checker keeps a
+    /// not-yet-implemented feature from silently becoming fake
+    /// behavior downstream: NIR lowering and the interpreter only ever
+    /// see it after this diagnostic has already been recorded.
+    fn push_unsupported(&mut self, span: Span, feature: &str) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNSUPPORTED_FEATURE,
+                self.source,
+                span,
+                format!("{feature} is not supported in Alpha 0.1"),
+            )
+            .with_primary_label("not yet implemented"),
+        );
     }
 }
 
@@ -844,16 +894,75 @@ mod tests {
     }
 
     #[test]
-    fn match_arms_must_agree_in_type() {
+    fn match_is_reported_as_an_unsupported_feature_regardless_of_arm_types() {
+        // Arm-type agreement is not checked at all: match isn't
+        // semantically validated in Alpha 0.1, so mismatched arms don't
+        // get their own T0001 -- every match unconditionally gets one
+        // T0007, whether or not its arms happen to agree.
         let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, _ => true } }");
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(diags[0].code, "T0007");
     }
 
     #[test]
-    fn well_typed_match_has_no_diagnostics() {
+    fn well_typed_match_is_still_reported_as_unsupported() {
         let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, n => n, _ => 0 } }");
-        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn defer_statement_is_reported_as_an_unsupported_feature() {
+        // `defer` must never be silently dropped: it is parsed and its
+        // expression is still checked, but running it has no
+        // implemented semantics yet.
+        let diags = check("func f() { value x = 1; defer x + 1; }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn postfix_try_is_reported_as_an_unsupported_feature() {
+        let diags = check("func f(x: i64) -> i64 { return x? }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn range_expression_is_reported_as_an_unsupported_feature() {
+        // A range must never be silently lowered to just its left
+        // operand -- it has to be flagged instead.
+        let diags = check("func f() { value r = 1..10; }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn inclusive_range_expression_is_reported_as_an_unsupported_feature() {
+        let diags = check("func f() { value r = 1..=10; }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn field_access_is_reported_as_an_unsupported_feature() {
+        let diags = check("func f(x: i64) -> i64 { return x.y }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn non_empty_uses_clause_is_reported_as_an_unsupported_feature() {
+        let diags = check("func f() uses Database.Read { }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn non_empty_raises_clause_is_reported_as_an_unsupported_feature() {
+        let diags = check("func f() raises NotFound { }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
     }
 
     #[test]
@@ -864,9 +973,23 @@ mod tests {
     }
 
     #[test]
-    fn cast_expression_takes_the_target_type() {
+    fn cast_expression_is_reported_as_an_unsupported_feature() {
+        // `as` performs no runtime conversion in Alpha 0.1, so accepting
+        // it silently would let a program type-check while lying about
+        // what it does; it must be flagged instead.
         let diags = check("func f() -> f64 { value x = 1; return x as f64 }");
-        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn cast_to_an_unknown_type_still_reports_the_unknown_type() {
+        // The unsupported-cast diagnostic must not swallow an
+        // independently wrong type name in the cast's target.
+        let diags = check("func f() -> i64 { value x = 1; return x as Banana }");
+        assert_eq!(diags.len(), 2);
+        assert!(diags.iter().any(|d| d.code == "T0006"));
+        assert!(diags.iter().any(|d| d.code == "T0007"));
     }
 
     #[test]

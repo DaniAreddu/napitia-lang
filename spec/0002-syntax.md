@@ -118,6 +118,8 @@ Statement = BindingStmt
           | "break" [ Expression ] ";"
           | "continue" ";"
           | "defer" Expression ";"
+          | WhileStmt
+          | LoopStmt
           ;
 
 BindingStmt = ("value" | "mutable") IDENT [ ":" Type ] "=" Expression ";" ;

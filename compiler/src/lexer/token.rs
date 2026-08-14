@@ -63,6 +63,7 @@ pub enum TokenKind {
     Match,
     Protocol,
     Extend,
+    With,
     Import,
     Module,
     Public,
@@ -161,6 +162,7 @@ pub fn keyword_kind(text: &str) -> Option<TokenKind> {
         "match" => TokenKind::Match,
         "protocol" => TokenKind::Protocol,
         "extend" => TokenKind::Extend,
+        "with" => TokenKind::With,
         "import" => TokenKind::Import,
         "module" => TokenKind::Module,
         "public" => TokenKind::Public,
@@ -187,8 +189,8 @@ mod tests {
         let keywords = [
             "func", "value", "mutable", "const", "return", "if", "else", "while", "for", "in",
             "loop", "break", "continue", "true", "false", "record", "variant", "match", "protocol",
-            "extend", "import", "module", "public", "private", "uses", "raises", "as", "is",
-            "unsafe", "async", "await", "region", "defer",
+            "extend", "with", "import", "module", "public", "private", "uses", "raises", "as",
+            "is", "unsafe", "async", "await", "region", "defer",
         ];
         for kw in keywords {
             assert!(keyword_kind(kw).is_some(), "{kw} should be a keyword");

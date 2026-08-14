@@ -52,7 +52,7 @@ The following are reserved and cannot be used as identifiers:
 func value mutable const return
 if else while for in loop break continue
 true false
-record variant match protocol extend
+record variant match protocol extend with
 import module public private
 uses raises
 as is
@@ -72,7 +72,9 @@ binding, `mutable` a mutable binding, `record` a product type, `variant`
 a sum type, `protocol` a behavioral contract, `extend` a protocol
 implementation (or inherent methods), `import` brings a path into scope,
 and `uses`/`raises` declare a function's effects/capabilities and typed
-errors respectively (see `spec/0002`, `spec/0005`). The reserved `move`
+errors respectively (see `spec/0002`, `spec/0005`). `with` introduces the
+protocol name in an `extend Type with Protocol { ... }` declaration. The
+reserved `move`
 keyword from the earlier table was dropped: with ownership transfer
 inferred by default (`spec/0004`), an explicit move marker is not
 currently needed, and reserving one anyway would imply a feature that has

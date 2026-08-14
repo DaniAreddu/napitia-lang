@@ -248,13 +248,14 @@ mod tests {
             "{:?}",
             typeck_result.diagnostics
         );
-        let (nir, skipped) = lower_module(
+        let nir = lower_module(
             &hir,
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &interner,
-        );
-        assert!(skipped.is_empty(), "{skipped:?}");
+            id,
+        )
+        .expect("expected lowering to succeed");
         print_module(&nir, &interner)
     }
 

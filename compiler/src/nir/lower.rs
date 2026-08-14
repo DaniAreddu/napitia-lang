@@ -8,35 +8,53 @@
 //! before jumping to a shared merge block, which then loads it — the
 //! same effect a phi node would have, without needing one.
 //!
-//! Lowering assumes its input already passed type-checking. `match` and
-//! field-access expressions are not lowered yet (`spec/0003`'s explicit
-//! scope limits) — a function using either is skipped, reported back to
-//! the caller by name rather than silently producing wrong NIR.
+//! Lowering assumes its input already passed type-checking, so in the
+//! ordinary pipeline (`driver::ir`) it never runs on a program the
+//! checker rejected. Even so, lowering is atomic: either every function
+//! lowers and the caller gets a complete `Module`, or lowering fails
+//! with diagnostics and the caller gets no module at all. There is no
+//! partial result -- a `Call` in a successfully-lowered function can
+//! never reference a function that lowering silently left out, because
+//! there is no way to leave one out and still get a `Module` back.
 
 use std::collections::HashMap;
 
 use super::{BasicBlock, Const, Function, Module, Param, Terminator, ValueId, ValueKind};
+use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId,
 };
+use crate::source::SourceId;
 use crate::symbol::Interner;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, is_numeric, primitive_from_name};
 
 use super::block::BlockId;
 
-type LowerResult<T> = Result<T, String>;
+mod codes {
+    /// A construct reached NIR lowering without the checker having
+    /// already rejected it. In the ordinary pipeline this should be
+    /// unreachable (`typeck` gates `match`/field access with its own
+    /// T0007 first) -- this is lowering's own defense-in-depth, for
+    /// direct callers that bypass that gate.
+    pub const UNSUPPORTED_IN_NIR: &str = "I0001";
+}
 
-/// Lowers every function in `hir` to NIR. Returns the successfully
-/// lowered functions plus a human-readable reason for each function that
-/// was skipped (named by its source function, e.g. `"main: match is not
-/// yet lowered to NIR"`).
+// Boxed so a single-`Diagnostic` `Err` doesn't force every `LowerResult`
+// (including `LowerResult<()>`) to be as large as `Diagnostic` itself.
+type LowerResult<T> = Result<T, Box<Diagnostic>>;
+
+/// Lowers every function in `hir` to NIR. Either every function lowers
+/// successfully and the whole `Module` is returned, or one or more
+/// failed and the *only* thing returned is their diagnostics -- there is
+/// no way to get back a `Module` with some functions missing.
 pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
     interner: &Interner,
-) -> (Module, Vec<String>) {
+    source: SourceId,
+) -> Result<Module, Vec<Diagnostic>> {
     let mut function_sigs = HashMap::new();
     for f in &hir.functions {
         let params = f
@@ -56,18 +74,23 @@ pub fn lower_module(
         local_types,
         expr_types,
         interner,
+        source,
         function_sigs,
     };
     let mut functions = Vec::new();
-    let mut skipped = Vec::new();
+    let mut diagnostics = Vec::new();
     for f in &hir.functions {
         match lowering.lower_function(f) {
             Ok(nir_fn) => functions.push(nir_fn),
-            Err(reason) => skipped.push(format!("{}: {reason}", interner.resolve(f.name))),
+            Err(diag) => diagnostics.push(*diag),
         }
     }
 
-    (Module { functions }, skipped)
+    if diagnostics.is_empty() {
+        Ok(Module { functions })
+    } else {
+        Err(diagnostics)
+    }
 }
 
 fn resolve_named_type(interner: &Interner, ty: &ast::Type) -> Ty {
@@ -78,6 +101,7 @@ struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
     interner: &'a Interner,
+    source: SourceId,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
 }
 
@@ -279,6 +303,18 @@ impl<'a> Lowering<'a> {
             .unwrap_or(Ty::Error)
     }
 
+    /// Builds the diagnostic for a construct that reached lowering
+    /// without the checker having already rejected it -- see
+    /// `codes::UNSUPPORTED_IN_NIR`.
+    fn unsupported(&self, span: crate::source::Span, feature: &str) -> Box<Diagnostic> {
+        Box::new(Diagnostic::error(
+            codes::UNSUPPORTED_IN_NIR,
+            self.source,
+            span,
+            format!("{feature} cannot be lowered to NIR"),
+        ))
+    }
+
     // ---- statement/block lowering ----
 
     fn lower_block_void(&mut self, fb: &mut FnBuilder, block: &HirBlock) -> LowerResult<()> {
@@ -455,7 +491,7 @@ impl<'a> Lowering<'a> {
                 target, op, value, ..
             } => self.lower_assign(fb, target, *op, value),
             HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args),
-            HirExpr::Field { .. } => Err("field access is not yet lowered to NIR".to_string()),
+            HirExpr::Field { span, .. } => Err(self.unsupported(*span, "field access")),
             HirExpr::Cast { expr, .. } => self.lower_expr(fb, expr),
             HirExpr::Try { expr, .. } => self.lower_expr(fb, expr),
             HirExpr::If {
@@ -467,7 +503,7 @@ impl<'a> Lowering<'a> {
                 let result_ty = self.expr_ty(expr);
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
-            HirExpr::Match { .. } => Err("match is not yet lowered to NIR".to_string()),
+            HirExpr::Match { span, .. } => Err(self.unsupported(*span, "match")),
             HirExpr::Block(b) => self.lower_block_value(fb, b),
             HirExpr::Return { value, .. } => {
                 let ret_ty = fb.return_ty.clone();
@@ -485,7 +521,7 @@ impl<'a> Lowering<'a> {
                 fb.terminate(Terminator::Return(v));
                 Ok(LoweredExpr::Diverged)
             }
-            HirExpr::Break { value, .. } => {
+            HirExpr::Break { value, span, .. } => {
                 if let Some(v) = value
                     && matches!(self.lower_expr(fb, v)?, LoweredExpr::Diverged)
                 {
@@ -495,16 +531,16 @@ impl<'a> Lowering<'a> {
                     .loop_stack
                     .last()
                     .map(|c| c.break_target)
-                    .ok_or_else(|| "break outside a loop".to_string())?;
+                    .ok_or_else(|| self.unsupported(*span, "`break` outside a loop"))?;
                 fb.terminate(Terminator::Branch(target));
                 Ok(LoweredExpr::Diverged)
             }
-            HirExpr::Continue { .. } => {
+            HirExpr::Continue { span, .. } => {
                 let target = fb
                     .loop_stack
                     .last()
                     .map(|c| c.continue_target)
-                    .ok_or_else(|| "continue outside a loop".to_string())?;
+                    .ok_or_else(|| self.unsupported(*span, "`continue` outside a loop"))?;
                 fb.terminate(Terminator::Branch(target));
                 Ok(LoweredExpr::Diverged)
             }
@@ -841,7 +877,7 @@ mod tests {
     use crate::source::SourceMap;
     use crate::typeck::check_module;
 
-    fn lower(text: &str) -> (Module, Vec<String>) {
+    fn lower(text: &str) -> Module {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -860,14 +896,13 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner)
+        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+            .expect("expected lowering to succeed")
     }
 
     #[test]
     fn simple_function_lowers_with_no_skips() {
-        let (module, skipped) =
-            lower("func add(left: i64, right: i64) -> i64 { return left + right }");
-        assert!(skipped.is_empty());
+        let module = lower("func add(left: i64, right: i64) -> i64 { return left + right }");
         assert_eq!(module.functions.len(), 1);
         assert_eq!(module.functions[0].params.len(), 2);
     }
@@ -876,8 +911,7 @@ mod tests {
     fn literal_takes_its_type_from_typeck_not_a_re_derived_default() {
         // `1`'s type comes from expr_types (typeck already unified it
         // with `x: i32`), not NIR re-inferring it as i64 by default.
-        let (module, skipped) = lower("func f(x: i32) -> i32 { return x + 1 }");
-        assert!(skipped.is_empty());
+        let module = lower("func f(x: i32) -> i32 { return x + 1 }");
         let add_ty = module.functions[0]
             .blocks
             .iter()
@@ -896,9 +930,7 @@ mod tests {
 
     #[test]
     fn every_block_has_a_terminator() {
-        let (module, skipped) =
-            lower("func f(x: i64) -> i64 { if x > 0 { return 1 } else { return 0 } }");
-        assert!(skipped.is_empty());
+        let module = lower("func f(x: i64) -> i64 { if x > 0 { return 1 } else { return 0 } }");
         for block in &module.functions[0].blocks {
             // Just accessing the field is enough: BasicBlock::terminator
             // is not an Option, so a missing terminator would already
@@ -909,8 +941,7 @@ mod tests {
 
     #[test]
     fn if_expression_lowers_with_cond_branch_and_merge_block() {
-        let (module, skipped) = lower("func f(x: bool) -> i64 { return if x { 1 } else { 2 } }");
-        assert!(skipped.is_empty());
+        let module = lower("func f(x: bool) -> i64 { return if x { 1 } else { 2 } }");
         let blocks = &module.functions[0].blocks;
         assert!(
             blocks.len() >= 4,
@@ -920,9 +951,8 @@ mod tests {
 
     #[test]
     fn while_loop_lowers_with_header_body_and_exit_blocks() {
-        let (module, skipped) =
+        let module =
             lower("func f() -> i64 { mutable x = 0; while x < 10 { x = x + 1; } return x }");
-        assert!(skipped.is_empty());
         assert!(module.functions[0].blocks.len() >= 3);
     }
 
@@ -932,8 +962,7 @@ mod tests {
         // so lowering must never allocate a slot for it or store into
         // one -- and the unreachable `x = 2; return x;` after it must
         // never be lowered either.
-        let (module, skipped) = lower("func f() -> i64 { mutable x = return 1; x = 2; return x }");
-        assert!(skipped.is_empty());
+        let module = lower("func f() -> i64 { mutable x = return 1; x = 2; return x }");
         let has_alloc_or_store = module.functions[0]
             .blocks
             .iter()
@@ -952,9 +981,8 @@ mod tests {
 
     #[test]
     fn recursive_call_lowers_to_a_call_instruction() {
-        let (module, skipped) =
+        let module =
             lower("func fact(n: i64) -> i64 { if n == 0 { return 1 } return n * fact(n - 1) }");
-        assert!(skipped.is_empty());
         let has_call = module.functions[0]
             .blocks
             .iter()
@@ -973,9 +1001,7 @@ mod tests {
 
     #[test]
     fn mutable_binding_uses_a_slot_immutable_binding_does_not() {
-        let (module, skipped) =
-            lower("func f() -> i64 { value a = 1; mutable b = 2; return a + b }");
-        assert!(skipped.is_empty());
+        let module = lower("func f() -> i64 { value a = 1; mutable b = 2; return a + b }");
         let allocs = module.functions[0]
             .blocks
             .iter()
@@ -996,13 +1022,15 @@ mod tests {
     }
 
     #[test]
-    fn match_expression_is_skipped_not_silently_wrong() {
+    fn match_expression_fails_lowering_not_silently_wrong() {
         // `match` is now rejected by the type checker itself (T0007)
         // before a program ever reaches NIR lowering, so this bypasses
         // check_module's diagnostics gate to exercise NIR's own
         // defense-in-depth: lowering must still refuse to guess at NIR
         // for a construct it cannot represent, rather than silently
-        // emitting something wrong, if it is ever handed one directly.
+        // emitting something wrong, if it is ever handed one directly --
+        // and it must fail atomically (no partial `Module` at all), not
+        // return a module missing just this one function.
         let text = "func f(x: i64) -> i64 { return match x { _ => 0 } }";
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
@@ -1014,17 +1042,46 @@ mod tests {
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty());
         let result = check_module(&hir, id, &interner);
-        let (module, skipped) =
-            lower_module(&hir, &result.local_types, &result.expr_types, &interner);
-        assert!(module.functions.is_empty());
-        assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].contains("match"));
+        let outcome = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id);
+        let Err(diagnostics) = outcome else {
+            panic!(
+                "expected lowering to fail, got {:?}",
+                outcome.ok().map(|_| ())
+            );
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "I0001");
+        assert!(diagnostics[0].message.contains("match"));
+    }
+
+    #[test]
+    fn one_function_failing_to_lower_fails_the_whole_module_atomically() {
+        // `add` alone would lower cleanly, but `bad` (bypassing typeck's
+        // gate, as above) cannot. Lowering must not return a `Module`
+        // containing just `add` -- either everything lowers, or nothing
+        // does.
+        let text = "func add(left: i64, right: i64) -> i64 { return left + right } \
+                    func bad(x: i64) -> i64 { return match x { _ => 0 } }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty());
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty());
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(diags.is_empty());
+        let result = check_module(&hir, id, &interner);
+        let outcome = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id);
+        assert!(
+            outcome.is_err(),
+            "expected the whole module to fail lowering"
+        );
     }
 
     #[test]
     fn short_circuit_and_does_not_evaluate_right_side_unconditionally() {
-        let (module, skipped) = lower("func f(a: bool, b: bool) -> bool { return a && b }");
-        assert!(skipped.is_empty());
+        let module = lower("func f(a: bool, b: bool) -> bool { return a && b }");
         // A branch must exist: short-circuiting is implemented via
         // control flow, not a plain eager `and` instruction.
         let has_condbr = module.functions[0]

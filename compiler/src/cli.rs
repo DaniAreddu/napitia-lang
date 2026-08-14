@@ -115,11 +115,8 @@ fn ir_command(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Exi
             print_diagnostics(&diagnostics, map);
             exit_for(&diagnostics)
         }
-        IrOutput::Ready { nir, skipped } => {
+        IrOutput::Ready { nir } => {
             print!("{}", crate::nir::print_module(&nir, interner));
-            for reason in &skipped {
-                eprintln!("note: not lowered to NIR: {reason}");
-            }
             ExitCode::SUCCESS
         }
     }
@@ -130,12 +127,6 @@ fn run_command(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Ex
         RunOutput::Diagnostics(diagnostics) => {
             print_diagnostics(&diagnostics, map);
             exit_for(&diagnostics)
-        }
-        RunOutput::EntryNotSupported(skipped) => {
-            for reason in &skipped {
-                eprintln!("error: cannot run: {reason}");
-            }
-            ExitCode::from(1)
         }
         RunOutput::Result(Ok(value)) => {
             println!("{}", format_value(&value));

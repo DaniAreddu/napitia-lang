@@ -37,7 +37,7 @@ project is sequenced:
 
 REST APIs, database access, distributed systems, and AI/ML are explicitly
 **not** language features. They are intended to be ordinary libraries built
-on top of Napitia's generics, traits, and effect system, once those exist.
+on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
 ## Current status: Alpha 0.1
@@ -76,11 +76,12 @@ questions that go beyond what is implemented today.
 
 ### Explicitly not yet implemented
 
-Generics, traits, `Option<T>`/`Result<T, E>`, ownership/region enforcement,
-effects, structured concurrency, modules beyond a single file, an LLVM (or
-any native) backend, garbage collection, a package manager, and any
-domain-specific library (REST, ORM, tensors, GPU). Design direction for most
-of these exists in `rfcs/`; none of it is faked in the implementation.
+Generics, protocols, a `Maybe<T>` absence type, checked `uses`/`raises`
+effects and errors, ownership/region enforcement, structured concurrency,
+modules beyond a single file, an LLVM (or any native) backend, garbage
+collection, a package manager, and any domain-specific library (REST,
+ORM, tensors, GPU). Design direction for most of these exists in `rfcs/`;
+none of it is faked in the implementation.
 
 ## Building
 

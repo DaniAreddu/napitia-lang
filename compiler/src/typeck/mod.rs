@@ -39,13 +39,24 @@ struct LocalInfo {
     mutable: bool,
 }
 
-/// Type-checks an already name-resolved [`HirModule`], returning every
-/// diagnostic produced. Checking one function never stops at the first
-/// error: each expression is still visited (so later independent errors
-/// in the same function are still reported), and `Ty::Error`/`Ty::Never`
-/// unify with anything so one bad expression does not cascade into
-/// unrelated type mismatches.
-pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> Vec<Diagnostic> {
+/// Every diagnostic produced by checking a module, plus the final
+/// resolved type of every local binding (parameters, `value`/`mutable`
+/// statements, and match-arm pattern bindings). `local_types` is what
+/// lets NIR lowering (`nir::lower`) know a local's concrete type without
+/// re-running unification: by the time checking finishes, every local
+/// that isn't part of an ill-typed program has a fully resolved type
+/// (literal defaults included).
+pub struct TypeckResult {
+    pub diagnostics: Vec<Diagnostic>,
+    pub local_types: HashMap<LocalId, Ty>,
+}
+
+/// Type-checks an already name-resolved [`HirModule`]. Checking one
+/// function never stops at the first error: each expression is still
+/// visited (so later independent errors in the same function are still
+/// reported), and `Ty::Error`/`Ty::Never` unify with anything so one bad
+/// expression does not cascade into unrelated type mismatches.
+pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> TypeckResult {
     let mut checker = Checker {
         source,
         interner,
@@ -61,7 +72,11 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> V
         checker.check_function(function);
     }
     checker.finalize_defaults();
-    checker.diagnostics
+
+    let local_types =
+        checker.locals.iter().map(|(id, info)| (*id, checker.ctx.resolve(&info.ty))).collect();
+
+    TypeckResult { diagnostics: checker.diagnostics, local_types }
 }
 
 struct Checker<'a> {
@@ -104,7 +119,11 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, f: &HirFunction) {
-        self.locals.clear();
+        // Local IDs are unique across the whole module (hir::lower),
+        // so locals from earlier functions are never looked up again;
+        // leaving them in place (rather than clearing per function) is
+        // what lets check_module snapshot every local's final type into
+        // TypeckResult::local_types afterward.
         let sig = self
             .functions
             .get(&f.id)
@@ -599,7 +618,7 @@ mod tests {
             resolve_diags.is_empty(),
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
-        check_module(&hir, id, &interner)
+        check_module(&hir, id, &interner).diagnostics
     }
 
     #[test]

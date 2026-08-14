@@ -8,7 +8,7 @@ use std::rc::Rc;
 /// `Symbol`s, and `Symbol` values are only meaningful relative to the
 /// `Interner` that produced them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Symbol(u32);
+pub struct Symbol(pub(crate) u32);
 
 /// Deduplicates identifier and keyword strings encountered during one
 /// compilation session. Owned by the caller (the lexer, or whatever sets

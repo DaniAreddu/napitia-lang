@@ -329,9 +329,21 @@ impl<'a> Checker<'a> {
                 let cond_ty = self.check_expr(condition);
                 self.expect_bool(&cond_ty, condition.span());
                 self.loop_depth += 1;
+                // The body is still checked for its own independent
+                // diagnostics even when the condition itself always
+                // diverges (making the body unreachable).
                 self.check_block(body);
                 self.loop_depth -= 1;
-                Ty::Unit
+                // A condition that never produces a value is evaluated
+                // exactly once, unconditionally, before the loop could
+                // ever run -- the `while` statement itself diverges,
+                // the same way any other strict use of a `never`
+                // expression does.
+                if matches!(cond_ty, Ty::Never) {
+                    Ty::Never
+                } else {
+                    Ty::Unit
+                }
             }
             HirStmt::Loop { body, .. } => {
                 self.loop_depth += 1;
@@ -455,14 +467,17 @@ impl<'a> Checker<'a> {
             }
             HirExpr::Break { value, span, .. } => {
                 if let Some(v) = value {
-                    let value_ty = self.check_expr(v);
-                    self.unify_report(
-                        &value_ty,
-                        &Ty::Unit,
-                        *span,
-                        "break with a value is not supported yet: loop-as-expression is accepted \
-                         direction, not implemented (spec/0002)",
-                    );
+                    // Still checked for its own independent diagnostics,
+                    // but the value itself is unconditionally
+                    // unsupported -- unifying it against `unit` and
+                    // accepting a unit-typed value silently would let
+                    // `break unit_expr;` through with no diagnostic at
+                    // all, which is exactly the kind of fake acceptance
+                    // this checker must not produce. Loop-as-expression
+                    // is accepted direction, not implemented
+                    // (spec/0002), regardless of the value's own type.
+                    self.check_expr(v);
+                    self.push_unsupported(*span, "`break` with a value (loop-as-expression)");
                 }
                 self.check_loop_control(*span, "break");
                 Ty::Never
@@ -477,6 +492,14 @@ impl<'a> Checker<'a> {
 
     fn check_unary(&mut self, op: UnaryOp, operand: &HirExpr, span: Span) -> Ty {
         let ty = self.check_expr(operand);
+        // Every unary operator strictly evaluates its operand first, so
+        // an operand that provably never produces a value means the
+        // operator itself is never reached either -- the result must
+        // stay `never`, not whatever this operator would otherwise
+        // produce (e.g. `Ty::Bool` for `!`).
+        if matches!(ty, Ty::Never) {
+            return Ty::Never;
+        }
         match op {
             UnaryOp::Neg => {
                 self.require_numeric(&ty, span);
@@ -495,7 +518,39 @@ impl<'a> Checker<'a> {
 
     fn check_binary(&mut self, op: BinaryOp, left: &HirExpr, right: &HirExpr, span: Span) -> Ty {
         let lt = self.check_expr(left);
+
+        // `&&`/`||` short-circuit: the right operand only actually runs
+        // when the left doesn't already decide the result, so a
+        // divergent *right* operand must not force the whole expression
+        // to `never` (there's a real, reachable path that skips it). A
+        // divergent *left* operand always runs, though, so it does.
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            if matches!(lt, Ty::Never) {
+                // The right side is unreachable, but still checked for
+                // its own independent diagnostics.
+                self.check_expr(right);
+                return Ty::Never;
+            }
+            self.expect_bool(&lt, span);
+            let rt = self.check_expr(right);
+            self.expect_bool(&rt, span);
+            return Ty::Bool;
+        }
+
         let rt = self.check_expr(right);
+
+        if matches!(op, BinaryOp::Range | BinaryOp::RangeInclusive) {
+            self.push_unsupported(span, "range expressions (`..`/`..=`)");
+            return Ty::Error;
+        }
+
+        // Every remaining operator strictly evaluates both operands
+        // before doing anything, so either side being `never` means the
+        // operator itself is never actually reached.
+        if matches!(lt, Ty::Never) || matches!(rt, Ty::Never) {
+            return Ty::Never;
+        }
+
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                 self.unify_report(
@@ -535,14 +590,8 @@ impl<'a> Checker<'a> {
                 );
                 Ty::Bool
             }
-            BinaryOp::And | BinaryOp::Or => {
-                self.expect_bool(&lt, span);
-                self.expect_bool(&rt, span);
-                Ty::Bool
-            }
-            BinaryOp::Range | BinaryOp::RangeInclusive => {
-                self.push_unsupported(span, "range expressions (`..`/`..=`)");
-                Ty::Error
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Range | BinaryOp::RangeInclusive => {
+                unreachable!("handled above")
             }
         }
     }
@@ -605,11 +654,20 @@ impl<'a> Checker<'a> {
             _ => self.require_numeric(&target_ty, span),
         }
 
-        Ty::Unit
+        // The assignment itself is strict: it evaluates the right-hand
+        // side before ever performing the store, so a right-hand side
+        // that never produces a value means the assignment never
+        // completes either.
+        if matches!(value_ty, Ty::Never) {
+            Ty::Never
+        } else {
+            Ty::Unit
+        }
     }
 
     fn check_call(&mut self, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
+        let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
 
         let HirExpr::Function { item, name, .. } = callee else {
             let callee_ty = self.check_expr(callee);
@@ -631,11 +689,15 @@ impl<'a> Checker<'a> {
                     .with_primary_label("not callable"),
                 );
             }
-            return Ty::Error;
+            return if any_arg_never || matches!(callee_ty, Ty::Never) {
+                Ty::Never
+            } else {
+                Ty::Error
+            };
         };
 
         let Some(sig) = self.functions.get(item).cloned() else {
-            return Ty::Error;
+            return if any_arg_never { Ty::Never } else { Ty::Error };
         };
 
         if sig.params.len() != args.len() {
@@ -665,7 +727,11 @@ impl<'a> Checker<'a> {
             }
         }
 
-        sig.ret
+        // A call is strict in its arguments: every one of them is
+        // evaluated before the call itself ever happens, so any
+        // argument that never produces a value means the call is never
+        // actually reached.
+        if any_arg_never { Ty::Never } else { sig.ret }
     }
 
     fn check_if(
@@ -677,29 +743,60 @@ impl<'a> Checker<'a> {
         let cond_ty = self.check_expr(condition);
         self.expect_bool(&cond_ty, condition.span());
         let then_ty = self.check_block(then_branch);
-        match else_branch {
+        let result = match else_branch {
             Some(HirElse::Block(b)) => {
                 let else_ty = self.check_block(b);
-                self.unify_report(
+                self.join_diverging_branches(
                     &then_ty,
                     &else_ty,
                     b.span,
                     "if/else branches must have the same type",
-                );
-                then_ty
+                )
             }
             Some(HirElse::If(inner)) => {
                 let else_ty = self.check_expr(inner);
                 let span = inner.span();
-                self.unify_report(
+                self.join_diverging_branches(
                     &then_ty,
                     &else_ty,
                     span,
                     "if/else branches must have the same type",
-                );
-                then_ty
+                )
             }
+            // No `else`: the implicit false-branch is always `unit` and
+            // always reachable, regardless of what the (discarded)
+            // then-branch's own value would have been -- an `if`
+            // without `else` is never used for its value, only its side
+            // effects (spec/0002), so this is `unit` even when the
+            // then-branch itself diverges.
             None => Ty::Unit,
+        };
+        // A condition that itself never produces a value means neither
+        // branch is ever reached at all, so the whole `if` is `never` --
+        // regardless of what the (still-checked, for their own
+        // diagnostics) branches resolved to.
+        if matches!(cond_ty, Ty::Never) {
+            Ty::Never
+        } else {
+            result
+        }
+    }
+
+    /// Joins two branch types where either may be `Ty::Never` (a branch
+    /// that unconditionally diverges). A diverging branch contributes no
+    /// information about the join's resulting type at all -- it must
+    /// never be allowed to overwrite the other, real branch's type, the
+    /// way naively returning "the then-branch's type" would. Only when
+    /// *both* branches diverge does the join itself become `never`.
+    fn join_diverging_branches(&mut self, a: &Ty, b: &Ty, span: Span, message: &str) -> Ty {
+        match (a, b) {
+            (Ty::Never, Ty::Never) => Ty::Never,
+            (Ty::Never, _) => b.clone(),
+            (_, Ty::Never) => a.clone(),
+            _ => {
+                self.unify_report(a, b, span, message);
+                a.clone()
+            }
         }
     }
 
@@ -1185,7 +1282,25 @@ mod tests {
     fn break_with_a_value_is_reported_until_loop_expressions_exist() {
         let diags = check("func f() { loop { break 1; } }");
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn break_with_a_unit_value_is_still_rejected() {
+        // A `unit`-typed value used to slip through silently (it
+        // unifies with `unit` with no diagnostic); every value-carrying
+        // `break` is unconditionally unsupported now, regardless of the
+        // value's type.
+        let diags = check("func f() { loop { break {}; } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0007");
+    }
+
+    #[test]
+    fn break_with_a_never_value_is_still_rejected() {
+        let diags = check("func f() { loop { break return; } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0007");
     }
 
     #[test]
@@ -1262,6 +1377,149 @@ mod tests {
             "func f(n: i64) -> i64 { \
                  value x: i64 = if n == 0 { return 1; } else { return 2; }; \
                  return x \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn if_join_is_the_non_diverging_branch_type_when_then_diverges() {
+        // The join must not naively return "the then-branch's type":
+        // here the then-branch is `never` and the else-branch is `i64`,
+        // so the overall `if` must resolve to `i64`, not `never`.
+        let diags = check(
+            "func choose(flag: bool) -> i64 { \
+                 if flag { return 1 } else { 2 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn if_join_is_the_non_diverging_branch_type_when_else_diverges() {
+        // The mirror image: the join must be symmetric, so a diverging
+        // else-branch must equally not overwrite a real then-branch type.
+        let diags = check(
+            "func choose(flag: bool) -> i64 { \
+                 if flag { 2 } else { return 1 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn if_join_reports_a_mismatch_when_neither_branch_diverges() {
+        let diags = check("func f() -> i64 { return if true { 1 } else { false } }");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn if_condition_that_diverges_makes_the_whole_if_never() {
+        // The condition itself never produces a value, so neither
+        // branch is ever reached -- the whole `if` must be `never`
+        // regardless of what the (still-checked) branches resolve to,
+        // and the mismatched branch types below must not be reported
+        // (unreachable code's *type* must not surface a diagnostic the
+        // way an independent nested error still would).
+        let diags = check(
+            "func f() -> i64 { \
+                 return if (return 1) { true } else { false } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn else_if_chain_propagates_the_join_through_every_link() {
+        let diags = check(
+            "func choose(n: i64) -> i64 { \
+                 if n == 0 { return 1 } else if n == 1 { 2 } else { return 3 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn unary_not_on_a_diverging_operand_is_never() {
+        let diags = check("func f() -> i64 { return !{ return 7 } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn comparison_with_a_diverging_right_operand_is_never() {
+        let diags = check("func f() -> i64 { return 1 == { return 7 } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn comparison_with_a_diverging_left_operand_is_never() {
+        let diags = check("func f() -> i64 { return { return 7 } == 1 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn arithmetic_with_a_diverging_operand_is_never() {
+        let diags = check("func f() -> i64 { return 1 + { return 7 } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn assignment_with_a_diverging_right_hand_side_is_never() {
+        let diags = check(
+            "func f() -> i64 { \
+                 mutable x = 0; \
+                 return { x = { return 7 }; 0 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn call_with_a_diverging_argument_is_never() {
+        let diags = check(
+            "func add(a: i64, b: i64) -> i64 { return a + b } \
+             func f() -> i64 { return add(1, { return 7 }) }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn logical_and_with_a_diverging_left_operand_is_never() {
+        let diags = check("func f() -> bool { return { return true } && true }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn logical_and_with_a_diverging_right_operand_is_not_forced_never() {
+        // The right side of `&&` is short-circuited: it may never
+        // actually execute, so a `never` right operand must not force
+        // the whole expression to `never` -- it stays `bool`.
+        let diags = check("func f(x: bool) -> bool { return x && { return true } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn logical_or_with_a_diverging_right_operand_is_not_forced_never() {
+        let diags = check("func f(x: bool) -> bool { return x || { return true } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn while_condition_that_diverges_makes_the_statement_diverge() {
+        let diags = check("func main() { while { return; } {} }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn nested_if_propagates_never_through_the_outer_join() {
+        let diags = check(
+            "func f(a: bool, b: bool) -> i64 { \
+                 if a { \
+                     if b { return 1 } else { return 2 } \
+                 } else { \
+                     3 \
+                 } \
              }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");

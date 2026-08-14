@@ -151,9 +151,6 @@ pub struct Block {
 pub enum Stmt {
     Binding(BindingStmt),
     Expr(Expr),
-    Return { value: Option<Expr>, span: Span },
-    Break { value: Option<Expr>, span: Span },
-    Continue { span: Span },
     Defer { expr: Expr, span: Span },
     While(WhileStmt),
     Loop(LoopStmt),
@@ -251,6 +248,21 @@ pub enum Expr {
     If(Box<IfExpr>),
     Match(Box<MatchExpr>),
     Block(Box<Block>),
+    /// `return [expr]`. Modeled as an expression (type `never`) rather
+    /// than a semicolon-mandatory statement so it can appear as a
+    /// block's tail with no trailing `;`, matching every example in
+    /// `spec/0002`.
+    Return {
+        value: Option<Box<Expr>>,
+        span: Span,
+    },
+    Break {
+        value: Option<Box<Expr>>,
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
     /// A malformed expression the parser recovered from. Carries no
     /// value; later stages must skip it rather than type-check it.
     Error {
@@ -274,6 +286,9 @@ impl Expr {
             | Expr::Field { span, .. }
             | Expr::Cast { span, .. }
             | Expr::Try { span, .. }
+            | Expr::Return { span, .. }
+            | Expr::Break { span, .. }
+            | Expr::Continue { span }
             | Expr::Error { span } => *span,
             Expr::Ident(ident) => ident.span,
             Expr::If(if_expr) => if_expr.span,

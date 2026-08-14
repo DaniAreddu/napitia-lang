@@ -114,9 +114,6 @@ Block = "{" { Statement } [ Expression ] "}" ;
 
 Statement = BindingStmt
           | ExprStmt
-          | "return" [ Expression ] ";"
-          | "break" [ Expression ] ";"
-          | "continue" ";"
           | "defer" Expression ";"
           | WhileStmt
           | LoopStmt
@@ -131,6 +128,15 @@ block's value (tail expression), matching how `if`/`match` produce values.
 `value` introduces an immutable binding; `mutable` introduces a mutable
 one. `const` (module-level compile-time constants) is reserved but not
 implemented in this milestone.
+
+`return`, `break`, and `continue` are **expressions**, not dedicated
+statements (see "Expressions" below) — this is what lets
+`return left + right` appear with no trailing `;` as a block's tail, as
+in the example at the end of this document, while still being usable as
+an ordinary `ExprStmt` (`return left + right;`) anywhere else. An earlier
+version of this grammar modeled them as semicolon-mandatory statements,
+which contradicted that same example; this is a correction, not a
+redesign of intent.
 
 `defer` is parsed and lowered but not yet executed by the interpreter in
 this milestone (no backend runs deferred cleanup yet); see `spec/0004`.
@@ -182,10 +188,22 @@ PrimaryExpr = INT | FLOAT | STRING | CHAR | "true" | "false"
             | IfExpr
             | MatchExpr
             | BlockExpr
+            | ReturnExpr
+            | BreakExpr
+            | ContinueExpr
             ;
 
-BlockExpr = Block ;
+BlockExpr    = Block ;
+ReturnExpr   = "return" [ Expression ] ;
+BreakExpr    = "break" [ Expression ] ;
+ContinueExpr = "continue" ;
 ```
+
+`ReturnExpr`/`BreakExpr`/`ContinueExpr` have type `never` (`spec/0003`),
+which is why they can appear anywhere an ordinary expression can —
+including as a binary operand or call argument, which a statement-shaped
+`return` could never do — while still working as a block's tail with no
+`;`, or as an ordinary `ExprStmt` (`return x;`) elsewhere.
 
 `?` (`TryPropagate`) is parsed as a postfix operator in this milestone.
 It is not yet lowered to any behavior — a function's `raises` clause is

@@ -3,9 +3,16 @@
 use super::{Parser, recovery};
 use crate::lexer::TokenKind;
 use crate::syntax::ast::{
-    Block, Case, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param, Path,
-    ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, VariantDecl, WhileStmt,
+    Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
+    Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, VariantDecl, WhileStmt,
 };
+
+/// Whether `expr`'s surface syntax already ends in a `}` (`if`/`match`/
+/// a bare block), which makes a trailing `;` after it, as a statement,
+/// optional rather than mandatory.
+fn ends_with_brace(expr: &Expr) -> bool {
+    matches!(expr, Expr::If(_) | Expr::Match(_) | Expr::Block(_))
+}
 
 impl<'a> Parser<'a> {
     pub(super) fn parse_item(&mut self) -> Option<Item> {
@@ -359,6 +366,13 @@ impl<'a> Parser<'a> {
                     StmtOrTail::Stmt(Stmt::Expr(expr))
                 } else if self.check(&TokenKind::RBrace) || self.at_eof() {
                     StmtOrTail::Tail(expr)
+                } else if ends_with_brace(&expr) {
+                    // if/match/block already end in `}`; requiring an
+                    // extra `;` after one used as a statement (as
+                    // opposed to a block's tail) would be needless
+                    // ceremony, so it's optional here, matching how most
+                    // brace-delimited languages treat this case.
+                    StmtOrTail::Stmt(Stmt::Expr(expr))
                 } else {
                     self.error_expected("`;`");
                     StmtOrTail::Recover

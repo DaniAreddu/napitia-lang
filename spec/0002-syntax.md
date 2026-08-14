@@ -123,6 +123,13 @@ BindingStmt = ("value" | "mutable") IDENT [ ":" Type ] "=" Expression ";" ;
 ExprStmt    = Expression ";" ;
 ```
 
+`ExprStmt`'s trailing `;` is optional when `Expression` is an `IfExpr`,
+`MatchExpr`, or `BlockExpr` — all three already end in a `}`, so a
+statement like `if cond { f() }` does not additionally need a `;` before
+the next statement, the same way most brace-delimited languages don't
+require one after a brace-terminated statement. A `;` is still accepted
+in that position; it is simply not mandatory.
+
 A block's final expression, if present without a trailing `;`, is the
 block's value (tail expression), matching how `if`/`match` produce values.
 `value` introduces an immutable binding; `mutable` introduces a mutable

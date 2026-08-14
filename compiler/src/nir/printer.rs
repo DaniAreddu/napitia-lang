@@ -248,7 +248,12 @@ mod tests {
             "{:?}",
             typeck_result.diagnostics
         );
-        let (nir, skipped) = lower_module(&hir, &typeck_result.local_types, &interner);
+        let (nir, skipped) = lower_module(
+            &hir,
+            &typeck_result.local_types,
+            &typeck_result.expr_types,
+            &interner,
+        );
         assert!(skipped.is_empty(), "{skipped:?}");
         print_module(&nir, &interner)
     }

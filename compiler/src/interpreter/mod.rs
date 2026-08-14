@@ -373,7 +373,7 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        let (nir, skipped) = lower_nir(&hir, &result.local_types, &interner);
+        let (nir, skipped) = lower_nir(&hir, &result.local_types, &result.expr_types, &interner);
         assert!(
             skipped.is_empty(),
             "unexpected skipped functions: {skipped:?}"
@@ -571,7 +571,7 @@ mod tests {
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
         let result = check_module(&hir, id, &interner);
-        let (nir, _) = lower_nir(&hir, &result.local_types, &interner);
+        let (nir, _) = lower_nir(&hir, &result.local_types, &result.expr_types, &interner);
         let outcome = Interpreter::new(&nir).run("does_not_exist", &interner);
         assert!(matches!(
             outcome,

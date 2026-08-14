@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 
 use super::{BasicBlock, Const, Function, Module, Param, Terminator, ValueId, ValueKind};
-use crate::hir::{HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId};
+use crate::hir::{
+    ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId,
+};
 use crate::symbol::Interner;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, is_numeric, primitive_from_name};
@@ -32,6 +34,7 @@ type LowerResult<T> = Result<T, String>;
 pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
     interner: &Interner,
 ) -> (Module, Vec<String>) {
     let mut function_sigs = HashMap::new();
@@ -51,6 +54,7 @@ pub fn lower_module(
 
     let mut lowering = Lowering {
         local_types,
+        expr_types,
         interner,
         function_sigs,
     };
@@ -72,6 +76,7 @@ fn resolve_named_type(interner: &Interner, ty: &ast::Type) -> Ty {
 
 struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
+    expr_types: &'a HashMap<ExprId, Ty>,
     interner: &'a Interner,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
 }
@@ -234,108 +239,19 @@ impl<'a> Lowering<'a> {
         resolve_named_type(self.interner, ty)
     }
 
-    // ---- type inference for NIR's typed instructions ----
+    // ---- reading typeck's already-resolved types ----
     //
-    // The checker (typeck) already proved the program well-typed but
-    // only exports each *local's* final type, not every intermediate
-    // expression's. These functions reconstruct enough of that
-    // information to pick the right instruction (e.g. `add.i64` vs
-    // `add.f64`): locals and calls look up an already-known type, a
-    // literal used directly against a known-typed peer takes that peer's
-    // type (mirroring what unification actually did), and an
-    // unconstrained literal falls back to the same i64/f64 default
-    // typeck itself would use.
+    // Lowering never re-derives or approximates a type: typeck recorded
+    // the final, resolved type of every expression and block it visited
+    // (`expr_types`), so picking the right instruction (e.g. `add.i64`
+    // vs `add.f64`) is always a lookup by the node's own `ExprId`, never
+    // a re-inference.
 
-    fn infer_ty(&self, expr: &HirExpr) -> Ty {
-        match expr {
-            HirExpr::Int { .. } => Ty::I64,
-            HirExpr::Float { .. } => Ty::F64,
-            HirExpr::Str { .. } => Ty::Str,
-            HirExpr::Char { .. } => Ty::Char,
-            HirExpr::Bool { .. } => Ty::Bool,
-            HirExpr::Local { local, .. } => {
-                self.local_types.get(local).cloned().unwrap_or(Ty::Error)
-            }
-            HirExpr::Function { .. } => Ty::Error,
-            HirExpr::Unary { op, operand, .. } => {
-                if matches!(op, UnaryOp::Not) {
-                    Ty::Bool
-                } else {
-                    self.infer_ty(operand)
-                }
-            }
-            HirExpr::Binary {
-                op, left, right, ..
-            } => match op {
-                BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge
-                | BinaryOp::And
-                | BinaryOp::Or => Ty::Bool,
-                _ => {
-                    let lt = self.infer_ty(left);
-                    if matches!(lt, Ty::Error) {
-                        self.infer_ty(right)
-                    } else {
-                        lt
-                    }
-                }
-            },
-            HirExpr::Assign { .. } => Ty::Unit,
-            HirExpr::Call { callee, .. } => match &**callee {
-                HirExpr::Function { item, .. } => self
-                    .function_sigs
-                    .get(item)
-                    .map(|(_, ret)| ret.clone())
-                    .unwrap_or(Ty::Error),
-                _ => Ty::Error,
-            },
-            HirExpr::Field { .. } => Ty::Error,
-            HirExpr::Cast { ty, .. } => self.resolve_named_type(ty),
-            HirExpr::Try { expr, .. } => self.infer_ty(expr),
-            HirExpr::If {
-                then_branch,
-                else_branch,
-                ..
-            } => self.infer_if_ty(then_branch, else_branch),
-            HirExpr::Match { arms, .. } => {
-                for arm in arms {
-                    let t = match &arm.body {
-                        crate::hir::HirMatchArmBody::Expr(e) => self.infer_ty(e),
-                        crate::hir::HirMatchArmBody::Block(b) => self.infer_block_ty(b),
-                    };
-                    if !matches!(t, Ty::Error | Ty::Never) {
-                        return t;
-                    }
-                }
-                Ty::Unit
-            }
-            HirExpr::Block(b) => self.infer_block_ty(b),
-            HirExpr::Return { .. } | HirExpr::Break { .. } | HirExpr::Continue { .. } => Ty::Never,
-            HirExpr::Error { .. } => Ty::Error,
-        }
-    }
-
-    fn infer_block_ty(&self, block: &HirBlock) -> Ty {
-        match &block.tail {
-            Some(e) => self.infer_ty(e),
-            None => Ty::Unit,
-        }
-    }
-
-    fn infer_if_ty(&self, then_branch: &HirBlock, else_branch: &Option<HirElse>) -> Ty {
-        let t = self.infer_block_ty(then_branch);
-        if !matches!(t, Ty::Error | Ty::Never) {
-            return t;
-        }
-        match else_branch {
-            Some(HirElse::Block(b)) => self.infer_block_ty(b),
-            Some(HirElse::If(i)) => self.infer_ty(i),
-            None => Ty::Unit,
-        }
+    fn expr_ty(&self, expr: &HirExpr) -> Ty {
+        self.expr_types
+            .get(&expr.id())
+            .cloned()
+            .unwrap_or(Ty::Error)
     }
 
     // ---- statement/block lowering ----
@@ -499,7 +415,10 @@ impl<'a> Lowering<'a> {
                 then_branch,
                 else_branch,
                 ..
-            } => self.lower_if(fb, condition, then_branch, else_branch),
+            } => {
+                let result_ty = self.expr_ty(expr);
+                self.lower_if(fb, condition, then_branch, else_branch, result_ty)
+            }
             HirExpr::Match { .. } => Err("match is not yet lowered to NIR".to_string()),
             HirExpr::Block(b) => self.lower_block_value(fb, b),
             HirExpr::Return { value, .. } => {
@@ -562,7 +481,7 @@ impl<'a> Lowering<'a> {
         op: UnaryOp,
         operand: &HirExpr,
     ) -> LowerResult<ValueId> {
-        let ty = self.infer_ty(operand);
+        let ty = self.expr_ty(operand);
         let v = self.lower_expr_hinted(fb, operand, &ty)?;
         Ok(match op {
             UnaryOp::Neg => fb.push_value(ty, ValueKind::Neg(v)),
@@ -591,12 +510,11 @@ impl<'a> Lowering<'a> {
             _ => {}
         }
 
-        let is_literal = |e: &HirExpr| matches!(e, HirExpr::Int { .. } | HirExpr::Float { .. });
-        let operand_ty = if is_literal(left) && !is_literal(right) {
-            self.infer_ty(right)
-        } else {
-            self.infer_ty(left)
-        };
+        // typeck already unified left and right to the same type (or
+        // recorded a diagnostic if it couldn't), so either side's
+        // resolved expr_type is the operand type -- no need to guess
+        // which side "actually" carries it based on which is a literal.
+        let operand_ty = self.expr_ty(left);
 
         let lv = self.lower_expr_hinted(fb, left, &operand_ty)?;
         let rv = self.lower_expr_hinted(fb, right, &operand_ty)?;
@@ -754,8 +672,8 @@ impl<'a> Lowering<'a> {
         condition: &HirExpr,
         then_branch: &HirBlock,
         else_branch: &Option<HirElse>,
+        result_ty: Ty,
     ) -> LowerResult<ValueId> {
-        let result_ty = self.infer_if_ty(then_branch, else_branch);
         let cond_value = self.lower_expr(fb, condition)?;
 
         let then_block = fb.new_block();
@@ -833,7 +751,7 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &interner)
+        lower_module(&hir, &result.local_types, &result.expr_types, &interner)
     }
 
     #[test]
@@ -843,6 +761,28 @@ mod tests {
         assert!(skipped.is_empty());
         assert_eq!(module.functions.len(), 1);
         assert_eq!(module.functions[0].params.len(), 2);
+    }
+
+    #[test]
+    fn literal_takes_its_type_from_typeck_not_a_re_derived_default() {
+        // `1`'s type comes from expr_types (typeck already unified it
+        // with `x: i32`), not NIR re-inferring it as i64 by default.
+        let (module, skipped) = lower("func f(x: i32) -> i32 { return x + 1 }");
+        assert!(skipped.is_empty());
+        let add_ty = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Instruction::Value {
+                    ty,
+                    kind: ValueKind::Add(..),
+                    ..
+                } => Some(ty.clone()),
+                _ => None,
+            })
+            .expect("expected an add instruction");
+        assert_eq!(add_ty, Ty::I32);
     }
 
     #[test]
@@ -941,7 +881,8 @@ mod tests {
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty());
         let result = check_module(&hir, id, &interner);
-        let (module, skipped) = lower_module(&hir, &result.local_types, &interner);
+        let (module, skipped) =
+            lower_module(&hir, &result.local_types, &result.expr_types, &interner);
         assert!(module.functions.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].contains("match"));

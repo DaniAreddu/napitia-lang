@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use super::{
-    HirBinding, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirParam, HirPattern, HirStmt, ItemId, LocalId, OtherItem, OtherItemKind,
+    ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody,
+    HirModule, HirParam, HirPattern, HirStmt, ItemId, LocalId, OtherItem, OtherItemKind,
 };
 use crate::diagnostics::Diagnostic;
 use crate::resolve::Scopes;
@@ -35,6 +35,7 @@ pub fn lower_module(
         functions_by_name: HashMap::new(),
         next_item_id: 0,
         next_local_id: 0,
+        next_expr_id: 0,
     };
     let hir = lowering.run(module);
     (hir, lowering.diagnostics)
@@ -47,6 +48,7 @@ struct Lowering<'a> {
     functions_by_name: HashMap<Symbol, ItemId>,
     next_item_id: u32,
     next_local_id: u32,
+    next_expr_id: u32,
 }
 
 impl<'a> Lowering<'a> {
@@ -140,6 +142,12 @@ impl<'a> Lowering<'a> {
         id
     }
 
+    fn fresh_expr_id(&mut self) -> ExprId {
+        let id = ExprId(self.next_expr_id);
+        self.next_expr_id += 1;
+        id
+    }
+
     fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
         let mut scopes = Scopes::new();
         let params = f
@@ -183,6 +191,7 @@ impl<'a> Lowering<'a> {
             .map(|e| Box::new(self.lower_expr(e, scopes)));
         scopes.pop();
         HirBlock {
+            id: self.fresh_expr_id(),
             statements,
             tail,
             span: block.span,
@@ -228,29 +237,35 @@ impl<'a> Lowering<'a> {
     fn lower_expr(&mut self, expr: &ast::Expr, scopes: &mut Scopes) -> HirExpr {
         match expr {
             ast::Expr::Int { value, base, span } => HirExpr::Int {
+                id: self.fresh_expr_id(),
                 value: *value,
                 base: *base,
                 span: *span,
             },
             ast::Expr::Float { value, span } => HirExpr::Float {
+                id: self.fresh_expr_id(),
                 value: *value,
                 span: *span,
             },
             ast::Expr::Str { value, span } => HirExpr::Str {
+                id: self.fresh_expr_id(),
                 value: value.clone(),
                 span: *span,
             },
             ast::Expr::Char { value, span } => HirExpr::Char {
+                id: self.fresh_expr_id(),
                 value: *value,
                 span: *span,
             },
             ast::Expr::Bool { value, span } => HirExpr::Bool {
+                id: self.fresh_expr_id(),
                 value: *value,
                 span: *span,
             },
             ast::Expr::Ident(ident) => self.resolve_ident(*ident, scopes),
             ast::Expr::Paren { inner, .. } => self.lower_expr(inner, scopes),
             ast::Expr::Unary { op, operand, span } => HirExpr::Unary {
+                id: self.fresh_expr_id(),
                 op: *op,
                 operand: Box::new(self.lower_expr(operand, scopes)),
                 span: *span,
@@ -261,6 +276,7 @@ impl<'a> Lowering<'a> {
                 right,
                 span,
             } => HirExpr::Binary {
+                id: self.fresh_expr_id(),
                 op: *op,
                 left: Box::new(self.lower_expr(left, scopes)),
                 right: Box::new(self.lower_expr(right, scopes)),
@@ -272,27 +288,32 @@ impl<'a> Lowering<'a> {
                 value,
                 span,
             } => HirExpr::Assign {
+                id: self.fresh_expr_id(),
                 target: Box::new(self.lower_expr(target, scopes)),
                 op: *op,
                 value: Box::new(self.lower_expr(value, scopes)),
                 span: *span,
             },
             ast::Expr::Call { callee, args, span } => HirExpr::Call {
+                id: self.fresh_expr_id(),
                 callee: Box::new(self.lower_expr(callee, scopes)),
                 args: args.iter().map(|a| self.lower_expr(a, scopes)).collect(),
                 span: *span,
             },
             ast::Expr::Field { base, name, span } => HirExpr::Field {
+                id: self.fresh_expr_id(),
                 base: Box::new(self.lower_expr(base, scopes)),
                 name: name.symbol,
                 span: *span,
             },
             ast::Expr::Cast { expr, ty, span } => HirExpr::Cast {
+                id: self.fresh_expr_id(),
                 expr: Box::new(self.lower_expr(expr, scopes)),
                 ty: ty.clone(),
                 span: *span,
             },
             ast::Expr::Try { expr, span } => HirExpr::Try {
+                id: self.fresh_expr_id(),
                 expr: Box::new(self.lower_expr(expr, scopes)),
                 span: *span,
             },
@@ -300,21 +321,30 @@ impl<'a> Lowering<'a> {
             ast::Expr::Match(m) => self.lower_match(m, scopes),
             ast::Expr::Block(b) => HirExpr::Block(Box::new(self.lower_block(b, scopes))),
             ast::Expr::Return { value, span } => HirExpr::Return {
+                id: self.fresh_expr_id(),
                 value: value.as_ref().map(|v| Box::new(self.lower_expr(v, scopes))),
                 span: *span,
             },
             ast::Expr::Break { value, span } => HirExpr::Break {
+                id: self.fresh_expr_id(),
                 value: value.as_ref().map(|v| Box::new(self.lower_expr(v, scopes))),
                 span: *span,
             },
-            ast::Expr::Continue { span } => HirExpr::Continue { span: *span },
-            ast::Expr::Error { span } => HirExpr::Error { span: *span },
+            ast::Expr::Continue { span } => HirExpr::Continue {
+                id: self.fresh_expr_id(),
+                span: *span,
+            },
+            ast::Expr::Error { span } => HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span: *span,
+            },
         }
     }
 
     fn resolve_ident(&mut self, ident: ast::Ident, scopes: &Scopes) -> HirExpr {
         if let Some(local) = scopes.lookup(ident.symbol) {
             return HirExpr::Local {
+                id: self.fresh_expr_id(),
                 local,
                 name: ident.symbol,
                 span: ident.span,
@@ -322,6 +352,7 @@ impl<'a> Lowering<'a> {
         }
         if let Some(&item) = self.functions_by_name.get(&ident.symbol) {
             return HirExpr::Function {
+                id: self.fresh_expr_id(),
                 item,
                 name: ident.symbol,
                 span: ident.span,
@@ -337,7 +368,10 @@ impl<'a> Lowering<'a> {
             )
             .with_primary_label("not found"),
         );
-        HirExpr::Error { span: ident.span }
+        HirExpr::Error {
+            id: self.fresh_expr_id(),
+            span: ident.span,
+        }
     }
 
     fn lower_if(&mut self, if_expr: &ast::IfExpr, scopes: &mut Scopes) -> HirExpr {
@@ -348,6 +382,7 @@ impl<'a> Lowering<'a> {
             ast::ElseBranch::If(i) => HirElse::If(Box::new(self.lower_if(i, scopes))),
         });
         HirExpr::If {
+            id: self.fresh_expr_id(),
             condition,
             then_branch,
             else_branch,
@@ -378,6 +413,7 @@ impl<'a> Lowering<'a> {
             })
             .collect();
         HirExpr::Match {
+            id: self.fresh_expr_id(),
             scrutinee,
             arms,
             span: m.span,

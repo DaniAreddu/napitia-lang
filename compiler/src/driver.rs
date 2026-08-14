@@ -50,6 +50,7 @@ pub fn parse(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Pars
 pub struct CheckOutput {
     pub hir: HirModule,
     pub local_types: HashMap<LocalId, Ty>,
+    pub expr_types: HashMap<hir::ExprId, Ty>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -63,6 +64,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
     CheckOutput {
         hir,
         local_types: typeck_result.local_types,
+        expr_types: typeck_result.expr_types,
         diagnostics,
     }
 }
@@ -85,7 +87,12 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
     if !checked.diagnostics.is_empty() {
         return IrOutput::Diagnostics(checked.diagnostics);
     }
-    let (nir_module, skipped) = nir::lower_module(&checked.hir, &checked.local_types, interner);
+    let (nir_module, skipped) = nir::lower_module(
+        &checked.hir,
+        &checked.local_types,
+        &checked.expr_types,
+        interner,
+    );
     IrOutput::Ready {
         nir: nir_module,
         skipped,

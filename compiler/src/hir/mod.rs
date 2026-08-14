@@ -28,6 +28,15 @@ pub struct ItemId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub(crate) u32);
 
+/// Identifies one HIR expression (or block, which carries its own
+/// `ExprId` for the same reason) for the lifetime of one compilation
+/// session. Deliberately not span-based: a synthesized or structurally
+/// nested expression can share a span with another node, but two
+/// `ExprId`s are never equal, so a map keyed by `ExprId` (`typeck`'s
+/// `expr_types`) can't collide the way one keyed by span could.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExprId(pub(crate) u32);
+
 #[derive(Debug, Clone, Default)]
 pub struct HirModule {
     pub functions: Vec<HirFunction>,
@@ -85,6 +94,7 @@ pub struct HirParam {
 
 #[derive(Debug, Clone)]
 pub struct HirBlock {
+    pub id: ExprId,
     pub statements: Vec<HirStmt>,
     pub tail: Option<Box<HirExpr>>,
     pub span: Span,
@@ -122,57 +132,68 @@ pub struct HirBinding {
 #[derive(Debug, Clone)]
 pub enum HirExpr {
     Int {
+        id: ExprId,
         value: u128,
         base: IntBase,
         span: Span,
     },
     Float {
+        id: ExprId,
         value: f64,
         span: Span,
     },
     Str {
+        id: ExprId,
         value: String,
         span: Span,
     },
     Char {
+        id: ExprId,
         value: char,
         span: Span,
     },
     Bool {
+        id: ExprId,
         value: bool,
         span: Span,
     },
     /// A resolved reference to a local binding (parameter, `value`/
     /// `mutable` statement, or pattern-bound match name).
     Local {
+        id: ExprId,
         local: LocalId,
         name: Symbol,
         span: Span,
     },
     /// A resolved reference to a module-level function.
     Function {
+        id: ExprId,
         item: ItemId,
         name: Symbol,
         span: Span,
     },
     Unary {
+        id: ExprId,
         op: UnaryOp,
         operand: Box<HirExpr>,
         span: Span,
     },
     Binary {
+        id: ExprId,
         op: BinaryOp,
         left: Box<HirExpr>,
         right: Box<HirExpr>,
         span: Span,
     },
     Assign {
+        id: ExprId,
         target: Box<HirExpr>,
         op: AssignOp,
         value: Box<HirExpr>,
         span: Span,
     },
     Call {
+        id: ExprId,
         callee: Box<HirExpr>,
         args: Vec<HirExpr>,
         span: Span,
@@ -180,11 +201,13 @@ pub enum HirExpr {
     /// Field access. The field name is not resolved against a record
     /// definition in this milestone (`spec/0003`).
     Field {
+        id: ExprId,
         base: Box<HirExpr>,
         name: Symbol,
         span: Span,
     },
     Cast {
+        id: ExprId,
         expr: Box<HirExpr>,
         ty: Type,
         span: Span,
@@ -192,36 +215,43 @@ pub enum HirExpr {
     /// Postfix `?`. Parsed and resolved, not yet given propagation
     /// semantics (`spec/0005`).
     Try {
+        id: ExprId,
         expr: Box<HirExpr>,
         span: Span,
     },
     If {
+        id: ExprId,
         condition: Box<HirExpr>,
         then_branch: HirBlock,
         else_branch: Option<HirElse>,
         span: Span,
     },
     Match {
+        id: ExprId,
         scrutinee: Box<HirExpr>,
         arms: Vec<HirMatchArm>,
         span: Span,
     },
     Block(Box<HirBlock>),
     Return {
+        id: ExprId,
         value: Option<Box<HirExpr>>,
         span: Span,
     },
     Break {
+        id: ExprId,
         value: Option<Box<HirExpr>>,
         span: Span,
     },
     Continue {
+        id: ExprId,
         span: Span,
     },
     /// A name that failed to resolve, or an expression the parser could
     /// not build. A diagnostic has already been recorded; later stages
     /// must skip this node rather than type-check it.
     Error {
+        id: ExprId,
         span: Span,
     },
 }
@@ -304,9 +334,38 @@ impl HirExpr {
             | HirExpr::Match { span, .. }
             | HirExpr::Return { span, .. }
             | HirExpr::Break { span, .. }
-            | HirExpr::Continue { span }
-            | HirExpr::Error { span } => *span,
+            | HirExpr::Continue { span, .. }
+            | HirExpr::Error { span, .. } => *span,
             HirExpr::Block(block) => block.span,
+        }
+    }
+
+    /// The stable identity typeck's `expr_types` (and any other
+    /// per-expression map) keys on -- see [`ExprId`] for why this,
+    /// rather than `span`, is the right key.
+    pub fn id(&self) -> ExprId {
+        match self {
+            HirExpr::Int { id, .. }
+            | HirExpr::Float { id, .. }
+            | HirExpr::Str { id, .. }
+            | HirExpr::Char { id, .. }
+            | HirExpr::Bool { id, .. }
+            | HirExpr::Local { id, .. }
+            | HirExpr::Function { id, .. }
+            | HirExpr::Unary { id, .. }
+            | HirExpr::Binary { id, .. }
+            | HirExpr::Assign { id, .. }
+            | HirExpr::Call { id, .. }
+            | HirExpr::Field { id, .. }
+            | HirExpr::Cast { id, .. }
+            | HirExpr::Try { id, .. }
+            | HirExpr::If { id, .. }
+            | HirExpr::Match { id, .. }
+            | HirExpr::Return { id, .. }
+            | HirExpr::Break { id, .. }
+            | HirExpr::Continue { id, .. }
+            | HirExpr::Error { id, .. } => *id,
+            HirExpr::Block(block) => block.id,
         }
     }
 }

@@ -10,8 +10,8 @@ use unify::unify;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule, HirPattern,
-    HirStmt, ItemId, LocalId, OtherItemKind,
+    ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
+    HirPattern, HirStmt, ItemId, LocalId, OtherItemKind,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -46,16 +46,20 @@ struct LocalInfo {
     mutable: bool,
 }
 
-/// Every diagnostic produced by checking a module, plus the final
-/// resolved type of every local binding (parameters, `value`/`mutable`
-/// statements, and match-arm pattern bindings). `local_types` is what
-/// lets NIR lowering (`nir::lower`) know a local's concrete type without
-/// re-running unification: by the time checking finishes, every local
-/// that isn't part of an ill-typed program has a fully resolved type
-/// (literal defaults included).
+/// Every diagnostic produced by checking a module, the final resolved
+/// type of every local binding (parameters, `value`/`mutable`
+/// statements, and match-arm pattern bindings), and the final resolved
+/// type of every expression. Both maps are what let NIR lowering
+/// (`nir::lower`) know a local's or an expression's concrete type
+/// without re-running unification or re-deriving an approximation of
+/// it: by the time checking finishes, every local and expression that
+/// isn't part of an ill-typed program has a fully resolved type
+/// (literal defaults included, and never a bare, still-unresolved
+/// `Ty::Var`).
 pub struct TypeckResult {
     pub diagnostics: Vec<Diagnostic>,
     pub local_types: HashMap<LocalId, Ty>,
+    pub expr_types: HashMap<ExprId, Ty>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`]. Checking one
@@ -87,6 +91,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         current_return_type: Ty::Unit,
         type_names,
         loop_depth: 0,
+        expr_types: HashMap::new(),
     };
     checker.build_signatures(hir);
     for function in &hir.functions {
@@ -99,10 +104,22 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         .iter()
         .map(|(id, info)| (*id, checker.ctx.resolve(&info.ty)))
         .collect();
+    // Resolved the same way as local_types, and for the same reason:
+    // an expression's raw recorded type can still be an unresolved
+    // `Ty::Var` at the point check_expr ran (unification may settle it
+    // later, or finalize_defaults may only just now be applying its
+    // literal default) -- this is the one place that's collapsed away
+    // before anything outside typeck ever sees these types.
+    let expr_types = checker
+        .expr_types
+        .iter()
+        .map(|(id, ty)| (*id, checker.ctx.resolve(ty)))
+        .collect();
 
     TypeckResult {
         diagnostics: checker.diagnostics,
         local_types,
+        expr_types,
     }
 }
 
@@ -123,6 +140,13 @@ struct Checker<'a> {
     /// diagnostic, not something deferred to NIR lowering or the
     /// interpreter to discover at run time.
     loop_depth: u32,
+    /// Every expression's (and block's) type as check_expr/check_block
+    /// resolved it, keyed by its stable `ExprId` rather than its span
+    /// (see `ExprId`'s doc comment for why). May still contain
+    /// unresolved `Ty::Var`s until `check_module` does a final
+    /// `ctx.resolve` pass over the whole map, mirroring how
+    /// `local_types` is finalized.
+    expr_types: HashMap<ExprId, Ty>,
 }
 
 impl<'a> Checker<'a> {
@@ -245,7 +269,15 @@ impl<'a> Checker<'a> {
             Some(expr) => self.check_expr(expr),
             None => Ty::Unit,
         };
-        if diverged { Ty::Never } else { tail_ty }
+        let ty = if diverged { Ty::Never } else { tail_ty };
+        // Recorded under the block's own id too, not just the
+        // HirExpr::Block wrapper's id (check_expr's caller-side
+        // recording): a `while`/`loop` body, an `if` branch, and a
+        // function body are all plain HirBlocks with no wrapping
+        // HirExpr, so this is the only place their type is ever
+        // captured.
+        self.expr_types.insert(block.id, ty.clone());
+        ty
     }
 
     /// Type-checks one statement, returning `never` iff the statement
@@ -310,7 +342,20 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Type-checks one expression and records its final resolved type
+    /// under its stable [`ExprId`] in `expr_types`, so NIR lowering
+    /// (`nir::lower`) can later read back exactly what this checker
+    /// decided rather than re-inferring an approximation of it. Every
+    /// arm below must produce a `Ty` and fall through to that recording
+    /// step -- there is no arm that returns without one, so no
+    /// expression can reach NIR lowering "unseen".
     fn check_expr(&mut self, expr: &HirExpr) -> Ty {
+        let ty = self.check_expr_kind(expr);
+        self.expr_types.insert(expr.id(), ty.clone());
+        ty
+    }
+
+    fn check_expr_kind(&mut self, expr: &HirExpr) -> Ty {
         match expr {
             HirExpr::Int { .. } => self.fresh_default(Ty::I64, VarKind::Integer),
             HirExpr::Float { .. } => self.fresh_default(Ty::F64, VarKind::Float),
@@ -341,26 +386,32 @@ impl<'a> Checker<'a> {
                 );
                 Ty::Error
             }
-            HirExpr::Unary { op, operand, span } => self.check_unary(*op, operand, *span),
+            HirExpr::Unary {
+                op, operand, span, ..
+            } => self.check_unary(*op, operand, *span),
             HirExpr::Binary {
                 op,
                 left,
                 right,
                 span,
+                ..
             } => self.check_binary(*op, left, right, *span),
             HirExpr::Assign {
                 target,
                 op,
                 value,
                 span,
+                ..
             } => self.check_assign(target, *op, value, *span),
-            HirExpr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            HirExpr::Call {
+                callee, args, span, ..
+            } => self.check_call(callee, args, *span),
             HirExpr::Field { base, span, .. } => {
                 self.check_expr(base);
                 self.push_unsupported(*span, "field access");
                 Ty::Error
             }
-            HirExpr::Cast { expr, ty, span } => {
+            HirExpr::Cast { expr, ty, span, .. } => {
                 self.check_expr(expr);
                 // Still resolve the target type name, so an unknown
                 // type in a cast gets its own T0006 diagnostic rather
@@ -370,7 +421,7 @@ impl<'a> Checker<'a> {
                 self.push_unsupported(*span, "casts (`as`)");
                 Ty::Error
             }
-            HirExpr::Try { expr, span } => {
+            HirExpr::Try { expr, span, .. } => {
                 self.check_expr(expr);
                 self.push_unsupported(*span, "postfix `?`");
                 Ty::Error
@@ -385,9 +436,10 @@ impl<'a> Checker<'a> {
                 scrutinee,
                 arms,
                 span,
+                ..
             } => self.check_match(scrutinee, arms, *span),
             HirExpr::Block(block) => self.check_block(block),
-            HirExpr::Return { value, span } => {
+            HirExpr::Return { value, span, .. } => {
                 let value_ty = value
                     .as_ref()
                     .map(|v| self.check_expr(v))
@@ -401,7 +453,7 @@ impl<'a> Checker<'a> {
                 );
                 Ty::Never
             }
-            HirExpr::Break { value, span } => {
+            HirExpr::Break { value, span, .. } => {
                 if let Some(v) = value {
                     let value_ty = self.check_expr(v);
                     self.unify_report(
@@ -415,7 +467,7 @@ impl<'a> Checker<'a> {
                 self.check_loop_control(*span, "break");
                 Ty::Never
             }
-            HirExpr::Continue { span } => {
+            HirExpr::Continue { span, .. } => {
                 self.check_loop_control(*span, "continue");
                 Ty::Never
             }
@@ -878,6 +930,28 @@ mod tests {
         check_module(&hir, id, &interner).diagnostics
     }
 
+    fn check_full(text: &str) -> TypeckResult {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        check_module(&hir, id, &interner)
+    }
+
     #[test]
     fn well_typed_function_has_no_diagnostics() {
         let diags = check("func add(left: i64, right: i64) -> i64 { return left + right }");
@@ -1293,5 +1367,69 @@ mod tests {
     fn main_with_no_parameters_is_fine() {
         let diags = check("func main() -> i64 { return 0 }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn expr_types_never_leaks_an_unresolved_type_variable() {
+        let result = check_full("func f() -> i64 { value x = 1; return x + 1 }");
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        for (id, ty) in &result.expr_types {
+            assert!(
+                !matches!(ty, Ty::Var(_)),
+                "expr {id:?} leaked an unresolved type variable: {ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expr_types_records_a_literals_type_as_unified_with_its_context() {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", "func f(x: i32) -> i32 { return x + 1 }");
+        let mut interner = Interner::new();
+        let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
+        let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
+        let (hir, _) = lower_module(&module, id, &interner);
+        let result = check_module(&hir, id, &interner);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        let HirExpr::Return { value, .. } = hir.functions[0].body.tail.as_deref().unwrap() else {
+            panic!("expected return")
+        };
+        let HirExpr::Binary { right, .. } = value.as_deref().unwrap() else {
+            panic!("expected binary")
+        };
+        // `1`'s own recorded type must be i32 -- what it was unified
+        // with via `x` -- not the bare i64 default a literal takes with
+        // no surrounding context. This is exactly what lets NIR lowering
+        // read the literal's real type instead of re-deriving it.
+        assert_eq!(result.expr_types.get(&right.id()), Some(&Ty::I32));
+    }
+
+    #[test]
+    fn distinct_expressions_get_distinct_expr_ids() {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", "func f() -> i64 { return 1 + 2 }");
+        let mut interner = Interner::new();
+        let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
+        let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
+        let (hir, _) = lower_module(&module, id, &interner);
+
+        let HirExpr::Return { value, .. } = hir.functions[0].body.tail.as_deref().unwrap() else {
+            panic!("expected return")
+        };
+        let binary = value.as_deref().unwrap();
+        let HirExpr::Binary { left, right, .. } = binary else {
+            panic!("expected binary")
+        };
+        assert_ne!(left.id(), right.id());
+        assert_ne!(left.id(), binary.id());
     }
 }

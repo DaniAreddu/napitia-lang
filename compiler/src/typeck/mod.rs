@@ -192,17 +192,40 @@ impl<'a> Checker<'a> {
         );
     }
 
+    /// A block's type is `never` if any statement in it unconditionally
+    /// diverges (its own type is `never`, e.g. an expression-statement
+    /// `return x;`) — even when that statement has no trailing tail
+    /// expression at all, which is exactly the case
+    /// `func f() -> i64 { return 42; }` needs: the block has one
+    /// statement and no tail, so without tracking divergence explicitly
+    /// it would otherwise wrongly report its own type as `unit`. Once a
+    /// statement has diverged, later statements and any tail are still
+    /// type-checked (so unrelated diagnostics in unreachable code are
+    /// still reported), but their types can no longer change the
+    /// block's own resulting type.
     fn check_block(&mut self, block: &HirBlock) -> Ty {
+        let mut diverged = false;
         for stmt in &block.statements {
-            self.check_stmt(stmt);
+            if matches!(self.check_stmt(stmt), Ty::Never) {
+                diverged = true;
+            }
         }
-        match &block.tail {
+        let tail_ty = match &block.tail {
             Some(expr) => self.check_expr(expr),
             None => Ty::Unit,
-        }
+        };
+        if diverged { Ty::Never } else { tail_ty }
     }
 
-    fn check_stmt(&mut self, stmt: &HirStmt) {
+    /// Type-checks one statement, returning `never` iff the statement
+    /// itself unconditionally diverges (so `check_block` can propagate
+    /// that to the enclosing block). `while`/`loop` never make the
+    /// *enclosing* block diverge in this milestone — proving a loop
+    /// always executes at least one divergent iteration would need loop
+    /// analysis this checker does not do — so they always contribute
+    /// `unit`, matching their statement-only (never tail) grammar
+    /// position.
+    fn check_stmt(&mut self, stmt: &HirStmt) -> Ty {
         match stmt {
             HirStmt::Binding(b) => {
                 let value_ty = self.check_expr(&b.value);
@@ -217,7 +240,7 @@ impl<'a> Checker<'a> {
                         );
                         declared
                     }
-                    None => value_ty,
+                    None => value_ty.clone(),
                 };
                 self.locals.insert(
                     b.local,
@@ -226,22 +249,24 @@ impl<'a> Checker<'a> {
                         mutable: b.mutable,
                     },
                 );
+                // A binding whose initializer itself never completes
+                // (`value x = return 5;`) means control never reaches
+                // past this statement either.
+                value_ty
             }
-            HirStmt::Expr(e) => {
-                self.check_expr(e);
-            }
-            HirStmt::Defer { expr, .. } => {
-                self.check_expr(expr);
-            }
+            HirStmt::Expr(e) => self.check_expr(e),
+            HirStmt::Defer { expr, .. } => self.check_expr(expr),
             HirStmt::While {
                 condition, body, ..
             } => {
                 let cond_ty = self.check_expr(condition);
                 self.expect_bool(&cond_ty, condition.span());
                 self.check_block(body);
+                Ty::Unit
             }
             HirStmt::Loop { body, .. } => {
                 self.check_block(body);
+                Ty::Unit
             }
         }
     }
@@ -900,5 +925,56 @@ mod tests {
         let diags = check("func f() { value x: Banana = 1; }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0006");
+    }
+
+    #[test]
+    fn return_with_trailing_semicolon_and_no_tail_type_checks() {
+        // Regression: a block whose only content is a semicolon-
+        // terminated `return` statement (no tail expression at all)
+        // must not be reported as having type `unit`.
+        let diags = check("func main() -> i64 { return 42; }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn multiple_explicit_return_paths_type_check() {
+        let diags = check(
+            "func classify(n: i64) -> i64 { \
+                 if n < 0 { return -1; } \
+                 if n == 0 { return 0; } \
+                 return 1; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn if_where_both_branches_diverge_has_never_type() {
+        // Used in a context (as a value bound to `x`) that would only
+        // type-check if the if-expression's own type is `never`
+        // (which unifies with anything) rather than `unit`.
+        let diags = check(
+            "func f(n: i64) -> i64 { \
+                 value x: i64 = if n == 0 { return 1; } else { return 2; }; \
+                 return x \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn diverging_statement_does_not_hide_later_unreachable_diagnostics() {
+        // The block still diverges (type never) even though later,
+        // unreachable code contains its own independent error; that
+        // later error is still worth reporting.
+        let diags = check("func f() -> i64 { return 1; return true; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn binding_with_diverging_initializer_diverges_the_block() {
+        let diags = check("func f() -> i64 { value x = return 1; }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

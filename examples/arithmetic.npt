@@ -1,0 +1,15 @@
+// Arithmetic, bitwise, and comparison operators, plus value/mutable
+// bindings (spec/0002, spec/0003).
+func main() -> i64 {
+    value sum = 1 + 2 * 3 - 4 / 2;
+    value bits = (6 & 3) | (1 << 4);
+    mutable total = 0;
+    total += sum;
+    total += bits;
+
+    if total == sum + bits {
+        return total
+    } else {
+        return -1
+    }
+}

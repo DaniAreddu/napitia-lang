@@ -1,0 +1,17 @@
+// Function declarations, calls, and recursion (spec/0002).
+func add(left: i64, right: i64) -> i64 {
+    return left + right
+}
+
+func factorial(n: i64) -> i64 {
+    if n == 0 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+func main() -> i64 {
+    value sum = add(40, 2);
+    value fact = factorial(5);
+    return sum + fact
+}

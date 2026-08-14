@@ -1,0 +1,16 @@
+// Deliberately malformed: exercises the parser's error recovery.
+// `napitia check examples/invalid_syntax.npt` should report several
+// independent diagnostics from one pass, not just the first one.
+
+func broken(x: i64 -> i64 {
+    return x
+}
+
+func also_broken() -> i64 {
+    value y = ;
+    return y
+}
+
+func unterminated_string() -> str {
+    return "never closes
+}

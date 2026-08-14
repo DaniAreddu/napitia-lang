@@ -38,6 +38,13 @@ mod codes {
     /// T0007 first) -- this is lowering's own defense-in-depth, for
     /// direct callers that bypass that gate.
     pub const UNSUPPORTED_IN_NIR: &str = "I0001";
+    /// Lowering itself failed to uphold one of its own structural
+    /// invariants (e.g. a block was left without a terminator). This
+    /// should never happen for any HIR built by `hir::lower_module` --
+    /// it is a bug in `nir::lower` itself, reported as a diagnostic
+    /// instead of a panic so that even a lowering bug degrades to a
+    /// normal compiler error rather than crashing the process.
+    pub const INTERNAL_INVARIANT_VIOLATED: &str = "I0002";
 }
 
 // Boxed so a single-`Diagnostic` `Err` doesn't force every `LowerResult`
@@ -227,15 +234,24 @@ impl FnBuilder {
         self.current_block_mut().terminator = Some(term);
     }
 
-    fn finish_blocks(self) -> Vec<BasicBlock> {
+    /// Converts every block built so far into its finished form, or
+    /// reports the id of the first block still missing a terminator.
+    /// Every code path that creates a block is responsible for either
+    /// terminating it or (for `while`'s lazily-created loop-body/exit
+    /// blocks) never creating it in the first place -- if that
+    /// invariant is ever violated despite that, this is where it is
+    /// caught, as a `Result` a caller with real source context can turn
+    /// into a diagnostic, not a panic on arbitrary user input.
+    fn finish_blocks(self) -> Result<Vec<BasicBlock>, BlockId> {
         self.blocks
             .into_iter()
-            .map(|b| BasicBlock {
-                id: b.id,
-                instructions: b.instructions,
-                terminator: b
-                    .terminator
-                    .expect("internal invariant: every NIR block must have a terminator"),
+            .map(|b| match b.terminator {
+                Some(terminator) => Ok(BasicBlock {
+                    id: b.id,
+                    instructions: b.instructions,
+                    terminator,
+                }),
+                None => Err(b.id),
             })
             .collect()
     }
@@ -275,12 +291,25 @@ impl<'a> Lowering<'a> {
             }
         }
 
+        let blocks = fb.finish_blocks().map_err(|block_id| {
+            Box::new(Diagnostic::error(
+                codes::INTERNAL_INVARIANT_VIOLATED,
+                self.source,
+                f.name_span,
+                format!(
+                    "internal error lowering `{}`: block bb{} was never given a terminator",
+                    self.interner.resolve(f.name),
+                    block_id.0
+                ),
+            ))
+        })?;
+
         Ok(Function {
             id: f.id,
             name: f.name,
             params,
             return_type,
-            blocks: fb.finish_blocks(),
+            blocks,
         })
     }
 
@@ -1012,6 +1041,24 @@ mod tests {
             // have failed to compile/construct.
             let _ = &block.terminator;
         }
+    }
+
+    #[test]
+    fn finish_blocks_reports_a_missing_terminator_instead_of_panicking() {
+        // Every real HIR program this session's fixes could reach is
+        // covered by the dedicated CFG tests above; this exercises
+        // FnBuilder in isolation to confirm the underlying invariant
+        // check itself is a structured error, not a panic, in case a
+        // future construct manages to violate it in some other way.
+        let mut fb = FnBuilder::new(Ty::Unit);
+        // Leaves the entry block (bb0) terminated but this new block
+        // (bb1) permanently without one.
+        let _dangling = fb.new_block();
+        fb.terminate(Terminator::Return(None));
+        assert!(
+            fb.finish_blocks().is_err(),
+            "a block with no terminator must be reported, not silently accepted"
+        );
     }
 
     #[test]

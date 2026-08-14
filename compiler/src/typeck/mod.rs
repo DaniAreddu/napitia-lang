@@ -816,4 +816,15 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "T0001");
     }
+
+    #[test]
+    fn mixed_integer_and_float_literal_addition_is_a_diagnostic() {
+        // Regression: unifying an Integer-kinded literal variable with a
+        // Float-kinded one must be rejected during `check`, never
+        // silently accepted only to disagree with NIR/the interpreter
+        // at runtime.
+        let diags = check("func main() { value x = 1 + 2.0; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
 }

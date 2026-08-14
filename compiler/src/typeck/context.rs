@@ -49,6 +49,15 @@ impl TypeContext {
         self.kinds[var.0 as usize]
     }
 
+    /// Overwrites `var`'s kind constraint. Used only when merging two
+    /// variables during unification: the surviving root must carry
+    /// whichever kind constraint the merged pair agreed on (see
+    /// `unify`'s `(Var, Var)` case), or the constraint from the
+    /// non-surviving variable would silently disappear.
+    pub(super) fn set_kind(&mut self, var: TyVar, kind: Option<VarKind>) {
+        self.kinds[var.0 as usize] = kind;
+    }
+
     pub(super) fn bind(&mut self, var: TyVar, ty: Ty) {
         self.substitutions[var.0 as usize] = Some(ty);
     }

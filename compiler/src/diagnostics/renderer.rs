@@ -52,6 +52,7 @@ pub fn render(diagnostic: &Diagnostic, sources: &SourceMap) -> String {
     );
 
     for label in &diagnostic.labels {
+        push_blank_gutter(&mut out, gutter_width);
         push_span_block(
             &mut out,
             sources,

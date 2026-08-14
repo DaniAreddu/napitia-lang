@@ -427,6 +427,7 @@ impl<'a> Checker<'a> {
                         args.len()
                     ),
                 )
+                .with_primary_label("wrong number of arguments")
                 .with_label(sig.span, "function defined here"),
             );
         } else {
@@ -558,11 +559,27 @@ impl<'a> Checker<'a> {
                 span,
                 format!(
                     "{message}: expected `{}`, found `{}`",
-                    display_ty(&ra),
-                    display_ty(&rb)
+                    self.display_for_diagnostic(&ra),
+                    self.display_for_diagnostic(&rb)
                 ),
             ));
         }
+    }
+
+    /// Like [`display_ty`], but shows a still-unresolved literal type
+    /// variable as the default it would take (`i64`/`f64`) rather than
+    /// `_` — unification failing is exactly what stops that default from
+    /// ever being applied, so the plain resolved form would otherwise
+    /// show a placeholder instead of the type the literal actually meant.
+    fn display_for_diagnostic(&self, ty: &Ty) -> &'static str {
+        if let Ty::Var(v) = ty {
+            match self.ctx.kind_of(*v) {
+                Some(VarKind::Integer) => return display_ty(&Ty::I64),
+                Some(VarKind::Float) => return display_ty(&Ty::F64),
+                None => {}
+            }
+        }
+        display_ty(ty)
     }
 
     fn expect_bool(&mut self, ty: &Ty, span: Span) {

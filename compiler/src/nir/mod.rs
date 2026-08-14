@@ -10,11 +10,13 @@ pub mod block;
 pub mod instruction;
 pub mod lower;
 pub mod printer;
+pub mod verify;
 
 pub use block::{BasicBlock, BlockId, Terminator};
 pub use instruction::{Const, FunctionRef, Instruction, ValueId, ValueKind};
 pub use lower::lower_module;
 pub use printer::print_module;
+pub use verify::verify_module;
 
 use crate::hir::ItemId;
 use crate::symbol::Symbol;

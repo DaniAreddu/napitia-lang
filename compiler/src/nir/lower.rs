@@ -832,11 +832,18 @@ impl<'a> Lowering<'a> {
         // A `Diverged` branch has already terminated its own block (via
         // whatever return/break/continue it lowered to); there is no
         // value to store into `result_slot` and no `after_block` branch
-        // to add on top of that terminator.
+        // to add on top of that terminator. `reached_after` tracks
+        // whether *either* branch actually falls through to
+        // `after_block`, since if neither does, `after_block` itself is
+        // unreachable dead code with nothing ever stored into
+        // `result_slot` -- there is no value to load there, so the
+        // whole `if` diverges too.
         fb.switch_to(then_block);
+        let mut reached_after = false;
         if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
             fb.push_store(result_slot, then_value);
             fb.terminate(Terminator::Branch(after_block));
+            reached_after = true;
         }
 
         fb.switch_to(else_block);
@@ -845,19 +852,33 @@ impl<'a> Lowering<'a> {
                 if let LoweredExpr::Value(else_value) = self.lower_block_value(fb, b)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
+                    reached_after = true;
                 }
             }
             Some(HirElse::If(inner)) => {
                 if let LoweredExpr::Value(else_value) = self.lower_expr(fb, inner)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
+                    reached_after = true;
                 }
             }
             None => {
                 let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
                 fb.push_store(result_slot, unit_value);
                 fb.terminate(Terminator::Branch(after_block));
+                reached_after = true;
             }
+        }
+
+        if !reached_after {
+            // `after_block` has no predecessor and was never given a
+            // terminator; a self-branch keeps it structurally valid
+            // (every block still has exactly one terminator, targeting
+            // a block that exists) without claiming it produces a
+            // value or is ever actually reached.
+            fb.switch_to(after_block);
+            fb.terminate(Terminator::Branch(after_block));
+            return Ok(LoweredExpr::Diverged);
         }
 
         fb.switch_to(after_block);
@@ -946,6 +967,35 @@ mod tests {
         assert!(
             blocks.len() >= 4,
             "expected entry + then + else + merge blocks"
+        );
+    }
+
+    #[test]
+    fn if_where_both_branches_diverge_has_no_orphaned_unterminated_block() {
+        // Both branches of this `if` return, so its merge block has no
+        // predecessor and nothing is ever stored into its result slot --
+        // every block must still end in exactly one terminator, and none
+        // may load from a slot nothing ever wrote to.
+        let module = lower("func f(x: bool) -> i64 { if x { return 1 } else { return 2 } }");
+        for block in &module.functions[0].blocks {
+            let _ = &block.terminator;
+        }
+        let has_load_from_result_slot = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Load(_),
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !has_load_from_result_slot,
+            "an unreachable merge block must never load a value nothing stored"
         );
     }
 

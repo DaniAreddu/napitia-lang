@@ -70,13 +70,15 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
 }
 
 pub enum IrOutput {
-    /// The program type-checked cleanly and every function lowered to
-    /// NIR -- lowering is atomic (`nir::lower_module`), so this is never
-    /// a partial module.
+    /// The program type-checked cleanly, every function lowered to NIR
+    /// (atomically -- `nir::lower_module`), and the result passed the
+    /// NIR verifier: this is never a partial or internally inconsistent
+    /// module.
     Ready { nir: NirModule },
     /// Lexing, parsing, resolution, or type-checking failed (NIR
-    /// lowering never ran), or lowering itself failed. Either way,
-    /// there is no NIR to run.
+    /// lowering never ran), lowering itself failed, or lowering
+    /// succeeded but produced NIR the verifier rejected. Either way,
+    /// there is no NIR safe to run.
     Diagnostics(Vec<Diagnostic>),
 }
 
@@ -85,16 +87,26 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
     if !checked.diagnostics.is_empty() {
         return IrOutput::Diagnostics(checked.diagnostics);
     }
-    match nir::lower_module(
+    let nir_module = match nir::lower_module(
         &checked.hir,
         &checked.local_types,
         &checked.expr_types,
         interner,
         source,
     ) {
-        Ok(nir_module) => IrOutput::Ready { nir: nir_module },
-        Err(diagnostics) => IrOutput::Diagnostics(diagnostics),
+        Ok(nir_module) => nir_module,
+        Err(diagnostics) => return IrOutput::Diagnostics(diagnostics),
+    };
+    // A module lowering itself considers well-formed is still checked
+    // independently before interpretation ever sees it: the verifier
+    // does not trust lowering's own bookkeeping, so a bug in `lower.rs`
+    // surfaces as a diagnostic here rather than a panic or silent
+    // misbehavior in the interpreter.
+    let verify_diagnostics = nir::verify_module(&nir_module, source, interner);
+    if !verify_diagnostics.is_empty() {
+        return IrOutput::Diagnostics(verify_diagnostics);
     }
+    IrOutput::Ready { nir: nir_module }
 }
 
 pub enum RunOutput {

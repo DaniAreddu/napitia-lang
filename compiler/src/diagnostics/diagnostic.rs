@@ -1,0 +1,1 @@
+//! The [`Diagnostic`] data model.

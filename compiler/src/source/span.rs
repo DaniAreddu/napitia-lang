@@ -1,0 +1,1 @@
+//! Byte-offset source spans.

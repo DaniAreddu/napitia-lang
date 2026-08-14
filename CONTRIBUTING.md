@@ -20,6 +20,11 @@ Before adding a feature, check `spec/` and `rfcs/`:
 
 ## Toolchain
 
+Built and tested against `rustc 1.97.1` (edition 2024, which itself
+requires `rustc >= 1.85`); see `rust-version` in `compiler/Cargo.toml`.
+CI (`.github/workflows/ci.yml`) runs the same three checks on every push
+and pull request.
+
 All contributions must pass, from the repository root:
 
 ```bash
@@ -37,9 +42,9 @@ dead-code exceptions in code that is meant to be complete.
 ## Compiler architecture
 
 The compiler is one library crate (`compiler`) plus a thin binary
-(`main.rs`). Keep `main.rs` and `cli.rs` free of compiler logic — they
-should only parse arguments and call into `driver.rs`, which sequences the
-compiler stages.
+(`main.rs`, built as `napitia`). Keep `main.rs` and `cli.rs` free of
+compiler logic — they should only parse arguments and call into
+`driver.rs`, which sequences the compiler stages.
 
 Compiler stages, in pipeline order:
 

@@ -9,7 +9,7 @@ fn fixture(name: &str) -> String {
 }
 
 fn napitia(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_compiler"))
+    Command::new(env!("CARGO_BIN_EXE_napitia"))
         .args(args)
         .output()
         .expect("failed to run the napitia binary")

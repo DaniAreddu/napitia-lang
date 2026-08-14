@@ -2,5 +2,13 @@
 name = "compiler"
 version = "0.1.0"
 edition = "2024"
+# The toolchain this compiler is built and tested against (`rustc
+# --version`). Not a verified minimum -- just the version this project
+# has actually run on; edition 2024 itself requires rustc >= 1.85.
+rust-version = "1.97.1"
+
+[[bin]]
+name = "napitia"
+path = "src/main.rs"
 
 [dependencies]

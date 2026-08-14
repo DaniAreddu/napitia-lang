@@ -35,14 +35,14 @@ fn print_function(out: &mut String, function: &Function, interner: &Interner) {
     let params = function
         .params
         .iter()
-        .map(|p| format!("%{}: {}", p.value.0, display_ty(&p.ty)))
+        .map(|p| format!("%{}: {}", p.value.0, display_ty(&p.ty, interner)))
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(
         out,
         "func @{}({params}) -> {} {{",
         interner.resolve(function.name),
-        display_ty(&function.return_type)
+        display_ty(&function.return_type, interner)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
     // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
@@ -50,7 +50,7 @@ fn print_function(out: &mut String, function: &Function, interner: &Interner) {
     // it, since a comparison instruction's own declared `ty` is `bool`.
     let value_types = collect_value_types(function);
     for block in &function.blocks {
-        print_block(out, block, &value_types);
+        print_block(out, block, &value_types, interner);
     }
     out.push_str("}\n");
 }
@@ -70,21 +70,34 @@ fn collect_value_types(function: &Function) -> HashMap<ValueId, Ty> {
     types
 }
 
-fn print_block(out: &mut String, block: &BasicBlock, value_types: &HashMap<ValueId, Ty>) {
+fn print_block(
+    out: &mut String,
+    block: &BasicBlock,
+    value_types: &HashMap<ValueId, Ty>,
+    interner: &Interner,
+) {
     let _ = writeln!(out, "bb{}:", block.id.0);
     for instruction in &block.instructions {
-        let _ = writeln!(out, "    {}", format_instruction(instruction, value_types));
+        let _ = writeln!(
+            out,
+            "    {}",
+            format_instruction(instruction, value_types, interner)
+        );
     }
     let _ = writeln!(out, "    {}", format_terminator(&block.terminator));
 }
 
-fn format_instruction(instruction: &Instruction, value_types: &HashMap<ValueId, Ty>) -> String {
+fn format_instruction(
+    instruction: &Instruction,
+    value_types: &HashMap<ValueId, Ty>,
+    interner: &Interner,
+) -> String {
     match instruction {
         Instruction::Value { result, ty, kind } => {
             format!(
                 "%{} = {}",
                 result.0,
-                format_value_kind(kind, ty, value_types)
+                format_value_kind(kind, ty, value_types, interner)
             )
         }
         Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
@@ -98,8 +111,13 @@ fn operand_ty<'a>(a: ValueId, ty: &'a Ty, value_types: &'a HashMap<ValueId, Ty>)
     value_types.get(&a).unwrap_or(ty)
 }
 
-fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, Ty>) -> String {
-    let ty_name = display_ty(ty);
+fn format_value_kind(
+    kind: &ValueKind,
+    ty: &Ty,
+    value_types: &HashMap<ValueId, Ty>,
+    interner: &Interner,
+) -> String {
+    let ty_name = display_ty(ty, interner);
     match kind {
         ValueKind::Alloc => format!("alloc.{ty_name}"),
         ValueKind::Const(c) => format!("const.{ty_name} {}", format_const(c)),
@@ -119,7 +137,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Eq(a, b) => {
             format!(
                 "eq.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )
@@ -127,7 +145,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Ne(a, b) => {
             format!(
                 "ne.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )
@@ -135,7 +153,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Lt(a, b) => {
             format!(
                 "lt.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )
@@ -143,7 +161,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Le(a, b) => {
             format!(
                 "le.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )
@@ -151,7 +169,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Gt(a, b) => {
             format!(
                 "gt.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )
@@ -159,7 +177,7 @@ fn format_value_kind(kind: &ValueKind, ty: &Ty, value_types: &HashMap<ValueId, T
         ValueKind::Ge(a, b) => {
             format!(
                 "ge.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types)),
+                display_ty(operand_ty(*a, ty, value_types), interner),
                 a.0,
                 b.0
             )

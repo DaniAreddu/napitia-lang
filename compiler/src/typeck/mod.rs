@@ -11,10 +11,10 @@ use unify::unify;
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule, HirPattern,
-    HirStmt, ItemId, LocalId,
+    HirStmt, ItemId, LocalId, OtherItemKind,
 };
 use crate::source::{SourceId, Span};
-use crate::symbol::Interner;
+use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name};
 
@@ -24,6 +24,7 @@ mod codes {
     pub const IMMUTABLE_ASSIGN: &str = "T0003";
     pub const EXPECTED_NUMERIC: &str = "T0004";
     pub const EXPECTED_INTEGER: &str = "T0005";
+    pub const UNKNOWN_TYPE: &str = "T0006";
 }
 
 #[derive(Clone)]
@@ -57,6 +58,18 @@ pub struct TypeckResult {
 /// reported), and `Ty::Error`/`Ty::Never` unify with anything so one bad
 /// expression does not cascade into unrelated type mismatches.
 pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> TypeckResult {
+    // The module's type namespace: primitives (spec/0003) plus every
+    // declared `record`/`variant` name. A named type that resolves
+    // against neither is genuinely unknown and must be diagnosed at its
+    // own span, never silently treated as `Ty::Error` -- see
+    // `resolve_named_type`.
+    let type_names = hir
+        .other_items
+        .iter()
+        .filter(|item| matches!(item.kind, OtherItemKind::Record | OtherItemKind::Variant))
+        .map(|item| (item.name, item.id))
+        .collect();
+
     let mut checker = Checker {
         source,
         interner,
@@ -66,6 +79,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         locals: HashMap::new(),
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
+        type_names,
     };
     checker.build_signatures(hir);
     for function in &hir.functions {
@@ -94,6 +108,9 @@ struct Checker<'a> {
     locals: HashMap<LocalId, LocalInfo>,
     pending_defaults: Vec<(TyVar, Ty)>,
     current_return_type: Ty,
+    /// The module's named-type namespace: declared `record`/`variant`
+    /// names, by their surface name, to the item they refer to.
+    type_names: HashMap<Symbol, ItemId>,
 }
 
 impl<'a> Checker<'a> {
@@ -120,8 +137,29 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn resolve_named_type(&self, ty: &ast::Type) -> Ty {
-        primitive_from_name(self.interner.resolve(ty.name.symbol)).unwrap_or(Ty::Error)
+    /// Resolves a written type name against the module's type namespace:
+    /// primitives first, then declared `record`/`variant` names. An
+    /// unknown name is a diagnostic at the type's own span -- `Ty::Error`
+    /// is only ever returned *after* recording why, never as a silent
+    /// wildcard for "some type we don't recognize".
+    fn resolve_named_type(&mut self, ty: &ast::Type) -> Ty {
+        let text = self.interner.resolve(ty.name.symbol);
+        if let Some(prim) = primitive_from_name(text) {
+            return prim;
+        }
+        if let Some(&item) = self.type_names.get(&ty.name.symbol) {
+            return Ty::Named(item, ty.name.symbol);
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNKNOWN_TYPE,
+                self.source,
+                ty.name.span,
+                format!("cannot find type `{text}` in this scope"),
+            )
+            .with_primary_label("unknown type"),
+        );
+        Ty::Error
     }
 
     fn check_function(&mut self, f: &HirFunction) {
@@ -571,15 +609,15 @@ impl<'a> Checker<'a> {
     /// `_` — unification failing is exactly what stops that default from
     /// ever being applied, so the plain resolved form would otherwise
     /// show a placeholder instead of the type the literal actually meant.
-    fn display_for_diagnostic(&self, ty: &Ty) -> &'static str {
+    fn display_for_diagnostic(&self, ty: &Ty) -> String {
         if let Ty::Var(v) = ty {
             match self.ctx.kind_of(*v) {
-                Some(VarKind::Integer) => return display_ty(&Ty::I64),
-                Some(VarKind::Float) => return display_ty(&Ty::F64),
+                Some(VarKind::Integer) => return display_ty(&Ty::I64, self.interner),
+                Some(VarKind::Float) => return display_ty(&Ty::F64, self.interner),
                 None => {}
             }
         }
-        display_ty(ty)
+        display_ty(ty, self.interner)
     }
 
     fn expect_bool(&mut self, ty: &Ty, span: Span) {
@@ -595,7 +633,10 @@ impl<'a> Checker<'a> {
             codes::EXPECTED_NUMERIC,
             self.source,
             span,
-            format!("expected a numeric type, found `{}`", display_ty(&resolved)),
+            format!(
+                "expected a numeric type, found `{}`",
+                display_ty(&resolved, self.interner)
+            ),
         ));
     }
 
@@ -618,7 +659,7 @@ impl<'a> Checker<'a> {
             span,
             format!(
                 "expected an integer type, found `{}`",
-                display_ty(&resolved)
+                display_ty(&resolved, self.interner)
             ),
         ));
     }
@@ -826,5 +867,38 @@ mod tests {
         let diags = check("func main() { value x = 1 + 2.0; }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn unknown_return_type_is_a_diagnostic() {
+        let diags = check("func main() -> Banana { return true }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0006");
+    }
+
+    #[test]
+    fn unknown_parameter_type_is_a_diagnostic() {
+        let diags = check("func f(x: Banana) -> i64 { return 0 }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0006");
+    }
+
+    #[test]
+    fn declared_record_name_is_a_known_type() {
+        let diags = check("record Point { x: i64, y: i64 } func f(p: Point) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn declared_variant_name_is_a_known_type() {
+        let diags = check("variant Shape { Circle } func f(s: Shape) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn unknown_binding_annotation_type_is_a_diagnostic() {
+        let diags = check("func f() { value x: Banana = 1; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0006");
     }
 }

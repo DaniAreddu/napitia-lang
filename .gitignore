@@ -1,0 +1,6 @@
+/compiler/target/
+**/*.rs.bk
+*.pdb
+.vscode/
+.idea/
+*.swp

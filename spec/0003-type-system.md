@@ -32,10 +32,10 @@ only expression-local inference happens inside a body.
 
 ### Local type inference
 
-Within a function body, `let`/`var` bindings without an explicit `: Type`
-annotation have their type inferred from the initializer expression via
-unification. Inference is purely local: no cross-function or whole-program
-inference happens in this milestone.
+Within a function body, `value`/`mutable` bindings without an explicit
+`: Type` annotation have their type inferred from the initializer
+expression via unification. Inference is purely local: no cross-function
+or whole-program inference happens in this milestone.
 
 ### Type variables and unification
 
@@ -67,8 +67,8 @@ inference, without introducing a separate compile-time-only numeric type.
   assignment operators) must unify with the binding's type. Compound
   assignment additionally requires the binding's type to support the
   underlying operator (see below).
-- **Immutable-binding enforcement**: assigning to a `let` binding (as
-  opposed to `var`) after its initialization is a checked error, not a
+- **Immutable-binding enforcement**: assigning to a `value` binding (as
+  opposed to `mutable`) after its initialization is a checked error, not a
   runtime condition.
 - **Numeric operator validation**: binary arithmetic operators (`+ - * / %`)
   and bitwise operators (`& | ^ << >>`) require both operands to unify with
@@ -93,9 +93,11 @@ called against.
   themselves a deliberate, visible operation, never inserted by the
   checker.
 - **No `null`.** There is no type-system-level "nullable" flag on any
-  type; absence is represented by `Option<T>` once generics exist (see
+  type; absence is represented by a Napitia-native `variant` type
+  (provisionally `Maybe<T>`, see `spec/0005`) once generics exist (see
   "Accepted design direction" below) — it is not part of the primitive
-  type system itself.
+  type system itself, and deliberately not a copy of another language's
+  type of that name (`rfcs/0004`).
 
 ## Accepted design direction
 
@@ -103,18 +105,22 @@ The internal type representation is deliberately structured so the
 following can be added without a redesign of the checker's core
 unification algorithm:
 
-- **Generic types**: type parameters with trait bounds
-  (`fn max<T: Ord>(a: T, b: T) -> T`). The type representation already
-  distinguishes a concrete `Type` from a `TypeVar`; a generic parameter is
-  a `TypeVar` that is universally quantified at a function/struct boundary
-  instead of being solved away by the end of checking that item.
-- **Traits**: as constraints on type variables during unification, not as
-  a runtime vtable mechanism at this layer.
-- **`Option<T>`** and **`Result<T, E>`**: as ordinary generic enums defined
-  in a future standard library, once generic enums are checkable. The
-  `never` type and the existing enum-lowering path in HIR/NIR are meant to
-  make `Result`'s "early return on error" pattern implementable without
-  new compiler primitives.
+- **Generic types**: type parameters with protocol bounds
+  (`func max<T: Comparable>(a: T, b: T) -> T`). The type representation
+  already distinguishes a concrete `Type` from a `TypeVar`; a generic
+  parameter is a `TypeVar` that is universally quantified at a
+  function/record boundary instead of being solved away by the end of
+  checking that item.
+- **Protocols**: as constraints on type variables during unification, not
+  as a runtime vtable mechanism at this layer.
+- **A `Maybe<T>` absence type**: as an ordinary generic `variant` defined
+  in a future standard library, once generic `variant`s are checkable
+  (`spec/0005`). Failure, by contrast, is intended to be modeled primarily
+  through `raises` clauses rather than a generic wrapper type; the `never`
+  type and the existing `variant`-lowering path in HIR/NIR are meant to
+  make early-return-on-error patterns implementable without new compiler
+  primitives regardless of which representation `raises` ultimately
+  compiles to.
 - **Effects** (`spec/0005`): tracked as an additional annotation on
   function types, parallel to but distinct from the return type.
 - **Ownership states and region variables** (`spec/0004`,
@@ -127,15 +133,14 @@ special-cased or faked to look implemented.
 
 ## Unresolved research questions
 
-- Whether trait bounds should support associated types/const generics
+- Whether protocol bounds should support associated types/const generics
   from the start, or be added later without breaking existing bounds.
 - Whether integer literal defaulting to `i64` is the right default, versus
-  requiring an explicit type in more contexts (Rust-style default vs.
-  stricter-than-Rust).
-- How much of Hindley-Milner-style let-polymorphism (if any) applies inside
-  a function body, versus every binding being fully monomorphic once
-  solved — the current implementation treats every local binding as
-  monomorphic.
+  requiring an explicit type in more contexts.
+- How much Hindley-Milner-style binding-local polymorphism (if any)
+  applies inside a function body, versus every binding being fully
+  monomorphic once solved — the current implementation treats every local
+  binding as monomorphic.
 
 ## Non-goals
 

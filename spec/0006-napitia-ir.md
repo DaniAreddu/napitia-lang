@@ -37,8 +37,8 @@ value is a real, typed value, not an absence of one.
 ### Locals and constants
 
 - A **local** is named stack storage within a function, introduced by
-  `let`/`var` in HIR, addressed in NIR by `alloc.<ty>` (reserve a local
-  slot) plus `load`/`store` instructions against it.
+  `value`/`mutable` in HIR, addressed in NIR by `alloc.<ty>` (reserve a
+  local slot) plus `load`/`store` instructions against it.
 - A **constant** is an immediate value materialized by a `const.<ty>`
   instruction (an integer, float, bool, or char literal folded in from
   HIR).
@@ -85,7 +85,7 @@ The implementation includes a deterministic textual printer, used for
 debugging and for the `napitia ir` CLI subcommand:
 
 ```text
-fn @add(%0: i64, %1: i64) -> i64 {
+func @add(%0: i64, %1: i64) -> i64 {
 bb0:
     %2 = add.i64 %0, %1
     ret %2

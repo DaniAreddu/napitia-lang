@@ -26,6 +26,11 @@ mod codes {
     pub const EXPECTED_INTEGER: &str = "T0005";
     pub const UNKNOWN_TYPE: &str = "T0006";
     pub const UNSUPPORTED_FEATURE: &str = "T0007";
+    pub const INVALID_ASSIGN_TARGET: &str = "T0008";
+    pub const NOT_CALLABLE: &str = "T0009";
+    pub const FUNCTION_NOT_FIRST_CLASS: &str = "T0010";
+    pub const LOOP_CONTROL_OUTSIDE_LOOP: &str = "T0011";
+    pub const INVALID_MAIN_SIGNATURE: &str = "T0012";
 }
 
 #[derive(Clone)]
@@ -81,6 +86,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
         type_names,
+        loop_depth: 0,
     };
     checker.build_signatures(hir);
     for function in &hir.functions {
@@ -112,6 +118,11 @@ struct Checker<'a> {
     /// The module's named-type namespace: declared `record`/`variant`
     /// names, by their surface name, to the item they refer to.
     type_names: HashMap<Symbol, ItemId>,
+    /// How many `while`/`loop` bodies currently enclose the expression
+    /// being checked. `break`/`continue` outside of any loop is a
+    /// diagnostic, not something deferred to NIR lowering or the
+    /// interpreter to discover at run time.
+    loop_depth: u32,
 }
 
 impl<'a> Checker<'a> {
@@ -186,6 +197,22 @@ impl<'a> Checker<'a> {
         self.current_return_type = sig.ret.clone();
         if !f.uses.is_empty() || !f.raises.is_empty() {
             self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
+        }
+        // `napitia run` always calls `main` with zero arguments (`cli.rs`
+        // hardcodes the entry point's name, not its arity), so a `main`
+        // declared with parameters can never actually receive them --
+        // that must be caught here, not discovered as missing values at
+        // interpretation time.
+        if self.interner.resolve(f.name) == "main" && !f.params.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::INVALID_MAIN_SIGNATURE,
+                    self.source,
+                    f.name_span,
+                    format!("`main` must take no parameters, found {}", f.params.len()),
+                )
+                .with_primary_label("`napitia run` calls `main` with no arguments"),
+            );
         }
         let body_ty = self.check_block(&f.body);
         self.unify_report(
@@ -269,11 +296,15 @@ impl<'a> Checker<'a> {
             } => {
                 let cond_ty = self.check_expr(condition);
                 self.expect_bool(&cond_ty, condition.span());
+                self.loop_depth += 1;
                 self.check_block(body);
+                self.loop_depth -= 1;
                 Ty::Unit
             }
             HirStmt::Loop { body, .. } => {
+                self.loop_depth += 1;
                 self.check_block(body);
+                self.loop_depth -= 1;
                 Ty::Unit
             }
         }
@@ -292,8 +323,24 @@ impl<'a> Checker<'a> {
                 .map(|i| i.ty.clone())
                 .unwrap_or(Ty::Error),
             // Functions are not first-class values in this milestone;
-            // only Call special-cases a Function callee directly.
-            HirExpr::Function { .. } => Ty::Error,
+            // only Call special-cases a Function callee directly, so
+            // reaching this arm means a function name was used
+            // somewhere else (assigned, passed as an argument, etc).
+            HirExpr::Function { name, span, .. } => {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::FUNCTION_NOT_FIRST_CLASS,
+                        self.source,
+                        *span,
+                        format!(
+                            "`{text}` is a function and cannot be used as a value in Alpha 0.1"
+                        ),
+                    )
+                    .with_primary_label("function used as a value"),
+                );
+                Ty::Error
+            }
             HirExpr::Unary { op, operand, span } => self.check_unary(*op, operand, *span),
             HirExpr::Binary {
                 op,
@@ -365,9 +412,13 @@ impl<'a> Checker<'a> {
                          direction, not implemented (spec/0002)",
                     );
                 }
+                self.check_loop_control(*span, "break");
                 Ty::Never
             }
-            HirExpr::Continue { .. } => Ty::Never,
+            HirExpr::Continue { span } => {
+                self.check_loop_control(*span, "continue");
+                Ty::Never
+            }
             HirExpr::Error { .. } => Ty::Error,
         }
     }
@@ -446,20 +497,40 @@ impl<'a> Checker<'a> {
 
     fn check_assign(&mut self, target: &HirExpr, op: AssignOp, value: &HirExpr, span: Span) -> Ty {
         let target_ty = self.check_expr(target);
-        if let HirExpr::Local { local, name, .. } = target
-            && let Some(info) = self.locals.get(local)
-            && !info.mutable
-        {
-            let text = self.interner.resolve(*name);
-            self.diagnostics.push(
-                Diagnostic::error(
-                    codes::IMMUTABLE_ASSIGN,
-                    self.source,
-                    span,
-                    format!("cannot assign to `{text}`, which is not declared `mutable`"),
-                )
-                .with_primary_label("assignment to an immutable binding"),
-            );
+        match target {
+            HirExpr::Local { local, name, .. } => {
+                if let Some(info) = self.locals.get(local)
+                    && !info.mutable
+                {
+                    let text = self.interner.resolve(*name);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::IMMUTABLE_ASSIGN,
+                            self.source,
+                            span,
+                            format!("cannot assign to `{text}`, which is not declared `mutable`"),
+                        )
+                        .with_primary_label("assignment to an immutable binding"),
+                    );
+                }
+            }
+            // Field access already gets its own "unsupported feature"
+            // diagnostic from check_expr above; Error already traces
+            // back to a diagnostic recorded elsewhere. Neither needs a
+            // second, redundant complaint about being an invalid
+            // target on top of that.
+            HirExpr::Field { .. } | HirExpr::Error { .. } => {}
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::INVALID_ASSIGN_TARGET,
+                        self.source,
+                        span,
+                        "the left-hand side of an assignment must be a mutable binding",
+                    )
+                    .with_primary_label("invalid assignment target"),
+                );
+            }
         }
 
         let value_ty = self.check_expr(value);
@@ -489,7 +560,25 @@ impl<'a> Checker<'a> {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
 
         let HirExpr::Function { item, name, .. } = callee else {
-            self.check_expr(callee);
+            let callee_ty = self.check_expr(callee);
+            // Error/Never already trace back to a diagnostic recorded
+            // elsewhere (an unresolved name, an unsupported feature, a
+            // divergent expression) -- piling "not callable" on top
+            // would just be noise about the same underlying problem.
+            if !matches!(callee_ty, Ty::Error | Ty::Never) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::NOT_CALLABLE,
+                        self.source,
+                        span,
+                        format!(
+                            "cannot call a value of type `{}`",
+                            self.display_for_diagnostic(&callee_ty)
+                        ),
+                    )
+                    .with_primary_label("not callable"),
+                );
+            }
             return Ty::Error;
         };
 
@@ -737,6 +826,25 @@ impl<'a> Checker<'a> {
             )
             .with_primary_label("not yet implemented"),
         );
+    }
+
+    /// `break`/`continue` outside of any enclosing `while`/`loop` is
+    /// rejected here, at check time, rather than left for NIR lowering
+    /// or the interpreter to discover -- tracking loop nesting during
+    /// checking is what lets this be a normal diagnostic instead of a
+    /// panic or an ignored no-op once execution reaches that point.
+    fn check_loop_control(&mut self, span: Span, keyword: &str) {
+        if self.loop_depth == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::LOOP_CONTROL_OUTSIDE_LOOP,
+                    self.source,
+                    span,
+                    format!("`{keyword}` used outside of a loop"),
+                )
+                .with_primary_label("not inside a loop"),
+            );
+        }
     }
 }
 
@@ -1098,6 +1206,92 @@ mod tests {
     #[test]
     fn binding_with_diverging_initializer_diverges_the_block() {
         let diags = check("func f() -> i64 { value x = return 1; }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn assigning_to_a_literal_is_a_diagnostic() {
+        let diags = check("func f() { 1 = 2; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0008");
+    }
+
+    #[test]
+    fn assigning_to_a_call_result_is_a_diagnostic() {
+        let diags = check("func g() -> i64 { return 1 } func f() { g() = 2; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0008");
+    }
+
+    #[test]
+    fn calling_a_non_function_value_is_a_diagnostic() {
+        let diags = check("func f() { value x = 1; x(); }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0009");
+    }
+
+    #[test]
+    fn using_a_function_name_as_a_value_is_a_diagnostic() {
+        let diags = check(
+            "func add(a: i64, b: i64) -> i64 { return a + b } \
+             func f() -> i64 { value g = add; return g }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0010");
+    }
+
+    #[test]
+    fn break_outside_a_loop_is_a_diagnostic() {
+        let diags = check("func f() { break; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0011");
+    }
+
+    #[test]
+    fn continue_outside_a_loop_is_a_diagnostic() {
+        let diags = check("func f() { continue; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0011");
+    }
+
+    #[test]
+    fn break_inside_a_loop_statement_is_fine() {
+        let diags = check("func f() { loop { break; } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn continue_inside_a_while_loop_is_fine() {
+        let diags = check("func f() { while true { continue; } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn break_nested_inside_an_if_inside_a_loop_is_fine() {
+        // The `if` itself doesn't change loop nesting; `break` still
+        // sees the enclosing `loop`.
+        let diags = check("func f() { loop { if true { break; } } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn break_after_a_loop_statement_ends_is_a_diagnostic() {
+        // Loop nesting must not leak past the loop it came from.
+        let diags = check("func f() { loop { break; } break; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0011");
+    }
+
+    #[test]
+    fn main_with_parameters_is_a_diagnostic() {
+        let diags = check("func main(x: i64) -> i64 { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0012");
+    }
+
+    #[test]
+    fn main_with_no_parameters_is_fine() {
+        let diags = check("func main() -> i64 { return 0 }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

@@ -15,7 +15,7 @@ pub use lower::lower_module;
 use crate::lexer::IntBase;
 use crate::source::Span;
 use crate::symbol::Symbol;
-use crate::syntax::ast::{AssignOp, BinaryOp, Type, UnaryOp};
+use crate::syntax::ast::{AssignOp, BinaryOp, Ident, Path, Type, UnaryOp};
 
 /// Identifies a module-level item (function, record, variant, protocol,
 /// extend, or import) for the lifetime of one compilation session.
@@ -63,6 +63,14 @@ pub struct HirFunction {
     pub name_span: Span,
     pub params: Vec<HirParam>,
     pub return_type: Option<Type>,
+    /// Effect/capability paths from a `uses` clause, preserved as-parsed.
+    /// Not semantically checked (`spec/0005`): the checker only reports
+    /// a function declaring a non-empty clause as using an unsupported
+    /// feature, rather than silently discarding it.
+    pub uses: Vec<Path>,
+    /// Error names from a `raises` clause, preserved as-parsed. Not
+    /// semantically checked (`spec/0005`), same as `uses`.
+    pub raises: Vec<Ident>,
     pub body: HirBlock,
     pub span: Span,
 }

@@ -163,6 +163,8 @@ impl<'a> Lowering<'a> {
             name_span: f.name.span,
             params,
             return_type: f.return_type.clone(),
+            uses: f.uses.clone(),
+            raises: f.raises.clone(),
             body,
             span: f.span,
         }
@@ -531,5 +533,16 @@ mod tests {
         let (hir, diags) = lower("record Point { x: i64, y: i64 } variant Shape { Circle }");
         assert!(diags.is_empty());
         assert_eq!(hir.other_items.len(), 2);
+    }
+
+    #[test]
+    fn uses_and_raises_clauses_are_preserved_not_discarded() {
+        let (hir, diags) = lower(
+            "func loadUser(id: i64) -> i64 uses Database.Read raises UserNotFound { return id }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.functions[0].uses.len(), 1);
+        assert_eq!(hir.functions[0].uses[0].segments.len(), 2);
+        assert_eq!(hir.functions[0].raises.len(), 1);
     }
 }

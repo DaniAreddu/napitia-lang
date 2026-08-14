@@ -2,12 +2,22 @@
 
 - Status: Design direction only. Not implemented in Alpha 0.1.
 
-Alpha 0.1 has no `unsafe` blocks, no pointers, no references, and no
-ownership enforcement — the NIR interpreter executes only primitive values
-and stack-local storage. This spec exists so later milestones build
-ownership/regions against a written-down design rather than an ad hoc one,
-and so nothing here is mistaken for already being enforced by the
-compiler.
+Alpha 0.1 has no `unsafe` blocks, no `owned`/`borrow`/`shared` boundary
+annotations, and no ownership enforcement — the NIR interpreter executes
+only primitive values and stack-local storage. This spec exists so later
+milestones build ownership/regions against a written-down design rather
+than an ad hoc one, and so nothing here is mistaken for already being
+enforced by the compiler.
+
+The vocabulary below (`owned`, `borrow`, `shared`, `region`) is the
+provisional set accepted in `rfcs/0004-language-independence.md`. It
+describes semantic *categories*, not necessarily a one-to-one reference
+syntax the way Rust's `&T`/`&mut T` and lifetime parameters are — the
+explicit design goal is that ordinary Napitia code should express
+ownership *intent* only at boundaries and let the compiler infer the rest
+(storage placement, moves, temporary access, escape behavior, region
+membership) everywhere else. See `rfcs/0002-ownership-and-regions.md` for
+the reasoning and the open questions this raises.
 
 ## Implemented features
 
@@ -26,13 +36,17 @@ ownership — never an implicit shared, mutable alias. Types that are cheap
 to duplicate (primitives) copy; larger/owning types move. There is no
 implicit reference-counting inserted by the compiler.
 
-### Ownership and move semantics
+### Ownership and inferred moves
 
 Every value has exactly one owning binding at a time. Moving a value out
 of a binding (e.g. passing it to a function that takes ownership)
 invalidates the source binding for further use; using a moved-from binding
-is a compile-time error, not a runtime one. Immutable bindings (`let`) may
-still be moved from; move and mutability are independent axes.
+is a compile-time error, not a runtime one. Immutable (`value`) bindings
+may still be moved from; move and mutability are independent axes. Unlike
+a model with an explicit move marker, whether a given use of a binding is
+a move or a copy is inferred from the binding's type (`spec/0003`) and
+context — there is no dedicated keyword the programmer writes to request
+a move.
 
 ### Compiler-inferred memory regions
 
@@ -54,12 +68,26 @@ statically-determined point — end of its owning region, or an explicit
 required for the language to be usable for resource management (files,
 sockets, locks) without a separate `try/finally`-shaped idiom.
 
-### Explicit shared ownership
+### Explicit shared ownership (`shared`)
 
 When more than one owner is genuinely required, it must be requested
-explicitly through a library type (analogous to `Rc`/`Arc`), never
-inferred silently by the compiler. Shared ownership is opt-in and visible
-at the type level.
+explicitly — either through the `shared` boundary annotation or a library
+type built on it — never inferred silently by the compiler. Shared
+ownership is opt-in and visible at the type level; the compiler chooses
+the underlying mechanism (e.g. runtime reference counting) rather than
+that mechanism being spelled out by name at every use site the way a
+Rust program must name `Rc`/`Arc` explicitly.
+
+### `owned` and `borrow` at API boundaries
+
+Within a function body, ownership is inferred and never annotated.
+`owned` and `borrow` exist only to say something at an API boundary that
+inference cannot see from the outside: `owned` marks a parameter that
+takes the value permanently (the caller cannot use its argument
+afterward); `borrow` marks a parameter that only needs temporary access
+(the caller retains the value). Neither carries a lifetime parameter —
+the borrowed access is scoped to the call, not to a named region the
+signature has to spell out.
 
 ### Quarantined `unsafe`
 
@@ -86,9 +114,13 @@ error/`return`.
 - How region inference interacts with structured concurrency: whether a
   spawned task can ever legally hold a value tied to a shorter-than-task
   region, and how that is rejected at compile time.
-- The precise relationship between "explicit shared ownership" types and
-  the borrow-checking rules that will need to exist for non-owning
-  references — full details are deferred to `rfcs/0002-ownership-and-regions.md`.
+- The precise aliasing/mutation discipline for `borrow` — whether multiple
+  simultaneous borrows of the same value are ever restricted, and if so,
+  by what rule. Napitia needs its own answer to the problem Rust's
+  `&`/`&mut` aliasing rules solve; it does not have one yet. Full details
+  are deferred to `rfcs/0002-ownership-and-regions.md`.
+- Whether `shared` implies any concurrency-safety guarantee on its own,
+  or only becomes concurrency-safe when paired with another mechanism.
 
 ## Non-goals
 

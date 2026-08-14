@@ -43,9 +43,12 @@ aspirations to be traded away for convenience:
 4. No undefined behavior in safe code. Anything that would be UB in C++
    must be either a compile error, a checked runtime error, or restricted
    to code inside an `unsafe` block.
-5. No `null`. Absence is represented by `Option<T>`.
-6. No unchecked exceptions. Failure is represented by `Result<T, E>` and,
-   longer-term, a typed effect system (see `spec/0005`, `rfcs/0003`).
+5. No `null`. Absence is represented by a Napitia-native optional type
+   (see `spec/0003`) — never by adopting another language's type of that
+   name wholesale (`rfcs/0004`).
+6. No unchecked exceptions. Failure is represented by a typed `raises`
+   declaration on a function's signature and, longer-term, a typed effect
+   system (see `spec/0005`, `rfcs/0003`, `rfcs/0004`).
 7. No textual preprocessor. Compile-time metaprogramming, when it exists,
    operates on typed structures, never raw text substitution.
 8. No implicit dangerous conversions (e.g. narrowing integer casts,
@@ -63,10 +66,39 @@ aspirations to be traded away for convenience:
 
 REST, HTTP, database access, ORMs, distributed systems primitives, and
 AI/ML (tensors, autograd, GPU kernels) are never keywords, builtin types,
-or compiler special cases. If the language's generics, traits, and effect
-system are not expressive enough to build these as ordinary libraries, that
-is treated as a deficiency in the generics/traits/effects design — the fix
-is to strengthen those facilities, not to carve out a special case.
+or compiler special cases. If the language's generics, protocols, and
+effect system are not expressive enough to build these as ordinary
+libraries, that is treated as a deficiency in the generics/protocols/effects
+design — the fix is to strengthen those facilities, not to carve out a
+special case.
+
+## Language independence
+
+Napitia's reference compiler is written in Rust. That is an implementation
+choice, made for Rust's own memory-safety guarantees and tooling, and it
+must never be allowed to determine Napitia's surface syntax or semantic
+model by default. Concretely, and non-exhaustively:
+
+- Napitia's keyword vocabulary, declaration syntax, and standard-library
+  type names must not be renamed copies of Rust's (or of any other single
+  language's). Ownership- and ergonomics-*inspired-by*-Rust is expected;
+  ownership- and ergonomics-*copied-from*-Rust is not acceptable.
+- Napitia's memory model must not require user-visible lifetime
+  annotations in ordinary programs, even though Rust's borrow checker is
+  the strongest existing evidence that the underlying safety property is
+  achievable at all.
+- Every design document must be able to state, for any feature it
+  proposes, whether that feature is inherited from prior art, deliberately
+  rejected from prior art, or a genuinely distinctive combination — see
+  `rfcs/0004-language-independence.md` for the worked example and the
+  corrective history of a point in time when this constraint was
+  violated and then repaired.
+
+This section exists because it was violated once already: the earliest
+lexical and syntax specs drifted into being Rust's keyword table with a
+different file extension. `rfcs/0004` is the corrective record of that
+mistake and must be read alongside this section, not as a one-time fix
+that this constraint can be considered "handled" after.
 
 ## Process
 

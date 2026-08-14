@@ -61,10 +61,11 @@ EffectPath   = IDENT { "." IDENT } ;
 ```
 
 A function with no `-> Type` has return type `unit`. `uses`/`raises` are
-parsed and attached to the function's AST/HIR node in this milestone, but
-are not yet enforced by the type checker (see `spec/0005`,
-`rfcs/0003-extensible-effects.md`) — a function's declared effects and
-errors are not faked as checked; they are simply not checked yet.
+parsed and preserved on the function's AST/HIR node in this milestone,
+but declaring either non-empty is a checked, reported error (see
+`spec/0005`, `rfcs/0003-extensible-effects.md`): the type checker does
+not yet implement effect/error checking, so it rejects any use of these
+clauses outright rather than silently accepting and ignoring them.
 
 ### Records, variants, and protocols
 
@@ -90,10 +91,16 @@ behavioral contract as a set of function signatures with no bodies.
 implementation (`extend Point with Printable { ... }`) or as inherent
 functions with no protocol (`extend Point { ... }`).
 
-All four are parsed and lowered into HIR items in this milestone. Full
-type-checking of record/variant construction, field access, protocol
-conformance, and pattern matching beyond the primitive-typed subset is
-accepted direction, not implemented (see `spec/0003-type-system.md`).
+All four are parsed, name-resolved, and duplicate-checked against a
+module-level item in HIR in this milestone. Their internal structure
+(field lists, case payloads, protocol member signatures, extend bodies)
+is *not* currently preserved beyond the declaration's own name and
+kind — HIR keeps only enough to know a name like `Point` refers to a
+declared `record` (so it can appear as a parameter/return type), not
+its fields. Field access, construction, protocol conformance, and
+pattern matching beyond the primitive-typed subset are accepted
+direction, not implemented, and are checked, reported errors rather
+than silently accepted (see `spec/0003-type-system.md`).
 
 ### Types
 
@@ -145,8 +152,9 @@ version of this grammar modeled them as semicolon-mandatory statements,
 which contradicted that same example; this is a correction, not a
 redesign of intent.
 
-`defer` is parsed and lowered but not yet executed by the interpreter in
-this milestone (no backend runs deferred cleanup yet); see `spec/0004`.
+`defer` is parsed, but using it is a checked, reported error in this
+milestone rather than being lowered or executed (no backend runs
+deferred cleanup yet); see `spec/0004`.
 
 ### Expressions
 
@@ -188,7 +196,16 @@ Call         = "(" [ Expression { "," Expression } [ "," ] ] ")" ;
 FieldAccess  = "." IDENT ;
 AsCast       = "as" Type ;
 TryPropagate = "?" ;
+```
 
+`FieldAccess` and `AsCast` are parsed, but using either is a checked,
+reported error in this milestone: field access is not resolved against
+a record definition (see "Records, variants, and protocols" above), and
+`as` performs no runtime conversion — accepting either silently would
+let a program type-check while lying about what it does, so both are
+rejected instead.
+
+```text
 PrimaryExpr = INT | FLOAT | STRING | CHAR | "true" | "false"
             | IDENT
             | "(" Expression ")"
@@ -212,13 +229,13 @@ including as a binary operand or call argument, which a statement-shaped
 `return` could never do — while still working as a block's tail with no
 `;`, or as an ordinary `ExprStmt` (`return x;`) elsewhere.
 
-`?` (`TryPropagate`) is parsed as a postfix operator in this milestone.
-It is not yet lowered to any behavior — a function's `raises` clause is
-not enforced yet (see "Functions" above), so `?` currently parses but the
-checker does not yet give it early-return-on-failure semantics. This is
-recorded here, not implemented, matching `rfcs/0004`'s note that
-`raises`/`?` is the intended primary failure-propagation path but is not
-frozen design.
+`?` (`TryPropagate`) is parsed as a postfix operator in this milestone,
+but using it is a checked, reported error rather than being given any
+behavior — a function's `raises` clause is not enforced yet (see
+"Functions" above), so the checker rejects `?` outright instead of
+silently accepting it with no effect. This is recorded here, not
+implemented, matching `rfcs/0004`'s note that `raises`/`?` is the
+intended primary failure-propagation path but is not frozen design.
 
 ### Control flow
 
@@ -249,10 +266,12 @@ Pattern   = IDENT                      (* binds, or matches a payload-less case 
 PatternList = Pattern { "," Pattern } [ "," ] ;
 ```
 
-`match` is parsed and lowered into HIR/NIR as a chain of equality
-comparisons for literal and payload-less-case patterns; payload-carrying
-variant-case patterns are parsed but exhaustiveness checking and payload
-binding are accepted direction, not implemented in this milestone (see
+`match` is parsed and lowered into HIR, but using it is a checked,
+reported error in this milestone rather than being lowered to NIR or
+executed: pattern-to-scrutinee compatibility and exhaustiveness are not
+checked, so accepting it silently would overstate how much of it is
+actually verified. Full pattern matching (including payload-carrying
+variant-case patterns) is accepted direction, not implemented (see
 `spec/0003-type-system.md`).
 
 ## Example
@@ -291,8 +310,8 @@ without treating a missing node as a silent success.
   once `rfcs/0002-ownership-and-regions.md` is implemented — never
   pervasive lifetime parameters (`rfcs/0004`).
 - `uses`/`raises` clauses actually checked against a real effect/error
-  system (`spec/0005`, `rfcs/0003`), rather than parsed-and-ignored as in
-  this milestone.
+  system (`spec/0005`, `rfcs/0003`), rather than rejected outright as
+  unsupported, as in this milestone.
 - `async`/`await` and structured-concurrency syntax.
 - `loop { ... break value }` as a value-producing expression.
 - Full pattern matching with exhaustiveness checking and variant-case

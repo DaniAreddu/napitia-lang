@@ -100,8 +100,9 @@ marker, not a file- or module-level ambient mode (RFC 0001).
 
 ### `defer`
 
-The `defer` statement (parsed today, not yet executed — `spec/0002`) is
-intended to schedule an expression to run when the enclosing region ends,
+The `defer` statement (parsed today; using it is a checked, reported
+error rather than being executed — `spec/0002`) is intended to schedule
+an expression to run when the enclosing region ends,
 in reverse order of the `defer` statements encountered, independent of
 whether the region ends via normal control flow or an early
 error/`return`.

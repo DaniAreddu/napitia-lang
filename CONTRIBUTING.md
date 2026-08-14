@@ -44,7 +44,7 @@ compiler stages.
 Compiler stages, in pipeline order:
 
 ```text
-source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> (interpreter | future backend)
+source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> (interpreter | future backend)
 ```
 
 Each stage lives in its own module and communicates failure through

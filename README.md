@@ -62,13 +62,19 @@ native backend exists.
 - Lowering from AST to a High-level IR (`hir/`) with lexical-scope based
   name resolution (`resolve/`).
 - A primitive type system (`types/`) and a local type checker (`typeck/`)
-  performing Hindley-Milner-style unification for integer/float literal
-  inference, argument/return checking, and assignment compatibility.
-- A typed Napitia IR (`nir/`): explicit control-flow graphs of basic blocks,
-  with a textual printer for debugging. `match` and field access are parsed,
-  resolved, and type-checked, but not yet lowered to NIR — a function using
-  either is reported back by name and skipped rather than silently
-  producing incorrect IR.
+  performing constraint-based, monomorphic unification for integer/float
+  literal inference, argument/return checking, and assignment
+  compatibility — not full Hindley-Milner-style polymorphism; every
+  binding is monomorphic once solved.
+- A typed Napitia IR (`nir/`): explicit control-flow graphs of basic
+  blocks, with a textual printer for debugging and a verifier pass that
+  re-checks structural and type invariants before a module is ever
+  interpreted. `match`, field access, casts, `defer`, postfix `?`, and
+  non-empty `uses`/`raises` clauses are all parsed, but using any of them
+  is a checked, reported error rather than being lowered or executed —
+  none of them are silently accepted or faked. Lowering the rest of a
+  module is atomic: either every function lowers, or the whole module
+  fails with diagnostics.
 - A tree-walking interpreter over NIR, used to execute the supported
   language subset without a native backend.
 - A CLI (`napitia lex|parse|check|ir|run`) exposing every stage.
@@ -88,7 +94,9 @@ none of it is faked in the implementation.
 
 ## Building
 
-Napitia's compiler is a standard Cargo workspace rooted at `compiler/`.
+Napitia's compiler is a single Cargo package rooted at `compiler/` (not
+a Cargo workspace — there is one crate: a `compiler` library plus a thin
+binary).
 
 ```bash
 cargo build --manifest-path compiler/Cargo.toml
@@ -111,7 +119,7 @@ ones used to exercise diagnostics.
 ## Repository layout
 
 ```text
-compiler/    Rust workspace: the reference Napitia compiler
+compiler/    Rust package (single crate): the reference Napitia compiler
 spec/        Normative specifications for implemented language behavior
 rfcs/        Accepted design direction and long-term research questions
 examples/    Sample .npt programs, including invalid ones for diagnostics

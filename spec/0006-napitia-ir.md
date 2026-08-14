@@ -36,9 +36,13 @@ value is a real, typed value, not an absence of one.
 
 ### Locals and constants
 
-- A **local** is named stack storage within a function, introduced by
-  `value`/`mutable` in HIR, addressed in NIR by `alloc.<ty>` (reserve a
-  local slot) plus `load`/`store` instructions against it.
+- A **local** is introduced by `value`/`mutable` in HIR. Only a
+  `mutable` local gets real storage: `alloc.<ty>` (reserve a slot) plus
+  `load`/`store` instructions against it, since it is the only kind that
+  can ever be reassigned after its initializer. A `value` local is never
+  reassigned, so it is simply the `ValueId` its initializer already
+  produced — referencing it needs no `load` at all, and it is never the
+  target of a `store`.
 - A **constant** is an immediate value materialized by a `const.<ty>`
   instruction (an integer, float, bool, or char literal folded in from
   HIR).
@@ -98,13 +102,35 @@ usable in tests as a golden-output comparison.
 
 ### Lowering from HIR
 
-HIR control-flow constructs (`if`/`else`, `while`, `loop`, `match` over
-literal/unit-variant patterns, `break`/`continue`) lower to plain
-`br`/`condbr` between basic blocks — NIR itself has no structured-control
-instructions. `while`/`loop` lower to a loop-header block that `condbr`s
-into a body block (which unconditionally branches back to the header) or
-an exit block; `break`/`continue` lower to direct branches to the
-loop's known exit/header block.
+HIR control-flow constructs (`if`/`else`, `while`, `loop`, `break`,
+`continue`) lower to plain `br`/`condbr` between basic blocks — NIR
+itself has no structured-control instructions. `while`/`loop` lower to
+a loop-header block that `condbr`s into a body block (which
+unconditionally branches back to the header) or an exit block;
+`break`/`continue` lower to direct branches to the loop's known
+exit/header block. `return`/`break`/`continue` lower straight to a
+real terminator; nothing is ever appended to a block after it acquires
+one. `match` is not in this list: using it is a checked, reported error
+(`spec/0002`) rather than being lowered to NIR at all.
+
+Lowering the whole module is atomic: either every function lowers and a
+complete `Module` is produced, or one or more failed and the only thing
+produced is diagnostics, never a `Module` with some functions silently
+missing.
+
+### Verification
+
+Between lowering and interpretation, a verifier pass re-checks the
+produced NIR independently of how it was built: every function/block id
+is unique, every function has an entry block, every branch target and
+called function exists, every referenced value was actually defined,
+every `load`/`store` targets a slot a matching `alloc` produced, stored
+values match the slot's declared type, branch conditions are `bool`,
+returned values match the declared return type, instruction operand and
+result types agree, and no unresolved type variable or error type
+survives into executable NIR. It reports structured diagnostics and
+never panics; a module that fails verification is never handed to the
+interpreter.
 
 ## Accepted design direction
 

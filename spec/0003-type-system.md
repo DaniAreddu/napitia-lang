@@ -79,10 +79,12 @@ inference, without introducing a separate compile-time-only numeric type.
 
 ### Diagnostics
 
-Type errors report: the two types that failed to unify, the span of the
-expression that introduced each side of the conflict where available, and
-(for argument/arity mismatches) the declared function signature being
-called against.
+Type errors report the two types that failed to unify and a single span
+for the overall expression where the mismatch was detected (a compound
+assignment's operator, an `if`/`else` branch, a call's argument list) —
+not a separate span per operand naming where each side's type came from;
+arity-mismatch diagnostics additionally point at the declared function
+signature being called against.
 
 ## Explicit non-goals of this milestone
 

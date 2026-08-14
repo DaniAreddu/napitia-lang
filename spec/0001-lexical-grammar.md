@@ -160,8 +160,12 @@ scalar value are lexical errors.
 ..  ..=
 ->  =>
 (  )  [  ]  {  }
-,  ;  :  ::  .
+,  ;  :  .
 ```
+
+There is no `::` token. Paths (`import`, `uses` capability paths) are
+dotted (`a.b.c`), matching `spec/0002-syntax.md`, not double-colon
+-separated.
 
 ### End of file
 

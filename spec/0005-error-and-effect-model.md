@@ -6,8 +6,10 @@ Alpha 0.1's checked "failure modes" are limited to compiler diagnostics
 (lexical/syntax/name-resolution/type errors) and two runtime conditions the
 NIR interpreter detects directly: division by zero and invalid internal
 operations (`spec/0006-napitia-ir.md`). The `uses`/`raises` clauses parsed
-in `spec/0002-syntax.md` are syntax only in this milestone — they are not
-enforced. This spec records the intended long-term model, using the
+in `spec/0002-syntax.md` are not checked against any real effect/error
+model in this milestone — declaring either non-empty is itself a checked,
+reported error, rather than being silently accepted and ignored. This
+spec records the intended long-term model, using the
 provisional vocabulary from `rfcs/0004-language-independence.md`. An
 earlier version of this spec named `Result<T, E>` and `Option<T>`
 directly — those are Rust's own standard-library type names, not Napitia
@@ -32,7 +34,8 @@ generic wrapper type as its primary interface. There is no
 that can propagate silently through a call it wasn't declared to cross —
 `raises` makes "this call can fail, and how" visible at the call site's
 signature, the same way a parameter list makes arguments visible. A
-postfix `?` operator (parsed in `spec/0002`, not yet given behavior)
+postfix `?` operator (parsed in `spec/0002`; using it is a checked,
+reported error in this milestone rather than being given behavior)
 propagates a raised error to the caller without manual matching at every
 call.
 

@@ -1,0 +1,11 @@
+variant LookupResult { Found(i64), Missing }
+
+func f() -> i64 {
+    mutable r = LookupResult.Found(1);
+    r = LookupResult.Missing;
+    return 0
+}
+
+func main() -> i64 {
+    return f()
+}

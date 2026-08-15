@@ -109,6 +109,25 @@ fn ir_prints_nir_for_a_valid_file() {
 }
 
 #[test]
+fn textual_nir_names_a_variant_local_by_its_declaration_not_its_case() {
+    // A local's declared type in textual NIR (`alloc.<ty>`) must show the
+    // variant's own name (`LookupResult`), never the case it happened to
+    // be constructed through (`Found`) -- `Ty::Named` must always carry
+    // the declaration's own symbol.
+    let output = napitia(&["ir", &fixture("variant_type_display_name.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("alloc.LookupResult"),
+        "expected the variant's own name in textual NIR: {text}"
+    );
+    assert!(
+        !text.contains("alloc.Found") && !text.contains("alloc.Missing"),
+        "textual NIR leaked a case name as a type: {text}"
+    );
+}
+
+#[test]
 fn ir_reports_diagnostics_instead_of_running_for_an_invalid_file() {
     let output = napitia(&["ir", &fixture("invalid_types.npt")]);
     assert_eq!(output.status.code(), Some(1));

@@ -1,0 +1,9 @@
+record Point { x: i64 }
+
+func identity(p: Point) -> Point {
+    p
+}
+
+func main() -> i64 {
+    42
+}

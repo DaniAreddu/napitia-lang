@@ -128,3 +128,99 @@ fn run_reports_diagnostics_for_an_invalid_file() {
     assert_eq!(output.status.code(), Some(1));
     assert!(!stderr(&output).is_empty());
 }
+
+/// Runs `check`, `ir`, and `run` on the same fixture and asserts every
+/// stage succeeds and never surfaces an internal `V`-coded verifier
+/// diagnostic, since that would mean typeck and lowering disagreed
+/// about a program that was accepted.
+fn assert_pipeline_is_clean_and_returns(fixture_name: &str, expected_run_output: &str) {
+    let path = fixture(fixture_name);
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(!stdout(&checked).contains("error["));
+
+    let ired = napitia(&["ir", &path]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), expected_run_output);
+}
+
+#[test]
+fn a_diverging_while_condition_leaves_no_orphan_block_and_returns_unit() {
+    assert_pipeline_is_clean_and_returns("diverging_while_condition.npt", "()");
+}
+
+#[test]
+fn an_if_without_an_else_is_unit_typed_and_discards_its_value() {
+    assert_pipeline_is_clean_and_returns("if_without_else_is_unit.npt", "()");
+}
+
+#[test]
+fn never_join_result_does_not_depend_on_which_branch_diverges() {
+    assert_pipeline_is_clean_and_returns("never_join_then_diverges.npt", "2");
+    assert_pipeline_is_clean_and_returns("never_join_else_diverges.npt", "2");
+}
+
+#[test]
+fn never_propagates_through_a_strict_unary_operand() {
+    assert_pipeline_is_clean_and_returns("never_through_unary.npt", "7");
+}
+
+#[test]
+fn never_propagates_through_a_strict_comparison_operand() {
+    assert_pipeline_is_clean_and_returns("never_through_comparison.npt", "7");
+}
+
+#[test]
+fn never_propagates_through_an_assignments_right_hand_side() {
+    assert_pipeline_is_clean_and_returns("never_through_assignment.npt", "7");
+}
+
+#[test]
+fn a_value_carrying_break_is_rejected_at_every_stage() {
+    let path = fixture("value_carrying_break.npt");
+    for command in ["check", "ir", "run"] {
+        let output = napitia(&[command, &path]);
+        assert_eq!(output.status.code(), Some(1), "`{command}` should fail");
+        assert!(
+            stderr(&output).contains("T0007"),
+            "`{command}` should report T0007, got: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn a_named_aggregate_type_is_rejected_by_ir_with_i0001_not_by_check() {
+    let path = fixture("named_aggregate_return_type.npt");
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+
+    for command in ["ir", "run"] {
+        let output = napitia(&[command, &path]);
+        assert_eq!(output.status.code(), Some(1), "`{command}` should fail");
+        assert!(
+            stderr(&output).contains("I0001"),
+            "`{command}` should report I0001, got: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("V0013"));
+    }
+}

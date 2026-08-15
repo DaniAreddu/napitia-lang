@@ -1,0 +1,4 @@
+func main() -> i64 {
+    mutable x = 0;
+    x = { return 7; };
+}

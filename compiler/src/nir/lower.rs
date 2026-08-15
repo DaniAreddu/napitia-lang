@@ -470,11 +470,14 @@ impl<'a> Lowering<'a> {
                 self.lower_expr(fb, e)?;
                 Ok(())
             }
-            // Deferred cleanup is not run by this milestone's
-            // interpreter yet (spec/0004); its expression is
-            // intentionally not lowered rather than run at the wrong
-            // time.
-            HirStmt::Defer { .. } => Ok(()),
+            // typeck rejects a non-empty `defer` outright (T0007) before
+            // lowering ever runs in the normal pipeline. A direct caller
+            // that bypasses that gate must not have it silently
+            // dropped (which would run the enclosing block as though
+            // the `defer` had never been written at all) -- this
+            // milestone's interpreter has nowhere correct to run
+            // deferred cleanup (spec/0004), so it is rejected here too.
+            HirStmt::Defer { span, .. } => Err(self.unsupported(*span, "`defer`")),
             HirStmt::While {
                 condition, body, ..
             } => self.lower_while(fb, condition, body),
@@ -583,20 +586,39 @@ impl<'a> Lowering<'a> {
                     }
                 }
             }
-            HirExpr::Function { .. } => Ok(LoweredExpr::Value(
-                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
-            )),
+            // typeck rejects a function name used outside of a call
+            // position outright (T0010) before lowering ever runs in
+            // the normal pipeline. A direct caller bypassing that gate
+            // must not get a fabricated `Ty::Error` placeholder value
+            // in its place -- functions are not first-class values in
+            // this milestone at all.
+            HirExpr::Function { name, span, .. } => {
+                let text = self.interner.resolve(*name);
+                Err(self.unsupported(*span, &format!("using `{text}` as a first-class value")))
+            }
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
-                op, left, right, ..
-            } => self.lower_binary(fb, *op, left, right),
+                op,
+                left,
+                right,
+                span,
+                ..
+            } => self.lower_binary(fb, *op, left, right, *span),
             HirExpr::Assign {
                 target, op, value, ..
             } => self.lower_assign(fb, target, *op, value),
             HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args),
             HirExpr::Field { span, .. } => Err(self.unsupported(*span, "field access")),
-            HirExpr::Cast { expr, .. } => self.lower_expr(fb, expr),
-            HirExpr::Try { expr, .. } => self.lower_expr(fb, expr),
+            // typeck rejects both of these outright (T0007) before
+            // lowering ever runs in the normal pipeline. A direct
+            // caller bypassing that gate must not get identity lowering
+            // in their place: `as` performs no runtime conversion at
+            // all in this milestone, and `?` has no propagation
+            // semantics -- silently forwarding the unconverted /
+            // unpropagated inner value would let either "succeed" while
+            // lying about what it does.
+            HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
+            HirExpr::Try { span, .. } => Err(self.unsupported(*span, "postfix `?`")),
             HirExpr::If {
                 condition,
                 then_branch,
@@ -625,10 +647,17 @@ impl<'a> Lowering<'a> {
                 Ok(LoweredExpr::Diverged)
             }
             HirExpr::Break { value, span, .. } => {
-                if let Some(v) = value
-                    && matches!(self.lower_expr(fb, v)?, LoweredExpr::Diverged)
-                {
-                    return Ok(LoweredExpr::Diverged);
+                // typeck rejects any value-carrying `break` outright
+                // (T0007) regardless of the value's type, before
+                // lowering ever runs in the normal pipeline. A direct
+                // caller bypassing that gate must not have the value
+                // silently evaluated and discarded as though it were an
+                // ordinary valueless `break` -- loop-as-expression has
+                // no lowering at all yet.
+                if value.is_some() {
+                    return Err(
+                        self.unsupported(*span, "`break` with a value (loop-as-expression)")
+                    );
                 }
                 let target = fb
                     .loop_stack
@@ -696,22 +725,20 @@ impl<'a> Lowering<'a> {
         op: BinaryOp,
         left: &HirExpr,
         right: &HirExpr,
+        span: Span,
     ) -> LowerResult<LoweredExpr> {
         match op {
             BinaryOp::And => return self.lower_short_circuit(fb, left, right, false),
             BinaryOp::Or => return self.lower_short_circuit(fb, left, right, true),
+            // typeck rejects every range expression outright (T0007)
+            // before lowering ever runs in the normal pipeline. A
+            // direct caller bypassing that gate must not get "lowered
+            // to its left endpoint" in its place -- there is no range
+            // value or iteration support at all in this milestone, so
+            // silently keeping just one side would misrepresent what
+            // the expression means, not merely leave it unsupported.
             BinaryOp::Range | BinaryOp::RangeInclusive => {
-                // Ranges are not lowered further in this milestone (no
-                // range value/iteration support yet); evaluate the
-                // endpoints for side effects and yield the start value.
-                let lv = match self.lower_expr(fb, left)? {
-                    LoweredExpr::Value(v) => v,
-                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
-                };
-                if matches!(self.lower_expr(fb, right)?, LoweredExpr::Diverged) {
-                    return Ok(LoweredExpr::Diverged);
-                }
-                return Ok(LoweredExpr::Value(lv));
+                return Err(self.unsupported(span, "range expressions (`..`/`..=`)"));
             }
             _ => {}
         }
@@ -1380,37 +1407,115 @@ mod tests {
         assert_eq!(allocs, 1);
     }
 
-    #[test]
-    fn match_expression_fails_lowering_not_silently_wrong() {
-        // `match` is now rejected by the type checker itself (T0007)
-        // before a program ever reaches NIR lowering, so this bypasses
-        // check_module's diagnostics gate to exercise NIR's own
-        // defense-in-depth: lowering must still refuse to guess at NIR
-        // for a construct it cannot represent, rather than silently
-        // emitting something wrong, if it is ever handed one directly --
-        // and it must fail atomically (no partial `Module` at all), not
-        // return a module missing just this one function.
-        let text = "func f(x: i64) -> i64 { return match x { _ => 0 } }";
+    /// Runs the full pipeline through `check_module` but, unlike `lower`
+    /// or `lower_result`, does *not* assert that typeck's own
+    /// diagnostics are empty -- typeck already gates every construct
+    /// tested here with its own diagnostic before lowering would
+    /// normally ever run, so this deliberately bypasses that gate to
+    /// exercise NIR's own defense-in-depth for a direct caller that
+    /// skips typeck entirely (e.g. a tool driving `hir`/`nir` directly).
+    fn lower_bypassing_typeck(text: &str) -> Result<Module, Vec<Diagnostic>> {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
         let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
-        assert!(diags.is_empty());
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
         let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
-        assert!(diags.is_empty());
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
         let (hir, diags) = lower_hir(&module, id, &interner);
-        assert!(diags.is_empty());
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
         let result = check_module(&hir, id, &interner);
-        let outcome = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id);
-        let Err(diagnostics) = outcome else {
-            panic!(
-                "expected lowering to fail, got {:?}",
-                outcome.ok().map(|_| ())
-            );
+        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+    }
+
+    fn assert_fails_with_i0001(text: &str, expect_in_message: &str) {
+        let Err(diagnostics) = lower_bypassing_typeck(text) else {
+            panic!("expected lowering to fail for: {text:?}");
         };
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "I0001");
-        assert!(diagnostics[0].message.contains("match"));
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0001"),
+            "expected an I0001 diagnostic for {text:?}, got {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains(expect_in_message)),
+            "expected a diagnostic mentioning {expect_in_message:?} for {text:?}, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn match_expression_fails_lowering_not_silently_wrong() {
+        // Lowering must refuse to guess at NIR for a construct it
+        // cannot represent, rather than silently emitting something
+        // wrong, if it is ever handed one directly -- and it must fail
+        // atomically (no partial `Module` at all), not return a module
+        // missing just this one function.
+        assert_fails_with_i0001(
+            "func f(x: i64) -> i64 { return match x { _ => 0 } }",
+            "match",
+        );
+    }
+
+    #[test]
+    fn field_access_fails_lowering_not_silently_wrong() {
+        assert_fails_with_i0001("func f(x: i64) -> i64 { return x.y }", "field access");
+    }
+
+    #[test]
+    fn cast_fails_lowering_instead_of_forwarding_the_unconverted_value() {
+        // Must never be lowered as identity: `as` performs no runtime
+        // conversion in this milestone, so silently forwarding the
+        // inner value would let a cast "succeed" while lying about what
+        // it does.
+        assert_fails_with_i0001("func f() -> f64 { value x = 1; return x as f64 }", "as");
+    }
+
+    #[test]
+    fn postfix_try_fails_lowering_instead_of_forwarding_the_inner_value() {
+        assert_fails_with_i0001("func f(x: i64) -> i64 { return x? }", "?");
+    }
+
+    #[test]
+    fn range_expression_fails_lowering_instead_of_becoming_its_left_endpoint() {
+        // Must never be lowered as "just the left endpoint": that would
+        // silently misrepresent what the expression means, not merely
+        // leave it unsupported.
+        assert_fails_with_i0001("func f() { value r = 1..10; }", "range");
+    }
+
+    #[test]
+    fn inclusive_range_expression_fails_lowering() {
+        assert_fails_with_i0001("func f() { value r = 1..=10; }", "range");
+    }
+
+    #[test]
+    fn defer_fails_lowering_instead_of_being_silently_dropped() {
+        assert_fails_with_i0001("func f() { value x = 1; defer x + 1; }", "defer");
+    }
+
+    #[test]
+    fn function_used_as_a_value_fails_lowering_instead_of_a_fabricated_error_value() {
+        assert_fails_with_i0001(
+            "func add(a: i64, b: i64) -> i64 { return a + b } \
+             func f() -> i64 { value g = add; return g }",
+            "add",
+        );
+    }
+
+    #[test]
+    fn break_with_a_value_fails_lowering_instead_of_discarding_it_silently() {
+        assert_fails_with_i0001("func f() { loop { break 1; } }", "break");
+    }
+
+    #[test]
+    fn break_with_a_unit_value_still_fails_lowering() {
+        // Not just a non-unit value: *every* value-carrying break must
+        // fail, regardless of the value's own type.
+        assert_fails_with_i0001("func f() { loop { break {}; } }", "break");
     }
 
     #[test]

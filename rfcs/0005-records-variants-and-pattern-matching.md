@@ -439,27 +439,46 @@ the module's static layout table at the value level.
 ## Diagnostics
 
 New stable codes, none colliding with Alpha 0.1's `T0001`–`T0012`,
-`R0001`–`R0003`, `I0001`–`I0002`, `V0001`–`V0018`:
+`R0001`–`R0003`, `I0001`–`I0002`, `V0001`–`V0018`. The dividing line
+between an `R`-code (`hir::lower`) and a `T`-code (`typeck`) is exactly
+the one Alpha 0.1 already draws for `Function`/local resolution: a name
+that can be resolved from **syntax alone** (a construction site's
+written type name, a qualified/unqualified constructor path, a pattern's
+own shape) is an `R`-code, mirroring how a call's callee is resolved at
+`hir::lower` time; a diagnostic that depends on an **inferred type**
+(field access's base type, a pattern's compatibility with its inferred
+scrutinee type, aggregate equality) is a `T`-code, mirroring
+`resolve_named_type`/`check_call`'s existing split. Where an existing
+generic code already fits exactly (a field's initializer type
+disagreeing with its declared type, or a payload's arity/type
+disagreeing with its case), this RFC reuses `T0001`/`T0002` rather than
+minting a redundant synonym — exactly how Alpha 0.1 already reuses
+`T0001` for return/assignment/if-branch mismatches alike.
 
 ```text
-T0013  unknown record type
-T0014  unknown field
-T0015  missing field in record construction
-T0016  duplicate field initializer
-T0017  malformed record construction
-T0018  field access on a non-record type
-T0019  field mutation is not implemented in Alpha 0.1.1
-T0020  unknown variant type
-T0021  unknown variant case
-T0022  case belongs to a different variant
-T0023  ambiguous unqualified constructor
-T0024  aggregate equality is not implemented in Alpha 0.1.1
-T0025  non-exhaustive match (carries a concrete missing-pattern witness)
-T0026  unreachable match arm
-T0027  pattern analysis budget exceeded
-T0028  infinite aggregate layout
 R0004  duplicate field in a record declaration
 R0005  duplicate case in a variant declaration
+R0006  ambiguous unqualified constructor (matches cases in 2+ variants)
+R0007  unknown record type at a construction site
+R0008  unknown field in a record construction
+R0009  missing field in a record construction
+R0010  duplicate field initializer in a record construction
+R0011  unknown variant type in a constructor path
+R0012  unknown variant case
+R0013  case belongs to a different variant than the one written
+R0014  duplicate binding within the same pattern
+
+T0013  field access on a non-record type
+T0014  unknown field (field access)
+T0015  field mutation is not implemented in Alpha 0.1.1
+T0016  aggregate equality is not implemented in Alpha 0.1.1
+T0017  non-exhaustive match (carries a concrete missing-pattern witness)
+T0018  unreachable match arm
+T0019  pattern analysis budget exceeded
+T0020  infinite aggregate layout
+T0021  incompatible pattern (pattern kind disagrees with the scrutinee's
+       type, e.g. a literal pattern against a variant-typed scrutinee)
+
 V0019  record.create references an unknown record
 V0020  record.create does not initialize every field exactly once
 V0021  record.field references an unknown/mismatched field
@@ -470,6 +489,11 @@ V0023  variant.switch does not cover every case exactly once, or targets
 V0024  variant.payload used outside its case's refinement, or its
        resolved type disagrees with the case's declared payload type
 ```
+
+Record-field-type, payload-arity, and payload-type errors are reported
+through the existing `T0001` (type mismatch) and `T0002` (arity
+mismatch) codes, with call-site-specific wording, rather than minting a
+redundant new code per position.
 
 `I0001` (unsupported-in-NIR) remains reachable for every construct this
 RFC does not touch (casts, `?`, ranges, `defer`, function-as-value,

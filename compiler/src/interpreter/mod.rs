@@ -77,14 +77,36 @@ impl<'a> Interpreter<'a> {
         function: &Function,
         args: Vec<Value>,
     ) -> Result<Value, InterpreterError> {
+        // `Vec::zip` silently truncates to the shorter side: too few
+        // arguments would leave the missing parameters unbound (an
+        // arbitrary "value not found" error later, from whichever
+        // instruction first reads one -- not a clear diagnosis of the
+        // actual problem), and too many would just drop the extra ones
+        // with no error at all. The verifier does not check call sites
+        // against argument *values* (only NIR-to-NIR signatures), so
+        // this is the one place a real arity mismatch at the API
+        // boundary is still checked before it can do either.
+        if function.params.len() != args.len() {
+            return Err(InterpreterError::InvalidOperation(format!(
+                "function expects {} argument(s), found {}",
+                function.params.len(),
+                args.len()
+            )));
+        }
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
             values.insert(param.value, arg);
         }
 
-        let mut block_id = function.blocks.first().map(|b| b.id).ok_or_else(|| {
-            InterpreterError::InvalidOperation("function has no basic blocks".to_string())
-        })?;
+        // `BlockId(0)` is the entry block by definition (the verifier
+        // requires exactly one to exist -- `nir::verify`), not whichever
+        // block happens to be first in the vector.
+        let mut block_id = crate::nir::BlockId(0);
+        if !function.blocks.iter().any(|b| b.id == block_id) {
+            return Err(InterpreterError::InvalidOperation(
+                "function has no entry block (bb0)".to_string(),
+            ));
+        }
 
         loop {
             let block = function
@@ -634,5 +656,108 @@ mod tests {
             outcome,
             Err(InterpreterError::InvalidOperation(_))
         ));
+    }
+
+    #[test]
+    fn calling_with_too_few_arguments_is_an_error_not_a_silent_partial_bind() {
+        // `Vec::zip` would otherwise silently truncate to the shorter
+        // side, leaving the missing parameter unbound instead of
+        // reporting the actual problem.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Function, Param, Terminator};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                params: vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: Ty::I64,
+                    },
+                    Param {
+                        value: ValueId(1),
+                        ty: Ty::I64,
+                    },
+                ],
+                return_type: Ty::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Some(ValueId(0))),
+                }],
+            }],
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected an arity-mismatch error, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn calling_with_too_many_arguments_is_an_error_not_a_silent_drop() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Function, Param, Terminator};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: Ty::I64,
+                }],
+                return_type: Ty::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Some(ValueId(0))),
+                }],
+            }],
+        };
+        let outcome =
+            Interpreter::new(&module).call("f", &interner, vec![Value::Int(1), Value::Int(2)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected an arity-mismatch error, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_missing_its_entry_block_is_an_error_not_a_panic() {
+        // `function.blocks.first()` would previously accept whichever
+        // block happened to be first in the vector, regardless of its
+        // id; entry status must come from being `bb0` specifically.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Function, Terminator};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                blocks: vec![BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a missing-entry-block error, got {outcome:?}"
+        );
     }
 }

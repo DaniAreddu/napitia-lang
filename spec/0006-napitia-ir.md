@@ -1,6 +1,6 @@
 # Spec 0006: Napitia IR (NIR)
 
-- Status: Partially implemented (Alpha 0.1)
+- Status: Partially implemented (Alpha 0.1.1)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -73,7 +73,19 @@ value is a real, typed value, not an absence of one.
 %d = gt.<ty>  %a, %b   -> bool
 %d = ge.<ty>  %a, %b   -> bool
 %d = call @<function>(%a, %b, ...)
+%d = record.create @<record>(%a, %b, ...)      ; fields in declaration order
+%d = record.field @<record>.<index> %base
+%d = variant.create @<variant>.<case>(%a, ...) ; payload in declaration order
+%d = variant.payload @<variant>.<case>.<index> %base
 ```
+
+`record.create`/`variant.create` reference fields/cases by resolved
+**declaration index**, never by name, matching how `call` already
+references a function by `ItemId`. `record.field`/`variant.payload`
+carry the record/variant identity alongside the index so the verifier
+can check the base's actual type, not just index-bounds. A unit case's
+`variant.create` supplies no payload values at all -- no fabricated
+placeholder is ever allocated for it.
 
 ### Terminators implemented
 
@@ -81,7 +93,14 @@ value is a real, typed value, not an absence of one.
 ret %v         ; ret (no value) when the function returns unit
 br bbN         ; unconditional branch
 condbr %cond, bbT, bbF   ; conditional branch
+switch %v : @<variant> { bb0, bb1, ... }  ; one target per case, index-aligned
 ```
+
+`switch` dispatches on a variant value's active case; every case has a
+target (a wildcard/binding pattern that covers several cases simply
+repeats the same target for each of them), since exhaustiveness is
+already proven before this is ever built -- there is no "default" arm
+at the NIR level.
 
 ### Textual printer
 
@@ -121,9 +140,20 @@ dominates both branches, before that block's `condbr` terminator is
 set, never after; when both branches diverge, `if` allocates no result
 slot, stores no fabricated merge value, and creates no unreachable
 merge block at all — each branch's own terminator is already a
-complete CFG on its own. `match` is not in this list: using it is a
-checked, reported error (`spec/0002`) rather than being lowered to NIR
-at all.
+complete CFG on its own.
+
+`match` (Alpha 0.1.1) lowers to a real decision tree over its pattern
+matrix, mirroring the same recursive specialize/default structure
+`typeck`'s exhaustiveness analysis uses: a variant-typed occurrence
+becomes a `switch` (one target per case); a `bool` occurrence becomes a
+direct two-way `condbr` on the value itself (a closed, enumerable
+domain, exactly like a variant's case set); an open-domain occurrence
+(`int`/`str`/`char`) becomes a chained `eq` + `condbr`. Descending into
+a `Variant` pattern's payload positions introduces fresh occurrences,
+extracted via `variant.payload`, only inside that case's own block.
+The shared result slot/merge block (when the match produces a value)
+is allocated once, before any branching starts, exactly like `if`/
+`else`'s own discipline; a fully-diverging match allocates neither.
 
 Lowering the whole module is atomic: either every function lowers and a
 complete `Module` is produced, or one or more failed and the only thing
@@ -134,12 +164,13 @@ The public `nir::lower_module` entry point does not rely on the type
 checker having already rejected every construct Alpha 0.1's NIR cannot
 represent — it is defense-in-depth against being called directly,
 bypassing the normal `check`-then-`ir` driver. Casts, postfix `?`,
-ranges, `defer`, function values, field access, `match`, a
-value-carrying `break`, and a named aggregate type in a function
-signature each produce an `I0001` diagnostic from the lowerer itself,
-never identity lowering, a range's left endpoint, `Const::Unit`,
-silently ignored cleanup, a discarded value, or a fake `Ty::Error`
-instruction.
+ranges, `defer`, function values, and a value-carrying `break` each
+produce an `I0001` diagnostic from the lowerer itself, never identity
+lowering, a range's left endpoint, `Const::Unit`, silently ignored
+cleanup, or a discarded value. (A named aggregate type in a function
+signature, field access, and `match` were on this list through
+Alpha 0.1 — all three now have real lowering, described above and in
+"Typed values" above.)
 
 ### Verification
 
@@ -172,8 +203,18 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   conditions are `bool`, returned values match the declared return
   type, instruction operand/result types agree, and no unresolved type
   variable or `Ty::Error` survives into executable NIR.
+- **Aggregates** (Alpha 0.1.1): `record.create`/`variant.create`
+  reference a declared record/variant and initialize every field/match
+  their case's payload arity and types exactly once each;
+  `record.field`/`variant.payload` reference a valid field/payload
+  index of the base's actual (not merely declared) nominal type;
+  `switch` covers every one of its variant's cases exactly once with
+  valid, unique-per-case targets; and a `variant.payload` extraction is
+  only legal in a block reached through that exact case's own `switch`
+  edge — re-derived independently from the CFG's actual predecessors,
+  never trusted from how lowering happened to build it.
 
-It reports structured diagnostics (`V0001`–`V0018` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0025` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no
@@ -201,9 +242,9 @@ interpreter partially lowered or unverified.
   value or a call instruction as additional fields, without changing the
   shape of the control-flow graph itself. Nothing reads or enforces this
   metadata yet.
-- **Aggregate types** (structs, enum payloads, arrays) as NIR-level values
-  with `getfield`/`setfield`/`construct`-style instructions, once the type
-  checker supports them beyond the primitive subset.
+- **Array/collection types** as NIR-level values, once the type checker
+  supports them (record/variant aggregates are implemented as of
+  Alpha 0.1.1 — see "Instructions implemented" above).
 - **SIMD/vector instructions** and **region-scoped allocation/free**
   instructions, once `spec/0004` is implemented — NIR's explicit
   basic-block structure is intended to remain the right shape for both.

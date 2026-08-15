@@ -2,15 +2,17 @@
 //!
 //! Lowering and resolution happen in the same pass: as each expression
 //! is lowered, identifiers are immediately resolved against the current
-//! [`Scopes`] stack (for locals) and the module's function table (for
-//! calls), rather than annotating the AST first and resolving in a
-//! second walk.
+//! [`Scopes`] stack (for locals), the module's function table (for
+//! calls), and the module's type/field/case namespaces (for record
+//! construction and variant constructors), rather than annotating the
+//! AST first and resolving in a second walk.
 
 use std::collections::HashMap;
 
 use super::{
-    ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody,
-    HirModule, HirParam, HirPattern, HirStmt, ItemId, LocalId, OtherItem, OtherItemKind,
+    ExprId, HirBinding, HirBlock, HirCase, HirElse, HirExpr, HirField, HirFieldInit, HirFunction,
+    HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirRecord, HirStmt, HirVariant,
+    ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
 };
 use crate::diagnostics::Diagnostic;
 use crate::resolve::Scopes;
@@ -22,6 +24,27 @@ mod codes {
     pub const DUPLICATE_DEFINITION: &str = "R0001";
     pub const UNRESOLVED_NAME: &str = "R0002";
     pub const DUPLICATE_PARAMETER: &str = "R0003";
+    pub const DUPLICATE_FIELD_DECL: &str = "R0004";
+    pub const DUPLICATE_CASE_DECL: &str = "R0005";
+    pub const AMBIGUOUS_CONSTRUCTOR: &str = "R0006";
+    pub const UNKNOWN_RECORD_TYPE: &str = "R0007";
+    pub const UNKNOWN_FIELD_IN_CONSTRUCTION: &str = "R0008";
+    pub const MISSING_FIELD: &str = "R0009";
+    pub const DUPLICATE_FIELD_INIT: &str = "R0010";
+    pub const UNKNOWN_VARIANT_TYPE: &str = "R0011";
+    pub const UNKNOWN_VARIANT_CASE: &str = "R0012";
+    pub const WRONG_VARIANT: &str = "R0013";
+    pub const DUPLICATE_PATTERN_BINDING: &str = "R0014";
+}
+
+/// Which kind of item a name in the type namespace refers to -- needed
+/// to tell "unknown record type" (named a variant, or nothing) apart
+/// from "unknown variant type" (named a record, or nothing) with an
+/// accurate diagnostic either way.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TypeNameKind {
+    Record,
+    Variant,
 }
 
 pub fn lower_module(
@@ -34,9 +57,14 @@ pub fn lower_module(
         interner,
         diagnostics: Vec::new(),
         functions_by_name: HashMap::new(),
+        type_names: HashMap::new(),
+        record_fields: HashMap::new(),
+        variant_cases: HashMap::new(),
+        case_lookup: HashMap::new(),
         next_item_id: 0,
         next_local_id: 0,
         next_expr_id: 0,
+        next_pattern_id: 0,
     };
     let hir = lowering.run(module);
     (hir, lowering.diagnostics)
@@ -47,17 +75,41 @@ struct Lowering<'a> {
     interner: &'a Interner,
     diagnostics: Vec<Diagnostic>,
     functions_by_name: HashMap<Symbol, ItemId>,
+    /// The module's type namespace: every declared `record`/`variant`
+    /// name (primitives live entirely in `typeck`/`nir::lower`'s own
+    /// copy of this concept, since they need no `ItemId`).
+    type_names: HashMap<Symbol, (ItemId, TypeNameKind)>,
+    /// Per-record field name -> declaration index, for resolving a
+    /// record literal's field initializers.
+    record_fields: HashMap<ItemId, HashMap<Symbol, usize>>,
+    /// Per-variant case name -> declaration index, for resolving a
+    /// qualified (`Variant.Case`) or scrutinee-typed pattern reference.
+    variant_cases: HashMap<ItemId, HashMap<Symbol, usize>>,
+    /// Case name -> every `(variant, case index)` it names anywhere in
+    /// the module, for resolving an *unqualified* constructor reference
+    /// and detecting ambiguity when it names more than one variant.
+    case_lookup: HashMap<Symbol, Vec<(ItemId, usize)>>,
     next_item_id: u32,
     next_local_id: u32,
     next_expr_id: u32,
+    next_pattern_id: u32,
 }
 
 impl<'a> Lowering<'a> {
     fn run(&mut self, module: &ast::Module) -> HirModule {
         let mut names: HashMap<Symbol, Span> = HashMap::new();
         let mut function_decls: Vec<(ItemId, &ast::FunctionDecl)> = Vec::new();
+        let mut record_decls: Vec<(ItemId, &ast::RecordDecl)> = Vec::new();
+        let mut variant_decls: Vec<(ItemId, &ast::VariantDecl)> = Vec::new();
         let mut other_items = Vec::new();
 
+        // First pass: mint every item's `ItemId` and populate the
+        // module-wide namespaces (functions, types, fields, cases)
+        // *before* lowering any function body or record/variant
+        // internals -- a forward reference (a field typed with a
+        // record declared later, a function calling one declared
+        // later) must resolve exactly like Alpha 0.1's existing
+        // forward-referenced function calls already do.
         for item in &module.items {
             match item {
                 ast::Item::Function(f) => {
@@ -69,12 +121,16 @@ impl<'a> Lowering<'a> {
                 ast::Item::Record(r) => {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, r.name, id);
-                    other_items.push(other_item(id, r.name, r.span, OtherItemKind::Record));
+                    self.type_names
+                        .insert(r.name.symbol, (id, TypeNameKind::Record));
+                    record_decls.push((id, r));
                 }
                 ast::Item::Variant(v) => {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, v.name, id);
-                    other_items.push(other_item(id, v.name, v.span, OtherItemKind::Variant));
+                    self.type_names
+                        .insert(v.name.symbol, (id, TypeNameKind::Variant));
+                    variant_decls.push((id, v));
                 }
                 ast::Item::Protocol(p) => {
                     let id = self.fresh_item();
@@ -97,6 +153,14 @@ impl<'a> Lowering<'a> {
             }
         }
 
+        let records: Vec<HirRecord> = record_decls
+            .into_iter()
+            .map(|(id, r)| self.lower_record(id, r))
+            .collect();
+        let variants: Vec<HirVariant> = variant_decls
+            .into_iter()
+            .map(|(id, v)| self.lower_variant(id, v))
+            .collect();
         let functions = function_decls
             .into_iter()
             .map(|(id, f)| self.lower_function(id, f))
@@ -104,7 +168,82 @@ impl<'a> Lowering<'a> {
 
         HirModule {
             functions,
+            records,
+            variants,
             other_items,
+        }
+    }
+
+    fn lower_record(&mut self, id: ItemId, r: &ast::RecordDecl) -> HirRecord {
+        let mut seen: HashMap<Symbol, usize> = HashMap::new();
+        let mut fields = Vec::new();
+        for field in &r.fields {
+            if let Some(&first_index) = seen.get(&field.name.symbol) {
+                let text = self.interner.resolve(field.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_FIELD_DECL,
+                        self.source,
+                        field.name.span,
+                        format!("field `{text}` is declared more than once"),
+                    )
+                    .with_primary_label("duplicate field")
+                    .with_label(r.fields[first_index].name.span, "first declared here"),
+                );
+                continue;
+            }
+            seen.insert(field.name.symbol, fields.len());
+            fields.push(HirField {
+                name: field.name.symbol,
+                span: field.span,
+                ty: field.ty.clone(),
+            });
+        }
+        self.record_fields.insert(id, seen);
+        HirRecord {
+            id,
+            name: r.name.symbol,
+            span: r.span,
+            fields,
+        }
+    }
+
+    fn lower_variant(&mut self, id: ItemId, v: &ast::VariantDecl) -> HirVariant {
+        let mut seen: HashMap<Symbol, usize> = HashMap::new();
+        let mut cases = Vec::new();
+        for case in &v.cases {
+            if let Some(&first_index) = seen.get(&case.name.symbol) {
+                let text = self.interner.resolve(case.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_CASE_DECL,
+                        self.source,
+                        case.name.span,
+                        format!("case `{text}` is declared more than once"),
+                    )
+                    .with_primary_label("duplicate case")
+                    .with_label(v.cases[first_index].name.span, "first declared here"),
+                );
+                continue;
+            }
+            let index = cases.len();
+            seen.insert(case.name.symbol, index);
+            self.case_lookup
+                .entry(case.name.symbol)
+                .or_default()
+                .push((id, index));
+            cases.push(HirCase {
+                name: case.name.symbol,
+                span: case.span,
+                payload: case.payload.clone(),
+            });
+        }
+        self.variant_cases.insert(id, seen);
+        HirVariant {
+            id,
+            name: v.name.symbol,
+            span: v.span,
+            cases,
         }
     }
 
@@ -146,6 +285,12 @@ impl<'a> Lowering<'a> {
     fn fresh_expr_id(&mut self) -> ExprId {
         let id = ExprId(self.next_expr_id);
         self.next_expr_id += 1;
+        id
+    }
+
+    fn fresh_pattern_id(&mut self) -> PatternId {
+        let id = PatternId(self.next_pattern_id);
+        self.next_pattern_id += 1;
         id
     }
 
@@ -317,12 +462,7 @@ impl<'a> Lowering<'a> {
                 args: args.iter().map(|a| self.lower_expr(a, scopes)).collect(),
                 span: *span,
             },
-            ast::Expr::Field { base, name, span } => HirExpr::Field {
-                id: self.fresh_expr_id(),
-                base: Box::new(self.lower_expr(base, scopes)),
-                name: name.symbol,
-                span: *span,
-            },
+            ast::Expr::Field { base, name, span } => self.lower_field(base, *name, *span, scopes),
             ast::Expr::Cast { expr, ty, span } => HirExpr::Cast {
                 id: self.fresh_expr_id(),
                 expr: Box::new(self.lower_expr(expr, scopes)),
@@ -351,22 +491,11 @@ impl<'a> Lowering<'a> {
                 id: self.fresh_expr_id(),
                 span: *span,
             },
-            // Record construction has surface grammar (this milestone's
-            // parser) but no resolution/semantics yet -- each field's
-            // value is still lowered so an unrelated error inside it is
-            // reported, but the literal itself becomes an `Error` node,
-            // matching how every other not-yet-implemented construct in
-            // this codebase is handled until its own dedicated pass
-            // lands.
-            ast::Expr::RecordLiteral { fields, span, .. } => {
-                for f in fields {
-                    self.lower_expr(&f.value, scopes);
-                }
-                HirExpr::Error {
-                    id: self.fresh_expr_id(),
-                    span: *span,
-                }
-            }
+            ast::Expr::RecordLiteral {
+                type_name,
+                fields,
+                span,
+            } => self.lower_record_literal(*type_name, fields, *span, scopes),
             ast::Expr::Error { span } => HirExpr::Error {
                 id: self.fresh_expr_id(),
                 span: *span,
@@ -391,6 +520,13 @@ impl<'a> Lowering<'a> {
                 span: ident.span,
             };
         }
+        // Not a local or a function: an unqualified reference to a
+        // variant case constructor is accepted when its name is
+        // unambiguous across every declared variant in the module (see
+        // RFC 0005's "Namespaces" section).
+        if let Some(candidates) = self.case_lookup.get(&ident.symbol) {
+            return self.resolve_case_candidates(ident, candidates.clone());
+        }
         let text = self.interner.resolve(ident.symbol);
         self.diagnostics.push(
             Diagnostic::error(
@@ -404,6 +540,285 @@ impl<'a> Lowering<'a> {
         HirExpr::Error {
             id: self.fresh_expr_id(),
             span: ident.span,
+        }
+    }
+
+    fn resolve_case_candidates(
+        &mut self,
+        ident: ast::Ident,
+        candidates: Vec<(ItemId, usize)>,
+    ) -> HirExpr {
+        if candidates.len() > 1 {
+            let text = self.interner.resolve(ident.symbol);
+            let variant_names: Vec<&str> = candidates
+                .iter()
+                .map(|(variant, _)| self.variant_name(*variant))
+                .collect();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::AMBIGUOUS_CONSTRUCTOR,
+                    self.source,
+                    ident.span,
+                    format!(
+                        "`{text}` is ambiguous: it names a case in more than one variant ({}); \
+                         use a qualified path (`Variant.{text}`)",
+                        variant_names.join(", ")
+                    ),
+                )
+                .with_primary_label("ambiguous constructor"),
+            );
+            return HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span: ident.span,
+            };
+        }
+        let (variant, case) = candidates[0];
+        HirExpr::CaseRef {
+            id: self.fresh_expr_id(),
+            variant,
+            case,
+            name: ident.symbol,
+            span: ident.span,
+        }
+    }
+
+    /// Looks up a declared item's name for use inside another
+    /// diagnostic's message; every `ItemId` reaching this function came
+    /// from this module's own `type_names`/`case_lookup` tables, so the
+    /// name is always present.
+    fn variant_name(&self, item: ItemId) -> &'a str {
+        let symbol = self
+            .type_names
+            .iter()
+            .find(|(_, (id, kind))| *id == item && *kind == TypeNameKind::Variant)
+            .map(|(name, _)| *name)
+            .expect("internal invariant: every case_lookup entry names a known variant");
+        self.interner.resolve(symbol)
+    }
+
+    /// Lowers `base.name`, distinguishing three shapes: ordinary field
+    /// access on a value, a qualified variant constructor
+    /// (`Variant.Case`), and a qualified reference into a record's
+    /// namespace (rejected -- records have no "cases").
+    fn lower_field(
+        &mut self,
+        base: &ast::Expr,
+        name: ast::Ident,
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> HirExpr {
+        if let ast::Expr::Ident(base_ident) = base
+            && scopes.lookup(base_ident.symbol).is_none()
+            && !self.functions_by_name.contains_key(&base_ident.symbol)
+            && let Some(&(item, kind)) = self.type_names.get(&base_ident.symbol)
+        {
+            return match kind {
+                TypeNameKind::Variant => self.resolve_qualified_case(item, *base_ident, name),
+                TypeNameKind::Record => {
+                    let base_text = self.interner.resolve(base_ident.symbol);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::UNKNOWN_VARIANT_TYPE,
+                            self.source,
+                            base_ident.span,
+                            format!("`{base_text}` is a record, which has no cases to qualify"),
+                        )
+                        .with_primary_label("not a variant type"),
+                    );
+                    HirExpr::Error {
+                        id: self.fresh_expr_id(),
+                        span,
+                    }
+                }
+            };
+        }
+        HirExpr::Field {
+            id: self.fresh_expr_id(),
+            base: Box::new(self.lower_expr(base, scopes)),
+            name: name.symbol,
+            span,
+        }
+    }
+
+    fn resolve_qualified_case(
+        &mut self,
+        variant: ItemId,
+        base_ident: ast::Ident,
+        case_name: ast::Ident,
+    ) -> HirExpr {
+        let span = base_ident.span.join(case_name.span);
+        if let Some(&index) = self
+            .variant_cases
+            .get(&variant)
+            .and_then(|cases| cases.get(&case_name.symbol))
+        {
+            return HirExpr::CaseRef {
+                id: self.fresh_expr_id(),
+                variant,
+                case: index,
+                name: case_name.symbol,
+                span,
+            };
+        }
+        let case_text = self.interner.resolve(case_name.symbol);
+        let variant_text = self.interner.resolve(base_ident.symbol);
+        if let Some(elsewhere) = self.case_lookup.get(&case_name.symbol) {
+            let owner = elsewhere
+                .iter()
+                .find(|(v, _)| *v != variant)
+                .map(|(v, _)| self.variant_name(*v));
+            if let Some(owner_name) = owner {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::WRONG_VARIANT,
+                        self.source,
+                        case_name.span,
+                        format!(
+                            "`{case_text}` is a case of variant `{owner_name}`, not `{variant_text}`"
+                        ),
+                    )
+                    .with_primary_label("wrong variant"),
+                );
+                return HirExpr::Error {
+                    id: self.fresh_expr_id(),
+                    span,
+                };
+            }
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNKNOWN_VARIANT_CASE,
+                self.source,
+                case_name.span,
+                format!("variant `{variant_text}` has no case named `{case_text}`"),
+            )
+            .with_primary_label("unknown case"),
+        );
+        HirExpr::Error {
+            id: self.fresh_expr_id(),
+            span,
+        }
+    }
+
+    fn lower_record_literal(
+        &mut self,
+        type_name: ast::Ident,
+        fields: &[ast::FieldInit],
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> HirExpr {
+        let record = match self.type_names.get(&type_name.symbol) {
+            Some(&(item, TypeNameKind::Record)) => item,
+            Some(&(_, TypeNameKind::Variant)) => {
+                let text = self.interner.resolve(type_name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_RECORD_TYPE,
+                        self.source,
+                        type_name.span,
+                        format!("`{text}` is a variant, which is constructed with `.Case(...)`, not `{{ ... }}`"),
+                    )
+                    .with_primary_label("not a record type"),
+                );
+                // Still lower every field's value expression, for
+                // cascading diagnostics, before giving up.
+                for f in fields {
+                    self.lower_expr(&f.value, scopes);
+                }
+                return HirExpr::Error {
+                    id: self.fresh_expr_id(),
+                    span,
+                };
+            }
+            None => {
+                let text = self.interner.resolve(type_name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_RECORD_TYPE,
+                        self.source,
+                        type_name.span,
+                        format!("cannot find record type `{text}` in this scope"),
+                    )
+                    .with_primary_label("unknown record type"),
+                );
+                for f in fields {
+                    self.lower_expr(&f.value, scopes);
+                }
+                return HirExpr::Error {
+                    id: self.fresh_expr_id(),
+                    span,
+                };
+            }
+        };
+
+        let field_indices = self.record_fields.get(&record).cloned().unwrap_or_default();
+        let mut seen: HashMap<Symbol, Span> = HashMap::new();
+        let mut resolved = Vec::with_capacity(fields.len());
+        for f in fields {
+            let value = self.lower_expr(&f.value, scopes);
+            if let Some(&first_span) = seen.get(&f.name.symbol) {
+                let text = self.interner.resolve(f.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_FIELD_INIT,
+                        self.source,
+                        f.name.span,
+                        format!("field `{text}` is initialized more than once"),
+                    )
+                    .with_primary_label("duplicate initializer")
+                    .with_label(first_span, "first initialized here"),
+                );
+                continue;
+            }
+            seen.insert(f.name.symbol, f.name.span);
+            match field_indices.get(&f.name.symbol) {
+                Some(&field_index) => resolved.push(HirFieldInit {
+                    field_index,
+                    value,
+                    span: f.span,
+                }),
+                None => {
+                    let text = self.interner.resolve(f.name.symbol);
+                    let record_text = self.interner.resolve(type_name.symbol);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::UNKNOWN_FIELD_IN_CONSTRUCTION,
+                            self.source,
+                            f.name.span,
+                            format!("record `{record_text}` has no field named `{text}`"),
+                        )
+                        .with_primary_label("unknown field"),
+                    );
+                }
+            }
+        }
+
+        let missing: Vec<&str> = field_indices
+            .iter()
+            .filter(|(name, _)| !seen.contains_key(*name))
+            .map(|(name, _)| self.interner.resolve(*name))
+            .collect();
+        if !missing.is_empty() {
+            let record_text = self.interner.resolve(type_name.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::MISSING_FIELD,
+                    self.source,
+                    span,
+                    format!(
+                        "missing field(s) in construction of `{record_text}`: {}",
+                        missing.join(", ")
+                    ),
+                )
+                .with_primary_label("missing field(s)"),
+            );
+        }
+
+        HirExpr::RecordLiteral {
+            id: self.fresh_expr_id(),
+            record,
+            fields: resolved,
+            span,
         }
     }
 
@@ -430,7 +845,8 @@ impl<'a> Lowering<'a> {
             .iter()
             .map(|arm| {
                 scopes.push();
-                let pattern = self.lower_pattern(&arm.pattern, scopes);
+                let mut bound: HashMap<Symbol, Span> = HashMap::new();
+                let pattern = self.lower_pattern(&arm.pattern, scopes, &mut bound);
                 let body = match &arm.body {
                     ast::MatchArmBody::Expr(e) => HirMatchArmBody::Expr(self.lower_expr(e, scopes)),
                     ast::MatchArmBody::Block(b) => {
@@ -453,39 +869,76 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    fn lower_pattern(&mut self, pattern: &ast::Pattern, scopes: &mut Scopes) -> HirPattern {
+    /// Lowers one pattern, minting a fresh [`PatternId`] and detecting a
+    /// name bound more than once within the *same* pattern tree (`bound`
+    /// is reset per-arm by the caller, and threaded through recursive
+    /// calls into `Variant` sub-patterns so `Found(user, user)` is
+    /// caught across positions, not just siblings at the same level).
+    fn lower_pattern(
+        &mut self,
+        pattern: &ast::Pattern,
+        scopes: &mut Scopes,
+        bound: &mut HashMap<Symbol, Span>,
+    ) -> HirPattern {
         match pattern {
-            ast::Pattern::Wildcard { span } => HirPattern::Wildcard { span: *span },
+            ast::Pattern::Wildcard { span } => HirPattern::Wildcard {
+                id: self.fresh_pattern_id(),
+                span: *span,
+            },
             ast::Pattern::Ident(ident) => {
+                if let Some(&first_span) = bound.get(&ident.symbol) {
+                    let text = self.interner.resolve(ident.symbol);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::DUPLICATE_PATTERN_BINDING,
+                            self.source,
+                            ident.span,
+                            format!("`{text}` is bound more than once in this pattern"),
+                        )
+                        .with_primary_label("duplicate binding")
+                        .with_label(first_span, "first bound here"),
+                    );
+                } else {
+                    bound.insert(ident.symbol, ident.span);
+                }
                 let local = self.fresh_local();
                 scopes.define(ident.symbol, local);
                 HirPattern::Bind {
+                    id: self.fresh_pattern_id(),
                     local,
                     name: ident.symbol,
                     span: ident.span,
                 }
             }
             ast::Pattern::Variant { name, args, span } => {
-                let args = args.iter().map(|a| self.lower_pattern(a, scopes)).collect();
+                let args = args
+                    .iter()
+                    .map(|a| self.lower_pattern(a, scopes, bound))
+                    .collect();
                 HirPattern::Variant {
+                    id: self.fresh_pattern_id(),
                     name: name.symbol,
                     args,
                     span: *span,
                 }
             }
             ast::Pattern::Int { value, span } => HirPattern::Int {
+                id: self.fresh_pattern_id(),
                 value: *value,
                 span: *span,
             },
             ast::Pattern::Str { value, span } => HirPattern::Str {
+                id: self.fresh_pattern_id(),
                 value: value.clone(),
                 span: *span,
             },
             ast::Pattern::Char { value, span } => HirPattern::Char {
+                id: self.fresh_pattern_id(),
                 value: *value,
                 span: *span,
             },
             ast::Pattern::Bool { value, span } => HirPattern::Bool {
+                id: self.fresh_pattern_id(),
                 value: *value,
                 span: *span,
             },
@@ -613,10 +1066,14 @@ mod tests {
     }
 
     #[test]
-    fn record_and_variant_items_are_lowered_without_deep_checking() {
+    fn record_and_variant_items_are_lowered_with_their_full_structure() {
         let (hir, diags) = lower("record Point { x: i64, y: i64 } variant Shape { Circle }");
         assert!(diags.is_empty());
-        assert_eq!(hir.other_items.len(), 2);
+        assert_eq!(hir.records.len(), 1);
+        assert_eq!(hir.records[0].fields.len(), 2);
+        assert_eq!(hir.variants.len(), 1);
+        assert_eq!(hir.variants[0].cases.len(), 1);
+        assert!(hir.other_items.is_empty());
     }
 
     #[test]
@@ -628,5 +1085,169 @@ mod tests {
         assert_eq!(hir.functions[0].uses.len(), 1);
         assert_eq!(hir.functions[0].uses[0].segments.len(), 2);
         assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_record_field_declaration_is_a_diagnostic() {
+        let (hir, diags) = lower("record Point { x: i64, x: i64 }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0004");
+        assert_eq!(hir.records[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_variant_case_declaration_is_a_diagnostic() {
+        let (hir, diags) = lower("variant Shape { Circle, Circle }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0005");
+        assert_eq!(hir.variants[0].cases.len(), 1);
+    }
+
+    #[test]
+    fn record_literal_resolves_fields_to_declaration_indices() {
+        let (hir, diags) = lower(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { value p = Point { y: 2, x: 1 }; return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let HirStmt::Binding(binding) = &hir.functions[0].body.statements[0] else {
+            panic!("expected binding")
+        };
+        let HirExpr::RecordLiteral { fields, .. } = &binding.value else {
+            panic!("expected record literal")
+        };
+        // Written in source order (y, then x), each resolved to its
+        // declaration index (y=1, x=0).
+        assert_eq!(fields[0].field_index, 1);
+        assert_eq!(fields[1].field_index, 0);
+    }
+
+    #[test]
+    fn unknown_record_type_is_a_diagnostic() {
+        let (_, diags) = lower("func f() { value p = Banana { x: 1 }; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0007");
+    }
+
+    #[test]
+    fn unknown_field_in_construction_is_a_diagnostic() {
+        let (_, diags) =
+            lower("record Point { x: i64 } func f() { value p = Point { x: 1, z: 2 }; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0008");
+    }
+
+    #[test]
+    fn missing_field_in_construction_is_a_diagnostic() {
+        let (_, diags) =
+            lower("record Point { x: i64, y: i64 } func f() { value p = Point { x: 1 }; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0009");
+    }
+
+    #[test]
+    fn duplicate_field_initializer_is_a_diagnostic() {
+        let (_, diags) =
+            lower("record Point { x: i64 } func f() { value p = Point { x: 1, x: 2 }; }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0010");
+    }
+
+    #[test]
+    fn qualified_variant_constructor_resolves_to_a_case_ref() {
+        let (hir, diags) = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Circle(1); return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let HirStmt::Binding(binding) = &hir.functions[0].body.statements[0] else {
+            panic!("expected binding")
+        };
+        let HirExpr::Call { callee, args, .. } = &binding.value else {
+            panic!("expected call")
+        };
+        assert!(matches!(**callee, HirExpr::CaseRef { case: 0, .. }));
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn qualified_unit_case_resolves_without_a_call() {
+        let (hir, diags) = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Empty; return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let HirStmt::Binding(binding) = &hir.functions[0].body.statements[0] else {
+            panic!("expected binding")
+        };
+        assert!(matches!(binding.value, HirExpr::CaseRef { case: 1, .. }));
+    }
+
+    #[test]
+    fn unqualified_unambiguous_constructor_resolves() {
+        let (hir, diags) = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Circle(1); return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let HirStmt::Binding(binding) = &hir.functions[0].body.statements[0] else {
+            panic!("expected binding")
+        };
+        let HirExpr::Call { callee, .. } = &binding.value else {
+            panic!("expected call")
+        };
+        assert!(matches!(**callee, HirExpr::CaseRef { .. }));
+    }
+
+    #[test]
+    fn ambiguous_unqualified_constructor_is_a_diagnostic() {
+        let (_, diags) = lower(
+            "variant A { Found(i64) } variant B { Found(i64) } \
+             func f() -> i64 { value s = Found(1); return 0 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0006");
+    }
+
+    #[test]
+    fn qualified_unknown_case_is_a_diagnostic() {
+        let (_, diags) = lower(
+            "variant Shape { Circle(i64) } \
+             func f() -> i64 { value s = Shape.Square; return 0 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0012");
+    }
+
+    #[test]
+    fn qualified_case_from_a_different_variant_is_a_diagnostic() {
+        let (_, diags) = lower(
+            "variant A { Found(i64) } variant B { Missing } \
+             func f() -> i64 { value s = B.Found; return 0 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+    }
+
+    #[test]
+    fn duplicate_pattern_binding_is_a_diagnostic() {
+        let (_, diags) = lower(
+            "variant Pair { Both(i64, i64) } \
+             func f(p: Pair) -> i64 { return match p { Both(a, a) => a } }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0014");
+    }
+
+    #[test]
+    fn record_name_still_lowers_cleanly_when_used_as_a_parameter_type() {
+        // Regression: pulling record/variant metadata out of
+        // `other_items` must not break the item's own name/id still
+        // being usable in a type position downstream (typeck rebuilds
+        // its own type namespace from `hir.records`/`hir.variants`).
+        let (hir, diags) = lower("record Point { x: i64 } func f(p: Point) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.records.len(), 1);
+        assert_eq!(hir.functions[0].params.len(), 1);
     }
 }

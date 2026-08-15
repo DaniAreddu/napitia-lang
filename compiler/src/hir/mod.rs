@@ -37,21 +37,29 @@ pub struct LocalId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub(crate) u32);
 
+/// Identifies one HIR pattern for the lifetime of one compilation
+/// session, the same way [`ExprId`] identifies an expression: never
+/// span-based, since a wildcard or binding pattern's span can coincide
+/// with another node's, but two `PatternId`s are never equal. This is
+/// what lets `typeck` key its per-pattern resolution maps (resolved
+/// case/type, per-pattern local bindings) on identity rather than span.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PatternId(pub(crate) u32);
+
 #[derive(Debug, Clone, Default)]
 pub struct HirModule {
     pub functions: Vec<HirFunction>,
-    /// `record`/`variant`/`protocol`/`extend`/`import` items. Alpha 0.1
-    /// resolves and duplicate-checks their names but does not lower
-    /// their bodies further (`spec/0003`): full support depends on
-    /// generics and protocol conformance checking, neither implemented
-    /// yet.
+    pub records: Vec<HirRecord>,
+    pub variants: Vec<HirVariant>,
+    /// `protocol`/`extend`/`import` items. Alpha 0.1 resolves and
+    /// duplicate-checks their names but does not lower their bodies
+    /// further (`spec/0003`): full support depends on generics and
+    /// protocol conformance checking, neither implemented yet.
     pub other_items: Vec<OtherItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtherItemKind {
-    Record,
-    Variant,
     Protocol,
     Extend,
     Import,
@@ -63,6 +71,47 @@ pub struct OtherItem {
     pub name: Symbol,
     pub span: Span,
     pub kind: OtherItemKind,
+}
+
+/// A resolved `record` declaration: its full field list, in declaration
+/// order (the order runtime layout follows), each field's name already
+/// checked for duplicates against its siblings.
+#[derive(Debug, Clone)]
+pub struct HirRecord {
+    pub id: ItemId,
+    pub name: Symbol,
+    pub span: Span,
+    pub fields: Vec<HirField>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirField {
+    pub name: Symbol,
+    pub span: Span,
+    /// Unresolved surface type; `typeck` resolves it against the
+    /// module's type namespace the same way it resolves a function
+    /// parameter's type, so an unknown field type gets its own
+    /// diagnostic rather than lowering silently defaulting it.
+    pub ty: Type,
+}
+
+/// A resolved `variant` declaration: its full case list, in declaration
+/// order, each case's name already checked for duplicates.
+#[derive(Debug, Clone)]
+pub struct HirVariant {
+    pub id: ItemId,
+    pub name: Symbol,
+    pub span: Span,
+    pub cases: Vec<HirCase>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirCase {
+    pub name: Symbol,
+    pub span: Span,
+    /// Positional payload types, in declaration order; empty for a
+    /// payload-less (unit) case.
+    pub payload: Vec<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +221,20 @@ pub enum HirExpr {
         name: Symbol,
         span: Span,
     },
+    /// A resolved reference to a variant case constructor (`Variant.Case`
+    /// qualified, or a bare case name unambiguous across the module) --
+    /// mirrors `Function` above. Used bare (a payload-less case) it is
+    /// itself a complete value; as the callee of `Call` it constructs a
+    /// payload-carrying case (`typeck`/`nir::lower` special-case a
+    /// `Call` whose callee is a `CaseRef`, the same way they already
+    /// special-case one whose callee is `Function`).
+    CaseRef {
+        id: ExprId,
+        variant: ItemId,
+        case: usize,
+        name: Symbol,
+        span: Span,
+    },
     Unary {
         id: ExprId,
         op: UnaryOp,
@@ -247,6 +310,17 @@ pub enum HirExpr {
         id: ExprId,
         span: Span,
     },
+    /// `TypeName { field: expr, ... }`. `fields` preserves **source
+    /// order** (the order evaluation actually happens in), each entry
+    /// already resolved to its declaration index within `record` --
+    /// runtime layout reorders into declaration order at NIR lowering
+    /// time, never here.
+    RecordLiteral {
+        id: ExprId,
+        record: ItemId,
+        fields: Vec<HirFieldInit>,
+        span: Span,
+    },
     /// A name that failed to resolve, or an expression the parser could
     /// not build. A diagnostic has already been recorded; later stages
     /// must skip this node rather than type-check it.
@@ -254,6 +328,14 @@ pub enum HirExpr {
         id: ExprId,
         span: Span,
     },
+}
+
+/// One resolved `field: expr` entry in a [`HirExpr::RecordLiteral`].
+#[derive(Debug, Clone)]
+pub struct HirFieldInit {
+    pub field_index: usize,
+    pub value: HirExpr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -278,39 +360,76 @@ pub enum HirMatchArmBody {
 #[derive(Debug, Clone)]
 pub enum HirPattern {
     Wildcard {
+        id: PatternId,
         span: Span,
     },
-    /// Binds a fresh local for the arm body. A bare identifier pattern
-    /// is always treated as a new binding in this milestone rather than
-    /// a payload-less variant match — distinguishing the two requires
-    /// resolving against a real variant definition, which is accepted
-    /// direction, not implemented (`spec/0003`).
+    /// Binds a fresh local for the arm body, *unless* the name resolves
+    /// (during `typeck`) to a payload-less variant case in the
+    /// scrutinee's own variant type, in which case it matches that case
+    /// instead of introducing a binding -- see `typeck`'s pattern
+    /// checking. Lowering (both HIR and this pattern's own `local`)
+    /// always mints a binding; `typeck` records the alternate
+    /// case-match resolution separately when it applies, and NIR
+    /// lowering consults that resolution, never `local` directly, to
+    /// decide which one actually happened.
     Bind {
+        id: PatternId,
         local: LocalId,
         name: Symbol,
         span: Span,
     },
     Variant {
+        id: PatternId,
         name: Symbol,
         args: Vec<HirPattern>,
         span: Span,
     },
     Int {
+        id: PatternId,
         value: u128,
         span: Span,
     },
     Str {
+        id: PatternId,
         value: String,
         span: Span,
     },
     Char {
+        id: PatternId,
         value: char,
         span: Span,
     },
     Bool {
+        id: PatternId,
         value: bool,
         span: Span,
     },
+}
+
+impl HirPattern {
+    pub fn id(&self) -> PatternId {
+        match self {
+            HirPattern::Wildcard { id, .. }
+            | HirPattern::Bind { id, .. }
+            | HirPattern::Variant { id, .. }
+            | HirPattern::Int { id, .. }
+            | HirPattern::Str { id, .. }
+            | HirPattern::Char { id, .. }
+            | HirPattern::Bool { id, .. } => *id,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            HirPattern::Wildcard { span, .. }
+            | HirPattern::Bind { span, .. }
+            | HirPattern::Variant { span, .. }
+            | HirPattern::Int { span, .. }
+            | HirPattern::Str { span, .. }
+            | HirPattern::Char { span, .. }
+            | HirPattern::Bool { span, .. } => *span,
+        }
+    }
 }
 
 impl HirExpr {
@@ -323,6 +442,7 @@ impl HirExpr {
             | HirExpr::Bool { span, .. }
             | HirExpr::Local { span, .. }
             | HirExpr::Function { span, .. }
+            | HirExpr::CaseRef { span, .. }
             | HirExpr::Unary { span, .. }
             | HirExpr::Binary { span, .. }
             | HirExpr::Assign { span, .. }
@@ -335,6 +455,7 @@ impl HirExpr {
             | HirExpr::Return { span, .. }
             | HirExpr::Break { span, .. }
             | HirExpr::Continue { span, .. }
+            | HirExpr::RecordLiteral { span, .. }
             | HirExpr::Error { span, .. } => *span,
             HirExpr::Block(block) => block.span,
         }
@@ -352,6 +473,7 @@ impl HirExpr {
             | HirExpr::Bool { id, .. }
             | HirExpr::Local { id, .. }
             | HirExpr::Function { id, .. }
+            | HirExpr::CaseRef { id, .. }
             | HirExpr::Unary { id, .. }
             | HirExpr::Binary { id, .. }
             | HirExpr::Assign { id, .. }
@@ -364,6 +486,7 @@ impl HirExpr {
             | HirExpr::Return { id, .. }
             | HirExpr::Break { id, .. }
             | HirExpr::Continue { id, .. }
+            | HirExpr::RecordLiteral { id, .. }
             | HirExpr::Error { id, .. } => *id,
             HirExpr::Block(block) => block.id,
         }

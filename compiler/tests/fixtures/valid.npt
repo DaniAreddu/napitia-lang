@@ -1,0 +1,13 @@
+func add(left: i64, right: i64) -> i64 {
+    return left + right
+}
+
+func main() -> i64 {
+    value answer = add(40, 2);
+
+    if answer == 42 {
+        return answer
+    } else {
+        return 0
+    }
+}

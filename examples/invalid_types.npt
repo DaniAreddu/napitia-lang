@@ -1,0 +1,28 @@
+// Deliberately ill-typed: exercises the type checker's diagnostics.
+// `napitia check examples/invalid_types.npt` should report several
+// independent type errors from one pass.
+
+func add(left: i64, right: i64) -> i64 {
+    return left + right
+}
+
+func wrong_return() -> i64 {
+    return true
+}
+
+func wrong_call() -> i64 {
+    return add(1, 2, 3)
+}
+
+func immutable_assign() -> i64 {
+    value x = 1;
+    x = 2;
+    return x
+}
+
+func bad_condition() -> i64 {
+    if 1 {
+        return 1
+    }
+    return 0
+}

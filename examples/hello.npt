@@ -1,0 +1,4 @@
+// The simplest complete Napitia program: one function, one return value.
+func main() -> i64 {
+    return 42
+}

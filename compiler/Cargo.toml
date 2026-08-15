@@ -2,5 +2,14 @@
 name = "compiler"
 version = "0.1.0"
 edition = "2024"
+# `rust-version` is Cargo's MSRV field: it would claim a *guaranteed
+# minimum* rustc, which has never been established here (edition 2024
+# itself only requires rustc >= 1.85). The one compiler this project is
+# actually built and tested against is pinned instead, honestly, in
+# `rust-toolchain.toml` at the repository root.
+
+[[bin]]
+name = "napitia"
+path = "src/main.rs"
 
 [dependencies]

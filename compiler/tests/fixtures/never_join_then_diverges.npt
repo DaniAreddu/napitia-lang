@@ -1,0 +1,7 @@
+func choose(flag: bool) -> i64 {
+    if flag { return 1 } else { 2 }
+}
+
+func main() -> i64 {
+    choose(false)
+}

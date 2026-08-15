@@ -1,6 +1,6 @@
 # Spec 0002: Syntax
 
-- Status: Partially implemented (Alpha 0.1)
+- Status: Partially implemented (Alpha 0.1.1)
 
 The grammar below uses the provisional vocabulary accepted in
 `rfcs/0004-language-independence.md`. It replaces an earlier version of
@@ -92,27 +92,75 @@ implementation (`extend Point with Printable { ... }`) or as inherent
 functions with no protocol (`extend Point { ... }`).
 
 All four are parsed, name-resolved, and duplicate-checked against a
-module-level item in HIR in this milestone. Their internal structure
-(field lists, case payloads, protocol member signatures, extend bodies)
-is *not* currently preserved beyond the declaration's own name and
-kind — HIR keeps only enough to know a name like `Point` refers to a
-declared `record` (so it can appear as a parameter/return type), not
-its fields. Field access, construction, protocol conformance, and
-pattern matching beyond the primitive-typed subset are accepted
-direction, not implemented, and are checked, reported errors rather
-than silently accepted (see `spec/0003-type-system.md`).
+module-level item in HIR. As of Alpha 0.1.1, `record`/`variant` are
+fully implemented end to end (construction, field access, variant
+constructors, pattern matching — see below and `spec/0003`); `protocol`/
+`extend` remain name/kind-only in HIR (field lists, case payloads are
+preserved for `record`/`variant`, but protocol member signatures and
+extend bodies are not) — protocol conformance checking is still
+accepted direction, not implemented.
 
 A named `record`/`variant` type is nominal (two declarations are
 distinct types even with identical fields, compared by declaration
 identity, never by name or structure) and `napitia check` accepts it
 anywhere a type is expected, including function parameter and return
-position — `check` never rejects a well-formed reference to a declared
-name. Alpha 0.1's NIR, however, has no aggregate runtime representation
-yet (see `spec/0006-napitia-ir.md`); `napitia ir`/`run` reject a
-function signature that mentions a named aggregate type with a
-dedicated, source-associated `I0001` diagnostic at lowering time —
-never by silently treating the type as an error, and never by only
-being caught later by the NIR verifier.
+position. Since Alpha 0.1.1, a named aggregate type has a real NIR
+runtime representation (see `spec/0006-napitia-ir.md`) and crosses
+function boundaries (parameters, return values, bindings, variant
+payloads) exactly like a primitive type — it is no longer rejected at
+lowering time.
+
+#### Record construction
+
+```text
+RecordLiteral = IDENT "{" [ FieldInit { "," FieldInit } [ "," ] ] "}" ;
+FieldInit     = IDENT ":" Expression ;
+```
+
+`User { id: 42, enabled: true }` constructs a value of the record named
+by the leading identifier. Fields may be written in any order; each
+must appear exactly once (a missing, duplicate, or unknown field is a
+checked, reported error — `spec/0003`). Field initializers are
+evaluated exactly once, in the order written (not declaration order);
+runtime layout always follows declaration order regardless.
+
+A record literal is syntactically **disabled** directly in the
+condition of `if`/`while` and the scrutinee of `match` (restored inside
+parentheses or call arguments), the same way most brace-delimited
+languages with struct literals resolve the ambiguity with the
+construct's own opening `{`: `if user { }` parses `user` as a plain
+identifier condition, never as `user { }` followed by an empty block.
+
+#### Field access
+
+`base.field` (already part of `PostfixExpr`, below) resolves against
+the base expression's inferred nominal record type. Field access on a
+non-record type, or on a record that doesn't declare that field, is a
+checked, reported error. Field *mutation* (`user.age = 20;`) is parsed
+as an ordinary assignment but is a dedicated, reported error in this
+milestone — see `spec/0003`.
+
+#### Variant constructors
+
+A variant case is constructed by qualifying its variant's name with a
+`.` and calling it (or, for a payload-less case, referencing it bare):
+
+```napitia
+value found = LookupResult.Found(user);
+value missing = LookupResult.Missing;
+```
+
+This needs no new grammar at all: `LookupResult.Found(user)` is exactly
+`PostfixExpr`'s existing `FieldAccess` followed by `Call` (`Ident` →
+`.Found` → `(user)`); the qualified path is intentionally **dotted, not
+`::`**, matching this spec's existing stance that Napitia paths are
+dotted (`import`/`uses`, above), not double-colon-separated. Name
+resolution (not new syntax) recognizes a `Field` whose base names a
+declared `variant` and turns it into a constructor reference rather
+than an ordinary field access. The qualifier may be omitted
+(`Found(user)`) when the case name is unambiguous across every declared
+variant in the module; if two variants both declare a case with that
+name, the unqualified form is a checked, reported ambiguity error.
 
 ### Types
 
@@ -210,12 +258,11 @@ AsCast       = "as" Type ;
 TryPropagate = "?" ;
 ```
 
-`FieldAccess` and `AsCast` are parsed, but using either is a checked,
-reported error in this milestone: field access is not resolved against
-a record definition (see "Records, variants, and protocols" above), and
-`as` performs no runtime conversion — accepting either silently would
-let a program type-check while lying about what it does, so both are
-rejected instead.
+`FieldAccess` is fully implemented as of Alpha 0.1.1 (see "Records,
+variants, and protocols" above). `AsCast` is still parsed, but using it
+remains a checked, reported error: `as` performs no runtime conversion
+in this milestone — accepting it silently would let a program
+type-check while lying about what it does.
 
 ```text
 PrimaryExpr = INT | FLOAT | STRING | CHAR | "true" | "false"
@@ -278,13 +325,24 @@ Pattern   = IDENT                      (* binds, or matches a payload-less case 
 PatternList = Pattern { "," Pattern } [ "," ] ;
 ```
 
-`match` is parsed and lowered into HIR, but using it is a checked,
-reported error in this milestone rather than being lowered to NIR or
-executed: pattern-to-scrutinee compatibility and exhaustiveness are not
-checked, so accepting it silently would overstate how much of it is
-actually verified. Full pattern matching (including payload-carrying
-variant-case patterns) is accepted direction, not implemented (see
-`spec/0003-type-system.md`).
+As of Alpha 0.1.1, `match` is fully checked and executed: pattern-to-
+scrutinee compatibility, exhaustiveness (with a concrete missing-pattern
+witness), and unreachable-arm detection are all implemented (see
+`spec/0003-type-system.md`), and a well-typed `match` lowers to a real
+NIR decision tree (`spec/0006-napitia-ir.md`).
+
+A pattern's case name is never qualified (`Found(user)`, not
+`LookupResult.Found(user)`) — unlike a constructor *expression*, a
+pattern's scrutinee type is always already known, so there is no
+ambiguity a qualifier would need to resolve. `match` is syntactically
+disabled as a record-literal position for its scrutinee the same way
+`if`/`while` conditions are (see "Record construction" above).
+
+Not implemented in this milestone, and not yet part of the grammar at
+all (each is a plain, structured "expected a pattern" parse error, not
+a silently-accepted-then-ignored construct): pattern guards,
+or-patterns, record-destructuring patterns, slice patterns, range
+patterns, and mutable pattern bindings.
 
 ## Example
 
@@ -326,8 +384,10 @@ without treating a missing node as a silent success.
   unsupported, as in this milestone.
 - `async`/`await` and structured-concurrency syntax.
 - `loop { ... break value }` as a value-producing expression.
-- Full pattern matching with exhaustiveness checking and variant-case
-  payload binding.
+- Pattern guards, or-patterns, record-destructuring patterns, slice
+  patterns, and range patterns (see "Match" above — full variant-case
+  pattern matching with exhaustiveness checking is implemented as of
+  Alpha 0.1.1; these extended pattern forms are not).
 
 ## Unresolved research questions
 

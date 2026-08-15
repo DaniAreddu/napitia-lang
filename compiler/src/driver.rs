@@ -51,6 +51,7 @@ pub struct CheckOutput {
     pub hir: HirModule,
     pub local_types: HashMap<LocalId, Ty>,
     pub expr_types: HashMap<hir::ExprId, Ty>,
+    pub pattern_case: HashMap<hir::PatternId, (hir::ItemId, usize)>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -65,6 +66,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         hir,
         local_types: typeck_result.local_types,
         expr_types: typeck_result.expr_types,
+        pattern_case: typeck_result.pattern_case,
         diagnostics,
     }
 }
@@ -91,6 +93,7 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.hir,
         &checked.local_types,
         &checked.expr_types,
+        &checked.pattern_case,
         interner,
         source,
     ) {
@@ -142,7 +145,7 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file(
             "t.npt",
-            "func helper(x: i64) -> i64 { return match x { _ => 0 } } \
+            "func helper(x: i64) -> i64 { defer x; return x } \
              func main() -> i64 { return helper(1) }",
         );
         let mut interner = Interner::new();

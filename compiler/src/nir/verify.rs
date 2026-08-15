@@ -17,7 +17,7 @@ use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::{Ty, is_integer, is_numeric};
 
-use super::block::{BlockId, Terminator};
+use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
 use super::{Function, Module};
 
@@ -36,6 +36,29 @@ mod codes {
     pub const UNRESOLVED_TYPE_VARIABLE: &str = "V0012";
     pub const UNEXPECTED_ERROR_TYPE: &str = "V0013";
     pub const ARITY_MISMATCH: &str = "V0014";
+    /// A function's blocks don't include one with id `BlockId(0)`. The
+    /// interpreter (and this verifier's own dominance analysis) treats
+    /// `BlockId(0)` as *the* entry block by definition, regardless of
+    /// where it sits in the block vector -- a function without one has
+    /// no defined starting point at all.
+    pub const MISSING_ENTRY_BLOCK: &str = "V0015";
+    /// Two definitions (some combination of a parameter and/or an
+    /// instruction result) claim the same `ValueId`. Every SSA value
+    /// must have exactly one definition; silently letting the second
+    /// one win (as a plain `HashMap::insert` would) hides a real
+    /// structural bug in whatever produced this NIR.
+    pub const DUPLICATE_VALUE_DEFINITION: &str = "V0016";
+    /// A value is used earlier in a block than the instruction that
+    /// defines it -- a forward reference within the same block, which
+    /// no valid lowering ever produces (every instruction is appended
+    /// only after everything it depends on already exists).
+    pub const USE_BEFORE_DEFINITION: &str = "V0017";
+    /// A value is used in a block that its definition does not
+    /// dominate: there is at least one path from the entry block to
+    /// this use that never passes through the block that defines it.
+    /// Reading it on that path would read a value that was never
+    /// actually produced.
+    pub const NON_DOMINATING_DEFINITION: &str = "V0018";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -105,6 +128,19 @@ fn verify_function(
         ));
         return;
     }
+    // `BlockId(0)` is the entry block by definition (the interpreter
+    // starts there explicitly, not at whatever happens to be first in
+    // the vector) -- a function whose blocks don't include one has no
+    // defined starting point, regardless of vector ordering.
+    if !function.blocks.iter().any(|b| b.id == BlockId(0)) {
+        diagnostics.push(Diagnostic::error(
+            codes::MISSING_ENTRY_BLOCK,
+            source,
+            Span::dummy(),
+            format!("function `{name}` has no block with id bb0 (the required entry block)"),
+        ));
+        return;
+    }
 
     check_no_bad_type(&function.return_type, source, name, diagnostics);
     for param in &function.params {
@@ -129,15 +165,46 @@ fn verify_function(
 
     // Every value this function ever defines (params, every
     // instruction's result), and its declared type -- built once so
-    // every later check is a lookup, never a re-derivation.
+    // every later check is a lookup, never a re-derivation. Tracked
+    // through `seen_value_ids` rather than relying on `value_types`
+    // itself, since a plain `HashMap::insert` silently accepts a
+    // duplicate key (the second definition would just overwrite the
+    // first with no diagnostic) -- every SSA value must have exactly
+    // one definition, across parameters *and* instruction results,
+    // regardless of which block they're in.
     let mut value_types: HashMap<ValueId, Ty> = HashMap::new();
     let mut alloc_slots: HashSet<ValueId> = HashSet::new();
+    let mut seen_value_ids: HashSet<ValueId> = HashSet::new();
+    let mut param_values: HashSet<ValueId> = HashSet::new();
     for param in &function.params {
+        param_values.insert(param.value);
+        if !seen_value_ids.insert(param.value) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_VALUE_DEFINITION,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{name}` has a parameter reusing value id %{}, already defined elsewhere in this function",
+                    param.value.0
+                ),
+            ));
+        }
         value_types.insert(param.value, param.ty.clone());
     }
     for block in &function.blocks {
         for instruction in &block.instructions {
             if let Instruction::Value { result, ty, kind } = instruction {
+                if !seen_value_ids.insert(*result) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::DUPLICATE_VALUE_DEFINITION,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` has an instruction reusing value id %{}, already defined elsewhere in this function",
+                            result.0
+                        ),
+                    ));
+                }
                 value_types.insert(*result, ty.clone());
                 if matches!(kind, ValueKind::Alloc) {
                     alloc_slots.insert(*result);
@@ -291,6 +358,239 @@ fn verify_function(
             }
         }
     }
+
+    verify_dominance(function, &param_values, source, name, diagnostics);
+}
+
+/// A value used anywhere in `function` must be either a parameter, or
+/// an instruction result whose defining block *dominates* the block of
+/// the use (every control-flow path from the entry block to the use
+/// passes through the definition first) -- and if the definition is in
+/// the very same block as the use, it must come strictly earlier in
+/// that block's instruction list. This is what actually backs up
+/// "every value used exists" with "and was actually produced on every
+/// path that could reach this use", which a plain existence check
+/// (`require_value`) cannot tell apart from a value that only happens
+/// to exist somewhere else in the function, e.g. in a sibling `if`
+/// branch that never ran.
+fn verify_dominance(
+    function: &Function,
+    param_values: &HashSet<ValueId>,
+    source: SourceId,
+    name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // (block, index within that block's instruction list) of each
+    // value's *first* definition. A duplicate definition is already
+    // reported on its own (V0016); picking one arbitrarily here just
+    // keeps this pass from also cascading into confusing double
+    // reports about the same underlying problem.
+    let mut def_site: HashMap<ValueId, (BlockId, usize)> = HashMap::new();
+    for block in &function.blocks {
+        for (idx, instruction) in block.instructions.iter().enumerate() {
+            if let Instruction::Value { result, .. } = instruction {
+                def_site.entry(*result).or_insert((block.id, idx));
+            }
+        }
+    }
+
+    let dom = compute_dominators(function);
+
+    let check_use = |v: ValueId,
+                     current_block: BlockId,
+                     current_idx: usize,
+                     diagnostics: &mut Vec<Diagnostic>| {
+        if param_values.contains(&v) {
+            // Parameters are defined at function entry and dominate
+            // every reachable block.
+            return;
+        }
+        let Some(&(def_block, def_idx)) = def_site.get(&v) else {
+            // Not defined anywhere at all -- already reported as
+            // V0006 by the existence check elsewhere; nothing further
+            // to say about its dominance.
+            return;
+        };
+        if def_block == current_block {
+            if def_idx >= current_idx {
+                diagnostics.push(Diagnostic::error(
+                    codes::USE_BEFORE_DEFINITION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{name}` uses %{} in bb{} before it is defined later in the same block",
+                        v.0, current_block.0
+                    ),
+                ));
+            }
+            return;
+        }
+        let dominates = dom
+            .get(&current_block)
+            .is_some_and(|d| d.contains(&def_block));
+        if !dominates {
+            diagnostics.push(Diagnostic::error(
+                codes::NON_DOMINATING_DEFINITION,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{name}` uses %{} in bb{}, but its definition in bb{} does not dominate that use (some path reaches bb{} without ever defining %{})",
+                    v.0, current_block.0, def_block.0, current_block.0, v.0
+                ),
+            ));
+        }
+    };
+
+    for block in &function.blocks {
+        for (idx, instruction) in block.instructions.iter().enumerate() {
+            match instruction {
+                Instruction::Value { kind, .. } => {
+                    for operand in operands_of(kind) {
+                        check_use(operand, block.id, idx, diagnostics);
+                    }
+                }
+                Instruction::Store { slot, value } => {
+                    check_use(*slot, block.id, idx, diagnostics);
+                    check_use(*value, block.id, idx, diagnostics);
+                }
+            }
+        }
+        // Terminator operands are treated as occurring after every
+        // instruction in the block: any same-block definition, at any
+        // instruction index, dominates the terminator that ends it.
+        let after_all = block.instructions.len();
+        match &block.terminator {
+            Terminator::Return(Some(v)) => check_use(*v, block.id, after_all, diagnostics),
+            Terminator::CondBranch { condition, .. } => {
+                check_use(*condition, block.id, after_all, diagnostics);
+            }
+            Terminator::Return(None) | Terminator::Branch(_) => {}
+        }
+    }
+}
+
+/// Every `ValueId` a `ValueKind` reads as an operand (not the value it
+/// itself produces).
+fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
+    match kind {
+        ValueKind::Alloc | ValueKind::Const(_) => Vec::new(),
+        ValueKind::Load(slot) => vec![*slot],
+        ValueKind::Neg(a) | ValueKind::Not(a) => vec![*a],
+        ValueKind::Add(a, b)
+        | ValueKind::Sub(a, b)
+        | ValueKind::Mul(a, b)
+        | ValueKind::Div(a, b)
+        | ValueKind::Rem(a, b)
+        | ValueKind::And(a, b)
+        | ValueKind::Or(a, b)
+        | ValueKind::Xor(a, b)
+        | ValueKind::Shl(a, b)
+        | ValueKind::Shr(a, b)
+        | ValueKind::Eq(a, b)
+        | ValueKind::Ne(a, b)
+        | ValueKind::Lt(a, b)
+        | ValueKind::Le(a, b)
+        | ValueKind::Gt(a, b)
+        | ValueKind::Ge(a, b) => vec![*a, *b],
+        ValueKind::Call(_, args) => args.clone(),
+    }
+}
+
+/// Computes, for every block in `function`, the set of blocks that
+/// dominate it (including itself) -- the standard iterative
+/// meet-over-predecessors fixpoint, restricted to blocks actually
+/// reachable from the entry block (`BlockId(0)`).
+///
+/// A block never reached from the entry is deliberately *not* folded
+/// into that fixpoint: a cycle purely among unreachable blocks (e.g. a
+/// dead merge block that branches to itself) would otherwise never
+/// converge below its pessimistic initial value using plain
+/// intersection, which would let it dominate -- and therefore
+/// silently accept -- a reference to literally anything else in the
+/// function. An unreachable block is instead defined to be dominated
+/// only by itself, so any operand it uses that isn't its own local
+/// definition is correctly flagged as non-dominating.
+fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+    let entry = BlockId(0);
+    let all_ids: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
+    if !all_ids.contains(&entry) {
+        // Already reported as V0015; there is no meaningful entry to
+        // compute dominance from.
+        return HashMap::new();
+    }
+
+    let block_by_id: HashMap<BlockId, &BasicBlock> =
+        function.blocks.iter().map(|b| (b.id, b)).collect();
+    let successors = |id: BlockId| -> Vec<BlockId> {
+        match &block_by_id[&id].terminator {
+            Terminator::Return(_) => Vec::new(),
+            Terminator::Branch(target) => vec![*target],
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+        }
+    };
+
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut worklist = vec![entry];
+    while let Some(id) = worklist.pop() {
+        for succ in successors(id) {
+            if all_ids.contains(&succ) && reachable.insert(succ) {
+                worklist.push(succ);
+            }
+        }
+    }
+
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for &id in &reachable {
+        for succ in successors(id) {
+            if reachable.contains(&succ) {
+                preds.entry(succ).or_default().push(id);
+            }
+        }
+    }
+
+    let mut dom: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+    for &id in &all_ids {
+        if !reachable.contains(&id) {
+            dom.insert(id, HashSet::from([id]));
+        } else if id == entry {
+            dom.insert(id, HashSet::from([entry]));
+        } else {
+            dom.insert(id, reachable.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &id in &reachable {
+            if id == entry {
+                continue;
+            }
+            let no_preds = Vec::new();
+            let ps = preds.get(&id).unwrap_or(&no_preds);
+            let mut new_dom = match ps.split_first() {
+                None => HashSet::from([id]),
+                Some((first, rest)) => {
+                    let mut acc = dom[first].clone();
+                    for p in rest {
+                        acc = acc.intersection(&dom[p]).copied().collect();
+                    }
+                    acc.insert(id);
+                    acc
+                }
+            };
+            let existing = dom.get_mut(&id).unwrap();
+            if new_dom != *existing {
+                std::mem::swap(existing, &mut new_dom);
+                changed = true;
+            }
+        }
+    }
+    dom
 }
 
 /// A type that can never legally appear in NIR the verifier accepts: an
@@ -904,5 +1204,435 @@ mod tests {
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
+    }
+
+    fn verify_one(function: Function, interner: &Interner) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let module = Module {
+            functions: vec![function],
+        };
+        verify_module(&module, source, interner)
+    }
+
+    #[test]
+    fn missing_entry_block_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let mut function = valid_function(ItemId(0), name);
+        // Only block is bb1, not bb0.
+        function.blocks[0].id = BlockId(1);
+        function.blocks[0].terminator = Terminator::Return(None);
+        function.blocks[0].instructions.clear();
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::MISSING_ENTRY_BLOCK));
+    }
+
+    #[test]
+    fn a_reordered_bb0_is_still_a_valid_entry_block() {
+        // bb0 exists but isn't first in the vector; entry status must
+        // come from the id, never from vector position.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(0)),
+                },
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(0))),
+                },
+            ],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_parameter_value_ids_are_rejected() {
+        use crate::nir::Param;
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let mut function = valid_function(ItemId(0), name);
+        function.params = vec![
+            Param {
+                value: ValueId(0),
+                ty: Ty::I64,
+            },
+            Param {
+                value: ValueId(0),
+                ty: Ty::Bool,
+            },
+        ];
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_VALUE_DEFINITION));
+    }
+
+    #[test]
+    fn duplicate_instruction_result_ids_are_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let mut function = valid_function(ItemId(0), name);
+        // %0 is already defined by `valid_function`'s single instruction;
+        // add a second instruction that reuses it.
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(2)),
+        });
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_VALUE_DEFINITION));
+    }
+
+    #[test]
+    fn a_parameter_colliding_with_an_instruction_result_is_rejected() {
+        use crate::nir::Param;
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let mut function = valid_function(ItemId(0), name);
+        // `valid_function`'s single instruction already produces %0;
+        // adding a parameter that also claims %0 is a collision across
+        // the two different kinds of definition.
+        function.params = vec![Param {
+            value: ValueId(0),
+            ty: Ty::I64,
+        }];
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_VALUE_DEFINITION));
+    }
+
+    #[test]
+    fn a_forward_reference_within_one_block_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions = vec![
+            // %0 used here, before it is defined below.
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::I64,
+                kind: ValueKind::Neg(ValueId(0)),
+            },
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            },
+        ];
+        function.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::USE_BEFORE_DEFINITION));
+    }
+
+    #[test]
+    fn a_value_defined_in_a_sibling_branch_is_rejected() {
+        // bb0 branches to bb1 or bb2; bb1 defines %1, bb2 uses it via
+        // its return terminator despite never having executed bb1.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    }],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(0),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    // %1 was only ever defined in the sibling bb1.
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                },
+            ],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::NON_DOMINATING_DEFINITION));
+    }
+
+    #[test]
+    fn loading_a_slot_only_allocated_in_one_branch_is_rejected() {
+        // bb1 allocates and stores a slot; bb2 (the sibling) never
+        // does; bb3 (their merge) loads it regardless.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    }],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(0),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::I64,
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(1),
+                            value: ValueId(2),
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    // %1 (the alloc) does not dominate bb3: the else
+                    // path (bb2) reaches it without ever allocating it.
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::I64,
+                        kind: ValueKind::Load(ValueId(1)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+            ],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::NON_DOMINATING_DEFINITION));
+    }
+
+    #[test]
+    fn a_valid_loop_cfg_has_no_diagnostics() {
+        // Standard header/body/exit shape: a mutable counter allocated
+        // in the entry, loaded/compared/incremented in the header and
+        // body, with a back-edge from body to header.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: Ty::I64,
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(0)),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(10)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Lt(ValueId(2), ValueId(3)),
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(4),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(5),
+                            ty: Ty::I64,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(6),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(7),
+                            ty: Ty::I64,
+                            kind: ValueKind::Add(ValueId(5), ValueId(6)),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(7),
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(8),
+                        ty: Ty::I64,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(8))),
+                },
+            ],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_conditional_cfg_with_an_entry_allocation_used_in_both_branches_has_no_diagnostics() {
+        // The slot is allocated once in the entry block (which
+        // dominates every other block), then both the then- and
+        // else-branches store into it before a shared merge block loads
+        // it back -- exactly the shape if/else lowering actually
+        // produces.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Const(Const::Bool(true)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::I64,
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(0),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(1),
+                            value: ValueId(2),
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(2)),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(1),
+                            value: ValueId(3),
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: Ty::I64,
+                        kind: ValueKind::Load(ValueId(1)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 }

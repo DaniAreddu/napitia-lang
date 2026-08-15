@@ -1932,6 +1932,264 @@ mod tests {
     }
 
     #[test]
+    fn record_create_orders_fields_by_declaration_not_construction_site() {
+        // Written `y` first, `x` second; declaration order is `x, y`.
+        let module = lower(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { value p = Point { y: 2, x: 1 }; return p.x }",
+        );
+        let instructions: Vec<&Instruction> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let (record, args) = instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Value {
+                    kind: ValueKind::RecordCreate(record, args),
+                    ..
+                } => Some((*record, args.clone())),
+                _ => None,
+            })
+            .expect("expected a record.create instruction");
+        // The two const instructions, in source order, produced `2`
+        // then `1`; record.create's args must be reordered so the
+        // first arg is `x`'s value (1) and the second is `y`'s (2).
+        let const_values: HashMap<ValueId, i128> = instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::Const(Const::Int(v)),
+                    ..
+                } => Some((*result, *v as i128)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(const_values[&args[0]], 1, "expected x's value first");
+        assert_eq!(const_values[&args[1]], 2, "expected y's value second");
+        let _ = record;
+    }
+
+    #[test]
+    fn record_field_initializers_evaluate_exactly_once_in_source_order() {
+        let module = lower(
+            "record Pair { a: i64, b: i64 } \
+             func f() -> i64 { value p = Pair { b: 2, a: 1 }; return p.a }",
+        );
+        let const_count = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Const(Const::Int(_)),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            const_count, 2,
+            "each field initializer must be evaluated exactly once"
+        );
+    }
+
+    #[test]
+    fn record_field_access_lowers_to_a_resolved_projection() {
+        let module = lower(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { value p = Point { x: 1, y: 2 }; return p.y }",
+        );
+        let has_field_projection = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::RecordField { field: 1, .. },
+                        ..
+                    }
+                )
+            });
+        assert!(
+            has_field_projection,
+            "expected a record.field projection at declaration index 1 (y)"
+        );
+    }
+
+    #[test]
+    fn variant_construction_lowers_explicitly() {
+        let module = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Circle(7); return 0 }",
+        );
+        let has_variant_create = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::VariantCreate { case: 0, .. },
+                        ..
+                    }
+                )
+            });
+        assert!(has_variant_create, "expected a variant.create for case 0");
+    }
+
+    #[test]
+    fn unit_case_construction_allocates_no_payload() {
+        let module = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Empty; return 0 }",
+        );
+        let payload_len = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Instruction::Value {
+                    kind:
+                        ValueKind::VariantCreate {
+                            case: 1, payload, ..
+                        },
+                    ..
+                } => Some(payload.len()),
+                _ => None,
+            })
+            .expect("expected a variant.create for the unit case");
+        assert_eq!(payload_len, 0);
+    }
+
+    #[test]
+    fn variant_match_lowers_to_a_deterministic_switch() {
+        let text = "variant Shape { Circle(i64), Square(i64) } \
+                     func f(s: Shape) -> i64 { return match s { Circle(v) => v, Square(v) => v } }";
+        let a = lower(text);
+        let b = lower(text);
+        let switches_of = |m: &Module| -> Vec<(ItemId, usize)> {
+            m.functions[0]
+                .blocks
+                .iter()
+                .filter_map(|blk| match &blk.terminator {
+                    Terminator::Switch { variant, cases, .. } => Some((*variant, cases.len())),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            switches_of(&a),
+            switches_of(&b),
+            "switch lowering must be deterministic across runs"
+        );
+        assert_eq!(switches_of(&a).len(), 1);
+        assert_eq!(switches_of(&a)[0].1, 2, "expected one target per case");
+    }
+
+    #[test]
+    fn nested_variant_pattern_lowers_to_nested_switches() {
+        let text = "variant Inner { X, Y } \
+                     variant Outer { A(Inner), B } \
+                     func f(o: Outer) -> i64 { \
+                         return match o { A(X) => 1, A(Y) => 2, B => 3 } \
+                     }";
+        let module = lower(text);
+        let switch_count = module.functions[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .count();
+        assert_eq!(
+            switch_count, 2,
+            "expected one switch for Outer and one for the nested Inner pattern"
+        );
+    }
+
+    #[test]
+    fn fully_diverging_match_allocates_no_result_slot() {
+        let text = "variant Shape { Circle, Empty } \
+                     func f(s: Shape) -> i64 { \
+                         match s { Circle => return 1, Empty => return 2 } \
+                     }";
+        let module = lower(text);
+        let has_alloc = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Alloc,
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !has_alloc,
+            "a fully diverging match must not allocate a result slot"
+        );
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn value_producing_match_allocates_exactly_one_result_slot() {
+        let text = "variant Shape { Circle(i64), Empty } \
+                     func f(s: Shape) -> i64 { return match s { Circle(v) => v, Empty => 0 } }";
+        let module = lower(text);
+        let alloc_count = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Alloc,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(alloc_count, 1);
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn payload_bindings_dominate_their_arm_body() {
+        // Exercised through the verifier's own dominance analysis: a
+        // payload extracted in a case's block, used in that same arm's
+        // body (however deeply nested), must never be flagged as a
+        // dominance violation.
+        let text = "variant Shape { Circle(i64) } \
+                     func f(s: Shape) -> i64 { \
+                         return match s { Circle(v) => if v > 0 { v } else { 0 - v } } \
+                     }";
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn simple_function_lowers_with_no_skips() {
         let module = lower("func add(left: i64, right: i64) -> i64 { return left + right }");
         assert_eq!(module.functions.len(), 1);

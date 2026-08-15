@@ -203,24 +203,9 @@ fn a_value_carrying_break_is_rejected_at_every_stage() {
 }
 
 #[test]
-fn a_named_aggregate_type_is_rejected_by_ir_with_i0001_not_by_check() {
-    let path = fixture("named_aggregate_return_type.npt");
-
-    let checked = napitia(&["check", &path]);
-    assert!(
-        checked.status.success(),
-        "check failed: {}",
-        stderr(&checked)
-    );
-
-    for command in ["ir", "run"] {
-        let output = napitia(&[command, &path]);
-        assert_eq!(output.status.code(), Some(1), "`{command}` should fail");
-        assert!(
-            stderr(&output).contains("I0001"),
-            "`{command}` should report I0001, got: {}",
-            stderr(&output)
-        );
-        assert!(!stderr(&output).contains("V0013"));
-    }
+fn a_named_aggregate_return_type_now_lowers_and_runs_successfully() {
+    // Alpha 0.1.1: records have a real aggregate runtime representation,
+    // so a named type in a function signature is no longer rejected --
+    // it lowers, verifies, and runs cleanly through every stage.
+    assert_pipeline_is_clean_and_returns("named_aggregate_return_type.npt", "42");
 }

@@ -75,6 +75,28 @@ pub(super) fn synchronize_to_stmt(p: &mut Parser) {
     }
 }
 
+/// Advances past tokens until the next `,` (consumed) or a closing `}`
+/// (left for the caller). Called after one entry of a comma-separated,
+/// brace-delimited list (a record's fields, a variant's cases, a
+/// match's arms) fails to parse, so a single malformed entry doesn't
+/// take the rest of the list down with it the way `synchronize_to_stmt`
+/// would (that helper only recognizes statement/item boundaries, which
+/// don't exist inside these lists).
+pub(super) fn synchronize_to_list_item(p: &mut Parser) {
+    loop {
+        match p.current() {
+            TokenKind::Eof | TokenKind::RBrace => return,
+            TokenKind::Comma => {
+                p.advance();
+                return;
+            }
+            _ => {
+                p.advance();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

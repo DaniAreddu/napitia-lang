@@ -171,12 +171,12 @@ impl<'a> Parser<'a> {
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
             let field_public = self.parse_visibility();
             let Some(fname) = self.expect_ident("a field name") else {
-                recovery::synchronize_to_stmt(self);
+                recovery::synchronize_to_list_item(self);
                 continue;
             };
             self.expect(&TokenKind::Colon, "`:`");
             let Some(ty) = self.parse_type() else {
-                recovery::synchronize_to_stmt(self);
+                recovery::synchronize_to_list_item(self);
                 continue;
             };
             let fspan = fname.span.join(ty.span());
@@ -210,7 +210,7 @@ impl<'a> Parser<'a> {
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
             let Some(cname) = self.expect_ident("a case name") else {
-                recovery::synchronize_to_stmt(self);
+                recovery::synchronize_to_list_item(self);
                 continue;
             };
             let mut payload = Vec::new();
@@ -549,6 +549,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_record_field_recovers_and_still_parses_the_rest() {
+        // A field missing its `:` type annotation must not abort the
+        // whole declaration -- recovery should still pick up `y`.
+        let (module, diags) = parse("record Point { x, y: i64 }");
+        assert!(!diags.is_empty());
+        let Item::Record(r) = &module.items[0] else {
+            panic!("expected record")
+        };
+        assert_eq!(r.fields.len(), 1, "expected only `y` to survive recovery");
+    }
+
+    #[test]
     fn parses_variant_declaration_with_payloads() {
         let (module, diags) = parse("variant Shape { Circle(i64), Square(i64), Empty }");
         assert!(diags.is_empty());
@@ -558,6 +570,23 @@ mod tests {
         assert_eq!(v.cases.len(), 3);
         assert_eq!(v.cases[0].payload.len(), 1);
         assert_eq!(v.cases[2].payload.len(), 0);
+    }
+
+    #[test]
+    fn malformed_variant_case_recovers_and_still_parses_the_rest() {
+        // A stray token where a case name is expected must not abort
+        // the whole declaration -- recovery should still pick up
+        // `Empty`.
+        let (module, diags) = parse("variant Shape { 1, Empty }");
+        assert!(!diags.is_empty());
+        let Item::Variant(v) = &module.items[0] else {
+            panic!("expected variant")
+        };
+        assert_eq!(
+            v.cases.len(),
+            1,
+            "expected only `Empty` to survive recovery"
+        );
     }
 
     #[test]

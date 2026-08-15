@@ -1180,9 +1180,16 @@ impl<'a> Checker<'a> {
         let scrutinee_ty = self.check_expr(scrutinee);
         let scrutinee_diverges = matches!(scrutinee_ty, Ty::Never);
 
+        // Every arm's pattern and body is checked for its own
+        // independent diagnostics regardless of reachability -- but the
+        // *join* only ever includes a reachable arm's body type: joining
+        // before exhaustiveness/unreachability is known would let an
+        // unreachable arm's mismatched type produce a spurious "match
+        // arms must have the same type" diagnostic on top of its own,
+        // correct "unreachable pattern" one.
         let mut resolved_patterns = Vec::with_capacity(arms.len());
         let mut any_pattern_invalid = false;
-        let mut arm_result: Option<Ty> = None;
+        let mut body_types = Vec::with_capacity(arms.len());
         for arm in arms {
             let (resolved, valid) = self.check_pattern(&arm.pattern, &scrutinee_ty);
             any_pattern_invalid |= !valid;
@@ -1191,24 +1198,16 @@ impl<'a> Checker<'a> {
                 HirMatchArmBody::Expr(e) => self.check_expr(e),
                 HirMatchArmBody::Block(b) => self.check_block(b),
             };
-            arm_result = Some(match arm_result {
-                None => body_ty,
-                Some(acc) => self.join_diverging_branches(
-                    &acc,
-                    &body_ty,
-                    arm.span,
-                    "match arms must have the same type",
-                ),
-            });
+            body_types.push(body_ty);
         }
-        let result = arm_result.unwrap_or(Ty::Never);
 
         // A diverging scrutinee is evaluated exactly once, unconditionally,
         // before any pattern could ever be tested -- no arm is ever
         // reached, so the whole match is `never`, mirroring `if`'s
-        // diverging-condition rule exactly. Exhaustiveness/unreachable-
-        // arm analysis is skipped in that case: reachability of arms
-        // that can never run is moot.
+        // diverging-condition rule exactly. Every arm's pattern/body was
+        // still checked above (for its own independent diagnostics), but
+        // none of them are reachable, so none may contribute to the
+        // result type or be analyzed for exhaustiveness/unreachability.
         if scrutinee_diverges {
             return Ty::Never;
         }
@@ -1219,23 +1218,44 @@ impl<'a> Checker<'a> {
         // stand-in for it can't be trusted to prove exhaustiveness or
         // unreachability, so that analysis -- and its own diagnostics --
         // are skipped entirely rather than risk a misleading cascade.
-        if !any_pattern_invalid {
-            self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
-        }
+        let unreachable: Vec<usize> = if any_pattern_invalid {
+            Vec::new()
+        } else {
+            self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span)
+        };
 
-        result
+        let mut arm_result: Option<Ty> = None;
+        for (i, body_ty) in body_types.into_iter().enumerate() {
+            if unreachable.contains(&i) {
+                continue;
+            }
+            arm_result = Some(match arm_result {
+                None => body_ty,
+                Some(acc) => self.join_diverging_branches(
+                    &acc,
+                    &body_ty,
+                    arms[i].span,
+                    "match arms must have the same type",
+                ),
+            });
+        }
+        arm_result.unwrap_or(Ty::Never)
     }
 
+    /// Runs exhaustiveness/unreachable-arm analysis and reports its
+    /// diagnostics, returning the indices of unreachable arms (empty if
+    /// the budget was exceeded, since nothing it found can be trusted
+    /// either).
     fn check_match_exhaustiveness(
         &mut self,
         scrutinee_ty: &Ty,
         resolved_patterns: &[ResolvedPattern],
         arms: &[HirMatchArm],
         span: Span,
-    ) {
+    ) -> Vec<usize> {
         let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
         if matches!(resolved_scrutinee, Ty::Error) {
-            return;
+            return Vec::new();
         }
         let variant_payloads: HashMap<ItemId, Vec<Vec<Ty>>> = self
             .variants
@@ -1257,7 +1277,7 @@ impl<'a> Checker<'a> {
                 )
                 .with_primary_label("match is too complex to analyze"),
             );
-            return;
+            return Vec::new();
         }
 
         if let Some(witness) = analysis.missing {
@@ -1284,6 +1304,8 @@ impl<'a> Checker<'a> {
                 .with_primary_label("unreachable"),
             );
         }
+
+        analysis.unreachable
     }
 
     /// Checks one pattern against its scrutinee's type, binding any
@@ -1828,6 +1850,57 @@ mod tests {
         let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, n => n, _ => 0 } }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0018");
+    }
+
+    #[test]
+    fn unreachable_arm_does_not_also_report_a_result_type_mismatch() {
+        // The second arm's body (`false`, a bool) would mismatch the
+        // first arm's body (`1`, an i64) if it were joined -- but the
+        // second arm is unreachable (the first arm's wildcard pattern
+        // already covers every bool), so only its own unreachable-arm
+        // diagnostic is expected, never a spurious arm-join mismatch on
+        // top of it.
+        let diags = check("func f(x: bool) -> i64 { return match x { _ => 1, true => false } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0018");
+    }
+
+    #[test]
+    fn diverging_scrutinee_with_mismatched_arm_types_does_not_report_a_join_mismatch() {
+        let diags = check(
+            "func f() -> i64 { \
+                 return match (return 1) { true => 1, false => \"x\" } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn reachable_arm_type_mismatch_is_still_reported() {
+        let diags = check("func f(x: bool) -> i64 { return match x { true => 1, false => true } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn one_diverging_arm_and_one_value_arm_resolves_to_the_value_type() {
+        let diags = check(
+            "func f(x: bool) -> i64 { \
+                 return match x { true => return 0, false => 1 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn all_reachable_arms_diverging_resolves_to_never() {
+        let diags = check(
+            "func f(x: bool) -> i64 { \
+                 value _y = match x { true => return 0, false => return 1 }; \
+                 return 0 \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

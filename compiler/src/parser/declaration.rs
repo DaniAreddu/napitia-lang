@@ -439,7 +439,7 @@ impl<'a> Parser<'a> {
     fn parse_while_stmt(&mut self) -> WhileStmt {
         let start = self.current_span();
         self.advance(); // 'while'
-        let condition = Box::new(self.parse_expression());
+        let condition = Box::new(self.parse_expression_no_struct_literal());
         let body = self.parse_block();
         WhileStmt {
             condition,

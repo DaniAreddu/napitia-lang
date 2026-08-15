@@ -351,6 +351,22 @@ impl<'a> Lowering<'a> {
                 id: self.fresh_expr_id(),
                 span: *span,
             },
+            // Record construction has surface grammar (this milestone's
+            // parser) but no resolution/semantics yet -- each field's
+            // value is still lowered so an unrelated error inside it is
+            // reported, but the literal itself becomes an `Error` node,
+            // matching how every other not-yet-implemented construct in
+            // this codebase is handled until its own dedicated pass
+            // lands.
+            ast::Expr::RecordLiteral { fields, span, .. } => {
+                for f in fields {
+                    self.lower_expr(&f.value, scopes);
+                }
+                HirExpr::Error {
+                    id: self.fresh_expr_id(),
+                    span: *span,
+                }
+            }
             ast::Expr::Error { span } => HirExpr::Error {
                 id: self.fresh_expr_id(),
                 span: *span,

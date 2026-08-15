@@ -263,11 +263,28 @@ pub enum Expr {
     Continue {
         span: Span,
     },
+    /// `TypeName { field: expr, ... }`. Only a bare identifier followed
+    /// directly by `{` in a position where struct literals are allowed
+    /// (see `Parser`'s `no_struct_literal` flag) parses as this; `{` in
+    /// every other postfix/primary position is a block.
+    RecordLiteral {
+        type_name: Ident,
+        fields: Vec<FieldInit>,
+        span: Span,
+    },
     /// A malformed expression the parser recovered from. Carries no
     /// value; later stages must skip it rather than type-check it.
     Error {
         span: Span,
     },
+}
+
+/// One `field: expr` entry in a [`Expr::RecordLiteral`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldInit {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
 }
 
 impl Expr {
@@ -289,6 +306,7 @@ impl Expr {
             | Expr::Return { span, .. }
             | Expr::Break { span, .. }
             | Expr::Continue { span }
+            | Expr::RecordLiteral { span, .. }
             | Expr::Error { span } => *span,
             Expr::Ident(ident) => ident.span,
             Expr::If(if_expr) => if_expr.span,

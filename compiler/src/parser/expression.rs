@@ -1,15 +1,29 @@
 //! Pratt-style expression parsing.
 
-use super::Parser;
+use super::{Parser, recovery};
 use crate::lexer::TokenKind;
 use crate::syntax::ast::{
-    AssignOp, BinaryOp, ElseBranch, Expr, IfExpr, MatchArm, MatchArmBody, MatchExpr, Pattern,
-    UnaryOp,
+    AssignOp, BinaryOp, ElseBranch, Expr, FieldInit, IfExpr, MatchArm, MatchArmBody, MatchExpr,
+    Pattern, UnaryOp,
 };
 
 impl<'a> Parser<'a> {
     pub(super) fn parse_expression(&mut self) -> Expr {
         self.parse_assignment()
+    }
+
+    /// Parses one expression with record-literal construction
+    /// syntactically disabled at its top level (restored afterward),
+    /// for the one position in the grammar (`if`/`while` condition,
+    /// `match` scrutinee) where a bare `TypeName { ... }` would
+    /// otherwise be ambiguous with the construct's own opening `{`. See
+    /// `Parser::no_struct_literal`'s doc comment.
+    pub(super) fn parse_expression_no_struct_literal(&mut self) -> Expr {
+        let previous = self.no_struct_literal;
+        self.no_struct_literal = true;
+        let expr = self.parse_expression();
+        self.no_struct_literal = previous;
+        expr
     }
 
     fn parse_assignment(&mut self) -> Expr {
@@ -146,9 +160,51 @@ impl<'a> Parser<'a> {
         expr
     }
 
+    /// `TypeName { field: expr, ... }`, called once the leading
+    /// identifier and the following `{` have already been recognized as
+    /// a record literal (not a block).
+    fn parse_record_literal(&mut self, type_name: crate::syntax::ast::Ident) -> Expr {
+        let start = type_name.span;
+        self.advance(); // '{'
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+            let Some(name) = self.expect_ident("a field name") else {
+                recovery::synchronize_to_stmt(self);
+                break;
+            };
+            self.expect(&TokenKind::Colon, "`:`");
+            let value = self.parse_expression();
+            let fspan = name.span.join(value.span());
+            fields.push(FieldInit {
+                name,
+                value,
+                span: fspan,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RBrace, "`}`")
+            .map(|t| t.span)
+            .unwrap_or(self.current_span());
+        Expr::RecordLiteral {
+            type_name,
+            fields,
+            span: start.join(end),
+        }
+    }
+
     fn parse_call_args(&mut self) -> Vec<Expr> {
+        // Call arguments are already unambiguously delimited by `(...)`,
+        // so an enclosing `if`/`while` condition or `match` scrutinee's
+        // struct-literal restriction does not need to (and must not)
+        // propagate into them: `if f(Foo { x: 1 }) { }` is unambiguous.
+        let previous = self.no_struct_literal;
+        self.no_struct_literal = false;
         let mut args = Vec::new();
         if self.check(&TokenKind::RParen) {
+            self.no_struct_literal = previous;
             return args;
         }
         loop {
@@ -161,6 +217,7 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        self.no_struct_literal = previous;
         args
     }
 
@@ -193,11 +250,23 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(symbol) => {
                 self.advance();
-                Expr::Ident(crate::syntax::ast::Ident { symbol, span })
+                let ident = crate::syntax::ast::Ident { symbol, span };
+                if !self.no_struct_literal && self.check(&TokenKind::LBrace) {
+                    self.parse_record_literal(ident)
+                } else {
+                    Expr::Ident(ident)
+                }
             }
             TokenKind::LParen => {
                 self.advance();
+                // Parentheses fully delimit a nested expression, so the
+                // struct-literal restriction from an enclosing `if`/
+                // `while` condition or `match` scrutinee does not apply
+                // inside them.
+                let previous = self.no_struct_literal;
+                self.no_struct_literal = false;
                 let inner = self.parse_expression();
+                self.no_struct_literal = previous;
                 let end = self
                     .expect(&TokenKind::RParen, "`)`")
                     .map(|t| t.span)
@@ -259,7 +328,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_if_expr(&mut self) -> IfExpr {
         let start = self.current_span();
         self.advance(); // 'if'
-        let condition = Box::new(self.parse_expression());
+        let condition = Box::new(self.parse_expression_no_struct_literal());
         let then_branch = self.parse_block();
         let else_branch = if self.eat(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
@@ -286,7 +355,7 @@ impl<'a> Parser<'a> {
     fn parse_match_expr(&mut self) -> MatchExpr {
         let start = self.current_span();
         self.advance(); // 'match'
-        let scrutinee = Box::new(self.parse_expression());
+        let scrutinee = Box::new(self.parse_expression_no_struct_literal());
         self.expect(&TokenKind::LBrace, "`{`");
         let mut arms = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -633,5 +702,89 @@ mod tests {
     fn malformed_expression_recovers_with_error_node() {
         let (_, diags) = parse("func f() -> i64 { value x = ; return 0 }");
         assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn parses_record_construction_with_fields_in_any_order() {
+        let expr = single_expr("User { id: 1, enabled: true }");
+        let Expr::RecordLiteral {
+            type_name, fields, ..
+        } = expr
+        else {
+            panic!("expected a record literal")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_ne!(type_name.symbol, fields[0].name.symbol);
+    }
+
+    #[test]
+    fn parses_empty_record_construction() {
+        let expr = single_expr("User {}");
+        assert!(matches!(expr, Expr::RecordLiteral { .. }));
+    }
+
+    #[test]
+    fn bare_identifier_followed_by_block_is_not_a_record_literal() {
+        // `if user { ... }` must parse `user` as the plain condition
+        // expression, not `user { ... }` as a record literal followed by
+        // an empty block -- the classic struct-literal-in-condition
+        // ambiguity.
+        let (module, diags) = parse("func f() { if user { } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        let Some(Expr::If(if_expr)) = f.body.tail.as_deref() else {
+            panic!("expected an if expression")
+        };
+        assert!(matches!(*if_expr.condition, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn parenthesized_record_literal_is_allowed_in_a_condition() {
+        let (module, diags) = parse("func f() { if (User { id: 1 }) { } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        let Some(Expr::If(if_expr)) = f.body.tail.as_deref() else {
+            panic!("expected an if expression")
+        };
+        let Expr::Paren { inner, .. } = &*if_expr.condition else {
+            panic!("expected a parenthesized condition")
+        };
+        assert!(matches!(**inner, Expr::RecordLiteral { .. }));
+    }
+
+    #[test]
+    fn record_literal_is_allowed_inside_call_arguments_within_a_condition() {
+        // Call arguments are already unambiguously delimited by `(...)`,
+        // so the struct-literal restriction from the enclosing `if`
+        // condition must not propagate into them.
+        let (module, diags) = parse("func f() { if f(User { id: 1 }) { } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        let Some(Expr::If(if_expr)) = f.body.tail.as_deref() else {
+            panic!("expected an if expression")
+        };
+        let Expr::Call { args, .. } = &*if_expr.condition else {
+            panic!("expected a call")
+        };
+        assert!(matches!(args[0], Expr::RecordLiteral { .. }));
+    }
+
+    #[test]
+    fn bare_identifier_followed_by_block_is_not_a_record_literal_in_match_scrutinee() {
+        let (module, diags) = parse("func f() { match result { _ => 1 } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        let Some(Expr::Match(m)) = f.body.tail.as_deref() else {
+            panic!("expected a match expression")
+        };
+        assert!(matches!(*m.scrutinee, Expr::Ident(_)));
     }
 }

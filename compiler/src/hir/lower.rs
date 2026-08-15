@@ -793,11 +793,19 @@ impl<'a> Lowering<'a> {
             }
         }
 
-        let missing: Vec<&str> = field_indices
+        // `field_indices` is a `HashMap`, whose iteration order is not
+        // itself meaningful -- but its value *is* each field's
+        // declaration index, so sorting by that recovers exact
+        // declaration order without needing a separately-threaded
+        // ordered field list. Diagnostic text must never depend on
+        // HashMap iteration order: it is not deterministic across runs.
+        let mut missing: Vec<(usize, &str)> = field_indices
             .iter()
             .filter(|(name, _)| !seen.contains_key(*name))
-            .map(|(name, _)| self.interner.resolve(*name))
+            .map(|(name, &index)| (index, self.interner.resolve(*name)))
             .collect();
+        missing.sort_by_key(|(index, _)| *index);
+        let missing: Vec<&str> = missing.into_iter().map(|(_, name)| name).collect();
         if !missing.is_empty() {
             let record_text = self.interner.resolve(type_name.symbol);
             self.diagnostics.push(
@@ -1155,6 +1163,52 @@ mod tests {
             lower("record Point { x: i64, y: i64 } func f() { value p = Point { x: 1 }; }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "R0009");
+    }
+
+    #[test]
+    fn missing_fields_are_reported_in_declaration_order() {
+        // Three missing fields, named so alphabetical/insertion order
+        // would disagree with declaration order if either leaked
+        // through: declaration order is z, a, m.
+        let record = "record Point { z: i64, a: i64, m: i64, x: i64 } ";
+        let ctor = "func f() { value p = Point { x: 1 }; }";
+        let (_, diags) = lower(&format!("{record}{ctor}"));
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0009");
+        assert!(
+            diags[0].message.contains("z, a, m"),
+            "expected declaration-order field list, got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn missing_field_diagnostic_text_is_identical_across_repeated_runs() {
+        let text = "record Point { z: i64, a: i64, m: i64, x: i64 } \
+                    func f() { value p = Point { x: 1 }; }";
+        let first = lower(text).1[0].message.clone();
+        for _ in 0..10 {
+            let (_, diags) = lower(text);
+            assert_eq!(diags[0].message, first);
+        }
+    }
+
+    #[test]
+    fn missing_field_order_is_declaration_order_not_construction_site_order() {
+        // The construction site never mentions any of the missing
+        // fields, so its own (empty) order can't influence anything;
+        // this instead confirms that field declaration order -- not
+        // HashMap iteration order, which this test's field names are
+        // chosen to disagree with alphabetically -- is what's reported.
+        let record = "record Point { z: i64, a: i64, m: i64 } ";
+        let ctor = "func f() { value p = Point {}; }";
+        let (_, diags) = lower(&format!("{record}{ctor}"));
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert!(
+            diags[0].message.contains("z, a, m"),
+            "expected declaration-order field list, got: {}",
+            diags[0].message
+        );
     }
 
     #[test]

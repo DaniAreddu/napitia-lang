@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
 use crate::symbol::Interner;
 
@@ -24,6 +25,20 @@ pub enum Value {
     Char(char),
     Str(String),
     Unit,
+    /// A record value: fields in declaration order, matching
+    /// `nir::RecordLayout`.
+    Record {
+        item: ItemId,
+        fields: Vec<Value>,
+    },
+    /// A variant value: `case` is the declaration index of its active
+    /// case, and `payload` holds that case's payload values in
+    /// declaration order (empty for a unit case).
+    Variant {
+        item: ItemId,
+        case: usize,
+        payload: Vec<Value>,
+    },
 }
 
 /// A condition the interpreter detects and reports instead of crashing:
@@ -149,6 +164,23 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                 }
+                Terminator::Switch {
+                    scrutinee,
+                    variant,
+                    cases,
+                } => {
+                    let Value::Variant { item, case, .. } = get(&values, scrutinee)? else {
+                        return Err(invalid("switch scrutinee was not a variant value"));
+                    };
+                    if item != *variant {
+                        return Err(invalid(
+                            "switch scrutinee's variant identity does not match the switch's declared variant",
+                        ));
+                    }
+                    block_id = *cases.get(case).ok_or_else(|| {
+                        invalid("switch scrutinee's case has no corresponding target")
+                    })?;
+                }
             }
         }
     }
@@ -227,6 +259,64 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| invalid("call to a function not present in this module"))?;
                 self.call_function(callee, arg_values)
             }
+            ValueKind::RecordCreate(item, field_ids) => {
+                let fields = field_ids
+                    .iter()
+                    .map(|id| get(values, id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Record {
+                    item: *item,
+                    fields,
+                })
+            }
+            ValueKind::RecordField {
+                base,
+                record,
+                field,
+            } => match get(values, base)? {
+                Value::Record { item, fields } if item == *record => fields
+                    .get(*field)
+                    .cloned()
+                    .ok_or_else(|| invalid("record field index out of range")),
+                other => Err(invalid(format!(
+                    "expected a record value of the expected type, found {}",
+                    kind_name(&other)
+                ))),
+            },
+            ValueKind::VariantCreate {
+                variant,
+                case,
+                payload,
+            } => {
+                let payload = payload
+                    .iter()
+                    .map(|id| get(values, id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Variant {
+                    item: *variant,
+                    case: *case,
+                    payload,
+                })
+            }
+            ValueKind::VariantPayload {
+                base,
+                variant,
+                case,
+                index,
+            } => match get(values, base)? {
+                Value::Variant {
+                    item,
+                    case: active_case,
+                    payload,
+                } if item == *variant && active_case == *case => payload
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| invalid("variant payload index out of range")),
+                other => Err(invalid(format!(
+                    "expected an active variant case matching this payload projection, found {}",
+                    kind_name(&other)
+                ))),
+            },
         }
     }
 }
@@ -250,6 +340,8 @@ fn kind_name(value: &Value) -> &'static str {
         Value::Char(_) => "a char",
         Value::Str(_) => "a string",
         Value::Unit => "unit",
+        Value::Record { .. } => "a record",
+        Value::Variant { .. } => "a variant",
     }
 }
 
@@ -395,8 +487,15 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        let nir = lower_nir(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed");
+        let nir = lower_nir(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
         Interpreter::new(&nir).run("main", &interner)
     }
 
@@ -649,8 +748,15 @@ mod tests {
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
         let result = check_module(&hir, id, &interner);
-        let nir = lower_nir(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed");
+        let nir = lower_nir(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
         let outcome = Interpreter::new(&nir).run("does_not_exist", &interner);
         assert!(matches!(
             outcome,
@@ -690,6 +796,8 @@ mod tests {
                     terminator: Terminator::Return(Some(ValueId(0))),
                 }],
             }],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
         assert!(
@@ -721,6 +829,8 @@ mod tests {
                     terminator: Terminator::Return(Some(ValueId(0))),
                 }],
             }],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let outcome =
             Interpreter::new(&module).call("f", &interner, vec![Value::Int(1), Value::Int(2)]);
@@ -753,11 +863,225 @@ mod tests {
                     terminator: Terminator::Return(None),
                 }],
             }],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a missing-entry-block error, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn record_values_cross_function_boundaries() {
+        let text = "record User { id: i64, enabled: bool } \
+                     func identity(u: User) -> User { return u } \
+                     func main() -> i64 { \
+                         value u = User { id: 42, enabled: true }; \
+                         return identity(u).id \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn field_access_reads_the_correct_field_regardless_of_construction_order() {
+        let text = "record Point { x: i64, y: i64 } \
+                     func main() -> i64 { \
+                         value p = Point { y: 2, x: 40 }; \
+                         return p.x + p.y \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn variant_values_cross_function_boundaries() {
+        let text = "variant LookupResult { Found(i64), Missing } \
+                     func identity(r: LookupResult) -> LookupResult { return r } \
+                     func main() -> i64 { \
+                         value r = identity(LookupResult.Found(42)); \
+                         return match r { Found(v) => v, Missing => 0 } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn nested_aggregates_execute_correctly() {
+        let text = "record User { id: i64 } \
+                     variant LookupResult { Found(User), Missing } \
+                     func main() -> i64 { \
+                         value user = User { id: 42 }; \
+                         value result = LookupResult.Found(user); \
+                         return match result { \
+                             Found(u) => u.id, \
+                             Missing => 0, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn match_executes_only_the_matching_variant_arm() {
+        let text = "variant Shape { Circle(i64), Square(i64) } \
+                     func main() -> i64 { \
+                         value s = Shape.Square(7); \
+                         return match s { Circle(v) => v * 100, Square(v) => v * 10 } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(70)));
+    }
+
+    #[test]
+    fn match_wildcard_fallback_is_used_when_no_case_matches() {
+        let text = "variant Shape { Circle(i64), Square(i64), Triangle } \
+                     func main() -> i64 { \
+                         value s = Shape.Triangle; \
+                         return match s { Circle(v) => v, Square(v) => v, _ => 99 } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn match_returns_a_value_used_by_the_caller() {
+        let text = "func main() -> i64 { return 1 + match true { true => 41, false => 0 } }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn match_with_one_diverging_arm_still_returns_the_other_arms_value() {
+        let text = "variant Shape { Circle(i64), Empty } \
+                     func f(s: Shape) -> i64 { \
+                         return match s { \
+                             Circle(v) => v, \
+                             Empty => return 42, \
+                         } \
+                     } \
+                     func main() -> i64 { return f(Shape.Circle(7)) }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn fully_diverging_match_never_produces_a_fabricated_value() {
+        let text = "variant Shape { Circle, Empty } \
+                     func f(s: Shape) -> i64 { \
+                         match s { \
+                             Circle => return 1, \
+                             Empty => return 2, \
+                         } \
+                     } \
+                     func main() -> i64 { return f(Shape.Empty) }";
+        assert_eq!(run(text), Ok(Value::Int(2)));
+    }
+
+    #[test]
+    fn nested_variant_pattern_extracts_the_correct_payload() {
+        let text = "variant Inner { X, Y } \
+                     variant Outer { A(Inner), B } \
+                     func main() -> i64 { \
+                         value o = Outer.A(Inner.Y); \
+                         return match o { \
+                             A(X) => 1, \
+                             A(Y) => 2, \
+                             B => 3, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(2)));
+    }
+
+    #[test]
+    fn malformed_switch_on_a_non_variant_value_is_an_error_not_a_panic() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let variant = ItemId(1);
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                params: Vec::new(),
+                return_type: Ty::I64,
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Value {
+                            result: ValueId(0),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        }],
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant,
+                            cases: vec![BlockId(1), BlockId(1)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(Some(ValueId(0))),
+                    },
+                ],
+            }],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_record_field_projection_on_the_wrong_record_is_an_error_not_a_panic() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let record_a = ItemId(1);
+        let record_b = ItemId(2);
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                params: Vec::new(),
+                return_type: Ty::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Named(record_a, name),
+                            kind: ValueKind::RecordCreate(record_a, vec![ValueId(0)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::RecordField {
+                                base: ValueId(1),
+                                record: record_b,
+                                field: 0,
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            }],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured error, not a panic, got {outcome:?}"
         );
     }
 }

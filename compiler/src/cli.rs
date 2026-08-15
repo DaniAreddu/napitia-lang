@@ -157,6 +157,18 @@ fn format_value(value: &Value) -> String {
         Value::Char(v) => v.to_string(),
         Value::Str(v) => v.clone(),
         Value::Unit => "()".to_string(),
+        Value::Record { fields, .. } => {
+            let rendered: Vec<String> = fields.iter().map(format_value).collect();
+            format!("{{{}}}", rendered.join(", "))
+        }
+        Value::Variant { case, payload, .. } => {
+            if payload.is_empty() {
+                format!("<case {case}>")
+            } else {
+                let rendered: Vec<String> = payload.iter().map(format_value).collect();
+                format!("<case {case}>({})", rendered.join(", "))
+            }
+        }
     }
 }
 

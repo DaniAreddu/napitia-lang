@@ -21,9 +21,13 @@ Before adding a feature, check `spec/` and `rfcs/`:
 ## Toolchain
 
 Built and tested against `rustc 1.97.1` (edition 2024, which itself
-requires `rustc >= 1.85`); see `rust-version` in `compiler/Cargo.toml`.
-CI (`.github/workflows/ci.yml`) runs the same three checks on every push
-and pull request.
+requires `rustc >= 1.85`); this exact toolchain is pinned in
+`rust-toolchain.toml` at the repository root, which `rustup` picks up
+automatically. `compiler/Cargo.toml` deliberately leaves `rust-version`
+unset — it would claim a verified minimum supported Rust version, and
+none has been established. CI (`.github/workflows/ci.yml`) installs the
+same pinned toolchain and runs the same three checks on every branch
+push, every pull request, and on manual `workflow_dispatch`.
 
 All contributions must pass, from the repository root:
 

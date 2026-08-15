@@ -97,9 +97,11 @@ none of it is faked in the implementation.
 Napitia's compiler is a single Cargo package rooted at `compiler/` (not
 a Cargo workspace — there is one crate: a `compiler` library plus a thin
 binary named `napitia`). Built and tested against `rustc 1.97.1`
-(edition 2024, which itself requires `rustc >= 1.85`); `rust-version` in
-`compiler/Cargo.toml` records this as the verified toolchain, not a
-guaranteed lower bound.
+(edition 2024, which itself requires `rustc >= 1.85`); `rust-toolchain.toml`
+at the repository root pins this as the tested toolchain (and is what
+`rustup` picks up automatically), not a guaranteed lower bound —
+`compiler/Cargo.toml` deliberately does not set `rust-version`, since no
+minimum has actually been established.
 
 ```bash
 cargo build --manifest-path compiler/Cargo.toml

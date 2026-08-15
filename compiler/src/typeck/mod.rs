@@ -8,6 +8,7 @@ pub mod unify;
 use std::collections::HashMap;
 
 use context::{TypeContext, VarKind};
+use exhaustive::{LiteralKey, ResolvedPattern, VariantSpace};
 use unify::unify;
 
 use crate::diagnostics::Diagnostic;
@@ -37,6 +38,10 @@ mod codes {
     pub const UNKNOWN_FIELD: &str = "T0014";
     pub const FIELD_MUTATION_UNSUPPORTED: &str = "T0015";
     pub const AGGREGATE_EQUALITY_UNSUPPORTED: &str = "T0016";
+    pub const NON_EXHAUSTIVE_MATCH: &str = "T0017";
+    pub const UNREACHABLE_ARM: &str = "T0018";
+    pub const PATTERN_BUDGET_EXCEEDED: &str = "T0019";
+    pub const INCOMPATIBLE_PATTERN: &str = "T0021";
 }
 
 #[derive(Clone)]
@@ -1165,59 +1170,273 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `match` is parsed and its pieces are walked so nested expressions
-    /// still get their own diagnostics (unresolved names and the like),
-    /// but it is not otherwise type-checked: pattern-to-scrutinee
-    /// compatibility and exhaustiveness are not implemented, so claiming
-    /// arms "agree in type" would overstate how much is actually
-    /// verified. Every `match` is therefore reported as an unsupported
-    /// feature, unconditionally.
+    /// `match` is an expression: the scrutinee is checked exactly once,
+    /// every pattern is checked against its type (binding locals to
+    /// their exact resolved type -- never `Ty::Error`), every reachable
+    /// arm body's result is joined through the same `never`-aware join
+    /// `if`/`else` already uses, and the whole arm list is checked for
+    /// exhaustiveness and unreachable arms (`typeck::exhaustive`).
     fn check_match(&mut self, scrutinee: &HirExpr, arms: &[HirMatchArm], span: Span) -> Ty {
-        self.check_expr(scrutinee);
+        let scrutinee_ty = self.check_expr(scrutinee);
+        let scrutinee_diverges = matches!(scrutinee_ty, Ty::Never);
+
+        let mut resolved_patterns = Vec::with_capacity(arms.len());
+        let mut arm_result: Option<Ty> = None;
         for arm in arms {
-            // Pattern-bound names get Ty::Error (not the scrutinee's
-            // type): match isn't semantically checked, so this checker
-            // does not claim to know what type a pattern binding
-            // actually carries.
-            self.bind_pattern(&arm.pattern, &Ty::Error);
-            match &arm.body {
-                HirMatchArmBody::Expr(e) => {
-                    self.check_expr(e);
-                }
-                HirMatchArmBody::Block(b) => {
-                    self.check_block(b);
-                }
-            }
+            let resolved = self.check_pattern(&arm.pattern, &scrutinee_ty);
+            resolved_patterns.push(resolved);
+            let body_ty = match &arm.body {
+                HirMatchArmBody::Expr(e) => self.check_expr(e),
+                HirMatchArmBody::Block(b) => self.check_block(b),
+            };
+            arm_result = Some(match arm_result {
+                None => body_ty,
+                Some(acc) => self.join_diverging_branches(
+                    &acc,
+                    &body_ty,
+                    arm.span,
+                    "match arms must have the same type",
+                ),
+            });
         }
-        self.push_unsupported(
-            span,
-            "match (pattern compatibility and exhaustiveness are not checked)",
-        );
-        Ty::Error
+        let result = arm_result.unwrap_or(Ty::Never);
+
+        // A diverging scrutinee is evaluated exactly once, unconditionally,
+        // before any pattern could ever be tested -- no arm is ever
+        // reached, so the whole match is `never`, mirroring `if`'s
+        // diverging-condition rule exactly. Exhaustiveness/unreachable-
+        // arm analysis is skipped in that case: reachability of arms
+        // that can never run is moot.
+        if scrutinee_diverges {
+            return Ty::Never;
+        }
+
+        self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
+
+        result
     }
 
-    fn bind_pattern(&mut self, pattern: &HirPattern, scrutinee_ty: &Ty) {
+    fn check_match_exhaustiveness(
+        &mut self,
+        scrutinee_ty: &Ty,
+        resolved_patterns: &[ResolvedPattern],
+        arms: &[HirMatchArm],
+        span: Span,
+    ) {
+        let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
+        if matches!(resolved_scrutinee, Ty::Error) {
+            return;
+        }
+        let variant_payloads: HashMap<ItemId, Vec<Vec<Ty>>> = self
+            .variants
+            .iter()
+            .map(|(id, info)| (*id, info.cases.iter().map(|(_, p)| p.clone()).collect()))
+            .collect();
+        let space = VariantSpace {
+            payloads: variant_payloads,
+        };
+        let analysis = exhaustive::analyze_match(&resolved_scrutinee, resolved_patterns, &space);
+
+        if analysis.budget_exceeded {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PATTERN_BUDGET_EXCEEDED,
+                    self.source,
+                    span,
+                    "pattern analysis exceeded its work budget for this match",
+                )
+                .with_primary_label("match is too complex to analyze"),
+            );
+            return;
+        }
+
+        if let Some(witness) = analysis.missing {
+            let description = exhaustive::describe_pattern(&witness, &self.variant_display);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::NON_EXHAUSTIVE_MATCH,
+                    self.source,
+                    span,
+                    format!("non-exhaustive match: missing pattern `{description}`"),
+                )
+                .with_primary_label("this match does not cover every case"),
+            );
+        }
+
+        for &i in &analysis.unreachable {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNREACHABLE_ARM,
+                    self.source,
+                    arms[i].pattern.span(),
+                    "unreachable pattern: already covered by an earlier arm",
+                )
+                .with_primary_label("unreachable"),
+            );
+        }
+    }
+
+    /// Checks one pattern against its scrutinee's type, binding any
+    /// fresh local at its exact resolved type, and returns the
+    /// `ResolvedPattern` the exhaustiveness analysis operates on. Also
+    /// records a `(variant, case)` resolution for `typeck::pattern_case`
+    /// whenever the pattern (a `Variant` pattern, or a bare `Bind`
+    /// pattern whose name matches a payload-less case of the
+    /// scrutinee's own variant type) actually matches a specific case.
+    fn check_pattern(&mut self, pattern: &HirPattern, scrutinee_ty: &Ty) -> ResolvedPattern {
+        let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
         match pattern {
-            HirPattern::Wildcard { .. } => {}
-            HirPattern::Bind { local, .. } => {
+            HirPattern::Wildcard { .. } => ResolvedPattern::Wildcard,
+            HirPattern::Bind {
+                id, local, name, ..
+            } => {
+                if let Ty::Named(item, _) = &resolved_scrutinee
+                    && let Some(info) = self.variants.get(item)
+                    && let Some(case_index) = info
+                        .cases
+                        .iter()
+                        .position(|(case_name, payload)| case_name == name && payload.is_empty())
+                {
+                    self.pattern_case.insert(*id, (*item, case_index));
+                    return ResolvedPattern::Variant {
+                        variant: *item,
+                        case: case_index,
+                        args: Vec::new(),
+                    };
+                }
                 self.locals.insert(
                     *local,
                     LocalInfo {
-                        ty: scrutinee_ty.clone(),
+                        ty: resolved_scrutinee.clone(),
                         mutable: false,
                     },
                 );
+                ResolvedPattern::Wildcard
             }
-            HirPattern::Variant { args, .. } => {
-                for arg in args {
-                    self.bind_pattern(arg, &Ty::Error);
+            HirPattern::Variant {
+                id,
+                name,
+                args,
+                span,
+            } => {
+                let Ty::Named(item, _) = &resolved_scrutinee else {
+                    if !matches!(resolved_scrutinee, Ty::Error) {
+                        self.push_incompatible_pattern(*span, &resolved_scrutinee);
+                    }
+                    for a in args {
+                        self.check_pattern(a, &Ty::Error);
+                    }
+                    return ResolvedPattern::Wildcard;
+                };
+                let Some(info) = self.variants.get(item).cloned() else {
+                    for a in args {
+                        self.check_pattern(a, &Ty::Error);
+                    }
+                    return ResolvedPattern::Wildcard;
+                };
+                let Some(case_index) = info.cases.iter().position(|(n, _)| n == name) else {
+                    let text = self.interner.resolve(*name);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::INCOMPATIBLE_PATTERN,
+                            self.source,
+                            *span,
+                            format!(
+                                "`{}` has no case named `{text}`",
+                                self.display_for_diagnostic(&resolved_scrutinee)
+                            ),
+                        )
+                        .with_primary_label("unknown case in this pattern"),
+                    );
+                    for a in args {
+                        self.check_pattern(a, &Ty::Error);
+                    }
+                    return ResolvedPattern::Wildcard;
+                };
+                self.pattern_case.insert(*id, (*item, case_index));
+                let payload = info.cases[case_index].1.clone();
+                if payload.len() != args.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::ARITY_MISMATCH,
+                            self.source,
+                            *span,
+                            format!(
+                                "expects {} sub-pattern(s), found {}",
+                                payload.len(),
+                                args.len()
+                            ),
+                        )
+                        .with_primary_label("wrong number of sub-patterns"),
+                    );
+                }
+                let resolved_args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let ty = payload.get(i).cloned().unwrap_or(Ty::Error);
+                        self.check_pattern(a, &ty)
+                    })
+                    .collect();
+                ResolvedPattern::Variant {
+                    variant: *item,
+                    case: case_index,
+                    args: resolved_args,
                 }
             }
-            HirPattern::Int { .. }
-            | HirPattern::Str { .. }
-            | HirPattern::Char { .. }
-            | HirPattern::Bool { .. } => {}
+            HirPattern::Int { value, span, .. } => {
+                let literal_ty = self.fresh_default(Ty::I64, VarKind::Integer);
+                self.unify_report(
+                    &resolved_scrutinee,
+                    &literal_ty,
+                    *span,
+                    "pattern does not match the scrutinee's type",
+                );
+                ResolvedPattern::Literal(LiteralKey::Int(*value))
+            }
+            HirPattern::Str { value, span, .. } => {
+                self.unify_report(
+                    &resolved_scrutinee,
+                    &Ty::Str,
+                    *span,
+                    "pattern does not match the scrutinee's type",
+                );
+                ResolvedPattern::Literal(LiteralKey::Str(value.clone()))
+            }
+            HirPattern::Char { value, span, .. } => {
+                self.unify_report(
+                    &resolved_scrutinee,
+                    &Ty::Char,
+                    *span,
+                    "pattern does not match the scrutinee's type",
+                );
+                ResolvedPattern::Literal(LiteralKey::Char(*value))
+            }
+            HirPattern::Bool { value, span, .. } => {
+                self.unify_report(
+                    &resolved_scrutinee,
+                    &Ty::Bool,
+                    *span,
+                    "pattern does not match the scrutinee's type",
+                );
+                ResolvedPattern::Bool(*value)
+            }
         }
+    }
+
+    fn push_incompatible_pattern(&mut self, span: Span, scrutinee_ty: &Ty) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::INCOMPATIBLE_PATTERN,
+                self.source,
+                span,
+                format!(
+                    "a variant pattern is not compatible with the scrutinee's type `{}`",
+                    self.display_for_diagnostic(scrutinee_ty)
+                ),
+            )
+            .with_primary_label("incompatible pattern"),
+        );
     }
 
     /// Allocates a fresh, kinded type variable for a literal, remembering
@@ -1538,21 +1757,76 @@ mod tests {
     }
 
     #[test]
-    fn match_is_reported_as_an_unsupported_feature_regardless_of_arm_types() {
-        // Arm-type agreement is not checked at all: match isn't
-        // semantically validated in Alpha 0.1, so mismatched arms don't
-        // get their own T0001 -- every match unconditionally gets one
-        // T0007, whether or not its arms happen to agree.
+    fn mismatched_match_arm_types_is_a_diagnostic() {
         let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, _ => true } }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
     }
 
     #[test]
-    fn well_typed_match_is_still_reported_as_unsupported() {
+    fn well_typed_exhaustive_match_has_no_diagnostics() {
+        let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, n => n } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn arm_after_a_catch_all_binding_is_unreachable() {
         let diags = check("func f(x: i64) -> i64 { return match x { 1 => 10, n => n, _ => 0 } }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0018");
+    }
+
+    #[test]
+    fn non_exhaustive_variant_match_is_a_diagnostic() {
+        let diags = check(
+            "variant LookupResult { Found(i64), Missing } \
+             func f(r: LookupResult) -> i64 { return match r { Found(v) => v } }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0017");
+        assert!(diags[0].message.contains("Missing"), "{:?}", diags[0]);
+    }
+
+    #[test]
+    fn exhaustive_variant_match_with_nested_pattern_has_no_diagnostics() {
+        let diags = check(
+            "record User { id: i64 } \
+             variant LookupResult { Found(User), Missing } \
+             func f(r: LookupResult) -> i64 { \
+                 return match r { \
+                     Found(user) => user.id, \
+                     Missing => 0, \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn literal_pattern_against_a_variant_scrutinee_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Circle } \
+             func f(s: Shape) -> i64 { return match s { 1 => 1, _ => 0 } }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn variant_pattern_against_a_non_variant_scrutinee_is_a_diagnostic() {
+        let diags = check("func f(x: i64) -> i64 { return match x { Found(v) => v } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0021");
+    }
+
+    #[test]
+    fn diverging_scrutinee_makes_the_whole_match_never() {
+        let diags = check(
+            "func f() -> i64 { \
+                 return match (return 1) { _ => true } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

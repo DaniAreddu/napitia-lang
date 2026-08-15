@@ -1066,6 +1066,18 @@ mod tests {
     }
 
     #[test]
+    fn a_pattern_binding_does_not_leak_into_another_arm() {
+        // `v`, bound in the first arm's pattern, must not be visible in
+        // the second arm's body -- each arm gets its own scope.
+        let (_, diags) = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f(s: Shape) -> i64 { return match s { Circle(v) => v, Empty => v } }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0002");
+    }
+
+    #[test]
     fn record_and_variant_items_are_lowered_with_their_full_structure() {
         let (hir, diags) = lower("record Point { x: i64, y: i64 } variant Shape { Circle }");
         assert!(diags.is_empty());

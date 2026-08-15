@@ -1,0 +1,9 @@
+record User {
+    age: i64,
+}
+
+func main() -> i64 {
+    value u = User { age: 20 };
+    u.age = 21;
+    return u.age
+}

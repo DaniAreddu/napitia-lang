@@ -1028,11 +1028,19 @@ impl<'a> Lowering<'a> {
         args: &[HirExpr],
         call_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
-        let payload_tys = self
-            .variants
-            .get(&variant)
-            .map(|v| v.cases[case].payload.clone())
-            .unwrap_or_default();
+        // A well-typed program always has a real entry here (typeck
+        // already validated the variant and case); a caller that lowers
+        // hand-built HIR bypassing typeck must get a structured
+        // diagnostic instead of an out-of-bounds panic or a fabricated
+        // payload-type hint for an unknown case.
+        let payload_tys = match self.variants.get(&variant).and_then(|v| v.cases.get(case)) {
+            Some(c) => c.payload.clone(),
+            None => {
+                return Err(self.internal_error(&format!(
+                    "variant construction references unknown variant/case ({variant:?}, {case})"
+                )));
+            }
+        };
         let mut payload = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = payload_tys.get(i).cloned().unwrap_or(Ty::Error);
@@ -1089,18 +1097,24 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        let ordered: Vec<ValueId> = by_index
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| {
-                v.unwrap_or_else(|| {
-                    panic!(
-                        "internal invariant: record construction reached NIR lowering missing \
-                         field {i}; typeck/hir::lower must have already rejected it"
-                    )
-                })
-            })
-            .collect();
+        let mut ordered: Vec<ValueId> = Vec::with_capacity(by_index.len());
+        for (i, v) in by_index.into_iter().enumerate() {
+            match v {
+                Some(v) => ordered.push(v),
+                // typeck/hir::lower already reject a source-level missing
+                // field; reaching here means a caller lowered a
+                // HirExpr::RecordLiteral built by hand (or otherwise
+                // bypassing those checks). Lowering must never fabricate a
+                // value for the missing slot, so the whole construction
+                // fails atomically with a structured diagnostic instead of
+                // panicking.
+                None => {
+                    return Err(
+                        self.internal_error(&format!("record construction is missing field {i}"))
+                    );
+                }
+            }
+        }
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(literal_expr),
             ValueKind::RecordCreate(record, ordered),
@@ -2637,6 +2651,179 @@ mod tests {
                 .any(|d| d.message.contains(expect_in_message)),
             "expected a diagnostic mentioning {expect_in_message:?} for {text:?}, got {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn record_construction_missing_a_field_fails_lowering_with_i0002_not_a_panic() {
+        // hir::lower itself diagnoses a missing field (R0009) but does
+        // not synthesize one, so a caller that lowers past *that*
+        // diagnostic too (not just typeck's, unlike every other test in
+        // this module) reaches NIR lowering with a genuinely incomplete
+        // field list. Must fail atomically with a structured
+        // diagnostic, never panic and never fabricate the missing
+        // field's value.
+        let text = "record Point { x: i64, y: i64 } \
+                    func f() { value p = Point { x: 1 }; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, resolve_diags) = lower_hir(&module, id, &interner);
+        assert!(
+            resolve_diags.iter().any(|d| d.code == "R0009"),
+            "expected a missing-field diagnostic from hir::lower: {resolve_diags:?}"
+        );
+        let result = check_module(&hir, id, &interner);
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail for a record literal missing a field")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic, got {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("missing field")),
+            "expected a diagnostic mentioning the missing field, got {diagnostics:?}"
+        );
+    }
+
+    /// Builds a `Lowering` directly (bypassing the whole lex/parse/hir/
+    /// typeck pipeline entirely, not just typeck's diagnostic gate) so a
+    /// single aggregate-lowering method can be exercised with an
+    /// out-of-range index no real frontend ever produces -- the only way
+    /// to reach these defense-in-depth paths at all, since `hir::lower`'s
+    /// own name resolution never emits a case/field index outside its
+    /// declaration's real range.
+    fn direct_lowering<'a>(
+        source: SourceId,
+        interner: &'a Interner,
+        local_types: &'a HashMap<LocalId, Ty>,
+        expr_types: &'a HashMap<ExprId, Ty>,
+        pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
+        records: HashMap<ItemId, RecordLayout>,
+        variants: HashMap<ItemId, VariantLayout>,
+    ) -> Lowering<'a> {
+        Lowering {
+            local_types,
+            expr_types,
+            pattern_case,
+            interner,
+            source,
+            type_names: HashMap::new(),
+            records,
+            variants,
+            function_sigs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn direct_variant_construction_with_an_unknown_case_index_fails_with_i0002_not_a_panic() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        // Case index 7 does not exist on a variant with a single case.
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 7, &[], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an unknown case index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn direct_record_construction_with_an_out_of_range_field_index_fails_with_i0002_not_a_panic() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![(interner.intern("x"), Ty::I64)],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        // Field index 9 does not exist on a record with a single field;
+        // its initializer's value is silently unused rather than
+        // written out of bounds, so the record's one real field (index
+        // 0) is left unset -- exercising the same missing-field
+        // diagnostic path as the source-level test above, but reached
+        // through a fabricated out-of-range index instead.
+        let bad_init = HirFieldInit {
+            field_index: 9,
+            value: HirExpr::Bool {
+                id: ExprId(1),
+                value: true,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &[bad_init], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an out-of-range field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
     }
 
     #[test]

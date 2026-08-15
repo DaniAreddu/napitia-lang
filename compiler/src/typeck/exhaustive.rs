@@ -105,9 +105,17 @@ pub fn is_useful(
             Usefulness::NotUseful
         };
     };
-    let (ty0, rest_tys) = occurrence_types
-        .split_first()
-        .expect("row and occurrence_types stay the same length");
+    // `row` and `occurrence_types` are always built in lockstep by every
+    // caller in this module, so this never actually fires -- but a
+    // malformed `ResolvedPattern` reaching this analysis by some path
+    // this module doesn't control (e.g. a future caller, or a defect
+    // elsewhere) must never be able to turn a compiler-internal
+    // inconsistency into a user-facing panic. Conservatively reporting
+    // "not useful" never fabricates a missing-pattern witness or an
+    // incorrect unreachable-arm diagnostic; it just stops analyzing.
+    let Some((ty0, rest_tys)) = occurrence_types.split_first() else {
+        return Usefulness::NotUseful;
+    };
 
     match head {
         ResolvedPattern::Variant {
@@ -129,7 +137,12 @@ pub fn is_useful(
             new_tys.extend_from_slice(rest_tys);
             match is_useful(&specialized, &new_row, &new_tys, variants, budget) {
                 Usefulness::Useful(mut witness) => {
-                    let args_witness: Vec<_> = witness.drain(0..arity).collect();
+                    // `witness` always has at least `arity` leading
+                    // entries in the well-formed case (one per payload
+                    // position just specialized); clamp defensively so a
+                    // shorter witness can never panic here.
+                    let split = arity.min(witness.len());
+                    let args_witness: Vec<_> = witness.drain(0..split).collect();
                     let mut out = vec![ResolvedPattern::Variant {
                         variant: *variant,
                         case: *case,
@@ -232,7 +245,8 @@ fn try_each_case(
         new_tys.extend_from_slice(rest_tys);
         match is_useful(&specialized, &new_row, &new_tys, variants, budget) {
             Usefulness::Useful(mut witness) => {
-                let args: Vec<_> = witness.drain(0..payload_tys.len()).collect();
+                let split = payload_tys.len().min(witness.len());
+                let args: Vec<_> = witness.drain(0..split).collect();
                 let mut out = vec![ResolvedPattern::Variant {
                     variant: item,
                     case,

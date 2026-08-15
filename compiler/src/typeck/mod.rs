@@ -1181,9 +1181,11 @@ impl<'a> Checker<'a> {
         let scrutinee_diverges = matches!(scrutinee_ty, Ty::Never);
 
         let mut resolved_patterns = Vec::with_capacity(arms.len());
+        let mut any_pattern_invalid = false;
         let mut arm_result: Option<Ty> = None;
         for arm in arms {
-            let resolved = self.check_pattern(&arm.pattern, &scrutinee_ty);
+            let (resolved, valid) = self.check_pattern(&arm.pattern, &scrutinee_ty);
+            any_pattern_invalid |= !valid;
             resolved_patterns.push(resolved);
             let body_ty = match &arm.body {
                 HirMatchArmBody::Expr(e) => self.check_expr(e),
@@ -1211,7 +1213,15 @@ impl<'a> Checker<'a> {
             return Ty::Never;
         }
 
-        self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
+        // A pattern whose declared shape didn't match its scrutinee (an
+        // arity mismatch, an unknown case, ...) already has its own
+        // diagnostic; the coverage matrix built from a fabricated
+        // stand-in for it can't be trusted to prove exhaustiveness or
+        // unreachability, so that analysis -- and its own diagnostics --
+        // are skipped entirely rather than risk a misleading cascade.
+        if !any_pattern_invalid {
+            self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
+        }
 
         result
     }
@@ -1278,15 +1288,32 @@ impl<'a> Checker<'a> {
 
     /// Checks one pattern against its scrutinee's type, binding any
     /// fresh local at its exact resolved type, and returns the
-    /// `ResolvedPattern` the exhaustiveness analysis operates on. Also
-    /// records a `(variant, case)` resolution for `typeck::pattern_case`
-    /// whenever the pattern (a `Variant` pattern, or a bare `Bind`
-    /// pattern whose name matches a payload-less case of the
-    /// scrutinee's own variant type) actually matches a specific case.
-    fn check_pattern(&mut self, pattern: &HirPattern, scrutinee_ty: &Ty) -> ResolvedPattern {
+    /// `ResolvedPattern` the exhaustiveness analysis operates on
+    /// alongside whether the pattern is *valid*: fully consistent with
+    /// its scrutinee/case (no arity mismatch, no unknown case, no
+    /// shape mismatch, and every nested sub-pattern likewise valid).
+    ///
+    /// A `false` result still returns a **structurally well-formed**
+    /// `ResolvedPattern` -- never one whose `Variant::args` length
+    /// disagrees with its case's declared payload arity -- so a caller
+    /// that (incorrectly) fed an invalid pattern into exhaustiveness
+    /// analysis anyway still could not corrupt its row/occurrence-type
+    /// length invariant. `check_match` uses the validity flag to skip
+    /// exhaustiveness/unreachability analysis for the whole match
+    /// instead, since a fabricated stand-in for a malformed pattern
+    /// cannot make that analysis's result trustworthy. Also records a
+    /// `(variant, case)` resolution for `typeck::pattern_case` whenever
+    /// the pattern (a `Variant` pattern, or a bare `Bind` pattern whose
+    /// name matches a payload-less case of the scrutinee's own variant
+    /// type) actually matches a specific case.
+    fn check_pattern(
+        &mut self,
+        pattern: &HirPattern,
+        scrutinee_ty: &Ty,
+    ) -> (ResolvedPattern, bool) {
         let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
         match pattern {
-            HirPattern::Wildcard { .. } => ResolvedPattern::Wildcard,
+            HirPattern::Wildcard { .. } => (ResolvedPattern::Wildcard, true),
             HirPattern::Bind {
                 id, local, name, ..
             } => {
@@ -1298,11 +1325,14 @@ impl<'a> Checker<'a> {
                         .position(|(case_name, payload)| case_name == name && payload.is_empty())
                 {
                     self.pattern_case.insert(*id, (*item, case_index));
-                    return ResolvedPattern::Variant {
-                        variant: *item,
-                        case: case_index,
-                        args: Vec::new(),
-                    };
+                    return (
+                        ResolvedPattern::Variant {
+                            variant: *item,
+                            case: case_index,
+                            args: Vec::new(),
+                        },
+                        true,
+                    );
                 }
                 self.locals.insert(
                     *local,
@@ -1311,7 +1341,7 @@ impl<'a> Checker<'a> {
                         mutable: false,
                     },
                 );
-                ResolvedPattern::Wildcard
+                (ResolvedPattern::Wildcard, true)
             }
             HirPattern::Variant {
                 id,
@@ -1326,13 +1356,13 @@ impl<'a> Checker<'a> {
                     for a in args {
                         self.check_pattern(a, &Ty::Error);
                     }
-                    return ResolvedPattern::Wildcard;
+                    return (ResolvedPattern::Wildcard, false);
                 };
                 let Some(info) = self.variants.get(item).cloned() else {
                     for a in args {
                         self.check_pattern(a, &Ty::Error);
                     }
-                    return ResolvedPattern::Wildcard;
+                    return (ResolvedPattern::Wildcard, false);
                 };
                 let Some(case_index) = info.cases.iter().position(|(n, _)| n == name) else {
                     let text = self.interner.resolve(*name);
@@ -1351,18 +1381,20 @@ impl<'a> Checker<'a> {
                     for a in args {
                         self.check_pattern(a, &Ty::Error);
                     }
-                    return ResolvedPattern::Wildcard;
+                    return (ResolvedPattern::Wildcard, false);
                 };
                 self.pattern_case.insert(*id, (*item, case_index));
                 let payload = info.cases[case_index].1.clone();
-                if payload.len() != args.len() {
+                let mut valid = payload.len() == args.len();
+                if !valid {
+                    let text = self.interner.resolve(*name);
                     self.diagnostics.push(
                         Diagnostic::error(
                             codes::ARITY_MISMATCH,
                             self.source,
                             *span,
                             format!(
-                                "expects {} sub-pattern(s), found {}",
+                                "`{text}` expects {} sub-pattern(s), found {}",
                                 payload.len(),
                                 args.len()
                             ),
@@ -1370,19 +1402,38 @@ impl<'a> Checker<'a> {
                         .with_primary_label("wrong number of sub-patterns"),
                     );
                 }
-                let resolved_args = args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let ty = payload.get(i).cloned().unwrap_or(Ty::Error);
-                        self.check_pattern(a, &ty)
-                    })
-                    .collect();
-                ResolvedPattern::Variant {
-                    variant: *item,
-                    case: case_index,
-                    args: resolved_args,
+                // The resolved pattern's arity always matches the
+                // case's *declared* payload arity, regardless of how
+                // many sub-patterns were actually written -- never the
+                // arg count from a possibly-malformed pattern (see this
+                // method's doc comment). A missing position (too few
+                // sub-patterns) has no HirPattern to check and is
+                // padded with a wildcard; a supplied sub-pattern beyond
+                // the declared arity (too many) is still checked here,
+                // for its own independent diagnostics, but excluded
+                // from the resolved pattern.
+                let mut resolved_args = Vec::with_capacity(payload.len());
+                for (i, payload_ty) in payload.iter().enumerate() {
+                    match args.get(i) {
+                        Some(a) => {
+                            let (resolved, arg_valid) = self.check_pattern(a, payload_ty);
+                            valid &= arg_valid;
+                            resolved_args.push(resolved);
+                        }
+                        None => resolved_args.push(ResolvedPattern::Wildcard),
+                    }
                 }
+                for extra in args.iter().skip(payload.len()) {
+                    self.check_pattern(extra, &Ty::Error);
+                }
+                (
+                    ResolvedPattern::Variant {
+                        variant: *item,
+                        case: case_index,
+                        args: resolved_args,
+                    },
+                    valid,
+                )
             }
             HirPattern::Int { value, span, .. } => {
                 let literal_ty = self.fresh_default(Ty::I64, VarKind::Integer);
@@ -1392,7 +1443,7 @@ impl<'a> Checker<'a> {
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                ResolvedPattern::Literal(LiteralKey::Int(*value))
+                (ResolvedPattern::Literal(LiteralKey::Int(*value)), true)
             }
             HirPattern::Str { value, span, .. } => {
                 self.unify_report(
@@ -1401,7 +1452,10 @@ impl<'a> Checker<'a> {
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                ResolvedPattern::Literal(LiteralKey::Str(value.clone()))
+                (
+                    ResolvedPattern::Literal(LiteralKey::Str(value.clone())),
+                    true,
+                )
             }
             HirPattern::Char { value, span, .. } => {
                 self.unify_report(
@@ -1410,7 +1464,7 @@ impl<'a> Checker<'a> {
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                ResolvedPattern::Literal(LiteralKey::Char(*value))
+                (ResolvedPattern::Literal(LiteralKey::Char(*value)), true)
             }
             HirPattern::Bool { value, span, .. } => {
                 self.unify_report(
@@ -1419,7 +1473,7 @@ impl<'a> Checker<'a> {
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                ResolvedPattern::Bool(*value)
+                (ResolvedPattern::Bool(*value), true)
             }
         }
     }
@@ -1817,6 +1871,71 @@ mod tests {
         let diags = check("func f(x: i64) -> i64 { return match x { Found(v) => v } }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0021");
+    }
+
+    #[test]
+    fn too_many_variant_sub_patterns_is_a_diagnostic_not_a_panic() {
+        let diags = check(
+            "variant V { A(i64) } \
+             func test(v: V) -> i64 { \
+                 return match v { \
+                     A(x, y) => x, \
+                     _ => 0 \
+                 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn too_few_variant_sub_patterns_is_a_diagnostic_not_a_panic() {
+        let diags = check(
+            "variant V { A(i64, i64) } \
+             func test(v: V) -> i64 { \
+                 return match v { \
+                     A(x) => x, \
+                     _ => 0 \
+                 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn nested_wrong_arity_pattern_is_a_diagnostic_not_a_panic() {
+        let diags = check(
+            "variant Inner { X(i64) } \
+             variant Outer { A(Inner) } \
+             func test(o: Outer) -> i64 { \
+                 return match o { \
+                     A(X(a, b)) => a, \
+                     _ => 0 \
+                 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn wrong_arity_pattern_with_no_catch_all_suppresses_exhaustiveness_cascade() {
+        // Without a valid coverage matrix, a wrong-arity arm must not
+        // also produce a non-exhaustive-match diagnostic: the coverage
+        // analysis cannot be trusted once any arm's pattern is invalid,
+        // so it is skipped entirely rather than risk a misleading
+        // cascade on top of the arity diagnostic.
+        let diags = check(
+            "variant V { A(i64) } \
+             func test(v: V) -> i64 { \
+                 return match v { \
+                     A(x, y) => x \
+                 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
     }
 
     #[test]

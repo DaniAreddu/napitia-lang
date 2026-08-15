@@ -118,19 +118,68 @@ complete `Module` is produced, or one or more failed and the only thing
 produced is diagnostics, never a `Module` with some functions silently
 missing.
 
+The public `nir::lower_module` entry point does not rely on the type
+checker having already rejected every construct Alpha 0.1's NIR cannot
+represent — it is defense-in-depth against being called directly,
+bypassing the normal `check`-then-`ir` driver. Casts, postfix `?`,
+ranges, `defer`, function values, field access, `match`, a
+value-carrying `break`, and a named aggregate type in a function
+signature each produce an `I0001` diagnostic from the lowerer itself,
+never identity lowering, a range's left endpoint, `Const::Unit`,
+silently ignored cleanup, a discarded value, or a fake `Ty::Error`
+instruction.
+
 ### Verification
 
 Between lowering and interpretation, a verifier pass re-checks the
-produced NIR independently of how it was built: every function/block id
-is unique, every function has an entry block, every branch target and
-called function exists, every referenced value was actually defined,
-every `load`/`store` targets a slot a matching `alloc` produced, stored
-values match the slot's declared type, branch conditions are `bool`,
-returned values match the declared return type, instruction operand and
-result types agree, and no unresolved type variable or error type
-survives into executable NIR. It reports structured diagnostics and
-never panics; a module that fails verification is never handed to the
-interpreter.
+produced NIR independently of how it was built — it does not trust the
+lowerer, and re-derives every invariant from the `Module` value itself:
+
+- **Structure**: every function/block id is unique; every branch target
+  and called function exists; call argument counts match.
+- **Entry block**: every function has exactly one block with id
+  `BlockId(0)`, which is its entry block *by id*, regardless of where it
+  sits in the function's block vector — nothing (verifier, interpreter,
+  or printer) is permitted to treat `blocks[0]` as the entry point.
+- **Unique definitions**: every `ValueId` is defined exactly once across
+  a function's parameters and instruction results combined; a duplicate
+  parameter, a duplicate instruction result, or a parameter colliding
+  with an instruction result are each rejected.
+- **Definition before use**: a same-block use of a value must occur
+  after the instruction that defines it (parameters are defined at
+  function entry, before every block); an unknown or purely
+  forward-referenced value is rejected.
+- **Dominance**: a cross-block use of a value must be dominated by its
+  definition, computed from real CFG predecessor/dominator analysis —
+  block-vector order is never a substitute. This also governs
+  `alloc`/`load`/`store`: an `alloc` must dominate every `load`/`store`
+  against its slot. A value defined only in one arm of a branch cannot
+  be used in the sibling arm or in a merge block that does not sit
+  strictly after both arms converge.
+- **Types**: stored values match the slot's declared type, branch
+  conditions are `bool`, returned values match the declared return
+  type, instruction operand/result types agree, and no unresolved type
+  variable or `Ty::Error` survives into executable NIR.
+
+It reports structured diagnostics (`V0001`–`V0018` as of this milestone)
+and never panics; a module that fails verification is never handed to
+the interpreter, and the interpreter's normal entry point
+(`Interpreter::run`) only ever receives a verified module — there is no
+path through the driver that skips verification. `Interpreter::call`
+additionally validates argument count against the function's declared
+parameter count and starts execution explicitly at `BlockId(0)`, never
+at whatever happens to be first in the block vector.
+
+Because valid source cannot produce a `Vxxxx` code (verifier codes are
+reachable only by a lowerer bug or by constructing malformed NIR
+directly, which is exactly what the verifier's own test suite does),
+and because lowering itself is atomic and rejects every construct it
+does not support with a source-associated `Ixxxx` diagnostic (never a
+silent `Ty::Error`, identity lowering, or discarded value — see
+"Lowering from HIR" above), a program that passes `napitia check` is
+guaranteed to either lower and verify cleanly or fail `napitia ir` with
+an `Ixxxx` diagnostic; it can never panic and can never reach the
+interpreter partially lowered or unverified.
 
 ## Accepted design direction
 

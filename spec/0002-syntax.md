@@ -102,6 +102,18 @@ pattern matching beyond the primitive-typed subset are accepted
 direction, not implemented, and are checked, reported errors rather
 than silently accepted (see `spec/0003-type-system.md`).
 
+A named `record`/`variant` type is nominal (two declarations are
+distinct types even with identical fields, compared by declaration
+identity, never by name or structure) and `napitia check` accepts it
+anywhere a type is expected, including function parameter and return
+position — `check` never rejects a well-formed reference to a declared
+name. Alpha 0.1's NIR, however, has no aggregate runtime representation
+yet (see `spec/0006-napitia-ir.md`); `napitia ir`/`run` reject a
+function signature that mentions a named aggregate type with a
+dedicated, source-associated `I0001` diagnostic at lowering time —
+never by silently treating the type as an error, and never by only
+being caught later by the NIR verifier.
+
 ### Types
 
 ```text

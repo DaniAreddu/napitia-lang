@@ -77,6 +77,43 @@ inference, without introducing a separate compile-time-only numeric type.
   to unify with the same type and produce `bool`. Logical `&&`/`||` require
   both operands to be `bool`.
 
+### Control-flow divergence (`never`)
+
+`never` is not merely "unifies with anything" in isolation — it is
+propagated according to exact rules so that which branch of a construct
+diverges never changes the construct's resulting type or runtime
+behavior:
+
+- **Strict evaluation propagates `never`.** Any expression that always
+  evaluates a given subexpression takes on type `never` if that
+  subexpression is `never`: unary operators, arithmetic/comparison/
+  bitwise/shift binary operators (either operand), function calls (any
+  argument), and assignment (the right-hand side).
+- **Short-circuit operators are the one exception.** `&&`/`||` only
+  always evaluate their left operand; a `never` left operand makes the
+  whole expression `never`, but a `never` right operand does not, since
+  it may never execute.
+- **`if`/`else if` joins are symmetric.** The resulting type is:
+  `never` join `never` = `never`; `never` join `T` = `T`; `T` join
+  `never` = `T`; `T` join `U` = `unify(T, U)`. This is applied
+  recursively through an `else if` chain. Only the non-diverging branch
+  (if any) determines the join's type — a partially diverging `if` is
+  never itself typed `never`, since one branch does still produce a
+  value. If the *condition* itself is `never`, the whole `if` is
+  `never` regardless of the branches (which are still checked for
+  independent diagnostics, but do not contribute to the result type).
+- **An `if` with no `else` is always `unit`-typed**, whether or not the
+  `then` branch diverges — there is no implicit `else` branch that
+  could produce a different type.
+- **`while` and a binding's initializer turn divergence into statement
+  divergence**: a `never`-typed condition or initializer means the
+  enclosing `while`/binding statement itself diverges, not that some
+  other expression silently receives type `never`.
+- Every relevant divergent expression's resolved type is recorded as
+  `Ty::Never` and can be inspected directly via `expr_types` — this is
+  exercised by tests, not just asserted by the diagnostics a divergent
+  program does or doesn't produce.
+
 ### Diagnostics
 
 Type errors report the two types that failed to unify and a single span

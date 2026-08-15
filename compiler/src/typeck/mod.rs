@@ -33,6 +33,10 @@ mod codes {
     pub const FUNCTION_NOT_FIRST_CLASS: &str = "T0010";
     pub const LOOP_CONTROL_OUTSIDE_LOOP: &str = "T0011";
     pub const INVALID_MAIN_SIGNATURE: &str = "T0012";
+    pub const FIELD_ACCESS_NON_RECORD: &str = "T0013";
+    pub const UNKNOWN_FIELD: &str = "T0014";
+    pub const FIELD_MUTATION_UNSUPPORTED: &str = "T0015";
+    pub const AGGREGATE_EQUALITY_UNSUPPORTED: &str = "T0016";
 }
 
 #[derive(Clone)]
@@ -502,10 +506,18 @@ impl<'a> Checker<'a> {
                 );
                 Ty::Error
             }
-            // Resolved by `hir::lower`, but not yet semantically
-            // checked -- construction/constructor validation lands in
-            // a following commit.
-            HirExpr::CaseRef { .. } => Ty::Error,
+            // A bare (uncalled) reference to a variant case constructor
+            // is itself a complete value only when the case carries no
+            // payload; `Call`'s own arm handles a `CaseRef` used as a
+            // callee, so reaching this arm bare means the case was
+            // referenced directly, e.g. `LookupResult.Missing`.
+            HirExpr::CaseRef {
+                variant,
+                case,
+                name,
+                span,
+                ..
+            } => self.check_case_ref(*variant, *case, *name, *span),
             HirExpr::Unary {
                 op, operand, span, ..
             } => self.check_unary(*op, operand, *span),
@@ -526,11 +538,9 @@ impl<'a> Checker<'a> {
             HirExpr::Call {
                 callee, args, span, ..
             } => self.check_call(callee, args, *span),
-            HirExpr::Field { base, span, .. } => {
-                self.check_expr(base);
-                self.push_unsupported(*span, "field access");
-                Ty::Error
-            }
+            HirExpr::Field {
+                base, name, span, ..
+            } => self.check_field_access(base, *name, *span),
             HirExpr::Cast { expr, ty, span, .. } => {
                 self.check_expr(expr);
                 // Still resolve the target type name, so an unknown
@@ -559,17 +569,12 @@ impl<'a> Checker<'a> {
                 ..
             } => self.check_match(scrutinee, arms, *span),
             HirExpr::Block(block) => self.check_block(block),
-            // Resolved by `hir::lower`, but not yet semantically
-            // checked -- each field's own value is still checked, for
-            // cascading diagnostics; full construction validation
-            // (missing/duplicate/unknown field, field type) lands in a
-            // following commit.
-            HirExpr::RecordLiteral { fields, .. } => {
-                for f in fields {
-                    self.check_expr(&f.value);
-                }
-                Ty::Error
-            }
+            HirExpr::RecordLiteral {
+                record,
+                fields,
+                span,
+                ..
+            } => self.check_record_literal(*record, fields, *span),
             HirExpr::Return { value, span, .. } => {
                 let value_ty = value
                     .as_ref()
@@ -695,12 +700,28 @@ impl<'a> Checker<'a> {
                 self.require_integer(&lt, span);
                 lt
             }
-            BinaryOp::Eq
-            | BinaryOp::Ne
-            | BinaryOp::Lt
-            | BinaryOp::Le
-            | BinaryOp::Gt
-            | BinaryOp::Ge => {
+            BinaryOp::Eq | BinaryOp::Ne => {
+                if self.is_aggregate(&lt) || self.is_aggregate(&rt) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::AGGREGATE_EQUALITY_UNSUPPORTED,
+                            self.source,
+                            span,
+                            "record/variant equality is not implemented in Alpha 0.1.1",
+                        )
+                        .with_primary_label("aggregate equality"),
+                    );
+                    return Ty::Error;
+                }
+                self.unify_report(
+                    &lt,
+                    &rt,
+                    span,
+                    "operands of a comparison must have the same type",
+                );
+                Ty::Bool
+            }
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                 self.unify_report(
                     &lt,
                     &rt,
@@ -734,12 +755,24 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            // Field access already gets its own "unsupported feature"
-            // diagnostic from check_expr above; Error already traces
-            // back to a diagnostic recorded elsewhere. Neither needs a
-            // second, redundant complaint about being an invalid
-            // target on top of that.
-            HirExpr::Field { .. } | HirExpr::Error { .. } => {}
+            // Field mutation gets its own dedicated diagnostic (T0015),
+            // distinct from T0008's generic "invalid assignment
+            // target" -- the point being made is that mutation itself
+            // is unimplemented, not that the target shape is wrong.
+            // `Error` already traces back to a diagnostic recorded
+            // elsewhere and needs no second complaint.
+            HirExpr::Field { span, .. } => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::FIELD_MUTATION_UNSUPPORTED,
+                        self.source,
+                        *span,
+                        "field mutation is not implemented in Alpha 0.1.1",
+                    )
+                    .with_primary_label("cannot assign to a field"),
+                );
+            }
+            HirExpr::Error { .. } => {}
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -785,6 +818,16 @@ impl<'a> Checker<'a> {
     }
 
     fn check_call(&mut self, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
+        if let HirExpr::CaseRef {
+            variant,
+            case,
+            name,
+            ..
+        } = callee
+        {
+            return self.check_variant_construct(*variant, *case, *name, args, span);
+        }
+
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
         let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
 
@@ -851,6 +894,209 @@ impl<'a> Checker<'a> {
         // argument that never produces a value means the call is never
         // actually reached.
         if any_arg_never { Ty::Never } else { sig.ret }
+    }
+
+    /// A bare (uncalled) variant-case reference: only valid when that
+    /// case carries no payload, in which case it is itself a complete
+    /// value of the variant's type -- `LookupResult.Missing` needs no
+    /// call syntax at all, matching a unit case allocating no
+    /// fabricated payload.
+    fn check_case_ref(&mut self, variant: ItemId, case: usize, name: Symbol, span: Span) -> Ty {
+        let Some(info) = self.variants.get(&variant).cloned() else {
+            return Ty::Error;
+        };
+        let (case_name, payload) = &info.cases[case];
+        if !payload.is_empty() {
+            let text = self.interner.resolve(*case_name);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    self.source,
+                    span,
+                    format!(
+                        "`{text}` expects {} argument(s), found 0 (write `{text}(...)`)",
+                        payload.len()
+                    ),
+                )
+                .with_primary_label("missing constructor arguments"),
+            );
+            return Ty::Error;
+        }
+        Ty::Named(variant, name)
+    }
+
+    fn check_variant_construct(
+        &mut self,
+        variant: ItemId,
+        case: usize,
+        name: Symbol,
+        args: &[HirExpr],
+        span: Span,
+    ) -> Ty {
+        let Some(info) = self.variants.get(&variant).cloned() else {
+            for a in args {
+                self.check_expr(a);
+            }
+            return Ty::Error;
+        };
+        let (case_name, payload) = info.cases[case].clone();
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
+        let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
+
+        if payload.len() != args.len() {
+            let text = self.interner.resolve(case_name);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    self.source,
+                    span,
+                    format!(
+                        "`{text}` expects {} argument(s), found {}",
+                        payload.len(),
+                        args.len()
+                    ),
+                )
+                .with_primary_label("wrong number of arguments"),
+            );
+        } else {
+            for (arg_ty, payload_ty) in arg_tys.iter().zip(payload.iter()) {
+                self.unify_report(
+                    payload_ty,
+                    arg_ty,
+                    span,
+                    "payload argument type does not match the case's declared type",
+                );
+            }
+        }
+
+        if any_arg_never {
+            Ty::Never
+        } else {
+            Ty::Named(variant, name)
+        }
+    }
+
+    /// `TypeName { field: expr, ... }`. `hir::lower` already resolved
+    /// every field name to its declaration index and every field's
+    /// presence/duplication (`R0007`-`R0010`); this only needs to check
+    /// each field's initializer against its declared type, in source
+    /// order, propagating `never` exactly like a record's fields are
+    /// evaluated (RFC 0005).
+    fn check_record_literal(
+        &mut self,
+        record: ItemId,
+        fields: &[crate::hir::HirFieldInit],
+        span: Span,
+    ) -> Ty {
+        let Some(info) = self.records.get(&record).cloned() else {
+            for f in fields {
+                self.check_expr(&f.value);
+            }
+            return Ty::Error;
+        };
+        let mut diverged = false;
+        for f in fields {
+            let field_ty = self.check_expr(&f.value);
+            if matches!(field_ty, Ty::Never) {
+                diverged = true;
+            }
+            let (_, declared_ty) = &info.fields[f.field_index];
+            self.unify_report(
+                declared_ty,
+                &field_ty,
+                f.span,
+                "the field's initializer does not match its declared type",
+            );
+        }
+        let _ = span;
+        if diverged {
+            Ty::Never
+        } else {
+            self.named_record_ty(record)
+        }
+    }
+
+    /// Ordinary `base.field` access: the base must resolve to a
+    /// declared record type, and the field must exist on it -- both
+    /// depend on the base's *inferred* type, which is why (unlike
+    /// record construction/variant constructors) this can only be
+    /// checked here, not during `hir::lower`.
+    fn check_field_access(&mut self, base: &HirExpr, name: Symbol, span: Span) -> Ty {
+        let base_ty = self.check_expr(base);
+        if matches!(base_ty, Ty::Never) {
+            return Ty::Never;
+        }
+        if matches!(base_ty, Ty::Error) {
+            return Ty::Error;
+        }
+        let Ty::Named(item, _) = &base_ty else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::FIELD_ACCESS_NON_RECORD,
+                    self.source,
+                    span,
+                    format!(
+                        "field access on a non-record type `{}`",
+                        self.display_for_diagnostic(&base_ty)
+                    ),
+                )
+                .with_primary_label("not a record"),
+            );
+            return Ty::Error;
+        };
+        let Some(info) = self.records.get(item).cloned() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::FIELD_ACCESS_NON_RECORD,
+                    self.source,
+                    span,
+                    format!(
+                        "field access on `{}`, which is a variant, not a record",
+                        self.display_for_diagnostic(&base_ty)
+                    ),
+                )
+                .with_primary_label("not a record"),
+            );
+            return Ty::Error;
+        };
+        match info.fields.iter().find(|(n, _)| *n == name) {
+            Some((_, ty)) => ty.clone(),
+            None => {
+                let text = self.interner.resolve(name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_FIELD,
+                        self.source,
+                        span,
+                        format!(
+                            "`{}` has no field named `{text}`",
+                            self.display_for_diagnostic(&base_ty)
+                        ),
+                    )
+                    .with_primary_label("unknown field"),
+                );
+                Ty::Error
+            }
+        }
+    }
+
+    fn is_aggregate(&self, ty: &Ty) -> bool {
+        let resolved = self.ctx.resolve(ty);
+        matches!(resolved, Ty::Named(item, _) if self.records.contains_key(&item) || self.variants.contains_key(&item))
+    }
+
+    /// Builds `Ty::Named` for a record item, resolving a display symbol
+    /// from the module's type namespace (the same one `resolve_named_type`
+    /// already searches) rather than requiring every call site to thread
+    /// the record's own `Symbol` through separately.
+    fn named_record_ty(&self, record: ItemId) -> Ty {
+        let symbol = self
+            .type_names
+            .iter()
+            .find(|(_, id)| **id == record)
+            .map(|(name, _)| *name)
+            .expect("internal invariant: a resolved record ItemId is always in type_names");
+        Ty::Named(record, symbol)
     }
 
     fn check_if(
@@ -1343,10 +1589,10 @@ mod tests {
     }
 
     #[test]
-    fn field_access_is_reported_as_an_unsupported_feature() {
+    fn field_access_on_a_primitive_type_is_a_diagnostic() {
         let diags = check("func f(x: i64) -> i64 { return x.y }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0013");
     }
 
     #[test]
@@ -1808,5 +2054,153 @@ mod tests {
         };
         assert_ne!(left.id(), right.id());
         assert_ne!(left.id(), binary.id());
+    }
+
+    #[test]
+    fn well_typed_record_construction_has_no_diagnostics() {
+        let diags = check(
+            "record User { id: i64, enabled: bool } \
+             func f() -> i64 { value u = User { id: 1, enabled: true }; return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn record_field_type_mismatch_is_a_diagnostic() {
+        let diags = check(
+            "record User { id: i64 } \
+             func f() { value u = User { id: true }; }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn well_typed_field_access_returns_the_declared_field_type() {
+        let diags = check(
+            "record User { id: i64 } \
+             func f(u: User) -> i64 { return u.id }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn unknown_field_access_is_a_diagnostic() {
+        let diags = check(
+            "record User { id: i64 } \
+             func f(u: User) -> i64 { return u.age }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0014");
+    }
+
+    #[test]
+    fn field_access_on_a_variant_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Circle } \
+             func f(s: Shape) -> i64 { return s.x }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0013");
+    }
+
+    #[test]
+    fn field_mutation_is_a_diagnostic() {
+        let diags = check(
+            "record User { age: i64 } \
+             func f(u: User) { u.age = 20; }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0015");
+    }
+
+    #[test]
+    fn well_typed_variant_construction_has_no_diagnostics() {
+        let diags = check(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Circle(1); value e = Shape.Empty; return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn variant_payload_arity_mismatch_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Circle(i64) } \
+             func f() { value s = Shape.Circle(1, 2); }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn variant_payload_type_mismatch_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Circle(i64) } \
+             func f() { value s = Shape.Circle(true); }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn bare_unit_case_reference_needs_no_call_syntax() {
+        let diags = check(
+            "variant Shape { Empty } \
+             func f() { value s = Shape.Empty; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn bare_case_reference_missing_required_payload_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Circle(i64) } \
+             func f() { value s = Shape.Circle; }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn record_equality_is_a_diagnostic() {
+        let diags = check(
+            "record Point { x: i64 } \
+             func f(a: Point, b: Point) -> bool { return a == b }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0016");
+    }
+
+    #[test]
+    fn variant_equality_is_a_diagnostic() {
+        let diags = check(
+            "variant Shape { Empty } \
+             func f(a: Shape, b: Shape) -> bool { return a != b }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0016");
+    }
+
+    #[test]
+    fn record_values_pass_through_function_calls() {
+        let diags = check(
+            "record Point { x: i64 } \
+             func identity(p: Point) -> Point { return p } \
+             func f(p: Point) -> Point { return identity(p) }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn diverging_record_field_initializer_makes_construction_never() {
+        let diags = check(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { \
+                 value p = Point { x: return 1, y: 2 }; \
+                 return 0 \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

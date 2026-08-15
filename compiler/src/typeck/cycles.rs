@@ -158,7 +158,6 @@ pub fn check_cycles(
                         diagnostics.push(cycle_diagnostic(
                             &path[start_idx..],
                             &nodes,
-                            current,
                             edge,
                             source,
                             interner,
@@ -176,7 +175,6 @@ pub fn check_cycles(
 fn cycle_diagnostic(
     cycle: &[ItemId],
     nodes: &HashMap<ItemId, Node>,
-    closing_from: ItemId,
     closing_edge: &Edge,
     source: SourceId,
     interner: &Interner,
@@ -188,8 +186,13 @@ fn cycle_diagnostic(
         }
         path_text.push_str(interner.resolve(nodes[id].name));
     }
+    // The cycle always closes back to its own entry point (`cycle[0]`,
+    // the same node `closing_edge` targets) -- never to whichever node
+    // happened to be current when the closing edge was found, which for
+    // an indirect cycle is a different, *later* node on the path (e.g.
+    // `A -> B -> A` must render as exactly that, not `A -> B -> B`).
     path_text.push_str(" -> ");
-    path_text.push_str(interner.resolve(nodes[&closing_from].name));
+    path_text.push_str(interner.resolve(nodes[&cycle[0]].name));
 
     let head_name = interner.resolve(nodes[&cycle[0]].name);
     let mut diag = Diagnostic::error(
@@ -209,4 +212,154 @@ fn cycle_diagnostic(
         diag = diag.with_label(node.span, format!("part of the cycle: `{name}`"));
     }
     diag
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::{HirCase, HirField, HirRecord, HirVariant};
+    use crate::source::SourceMap;
+
+    fn record(id: u32, name: Symbol, field_name: Symbol, field_ty: Ty) -> (HirRecord, Ty) {
+        (
+            HirRecord {
+                id: ItemId(id),
+                name,
+                span: Span::dummy(),
+                fields: vec![HirField {
+                    name: field_name,
+                    span: Span::dummy(),
+                    ty: crate::syntax::ast::Type {
+                        name: crate::syntax::ast::Ident {
+                            symbol: name,
+                            span: Span::dummy(),
+                        },
+                    },
+                }],
+            },
+            field_ty,
+        )
+    }
+
+    fn variant(id: u32, name: Symbol, case_name: Symbol, payload_ty: Ty) -> (HirVariant, Ty) {
+        (
+            HirVariant {
+                id: ItemId(id),
+                name,
+                span: Span::dummy(),
+                cases: vec![HirCase {
+                    name: case_name,
+                    span: Span::dummy(),
+                    payload: vec![crate::syntax::ast::Type {
+                        name: crate::syntax::ast::Ident {
+                            symbol: name,
+                            span: Span::dummy(),
+                        },
+                    }],
+                }],
+            },
+            payload_ty,
+        )
+    }
+
+    /// Runs `check_cycles` over a hand-built module of records only,
+    /// each `records[i]` having a single field of type `records[i +
+    /// 1]` (wrapping around), so `check_cycles` never needs to resolve
+    /// anything itself: `field_types`/`payload_types` are already
+    /// exactly the `Ty::Named` edges this test wants to exist.
+    fn check_record_cycle(names: &[&str]) -> (Vec<Diagnostic>, Vec<String>, Interner) {
+        let mut interner = Interner::new();
+        let symbols: Vec<Symbol> = names.iter().map(|n| interner.intern(n)).collect();
+        let mut records = Vec::new();
+        let mut field_types = HashMap::new();
+        for (i, &sym) in symbols.iter().enumerate() {
+            let next = symbols[(i + 1) % symbols.len()];
+            let next_id = ItemId((i as u32 + 1) % symbols.len() as u32);
+            let (r, ty) = record(i as u32, sym, next, Ty::Named(next_id, next));
+            field_types.insert(r.id, vec![ty]);
+            records.push(r);
+        }
+        let hir = HirModule {
+            functions: Vec::new(),
+            records,
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), source, &interner);
+        (
+            diagnostics,
+            names.iter().map(|s| s.to_string()).collect(),
+            interner,
+        )
+    }
+
+    #[test]
+    fn direct_self_cycle_path_text_is_exact() {
+        let (diags, _, _) = check_record_cycle(&["A"]);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert!(diags[0].message.contains("A -> A"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn two_node_indirect_cycle_path_text_is_exact() {
+        let (diags, _, _) = check_record_cycle(&["A", "B"]);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert!(
+            diags[0].message.contains("A -> B -> A"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("A -> B -> B"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn three_node_indirect_cycle_path_text_is_exact() {
+        let (diags, _, _) = check_record_cycle(&["A", "B", "C"]);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert!(
+            diags[0].message.contains("A -> B -> C -> A"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn mixed_record_and_variant_cycle_path_text_is_exact() {
+        let mut interner = Interner::new();
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let field_name = interner.intern("next");
+        let case_name = interner.intern("X");
+        let (record_a, record_ty) = record(0, a, field_name, Ty::Named(ItemId(1), b));
+        let (variant_b, variant_ty) = variant(1, b, case_name, Ty::Named(ItemId(0), a));
+        let mut field_types = HashMap::new();
+        field_types.insert(record_a.id, vec![record_ty]);
+        let mut payload_types = HashMap::new();
+        payload_types.insert(variant_b.id, vec![vec![variant_ty]]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![record_a],
+            variants: vec![variant_b],
+            other_items: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = check_cycles(&hir, &field_types, &payload_types, source, &interner);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("A -> B -> A"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
 }

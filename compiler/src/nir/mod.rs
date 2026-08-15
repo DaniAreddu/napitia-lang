@@ -25,6 +25,34 @@ use crate::types::Ty;
 #[derive(Debug, Clone, Default)]
 pub struct Module {
     pub functions: Vec<Function>,
+    /// Every declared record's layout, in declaration order (never a
+    /// bare `HashMap` iterated for output -- see `printer`/`verify`,
+    /// which both need deterministic iteration).
+    pub records: Vec<(ItemId, RecordLayout)>,
+    /// Every declared variant's layout, in declaration order.
+    pub variants: Vec<(ItemId, VariantLayout)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordLayout {
+    pub name: Symbol,
+    /// `(field name, declared type)`, in declaration order -- the order
+    /// `record.create`'s arguments are always given in.
+    pub fields: Vec<(Symbol, Ty)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantLayout {
+    pub name: Symbol,
+    /// One entry per case, in declaration order -- the order
+    /// `Terminator::Switch`'s targets are always given in.
+    pub cases: Vec<CaseLayout>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseLayout {
+    pub name: Symbol,
+    pub payload: Vec<Ty>,
 }
 
 #[derive(Debug, Clone)]

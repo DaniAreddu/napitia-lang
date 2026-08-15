@@ -1361,9 +1361,100 @@ impl<'a> Lowering<'a> {
 
         if matches!(&occurrences[0].ty, Ty::Named(item, _) if self.variants.contains_key(item)) {
             self.lower_variant_switch(fb, rows, occurrences, arms, merge)
+        } else if matches!(&occurrences[0].ty, Ty::Bool) {
+            // `bool` is a closed two-constructor domain (like a
+            // variant's finite case set), so it is switched on
+            // directly rather than through the open-domain literal
+            // chain below -- an exhaustive `match true { true => ..,
+            // false => .. }` (no wildcard at all) would otherwise have
+            // no catch-all to terminate that chain's recursion on.
+            self.lower_bool_switch(fb, rows, occurrences, arms, merge)
         } else {
             self.lower_literal_chain(fb, rows, occurrences, arms, merge)
         }
+    }
+
+    fn lower_bool_switch<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+
+        let any_real_test = rows.iter().any(|r| {
+            matches!(
+                self.classify(&r.patterns[0]),
+                Classified::Literal(LiteralTest::Bool(_))
+            )
+        });
+        if !any_real_test {
+            let mut new_rows = Vec::with_capacity(rows.len());
+            for r in rows {
+                let mut bindings = r.bindings;
+                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
+                    bindings.push((local, occ.value));
+                }
+                new_rows.push(MatrixRow {
+                    arm_index: r.arm_index,
+                    patterns: r.patterns[1..].to_vec(),
+                    bindings,
+                });
+            }
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge);
+        }
+
+        let then_block = fb.new_block();
+        let else_block = fb.new_block();
+        fb.terminate(Terminator::CondBranch {
+            condition: occ.value,
+            then_block,
+            else_block,
+        });
+
+        for (value, block) in [(true, then_block), (false, else_block)] {
+            fb.switch_to(block);
+            let mut new_rows = Vec::new();
+            for r in &rows {
+                match self.classify(&r.patterns[0]) {
+                    Classified::Literal(LiteralTest::Bool(b)) if b == value => {
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    Classified::Literal(LiteralTest::Bool(_)) => {}
+                    Classified::Bind(local) => {
+                        let mut bindings = r.bindings.clone();
+                        bindings.push((local, occ.value));
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings,
+                        });
+                    }
+                    Classified::Wildcard => {
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if new_rows.is_empty() {
+                return Err(
+                    self.internal_error("a match's bool switch left a branch with no covering arm")
+                );
+            }
+            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge)?;
+        }
+        Ok(())
     }
 
     fn lower_variant_switch<'h>(

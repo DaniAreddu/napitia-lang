@@ -209,3 +209,101 @@ fn a_named_aggregate_return_type_now_lowers_and_runs_successfully() {
     // it lowers, verifies, and runs cleanly through every stage.
     assert_pipeline_is_clean_and_returns("named_aggregate_return_type.npt", "42");
 }
+
+/// The example program from RFC 0005 / this milestone's requirements:
+/// records, a variant payload, field access, and an exhaustive match,
+/// all the way through `run`.
+#[test]
+fn records_and_variants_example_runs_end_to_end() {
+    let path = format!(
+        "{}/../examples/records_and_variants.npt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+
+    let ired = napitia(&["ir", &path]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn missing_record_field_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("missing_record_field.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[R0009]"));
+}
+
+#[test]
+fn unknown_record_field_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("unknown_record_field.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[R0008]"));
+}
+
+#[test]
+fn field_mutation_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("field_mutation.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0015]"));
+}
+
+#[test]
+fn non_exhaustive_match_reports_a_concrete_missing_pattern() {
+    let output = napitia(&["check", &fixture("non_exhaustive_match.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0017]"));
+    assert!(stderr(&output).contains("LookupResult.Missing"));
+}
+
+#[test]
+fn unreachable_match_arm_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("unreachable_match_arm.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0018]"));
+}
+
+#[test]
+fn infinite_aggregate_layout_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("infinite_aggregate_layout.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0020]"));
+}
+
+/// Every invalid fixture above must fail at `check` already -- `ir`/
+/// `run` must never be reached for a program `check` already rejected,
+/// and neither may ever leak an internal `Ixxxx`/`Vxxxx` diagnostic for
+/// these ordinary, user-triggerable errors.
+#[test]
+fn invalid_aggregate_fixtures_fail_at_check_with_no_leaked_internal_diagnostic() {
+    for name in [
+        "missing_record_field.npt",
+        "unknown_record_field.npt",
+        "field_mutation.npt",
+        "non_exhaustive_match.npt",
+        "unreachable_match_arm.npt",
+        "infinite_aggregate_layout.npt",
+    ] {
+        let path = fixture(name);
+        let output = napitia(&["check", &path]);
+        assert_eq!(output.status.code(), Some(1), "`{name}` should fail check");
+        let err = stderr(&output);
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{name}` leaked an internal diagnostic: {err}"
+        );
+    }
+}

@@ -19,11 +19,14 @@
 
 use std::collections::HashMap;
 
-use super::{BasicBlock, Const, Function, Module, Param, Terminator, ValueId, ValueKind};
+use super::{
+    BasicBlock, CaseLayout, Const, Function, Module, Param, RecordLayout, Terminator, ValueId,
+    ValueKind, VariantLayout,
+};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId,
-    OtherItemKind,
+    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirModule, HirStmt, ItemId,
+    LocalId, PatternId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -60,6 +63,10 @@ pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
+    // Consumed by match's own decision-tree lowering, landing in the
+    // next commit; accepted here already so `driver`/`TypeckResult`'s
+    // shape doesn't need to change twice.
+    _pattern_case: &HashMap<PatternId, (ItemId, usize)>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -71,11 +78,53 @@ pub fn lower_module(
     // "unknown type becomes Error with no diagnostic" bug this whole
     // pass exists to close.
     let type_names: HashMap<Symbol, ItemId> = hir
-        .other_items
+        .records
         .iter()
-        .filter(|item| matches!(item.kind, OtherItemKind::Record | OtherItemKind::Variant))
-        .map(|item| (item.name, item.id))
+        .map(|r| (r.name, r.id))
+        .chain(hir.variants.iter().map(|v| (v.name, v.id)))
         .collect();
+
+    let mut record_layouts: HashMap<ItemId, RecordLayout> = HashMap::new();
+    let mut record_order: Vec<ItemId> = Vec::new();
+    for r in &hir.records {
+        let fields = r
+            .fields
+            .iter()
+            .map(|f| (f.name, resolve_named_type(interner, &type_names, &f.ty)))
+            .collect();
+        record_order.push(r.id);
+        record_layouts.insert(
+            r.id,
+            RecordLayout {
+                name: r.name,
+                fields,
+            },
+        );
+    }
+    let mut variant_layouts: HashMap<ItemId, VariantLayout> = HashMap::new();
+    let mut variant_order: Vec<ItemId> = Vec::new();
+    for v in &hir.variants {
+        let cases = v
+            .cases
+            .iter()
+            .map(|c| CaseLayout {
+                name: c.name,
+                payload: c
+                    .payload
+                    .iter()
+                    .map(|t| resolve_named_type(interner, &type_names, t))
+                    .collect(),
+            })
+            .collect();
+        variant_order.push(v.id);
+        variant_layouts.insert(
+            v.id,
+            VariantLayout {
+                name: v.name,
+                cases,
+            },
+        );
+    }
 
     let mut function_sigs = HashMap::new();
     for f in &hir.functions {
@@ -98,6 +147,8 @@ pub fn lower_module(
         interner,
         source,
         type_names,
+        records: record_layouts,
+        variants: variant_layouts,
         function_sigs,
     };
     let mut functions = Vec::new();
@@ -109,11 +160,24 @@ pub fn lower_module(
         }
     }
 
-    if diagnostics.is_empty() {
-        Ok(Module { functions })
-    } else {
-        Err(diagnostics)
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
     }
+
+    let records = record_order
+        .into_iter()
+        .map(|id| (id, lowering.records.remove(&id).expect("just inserted")))
+        .collect();
+    let variants = variant_order
+        .into_iter()
+        .map(|id| (id, lowering.variants.remove(&id).expect("just inserted")))
+        .collect();
+
+    Ok(Module {
+        functions,
+        records,
+        variants,
+    })
 }
 
 /// Resolves a written type name the same way `typeck::resolve_named_type`
@@ -145,6 +209,8 @@ struct Lowering<'a> {
     interner: &'a Interner,
     source: SourceId,
     type_names: HashMap<Symbol, ItemId>,
+    records: HashMap<ItemId, RecordLayout>,
+    variants: HashMap<ItemId, VariantLayout>,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
 }
 
@@ -321,21 +387,10 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|t| self.resolve_named_type(t))
             .unwrap_or(Ty::Unit);
-        // A declared `record`/`variant` name resolves and nominally
-        // compares fine in typeck (`spec/0003`), but Alpha 0.1 NIR has
-        // no aggregate runtime representation at all -- no instruction
-        // constructs one, no `Value` variant holds one. Silently
-        // treating it as `Ty::Error` here (the previous behavior) would
-        // reach the verifier as an unexplained error type; explicitly
-        // rejecting it here, with a diagnostic naming the actual type
-        // and where it appears, is what keeps that failure at the right
-        // layer instead.
-        self.reject_named_type(&return_type, f.name_span, "a function's return type")?;
         let mut fb = FnBuilder::new(return_type.clone());
         let mut params = Vec::new();
         for p in &f.params {
             let ty = self.local_types.get(&p.local).cloned().unwrap_or(Ty::Error);
-            self.reject_named_type(&ty, p.span, "a function parameter's type")?;
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
@@ -383,22 +438,6 @@ impl<'a> Lowering<'a> {
 
     fn resolve_named_type(&self, ty: &ast::Type) -> Ty {
         resolve_named_type(self.interner, &self.type_names, ty)
-    }
-
-    fn reject_named_type(&self, ty: &Ty, span: Span, position: &str) -> LowerResult<()> {
-        if let Ty::Named(_, name) = ty {
-            return Err(Box::new(Diagnostic::error(
-                codes::UNSUPPORTED_IN_NIR,
-                self.source,
-                span,
-                format!(
-                    "{position} uses the named type `{}`, which has no aggregate runtime \
-                     representation in Alpha 0.1 NIR",
-                    self.interner.resolve(*name)
-                ),
-            )));
-        }
-        Ok(())
     }
 
     // ---- reading typeck's already-resolved types ----
@@ -617,6 +656,19 @@ impl<'a> Lowering<'a> {
                 let text = self.interner.resolve(*name);
                 Err(self.unsupported(*span, &format!("using `{text}` as a first-class value")))
             }
+            // A bare (uncalled) case reference: `typeck` already
+            // confirmed this case carries no payload (else it recorded
+            // `Ty::Error` and this is unreachable for a well-typed
+            // program) -- constructs the unit case directly, with no
+            // fabricated payload.
+            HirExpr::CaseRef { variant, case, .. } => Ok(LoweredExpr::Value(fb.push_value(
+                self.expr_ty(expr),
+                ValueKind::VariantCreate {
+                    variant: *variant,
+                    case: *case,
+                    payload: Vec::new(),
+                },
+            ))),
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
                 op,
@@ -628,8 +680,8 @@ impl<'a> Lowering<'a> {
             HirExpr::Assign {
                 target, op, value, ..
             } => self.lower_assign(fb, target, *op, value),
-            HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args),
-            HirExpr::Field { span, .. } => Err(self.unsupported(*span, "field access")),
+            HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args, expr),
+            HirExpr::Field { base, name, .. } => self.lower_field(fb, base, *name, expr),
             // typeck rejects both of these outright (T0007) before
             // lowering ever runs in the normal pipeline. A direct
             // caller bypassing that gate must not get identity lowering
@@ -649,8 +701,14 @@ impl<'a> Lowering<'a> {
                 let result_ty = self.expr_ty(expr);
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
+            // `match`'s own decision-tree lowering lands in the next
+            // commit; typeck already validates it fully, so this is
+            // only reachable via a direct caller bypassing that gate.
             HirExpr::Match { span, .. } => Err(self.unsupported(*span, "match")),
             HirExpr::Block(b) => self.lower_block_value(fb, b),
+            HirExpr::RecordLiteral { record, fields, .. } => {
+                self.lower_record_literal(fb, *record, fields, expr)
+            }
             HirExpr::Return { value, .. } => {
                 let ret_ty = fb.return_ty.clone();
                 let v = match value {
@@ -924,7 +982,12 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         callee: &HirExpr,
         args: &[HirExpr],
+        call_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
+        if let HirExpr::CaseRef { variant, case, .. } = callee {
+            return self.lower_variant_construct(fb, *variant, *case, args, call_expr);
+        }
+
         let HirExpr::Function { item, .. } = callee else {
             if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
                 return Ok(LoweredExpr::Diverged);
@@ -954,6 +1017,125 @@ impl<'a> Lowering<'a> {
         Ok(LoweredExpr::Value(
             fb.push_value(ret_ty, ValueKind::Call(*item, arg_values)),
         ))
+    }
+
+    fn lower_variant_construct(
+        &mut self,
+        fb: &mut FnBuilder,
+        variant: ItemId,
+        case: usize,
+        args: &[HirExpr],
+        call_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        let payload_tys = self
+            .variants
+            .get(&variant)
+            .map(|v| v.cases[case].payload.clone())
+            .unwrap_or_default();
+        let mut payload = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let hint = payload_tys.get(i).cloned().unwrap_or(Ty::Error);
+            match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => payload.push(v),
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
+        }
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(call_expr),
+            ValueKind::VariantCreate {
+                variant,
+                case,
+                payload,
+            },
+        )))
+    }
+
+    /// `TypeName { field: expr, ... }`. Each field is evaluated exactly
+    /// once, in **source order** (`fields` is already in that order --
+    /// see `HirExpr::RecordLiteral`'s doc comment), then reordered into
+    /// **declaration order** for `record.create` -- runtime layout
+    /// always follows declaration order, independent of how the
+    /// construction site wrote them.
+    fn lower_record_literal(
+        &mut self,
+        fb: &mut FnBuilder,
+        record: ItemId,
+        fields: &[HirFieldInit],
+        literal_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        let field_count = self
+            .records
+            .get(&record)
+            .map(|r| r.fields.len())
+            .unwrap_or(fields.len());
+        let mut by_index: Vec<Option<ValueId>> = vec![None; field_count];
+        for f in fields {
+            let hint = self
+                .records
+                .get(&record)
+                .and_then(|r| r.fields.get(f.field_index))
+                .map(|(_, ty)| ty.clone())
+                .unwrap_or(Ty::Error);
+            match self.lower_expr_hinted(fb, &f.value, &hint)? {
+                LoweredExpr::Value(v) => {
+                    if let Some(slot) = by_index.get_mut(f.field_index) {
+                        *slot = Some(v);
+                    }
+                }
+                // A diverging initializer means the whole construction
+                // never completes; no field written after it in source
+                // order is lowered as reachable work.
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
+        }
+        let ordered: Vec<ValueId> = by_index
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.unwrap_or_else(|| {
+                    panic!(
+                        "internal invariant: record construction reached NIR lowering missing \
+                         field {i}; typeck/hir::lower must have already rejected it"
+                    )
+                })
+            })
+            .collect();
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(literal_expr),
+            ValueKind::RecordCreate(record, ordered),
+        )))
+    }
+
+    fn lower_field(
+        &mut self,
+        fb: &mut FnBuilder,
+        base: &HirExpr,
+        name: Symbol,
+        field_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        let base_value = match self.lower_expr(fb, base)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let base_ty = self.expr_ty(base);
+        let Ty::Named(record, _) = base_ty else {
+            return Err(self.unsupported(field_expr.span(), "field access on a non-record type"));
+        };
+        let field_index = self
+            .records
+            .get(&record)
+            .and_then(|r| r.fields.iter().position(|(n, _)| *n == name))
+            .ok_or_else(|| {
+                self.unsupported(field_expr.span(), "field access on an unknown field")
+            })?;
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(field_expr),
+            ValueKind::RecordField {
+                base: base_value,
+                record,
+                field: field_index,
+            },
+        )))
     }
 
     fn lower_if(
@@ -1074,7 +1256,6 @@ impl<'a> Lowering<'a> {
         ))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,8 +1285,15 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed")
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed")
     }
 
     /// Like `lower`, but for a program that type-checks cleanly and is
@@ -1131,7 +1319,14 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
     }
 
     /// Like `lower`, but also runs the module through the NIR verifier
@@ -1157,71 +1352,46 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        let module = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed");
+        let module = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
         crate::nir::verify_module(&module, id, &interner)
     }
 
     #[test]
-    fn a_named_return_type_fails_lowering_with_i0001_not_v0013() {
-        // `check` accepts this (nominal resolution/comparison of a
-        // declared record name is real, spec/0003), but lowering has no
-        // aggregate runtime representation for it. This must surface as
-        // I0001 at the point lowering actually gives up, not filter
-        // through as a silent Ty::Error caught later by the verifier as
-        // V0013.
+    fn a_named_return_type_lowers_and_verifies_cleanly() {
+        // Alpha 0.1.1: records now have a real aggregate runtime
+        // representation, so a named type in a function signature is
+        // no longer rejected -- it lowers and verifies like any other
+        // type.
         let text = "record Point { x: i64 } func identity(p: Point) -> Point { p } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named aggregate type");
-        };
+        let diagnostics = lower_and_verify(text);
         assert!(
-            diagnostics.iter().any(|d| d.code == "I0001"),
-            "expected an I0001 diagnostic, got {diagnostics:?}"
-        );
-        assert!(
-            !diagnostics.iter().any(|d| d.code == "V0013"),
-            "a named type must never fall through to the verifier as an \
-             unexplained error type: {diagnostics:?}"
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
         );
     }
 
     #[test]
-    fn a_named_parameter_type_fails_lowering_with_i0001() {
+    fn a_named_parameter_type_lowers_successfully() {
         let text = "record Point { x: i64 } func describe(p: Point) -> i64 { 0 } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named parameter type");
-        };
-        assert!(
-            diagnostics.iter().any(|d| d.code == "I0001"),
-            "expected an I0001 diagnostic, got {diagnostics:?}"
-        );
+        assert!(lower_result(text).is_ok());
     }
 
     #[test]
-    fn main_coexisting_with_a_named_type_function_fails_the_whole_module() {
-        // `main` itself never touches the named type, but lowering is
-        // atomic: the module must fail as a whole, not silently produce
-        // a `Module` containing just `main`.
-        let text = "record Point { x: i64 } \
-                    func identity(p: Point) -> Point { p } \
-                    func main() -> i64 { return 42 }";
-        assert!(
-            lower_result(text).is_err(),
-            "expected the whole module to fail lowering"
-        );
-    }
-
-    #[test]
-    fn variant_names_also_resolve_and_are_rejected_in_nir() {
+    fn variant_names_also_resolve_and_lower_successfully() {
         let text = "variant Shape { Circle } \
                     func describe(s: Shape) -> i64 { 0 } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named variant type");
-        };
-        assert!(diagnostics.iter().any(|d| d.code == "I0001"));
+        assert!(lower_result(text).is_ok());
     }
 
     #[test]
@@ -1648,7 +1818,14 @@ mod tests {
             "unexpected resolve diagnostics: {diags:?}"
         );
         let result = check_module(&hir, id, &interner);
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
     }
 
     fn assert_fails_with_i0001(text: &str, expect_in_message: &str) {
@@ -1668,21 +1845,16 @@ mod tests {
     }
 
     #[test]
-    fn match_expression_fails_lowering_not_silently_wrong() {
-        // Lowering must refuse to guess at NIR for a construct it
-        // cannot represent, rather than silently emitting something
-        // wrong, if it is ever handed one directly -- and it must fail
-        // atomically (no partial `Module` at all), not return a module
-        // missing just this one function.
+    fn match_expression_still_fails_lowering_for_now() {
+        // `match`'s own decision-tree lowering lands in the next
+        // commit; typeck already accepts this program cleanly, so this
+        // exercises nir::lower's own (temporary, for this commit)
+        // unconditional rejection directly, the same defense-in-depth
+        // posture every not-yet-lowered construct already has.
         assert_fails_with_i0001(
             "func f(x: i64) -> i64 { return match x { _ => 0 } }",
             "match",
         );
-    }
-
-    #[test]
-    fn field_access_fails_lowering_not_silently_wrong() {
-        assert_fails_with_i0001("func f(x: i64) -> i64 { return x.y }", "field access");
     }
 
     #[test]
@@ -1745,7 +1917,7 @@ mod tests {
         // containing just `add` -- either everything lowers, or nothing
         // does.
         let text = "func add(left: i64, right: i64) -> i64 { return left + right } \
-                    func bad(x: i64) -> i64 { return match x { _ => 0 } }";
+                    func bad(x: i64) -> i64 { return x? }";
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -1756,7 +1928,14 @@ mod tests {
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty());
         let result = check_module(&hir, id, &interner);
-        let outcome = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id);
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        );
         assert!(
             outcome.is_err(),
             "expected the whole module to fail lowering"

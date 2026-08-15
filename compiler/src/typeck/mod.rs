@@ -194,6 +194,10 @@ struct RecordInfo {
 
 #[derive(Clone)]
 struct VariantInfo {
+    /// The variant's own declaration symbol -- e.g. `LookupResult`, not
+    /// one of its case names -- carried so `Ty::Named` can always be
+    /// built with the declaration's own name (see `named_variant_ty`).
+    name: Symbol,
     /// `(case name, declared payload types)`, in declaration order.
     cases: Vec<(Symbol, Vec<Ty>)>,
 }
@@ -225,7 +229,13 @@ impl<'a> Checker<'a> {
                     (c.name, payload)
                 })
                 .collect();
-            self.variants.insert(v.id, VariantInfo { cases });
+            self.variants.insert(
+                v.id,
+                VariantInfo {
+                    name: v.name,
+                    cases,
+                },
+            );
             self.variant_display.insert(
                 v.id,
                 (
@@ -519,10 +529,9 @@ impl<'a> Checker<'a> {
             HirExpr::CaseRef {
                 variant,
                 case,
-                name,
                 span,
                 ..
-            } => self.check_case_ref(*variant, *case, *name, *span),
+            } => self.check_case_ref(*variant, *case, *span),
             HirExpr::Unary {
                 op, operand, span, ..
             } => self.check_unary(*op, operand, *span),
@@ -823,14 +832,8 @@ impl<'a> Checker<'a> {
     }
 
     fn check_call(&mut self, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
-        if let HirExpr::CaseRef {
-            variant,
-            case,
-            name,
-            ..
-        } = callee
-        {
-            return self.check_variant_construct(*variant, *case, *name, args, span);
+        if let HirExpr::CaseRef { variant, case, .. } = callee {
+            return self.check_variant_construct(*variant, *case, args, span);
         }
 
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
@@ -906,7 +909,7 @@ impl<'a> Checker<'a> {
     /// value of the variant's type -- `LookupResult.Missing` needs no
     /// call syntax at all, matching a unit case allocating no
     /// fabricated payload.
-    fn check_case_ref(&mut self, variant: ItemId, case: usize, name: Symbol, span: Span) -> Ty {
+    fn check_case_ref(&mut self, variant: ItemId, case: usize, span: Span) -> Ty {
         let Some(info) = self.variants.get(&variant).cloned() else {
             return Ty::Error;
         };
@@ -927,14 +930,13 @@ impl<'a> Checker<'a> {
             );
             return Ty::Error;
         }
-        Ty::Named(variant, name)
+        self.named_variant_ty(variant)
     }
 
     fn check_variant_construct(
         &mut self,
         variant: ItemId,
         case: usize,
-        name: Symbol,
         args: &[HirExpr],
         span: Span,
     ) -> Ty {
@@ -977,7 +979,7 @@ impl<'a> Checker<'a> {
         if any_arg_never {
             Ty::Never
         } else {
-            Ty::Named(variant, name)
+            self.named_variant_ty(variant)
         }
     }
 
@@ -1102,6 +1104,21 @@ impl<'a> Checker<'a> {
             .map(|(name, _)| *name)
             .expect("internal invariant: a resolved record ItemId is always in type_names");
         Ty::Named(record, symbol)
+    }
+
+    /// Builds `Ty::Named` for a variant item using the variant
+    /// declaration's own symbol (e.g. `LookupResult`), never one of its
+    /// case names (e.g. `Found`/`Missing`) -- nominal equality only ever
+    /// compares by `ItemId`, but diagnostics and textual NIR display this
+    /// symbol, so it must name the type, not the specific case a value
+    /// happened to be constructed or matched through.
+    fn named_variant_ty(&self, variant: ItemId) -> Ty {
+        let symbol = self
+            .variants
+            .get(&variant)
+            .map(|info| info.name)
+            .expect("internal invariant: a resolved variant ItemId is always in self.variants");
+        Ty::Named(variant, symbol)
     }
 
     fn check_if(
@@ -2607,6 +2624,51 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn qualified_payload_carrying_constructor_prints_the_variant_type_name() {
+        // `Ty::Named`'s displayed symbol must be the variant declaration's
+        // own name (`Shape`), never the case name (`Circle`), even though
+        // the constructor was written qualified and carries a payload.
+        let diags =
+            check("variant Shape { Circle(i64) } func f() -> bool { return Shape.Circle(1) }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(diags[0].message.contains("Shape"), "{:?}", diags[0]);
+        assert!(!diags[0].message.contains("Circle"), "{:?}", diags[0]);
+    }
+
+    #[test]
+    fn unqualified_constructor_prints_the_variant_type_name() {
+        let diags = check("variant Shape { Circle(i64) } func f() -> bool { return Circle(1) }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(diags[0].message.contains("Shape"), "{:?}", diags[0]);
+        assert!(!diags[0].message.contains("Circle"), "{:?}", diags[0]);
+    }
+
+    #[test]
+    fn unit_case_reference_prints_the_variant_type_name() {
+        let diags = check("variant Shape { Empty } func f() -> bool { return Shape.Empty }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(diags[0].message.contains("Shape"), "{:?}", diags[0]);
+        assert!(!diags[0].message.contains("Empty"), "{:?}", diags[0]);
+    }
+
+    #[test]
+    fn variant_argument_type_mismatch_diagnostic_mentions_the_variant_not_the_case() {
+        let diags = check(
+            "variant Shape { Circle(i64) } \
+             variant Other { X } \
+             func take(o: Other) { } \
+             func f() { take(Shape.Circle(1)); }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(diags[0].message.contains("Shape"), "{:?}", diags[0]);
+        assert!(!diags[0].message.contains("Circle"), "{:?}", diags[0]);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+variant LookupResult {
+    Found(i64),
+    Missing,
+}
+
+func main() -> i64 {
+    value result = LookupResult.Found(1);
+    return match result {
+        Found(v) => v,
+        n => 0,
+        Missing => 0,
+    }
+}

@@ -183,6 +183,7 @@ enum LocalBinding {
 /// is ever appended after a block's terminator" a property the type
 /// system enforces, rather than something callers have to remember to
 /// check with `current_terminated()`.
+#[derive(Copy, Clone, Debug, PartialEq)]
 enum LoweredExpr {
     Value(ValueId),
     Diverged,
@@ -253,6 +254,11 @@ impl FnBuilder {
     }
 
     fn push_value(&mut self, ty: Ty, kind: ValueKind) -> ValueId {
+        debug_assert!(
+            !self.current_terminated(),
+            "internal invariant: appended a value to block {:?} after it was already terminated",
+            self.current
+        );
         let result = self.fresh_value();
         self.current_block_mut()
             .instructions
@@ -261,12 +267,27 @@ impl FnBuilder {
     }
 
     fn push_store(&mut self, slot: ValueId, value: ValueId) {
+        debug_assert!(
+            !self.current_terminated(),
+            "internal invariant: appended a store to block {:?} after it was already terminated",
+            self.current
+        );
         self.current_block_mut()
             .instructions
             .push(crate::nir::Instruction::Store { slot, value });
     }
 
+    /// Sets the current block's terminator. This is the one place a
+    /// block transitions from "still being built" to "closed" --
+    /// `push_value`/`push_store` refuse (in debug builds) to append
+    /// anything to a block afterward, so every lowering path must emit
+    /// all of a block's instructions before calling this, never after.
     fn terminate(&mut self, term: Terminator) {
+        debug_assert!(
+            !self.current_terminated(),
+            "internal invariant: block {:?} was terminated twice",
+            self.current
+        );
         self.current_block_mut().terminator = Some(term);
     }
 
@@ -950,6 +971,54 @@ impl<'a> Lowering<'a> {
 
         let then_block = fb.new_block();
         let else_block = fb.new_block();
+
+        // `result_ty` is typeck's already-resolved never-join of both
+        // branches (spec/0003): the condition itself already produced a
+        // real value above, so the only way this whole `if` can be
+        // `never` is if both branches diverge. When that's the case
+        // there is nothing to merge -- no result slot and no
+        // `after_block` are ever created, since each branch's own
+        // terminator (whatever `return`/nested-diverging-`if` it
+        // lowers to) already leaves a complete, valid CFG on its own.
+        if result_ty == Ty::Never {
+            fb.terminate(Terminator::CondBranch {
+                condition: cond_value,
+                then_block,
+                else_block,
+            });
+
+            fb.switch_to(then_block);
+            let then_result = self.lower_block_value(fb, then_branch)?;
+
+            fb.switch_to(else_block);
+            let else_result = match else_branch {
+                Some(HirElse::Block(b)) => self.lower_block_value(fb, b)?,
+                Some(HirElse::If(inner)) => self.lower_expr(fb, inner)?,
+                // An else-less `if` always types as `unit` (see below),
+                // never `never` -- typeck cannot have produced this
+                // combination.
+                None => unreachable!(
+                    "internal invariant: an else-less `if` is always unit-typed, not never"
+                ),
+            };
+            debug_assert!(
+                matches!(then_result, LoweredExpr::Diverged)
+                    && matches!(else_result, LoweredExpr::Diverged),
+                "internal invariant: typeck reported this `if` as `never`, so both branches \
+                 must diverge"
+            );
+            return Ok(LoweredExpr::Diverged);
+        }
+
+        // At least one branch is required to produce a real value of
+        // `result_ty` here (typeck already ruled out "both diverge"
+        // above). The slot and merge block belong to whichever block
+        // is current before the branch -- allocating the slot here
+        // both keeps it dominating both `then_block` and `else_block`
+        // (required by the verifier) and keeps every instruction
+        // belonging to this block emitted before it acquires its
+        // terminator (spec/0006): nothing may be appended afterward.
+        let result_slot = fb.alloc_slot(result_ty.clone());
         let after_block = fb.new_block();
         fb.terminate(Terminator::CondBranch {
             condition: cond_value,
@@ -957,21 +1026,8 @@ impl<'a> Lowering<'a> {
             else_block,
         });
 
-        let result_slot = fb.alloc_slot(result_ty.clone());
-
-        // A `Diverged` branch has already terminated its own block (via
-        // whatever return/break/continue it lowered to); there is no
-        // value to store into `result_slot` and no `after_block` branch
-        // to add on top of that terminator. `reached_after` tracks
-        // whether *either* branch actually falls through to
-        // `after_block`, since if neither does, `after_block` itself is
-        // unreachable dead code with nothing ever stored into
-        // `result_slot` -- there is no value to load there, so the
-        // whole `if` diverges too.
         fb.switch_to(then_block);
-        let mut reached_after = false;
         if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
-            reached_after = true;
             if else_branch.is_none() {
                 // No `else`: typeck gives the whole expression type
                 // `unit` regardless of what the then-branch's own tail
@@ -997,33 +1053,19 @@ impl<'a> Lowering<'a> {
                 if let LoweredExpr::Value(else_value) = self.lower_block_value(fb, b)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
-                    reached_after = true;
                 }
             }
             Some(HirElse::If(inner)) => {
                 if let LoweredExpr::Value(else_value) = self.lower_expr(fb, inner)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
-                    reached_after = true;
                 }
             }
             None => {
                 let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
                 fb.push_store(result_slot, unit_value);
                 fb.terminate(Terminator::Branch(after_block));
-                reached_after = true;
             }
-        }
-
-        if !reached_after {
-            // `after_block` has no predecessor and was never given a
-            // terminator; a self-branch keeps it structurally valid
-            // (every block still has exactly one terminator, targeting
-            // a block that exists) without claiming it produces a
-            // value or is ever actually reached.
-            fb.switch_to(after_block);
-            fb.terminate(Terminator::Branch(after_block));
-            return Ok(LoweredExpr::Diverged);
         }
 
         fb.switch_to(after_block);
@@ -1249,6 +1291,61 @@ mod tests {
         );
     }
 
+    /// Item 1: an ordinary value-producing `if/else` allocates exactly
+    /// one result slot, stores each branch's value into that same slot,
+    /// and loads that same slot's value back at the merge point -- the
+    /// three instructions must agree on one `ValueId`, not merely exist
+    /// somewhere in the function.
+    #[test]
+    fn if_else_with_real_values_allocates_stores_and_loads_the_same_slot() {
+        let module = lower("func f(x: bool) -> i64 { return if x { 1 } else { 2 } }");
+        let instructions: Vec<&Instruction> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .collect();
+
+        let allocs: Vec<ValueId> = instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::Alloc,
+                    ty: Ty::I64,
+                } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            allocs.len(),
+            1,
+            "expected exactly one i64 result slot, found {instructions:?}"
+        );
+        let slot = allocs[0];
+
+        let stores: Vec<&Instruction> = instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Store { slot: s, .. } if *s == slot))
+            .copied()
+            .collect();
+        assert_eq!(
+            stores.len(),
+            2,
+            "expected one store per branch into the result slot, found {instructions:?}"
+        );
+
+        let loads_result_slot = instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Value { kind: ValueKind::Load(s), .. } if *s == slot
+            )
+        });
+        assert!(
+            loads_result_slot,
+            "expected the merge block to load the result slot, found {instructions:?}"
+        );
+    }
+
     #[test]
     fn if_where_both_branches_diverge_has_no_orphaned_unterminated_block() {
         // Both branches of this `if` return, so its merge block has no
@@ -1276,6 +1373,129 @@ mod tests {
             !has_load_from_result_slot,
             "an unreachable merge block must never load a value nothing stored"
         );
+    }
+
+    /// Items 5 & 6: a fully diverging `if` produces no result slot at
+    /// all -- no `alloc` (of `never` or of anything else attributable
+    /// to the `if`'s result), no `store` of a fabricated value, and no
+    /// `load` -- and lowers to exactly the entry, then, and else
+    /// blocks; no extra merge block is created to be immediately
+    /// unreachable.
+    #[test]
+    fn if_where_both_branches_diverge_allocates_no_result_slot() {
+        let module = lower("func f(x: bool) -> i64 { if x { return 1 } else { return 2 } }");
+        let blocks = &module.functions[0].blocks;
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected exactly entry + then + else, no merge block: {blocks:?}"
+        );
+
+        let instructions: Vec<&Instruction> = blocks.iter().flat_map(|b| &b.instructions).collect();
+        assert!(
+            !instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Value {
+                    kind: ValueKind::Alloc,
+                    ..
+                }
+            )),
+            "a fully diverging `if` must not allocate any result slot: {instructions:?}"
+        );
+        assert!(
+            !instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Store { .. })),
+            "a fully diverging `if` must not store a fabricated merge value: {instructions:?}"
+        );
+        assert!(
+            !instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Value {
+                    kind: ValueKind::Load(_),
+                    ..
+                }
+            )),
+            "a fully diverging `if` must not load a result nothing produced: {instructions:?}"
+        );
+    }
+
+    /// Item 5 (propagation): when a fully diverging `if` is used as a
+    /// statement rather than the function's tail, `LoweredExpr::Diverged`
+    /// must stop the surrounding block from lowering anything after it
+    /// -- if it didn't, the `99` tail below would still appear as a
+    /// `const.i64` instruction in the output.
+    #[test]
+    fn a_fully_diverging_if_statement_makes_the_rest_of_the_block_unreachable() {
+        let module =
+            lower("func f(flag: bool) -> i64 { if flag { return 1 } else { return 2 } 99 }");
+        let has_99 = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Const(Const::Int(99)),
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !has_99,
+            "code after a fully diverging `if` statement must never be lowered"
+        );
+    }
+
+    /// Item 8: the verifier independently accepts every CFG shape this
+    /// fix produces -- real values, an else-less `if`, and a fully
+    /// diverging `if` alike.
+    #[test]
+    fn the_verifier_accepts_every_if_lowering_shape() {
+        for text in [
+            "func f(x: bool) -> i64 { return if x { 1 } else { 2 } }",
+            "func main() { if true { 1 } }",
+            "func f(x: bool) -> i64 { if x { return 1 } else { return 2 } }",
+            "func f(x: bool) -> i64 { if x { return 1 } else { return 2 } return 0 }",
+        ] {
+            let diagnostics = lower_and_verify(text);
+            assert!(
+                diagnostics.is_empty(),
+                "unexpected diagnostics for {text:?}: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// Item 9: the builder's own append-after-terminate guard (the
+    /// safeguard `fix(nir): enforce block termination invariants` adds
+    /// right at the `FnBuilder` API boundary) must actually fire if a
+    /// future lowering bug reintroduces this shape -- exercised here by
+    /// calling the builder directly, bypassing all real lowering.
+    #[test]
+    #[should_panic(expected = "already terminated")]
+    fn appending_a_value_after_terminate_is_caught_by_the_builder_invariant() {
+        let mut fb = FnBuilder::new(Ty::Unit);
+        fb.terminate(Terminator::Return(None));
+        fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+    }
+
+    #[test]
+    #[should_panic(expected = "already terminated")]
+    fn appending_a_store_after_terminate_is_caught_by_the_builder_invariant() {
+        let mut fb = FnBuilder::new(Ty::Unit);
+        let slot = fb.alloc_slot(Ty::I64);
+        let value = fb.push_value(Ty::I64, ValueKind::Const(Const::Int(1)));
+        fb.terminate(Terminator::Return(None));
+        fb.push_store(slot, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "terminated twice")]
+    fn terminating_a_block_twice_is_caught_by_the_builder_invariant() {
+        let mut fb = FnBuilder::new(Ty::Unit);
+        fb.terminate(Terminator::Return(None));
+        fb.terminate(Terminator::Return(None));
     }
 
     #[test]

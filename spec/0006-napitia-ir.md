@@ -110,8 +110,20 @@ unconditionally branches back to the header) or an exit block;
 `break`/`continue` lower to direct branches to the loop's known
 exit/header block. `return`/`break`/`continue` lower straight to a
 real terminator; nothing is ever appended to a block after it acquires
-one. `match` is not in this list: using it is a checked, reported error
-(`spec/0002`) rather than being lowered to NIR at all.
+one — the lowering builder itself refuses (as a debug-time internal
+invariant, not a diagnostic a user program can trigger) to append an
+instruction, allocation, or store to a block that already has a
+terminator, so this is a property the builder enforces at its own API
+boundary rather than something every call site has to remember to
+check. `if`/`else` follows the same rule for its own result slot: the
+slot (when one is needed at all) is allocated in the block that still
+dominates both branches, before that block's `condbr` terminator is
+set, never after; when both branches diverge, `if` allocates no result
+slot, stores no fabricated merge value, and creates no unreachable
+merge block at all — each branch's own terminator is already a
+complete CFG on its own. `match` is not in this list: using it is a
+checked, reported error (`spec/0002`) rather than being lowered to NIR
+at all.
 
 Lowering the whole module is atomic: either every function lowers and a
 complete `Module` is produced, or one or more failed and the only thing

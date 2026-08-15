@@ -1,6 +1,8 @@
 //! The local type checker.
 
 pub mod context;
+mod cycles;
+pub mod exhaustive;
 pub mod unify;
 
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use unify::unify;
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirPattern, HirStmt, ItemId, LocalId, OtherItemKind,
+    HirPattern, HirStmt, ItemId, LocalId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -60,6 +62,13 @@ pub struct TypeckResult {
     pub diagnostics: Vec<Diagnostic>,
     pub local_types: HashMap<LocalId, Ty>,
     pub expr_types: HashMap<ExprId, Ty>,
+    /// For every `HirPattern::Variant`, and every `HirPattern::Bind` that
+    /// resolves to a payload-less variant case rather than a fresh
+    /// binding, the specific `(variant, case index)` it matches. Not yet
+    /// populated (`match`'s own checking, and the pattern resolution
+    /// that fills this in, lands in a later commit); NIR lowering will
+    /// consult it, keyed by the pattern's own stable `PatternId`.
+    pub pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`]. Checking one
@@ -74,10 +83,10 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
     // own span, never silently treated as `Ty::Error` -- see
     // `resolve_named_type`.
     let type_names = hir
-        .other_items
+        .records
         .iter()
-        .filter(|item| matches!(item.kind, OtherItemKind::Record | OtherItemKind::Variant))
-        .map(|item| (item.name, item.id))
+        .map(|r| (r.name, r.id))
+        .chain(hir.variants.iter().map(|v| (v.name, v.id)))
         .collect();
 
     let mut checker = Checker {
@@ -90,9 +99,15 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
         type_names,
+        records: HashMap::new(),
+        variants: HashMap::new(),
+        variant_display: HashMap::new(),
         loop_depth: 0,
         expr_types: HashMap::new(),
+        pattern_case: HashMap::new(),
     };
+    checker.build_aggregate_info(hir);
+    checker.check_aggregate_cycles(hir);
     checker.build_signatures(hir);
     for function in &hir.functions {
         checker.check_function(function);
@@ -120,6 +135,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         diagnostics: checker.diagnostics,
         local_types,
         expr_types,
+        pattern_case: checker.pattern_case,
     }
 }
 
@@ -135,6 +151,16 @@ struct Checker<'a> {
     /// The module's named-type namespace: declared `record`/`variant`
     /// names, by their surface name, to the item they refer to.
     type_names: HashMap<Symbol, ItemId>,
+    /// Every declared record's fields, resolved to `Ty` and in
+    /// declaration order -- the layout NIR's `record.create`/
+    /// `record.field` will follow.
+    records: HashMap<ItemId, RecordInfo>,
+    /// Every declared variant's cases, resolved to `Ty` payloads and in
+    /// declaration order.
+    variants: HashMap<ItemId, VariantInfo>,
+    /// Display-only `(variant name, [case names])` for rendering a
+    /// non-exhaustive-match witness back into surface syntax.
+    variant_display: HashMap<ItemId, (String, Vec<String>)>,
     /// How many `while`/`loop` bodies currently enclose the expression
     /// being checked. `break`/`continue` outside of any loop is a
     /// diagnostic, not something deferred to NIR lowering or the
@@ -147,9 +173,87 @@ struct Checker<'a> {
     /// `ctx.resolve` pass over the whole map, mirroring how
     /// `local_types` is finalized.
     expr_types: HashMap<ExprId, Ty>,
+    /// See [`TypeckResult::pattern_case`].
+    pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
+}
+
+#[derive(Clone)]
+struct RecordInfo {
+    /// `(field name, declared type)`, in declaration order.
+    fields: Vec<(Symbol, Ty)>,
+}
+
+#[derive(Clone)]
+struct VariantInfo {
+    /// `(case name, declared payload types)`, in declaration order.
+    cases: Vec<(Symbol, Vec<Ty>)>,
 }
 
 impl<'a> Checker<'a> {
+    /// Resolves every declared record's field types and every declared
+    /// variant's case payload types, once, before any function body or
+    /// the aggregate-cycle check runs -- both need every item's fields/
+    /// payloads already resolved to `Ty`.
+    fn build_aggregate_info(&mut self, hir: &HirModule) {
+        for r in &hir.records {
+            let fields = r
+                .fields
+                .iter()
+                .map(|f| (f.name, self.resolve_named_type(&f.ty)))
+                .collect();
+            self.records.insert(r.id, RecordInfo { fields });
+        }
+        for v in &hir.variants {
+            let cases = v
+                .cases
+                .iter()
+                .map(|c| {
+                    let payload = c
+                        .payload
+                        .iter()
+                        .map(|t| self.resolve_named_type(t))
+                        .collect();
+                    (c.name, payload)
+                })
+                .collect();
+            self.variants.insert(v.id, VariantInfo { cases });
+            self.variant_display.insert(
+                v.id,
+                (
+                    self.interner.resolve(v.name).to_string(),
+                    v.cases
+                        .iter()
+                        .map(|c| self.interner.resolve(c.name).to_string())
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    /// Rejects an infinitely-sized direct (or indirect) aggregate cycle
+    /// -- see `typeck::cycles` -- once, before any function body is
+    /// checked, so a cyclic declaration is reported even if nothing in
+    /// the module ever constructs it.
+    fn check_aggregate_cycles(&mut self, hir: &HirModule) {
+        let field_types: HashMap<ItemId, Vec<Ty>> = self
+            .records
+            .iter()
+            .map(|(id, info)| (*id, info.fields.iter().map(|(_, ty)| ty.clone()).collect()))
+            .collect();
+        let payload_types: HashMap<ItemId, Vec<Vec<Ty>>> = self
+            .variants
+            .iter()
+            .map(|(id, info)| (*id, info.cases.iter().map(|(_, tys)| tys.clone()).collect()))
+            .collect();
+        self.diagnostics.extend(cycles::check_cycles(
+            hir,
+            &field_types,
+            &payload_types,
+            self.source,
+            self.interner,
+        ));
+    }
+
     fn build_signatures(&mut self, hir: &HirModule) {
         for f in &hir.functions {
             let params = f
@@ -398,6 +502,10 @@ impl<'a> Checker<'a> {
                 );
                 Ty::Error
             }
+            // Resolved by `hir::lower`, but not yet semantically
+            // checked -- construction/constructor validation lands in
+            // a following commit.
+            HirExpr::CaseRef { .. } => Ty::Error,
             HirExpr::Unary {
                 op, operand, span, ..
             } => self.check_unary(*op, operand, *span),
@@ -451,6 +559,17 @@ impl<'a> Checker<'a> {
                 ..
             } => self.check_match(scrutinee, arms, *span),
             HirExpr::Block(block) => self.check_block(block),
+            // Resolved by `hir::lower`, but not yet semantically
+            // checked -- each field's own value is still checked, for
+            // cascading diagnostics; full construction validation
+            // (missing/duplicate/unknown field, field type) lands in a
+            // following commit.
+            HirExpr::RecordLiteral { fields, .. } => {
+                for f in fields {
+                    self.check_expr(&f.value);
+                }
+                Ty::Error
+            }
             HirExpr::Return { value, span, .. } => {
                 let value_ty = value
                     .as_ref()

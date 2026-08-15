@@ -25,8 +25,8 @@ use super::{
 };
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirModule, HirStmt, ItemId,
-    LocalId, PatternId,
+    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
+    HirModule, HirPattern, HirStmt, ItemId, LocalId, PatternId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -63,10 +63,7 @@ pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
-    // Consumed by match's own decision-tree lowering, landing in the
-    // next commit; accepted here already so `driver`/`TypeckResult`'s
-    // shape doesn't need to change twice.
-    _pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -144,6 +141,7 @@ pub fn lower_module(
     let mut lowering = Lowering {
         local_types,
         expr_types,
+        pattern_case,
         interner,
         source,
         type_names,
@@ -206,6 +204,7 @@ fn resolve_named_type(
 struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
+    pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
     interner: &'a Interner,
     source: SourceId,
     type_names: HashMap<Symbol, ItemId>,
@@ -701,10 +700,12 @@ impl<'a> Lowering<'a> {
                 let result_ty = self.expr_ty(expr);
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
-            // `match`'s own decision-tree lowering lands in the next
-            // commit; typeck already validates it fully, so this is
-            // only reachable via a direct caller bypassing that gate.
-            HirExpr::Match { span, .. } => Err(self.unsupported(*span, "match")),
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => {
+                let result_ty = self.expr_ty(expr);
+                self.lower_match(fb, scrutinee, arms, result_ty)
+            }
             HirExpr::Block(b) => self.lower_block_value(fb, b),
             HirExpr::RecordLiteral { record, fields, .. } => {
                 self.lower_record_literal(fb, *record, fields, expr)
@@ -1255,7 +1256,452 @@ impl<'a> Lowering<'a> {
             fb.push_value(result_ty, ValueKind::Load(result_slot)),
         ))
     }
+
+    // ---- match lowering: a decision tree over a pattern matrix ----
+    //
+    // Mirrors the same recursive specialize/default structure
+    // `typeck::exhaustive` uses for its analysis (see RFC 0005's "Match
+    // lowering"), but building real NIR blocks instead of checking
+    // coverage. A "row" carries one pattern slot per currently pending
+    // occurrence (the original scrutinee, plus one fresh occurrence per
+    // payload position introduced by descending into a `Variant`
+    // pattern) -- `PatternSlot::Wildcard` pads a row that doesn't
+    // itself constrain a newly-introduced occurrence (a wildcard/
+    // binding/unit-case row matches every payload position trivially),
+    // keeping every row in one matrix the same length.
+
+    fn lower_match(
+        &mut self,
+        fb: &mut FnBuilder,
+        scrutinee: &HirExpr,
+        arms: &[HirMatchArm],
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
+        let scrutinee_value = match self.lower_expr(fb, scrutinee)? {
+            LoweredExpr::Value(v) => v,
+            // A diverging scrutinee is evaluated exactly once, before
+            // any pattern could ever be tested -- the whole match is
+            // `never`, and no arm is lowered as reachable work.
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let scrutinee_ty = self.expr_ty(scrutinee);
+
+        let rows: Vec<MatrixRow> = arms
+            .iter()
+            .enumerate()
+            .map(|(i, arm)| MatrixRow {
+                arm_index: i,
+                patterns: vec![PatternSlot::Real(&arm.pattern)],
+                bindings: Vec::new(),
+            })
+            .collect();
+        let occurrences = vec![Occurrence {
+            value: scrutinee_value,
+            ty: scrutinee_ty,
+        }];
+
+        if result_ty == Ty::Never {
+            // Every arm diverges (typeck already proved this); no
+            // result slot or merge block is ever created -- each arm's
+            // own terminator is already a complete CFG on its own.
+            self.lower_decision(fb, rows, occurrences, arms, None)?;
+            return Ok(LoweredExpr::Diverged);
+        }
+
+        // The slot and merge block belong to the block current before
+        // any branching starts, so they dominate every arm -- the same
+        // discipline `lower_if` already uses for its own result slot.
+        let result_slot = fb.alloc_slot(result_ty.clone());
+        let after_block = fb.new_block();
+        self.lower_decision(
+            fb,
+            rows,
+            occurrences,
+            arms,
+            Some((result_slot, after_block)),
+        )?;
+
+        fb.switch_to(after_block);
+        Ok(LoweredExpr::Value(
+            fb.push_value(result_ty, ValueKind::Load(result_slot)),
+        ))
+    }
+
+    fn lower_decision<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        if occurrences.is_empty() {
+            let Some(winner) = rows.first() else {
+                return Err(self.internal_error(
+                    "a match's decision tree ran out of candidate arms with no winner",
+                ));
+            };
+            for (local, value) in &winner.bindings {
+                fb.local_bindings
+                    .insert(*local, LocalBinding::Direct(*value));
+            }
+            let arm = &arms[winner.arm_index];
+            let result = match &arm.body {
+                HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
+                HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+            };
+            if let LoweredExpr::Value(v) = result
+                && let Some((slot, after)) = merge
+            {
+                fb.push_store(slot, v);
+                fb.terminate(Terminator::Branch(after));
+            }
+            return Ok(());
+        }
+
+        if matches!(&occurrences[0].ty, Ty::Named(item, _) if self.variants.contains_key(item)) {
+            self.lower_variant_switch(fb, rows, occurrences, arms, merge)
+        } else {
+            self.lower_literal_chain(fb, rows, occurrences, arms, merge)
+        }
+    }
+
+    fn lower_variant_switch<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+        let Ty::Named(variant_item, _) = occ.ty.clone() else {
+            return Err(self.internal_error("expected a variant-typed occurrence"));
+        };
+
+        let any_real_test = rows
+            .iter()
+            .any(|r| matches!(self.classify(&r.patterns[0]), Classified::Case { .. }));
+        if !any_real_test {
+            let mut new_rows = Vec::with_capacity(rows.len());
+            for r in rows {
+                let mut bindings = r.bindings;
+                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
+                    bindings.push((local, occ.value));
+                }
+                new_rows.push(MatrixRow {
+                    arm_index: r.arm_index,
+                    patterns: r.patterns[1..].to_vec(),
+                    bindings,
+                });
+            }
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge);
+        }
+
+        let num_cases = self
+            .variants
+            .get(&variant_item)
+            .map(|v| v.cases.len())
+            .unwrap_or(0);
+        let case_blocks: Vec<BlockId> = (0..num_cases).map(|_| fb.new_block()).collect();
+        fb.terminate(Terminator::Switch {
+            scrutinee: occ.value,
+            variant: variant_item,
+            cases: case_blocks.clone(),
+        });
+
+        for (case_index, case_block) in case_blocks.iter().enumerate() {
+            fb.switch_to(*case_block);
+            let payload_types = self.variants[&variant_item].cases[case_index]
+                .payload
+                .clone();
+            let arity = payload_types.len();
+
+            let mut new_rows: Vec<MatrixRow<'h>> = Vec::new();
+            for r in &rows {
+                let rest: Vec<PatternSlot<'h>> = r.patterns[1..].to_vec();
+                match self.classify(&r.patterns[0]) {
+                    Classified::Case {
+                        variant,
+                        case,
+                        args,
+                    } if variant == variant_item && case == case_index => {
+                        let mut patterns: Vec<PatternSlot<'h>> =
+                            args.iter().map(PatternSlot::Real).collect();
+                        patterns.resize(arity, PatternSlot::Wildcard);
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    Classified::Case { .. } => {}
+                    Classified::Bind(local) => {
+                        let mut bindings = r.bindings.clone();
+                        bindings.push((local, occ.value));
+                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings,
+                        });
+                    }
+                    Classified::Wildcard => {
+                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    // A literal pattern against a variant-typed
+                    // occurrence is rejected by typeck (T0021,
+                    // incompatible pattern) before lowering ever runs
+                    // in the normal pipeline; excluded here rather than
+                    // panicking, matching this module's defense-in-depth
+                    // posture for a direct caller that bypasses typeck.
+                    Classified::Literal(_) => {}
+                }
+            }
+            if new_rows.is_empty() {
+                return Err(self.internal_error(
+                    "a match's decision tree left a variant case with no covering arm",
+                ));
+            }
+
+            let mut payload_occurrences = Vec::with_capacity(arity);
+            for (i, ty) in payload_types.iter().enumerate() {
+                let v = fb.push_value(
+                    ty.clone(),
+                    ValueKind::VariantPayload {
+                        base: occ.value,
+                        variant: variant_item,
+                        case: case_index,
+                        index: i,
+                    },
+                );
+                payload_occurrences.push(Occurrence {
+                    value: v,
+                    ty: ty.clone(),
+                });
+            }
+
+            let mut new_occurrences = payload_occurrences;
+            new_occurrences.extend(rest_occ.clone());
+            self.lower_decision(fb, new_rows, new_occurrences, arms, merge)?;
+        }
+        Ok(())
+    }
+
+    fn lower_literal_chain<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+
+        let Some(first) = rows.first() else {
+            return Err(self.internal_error("a match's literal chain ran out of candidate arms"));
+        };
+        match self.classify(&first.patterns[0]) {
+            Classified::Wildcard => {
+                let new_rows = vec![MatrixRow {
+                    arm_index: first.arm_index,
+                    patterns: first.patterns[1..].to_vec(),
+                    bindings: first.bindings.clone(),
+                }];
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge)
+            }
+            Classified::Bind(local) => {
+                let mut bindings = first.bindings.clone();
+                bindings.push((local, occ.value));
+                let new_rows = vec![MatrixRow {
+                    arm_index: first.arm_index,
+                    patterns: first.patterns[1..].to_vec(),
+                    bindings,
+                }];
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge)
+            }
+            Classified::Literal(lit) => {
+                let const_value = literal_const(fb, &lit, &occ.ty);
+                let eq = fb.push_value(Ty::Bool, ValueKind::Eq(occ.value, const_value));
+                let then_block = fb.new_block();
+                let else_block = fb.new_block();
+                fb.terminate(Terminator::CondBranch {
+                    condition: eq,
+                    then_block,
+                    else_block,
+                });
+
+                let mut then_rows = Vec::new();
+                for r in &rows {
+                    match self.classify(&r.patterns[0]) {
+                        Classified::Literal(l2) if literal_eq(&lit, &l2) => {
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings: r.bindings.clone(),
+                            });
+                        }
+                        Classified::Wildcard => {
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings: r.bindings.clone(),
+                            });
+                        }
+                        Classified::Bind(local) => {
+                            let mut bindings = r.bindings.clone();
+                            bindings.push((local, occ.value));
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                fb.switch_to(then_block);
+                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge)?;
+
+                let else_rows: Vec<MatrixRow<'h>> = rows
+                    .into_iter()
+                    .filter(|r| {
+                        !matches!(self.classify(&r.patterns[0]), Classified::Literal(l2) if literal_eq(&lit, &l2))
+                    })
+                    .collect();
+                fb.switch_to(else_block);
+                if else_rows.is_empty() {
+                    return Err(self.internal_error(
+                        "a match's literal chain ran out of rows without a catch-all",
+                    ));
+                }
+                let mut all_occ = vec![occ];
+                all_occ.extend(rest_occ);
+                self.lower_decision(fb, else_rows, all_occ, arms, merge)
+            }
+            Classified::Case { .. } => Err(self
+                .internal_error("a variant pattern was tested against a non-variant occurrence")),
+        }
+    }
+
+    fn classify<'h>(&self, slot: &PatternSlot<'h>) -> Classified<'h> {
+        let pattern = match slot {
+            PatternSlot::Wildcard => return Classified::Wildcard,
+            PatternSlot::Real(p) => *p,
+        };
+        match pattern {
+            HirPattern::Wildcard { .. } => Classified::Wildcard,
+            HirPattern::Bind { id, local, .. } => match self.pattern_case.get(id) {
+                Some(&(variant, case)) => Classified::Case {
+                    variant,
+                    case,
+                    args: &[],
+                },
+                None => Classified::Bind(*local),
+            },
+            HirPattern::Variant { id, args, .. } => match self.pattern_case.get(id) {
+                Some(&(variant, case)) => Classified::Case {
+                    variant,
+                    case,
+                    args,
+                },
+                // Unresolved (typeck-unreachable for a valid program):
+                // treated as matching nothing, defensively.
+                None => Classified::Case {
+                    variant: ItemId(u32::MAX),
+                    case: usize::MAX,
+                    args,
+                },
+            },
+            HirPattern::Int { value, .. } => Classified::Literal(LiteralTest::Int(*value)),
+            HirPattern::Str { value, .. } => Classified::Literal(LiteralTest::Str(value)),
+            HirPattern::Char { value, .. } => Classified::Literal(LiteralTest::Char(*value)),
+            HirPattern::Bool { value, .. } => Classified::Literal(LiteralTest::Bool(*value)),
+        }
+    }
+
+    fn internal_error(&self, message: &str) -> Box<Diagnostic> {
+        Box::new(Diagnostic::error(
+            codes::INTERNAL_INVARIANT_VIOLATED,
+            self.source,
+            Span::dummy(),
+            message.to_string(),
+        ))
+    }
 }
+
+/// One pattern slot in a decision-tree matrix row: either a real
+/// surface pattern, or a synthetic filler for a newly-introduced
+/// occurrence that a wildcard/binding/unit-case row doesn't itself
+/// constrain -- keeps every row in one matrix the same length (see
+/// `Lowering::lower_decision`'s doc comment).
+#[derive(Clone, Copy)]
+enum PatternSlot<'h> {
+    Real(&'h HirPattern),
+    Wildcard,
+}
+
+#[derive(Clone)]
+struct Occurrence {
+    value: ValueId,
+    ty: Ty,
+}
+
+struct MatrixRow<'h> {
+    arm_index: usize,
+    patterns: Vec<PatternSlot<'h>>,
+    bindings: Vec<(LocalId, ValueId)>,
+}
+
+enum Classified<'h> {
+    Wildcard,
+    Bind(LocalId),
+    Case {
+        variant: ItemId,
+        case: usize,
+        args: &'h [HirPattern],
+    },
+    Literal(LiteralTest<'h>),
+}
+
+enum LiteralTest<'h> {
+    Int(u128),
+    Str(&'h str),
+    Char(char),
+    Bool(bool),
+}
+
+fn literal_eq(a: &LiteralTest, b: &LiteralTest) -> bool {
+    match (a, b) {
+        (LiteralTest::Int(x), LiteralTest::Int(y)) => x == y,
+        (LiteralTest::Str(x), LiteralTest::Str(y)) => x == y,
+        (LiteralTest::Char(x), LiteralTest::Char(y)) => x == y,
+        (LiteralTest::Bool(x), LiteralTest::Bool(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn literal_const(fb: &mut FnBuilder, lit: &LiteralTest, ty: &Ty) -> ValueId {
+    match lit {
+        LiteralTest::Int(v) => fb.push_value(ty.clone(), ValueKind::Const(Const::Int(*v))),
+        LiteralTest::Str(s) => {
+            fb.push_value(ty.clone(), ValueKind::Const(Const::Str((*s).to_string())))
+        }
+        LiteralTest::Char(c) => fb.push_value(ty.clone(), ValueKind::Const(Const::Char(*c))),
+        LiteralTest::Bool(b) => fb.push_value(ty.clone(), ValueKind::Const(Const::Bool(*b))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1845,16 +2291,12 @@ mod tests {
     }
 
     #[test]
-    fn match_expression_still_fails_lowering_for_now() {
-        // `match`'s own decision-tree lowering lands in the next
-        // commit; typeck already accepts this program cleanly, so this
-        // exercises nir::lower's own (temporary, for this commit)
-        // unconditional rejection directly, the same defense-in-depth
-        // posture every not-yet-lowered construct already has.
-        assert_fails_with_i0001(
-            "func f(x: i64) -> i64 { return match x { _ => 0 } }",
-            "match",
-        );
+    fn match_expression_now_lowers_successfully() {
+        // Alpha 0.1.1: `match` has real NIR lowering (a decision tree
+        // over `variant.switch`/`condbr`), so it no longer fails with
+        // I0001.
+        let module = lower("func f(x: i64) -> i64 { return match x { _ => 0 } }");
+        assert_eq!(module.functions.len(), 1);
     }
 
     #[test]

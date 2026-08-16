@@ -1,0 +1,11 @@
+record Hidden {
+    public v: i64,
+}
+
+public func leak() -> Hidden {
+    Hidden { v: 1 }
+}
+
+func main() -> i64 {
+    return 0
+}

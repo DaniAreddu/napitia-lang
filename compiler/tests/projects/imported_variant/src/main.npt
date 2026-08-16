@@ -1,0 +1,7 @@
+import shapes.Shape;
+import shapes.area;
+
+func main() -> i64 {
+    value c = Shape.Circle(5);
+    return area(c)
+}

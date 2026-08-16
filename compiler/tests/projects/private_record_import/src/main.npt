@@ -1,0 +1,6 @@
+import shapes.Hidden;
+
+func main() -> i64 {
+    value h = Hidden { x: 1 };
+    return h.x
+}

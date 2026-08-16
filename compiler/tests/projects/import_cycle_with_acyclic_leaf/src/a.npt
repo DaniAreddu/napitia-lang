@@ -1,0 +1,6 @@
+import b.helper;
+import c.leaf;
+
+public func thing() -> i64 {
+    return helper() + leaf()
+}

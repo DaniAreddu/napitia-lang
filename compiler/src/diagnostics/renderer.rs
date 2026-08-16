@@ -16,12 +16,16 @@ pub fn render(diagnostic: &Diagnostic, sources: &SourceMap) -> String {
     let file = sources.get(diagnostic.source);
     let primary_loc = file.location(diagnostic.primary_span.start);
 
+    // The gutter is sized to the widest line number that will actually
+    // be printed, across every label regardless of which file it names
+    // -- a label in a different, shorter file must not misalign the
+    // primary block's gutter, and vice versa.
     let gutter_width = std::iter::once(primary_loc.line)
         .chain(
             diagnostic
                 .labels
                 .iter()
-                .map(|label| file.location(label.span.start).line),
+                .map(|label| sources.get(label.source).location(label.span.start).line),
         )
         .map(digit_count)
         .max()
@@ -51,12 +55,28 @@ pub fn render(diagnostic: &Diagnostic, sources: &SourceMap) -> String {
         gutter_width,
     );
 
+    // A label naming a different file than the one just rendered gets
+    // its own `--> file:line:col` header first, exactly like switching
+    // to a new primary location -- otherwise its line/column would be
+    // silently misread against the wrong file's line table.
+    let mut current_source = diagnostic.source;
     for label in &diagnostic.labels {
+        if label.source != current_source {
+            let label_file = sources.get(label.source);
+            let label_loc = label_file.location(label.span.start);
+            out.push_str(&format!(
+                " --> {}:{}:{}\n",
+                label_file.name(),
+                label_loc.line,
+                label_loc.column
+            ));
+            current_source = label.source;
+        }
         push_blank_gutter(&mut out, gutter_width);
         push_span_block(
             &mut out,
             sources,
-            diagnostic.source,
+            label.source,
             label.span,
             Some(&label.message),
             gutter_width,
@@ -190,6 +210,26 @@ mod tests {
         assert!(rendered.contains("1 | value x = 1"));
         assert!(rendered.contains("2 | value y = 2"));
         assert!(rendered.contains("also defined here"));
+    }
+
+    #[test]
+    fn renders_a_secondary_label_from_a_different_source_file() {
+        let mut map = SourceMap::new();
+        let importer = map.add_file("importer.npt", "import math.secret;");
+        let declaration = map.add_file("math.npt", "func secret() -> i64 { 0 }");
+        let diag = Diagnostic::error("M0006", importer, Span::new(7, 18), "item is private")
+            .with_label_in(declaration, Span::new(5, 11), "declared here");
+        let rendered = render(&diag, &map);
+        assert!(
+            rendered.contains(" --> importer.npt:1:8\n"),
+            "expected the primary header to name importer.npt: {rendered}"
+        );
+        assert!(
+            rendered.contains(" --> math.npt:1:6\n"),
+            "expected a second header naming math.npt for the cross-file label: {rendered}"
+        );
+        assert!(rendered.contains("declared here"));
+        assert!(rendered.contains("func secret"));
     }
 
     #[test]

@@ -40,12 +40,15 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.1
+## Current status: Alpha 0.1.2
 
-This milestone extends Alpha 0.1's compiler **frontend** and typed
-intermediate representation with a real data model: nominal records and
-variants, construction, field access, qualified variant constructors,
-and exhaustive pattern matching, executed end to end by the interpreter.
+This milestone makes Napitia a real multi-file project language: a
+`napitia.toml` manifest names a source root and an entry file, every
+`.npt` file under the source root is its own module, and `import` brings
+a single public item from another module into scope. It builds on Alpha
+0.1.1's data model (nominal records and variants, construction, field
+access, qualified variant constructors, and exhaustive pattern matching,
+executed end to end by the interpreter).
 
 ### Implemented in this milestone
 
@@ -88,11 +91,88 @@ and exhaustive pattern matching, executed end to end by the interpreter.
 - A tree-walking interpreter over NIR, used to execute the supported
   language subset (including records, variants, and `match`) without a
   native backend.
-- A CLI (`napitia lex|parse|check|ir|run`) exposing every stage.
+- A CLI (`napitia lex|parse|check|ir|run`) exposing every stage, now
+  accepting either a single `.npt` file or a multi-file project.
+- Multi-file projects (`project/`): a `napitia.toml` manifest, one file
+  per module, cross-module `import`, and `public`/`private` enforced for
+  real across module boundaries — see below.
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
 questions that go beyond what is implemented today.
+
+### Multi-file projects
+
+A project is a directory with a manifest:
+
+```toml
+# napitia.toml
+[package]
+name = "hello"
+version = "0.1.0"
+
+[project]
+source-root = "src"
+entry = "main.npt"
+```
+
+One `.npt` file is one module — there is no `module` declaration, and a
+module never spans more than one file. A module's dotted path is its file
+path relative to `source-root` with the extension stripped
+(`src/models/user.npt` → `models.user`). `import models.user.User;` brings
+item `User`, declared in module `models.user`, into the importing
+module's own namespace by that unqualified name; every segment before the
+last is the module path, the last is the imported item.
+
+Items (`func`/`record`/`variant`) and individual record fields are
+private by default and only reachable from another module if declared
+`public` *and* actually imported — a private item, or a private field on
+an otherwise-public record, can never be named from outside its
+declaring module:
+
+```napitia
+// src/models/user.npt
+public record User {
+    public id: i64,
+    email: str,      // private: not reachable from another module
+}
+
+public func make_user(id: i64) -> User {
+    User { id: id, email: "" }
+}
+```
+
+```napitia
+// src/main.npt
+import models.user.User;
+import models.user.make_user;
+
+func main() -> i64 {
+    value u = make_user(7);
+    return u.id
+}
+```
+
+`check`/`ir`/`run` all accept a directory, a manifest path, or a `.npt`
+file directly:
+
+```bash
+cargo run --manifest-path compiler/Cargo.toml -- run path/to/project
+cargo run --manifest-path compiler/Cargo.toml -- run path/to/project/napitia.toml
+cargo run --manifest-path compiler/Cargo.toml -- run path/to/project/src/main.npt
+```
+
+The manifest path itself can also be a bare relative path — `cd` into a
+project directory and run `napitia check napitia.toml` — or `./napitia.toml`,
+not just an absolute path.
+
+The third form is legacy single-file mode: an explicit `.npt` path always
+compiles just that one file through the same lex/parse/HIR/typeck/NIR
+pipeline single-file compilation always used, even if a `napitia.toml`
+happens to sit next to it.
+
+See `rfcs/0006-multi-file-projects-and-modules.md` for the full
+architecture and the complete list of project-level diagnostic codes.
 
 ### Explicitly not yet implemented
 
@@ -100,10 +180,11 @@ Field mutation, record/variant equality, pattern guards, or-patterns,
 record-destructuring/slice/range patterns, generics, protocols, a
 `Maybe<T>` absence type, checked `uses`/`raises` effects and errors,
 ownership/region enforcement (and the indirection that would lift the
-recursive-aggregate restriction), structured concurrency, modules
-beyond a single file, an LLVM (or any native) backend, garbage
-collection, a package manager, and any domain-specific library (REST,
-ORM, tensors, GPU). Design direction for most of these exists in `rfcs/`;
+recursive-aggregate restriction), structured concurrency, remote
+packages/dependency declarations, import aliases/wildcards/re-exports,
+incremental/cached compilation, an LLVM (or any native) backend, garbage
+collection, and any domain-specific library (REST, ORM, tensors, GPU).
+Design direction for most of these exists in `rfcs/`;
 none of it is faked in the implementation.
 
 ## Building

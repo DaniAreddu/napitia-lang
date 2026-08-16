@@ -1,0 +1,5 @@
+import other.fetch;
+
+func main() -> i64 {
+    return fetch()
+}

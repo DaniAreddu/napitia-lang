@@ -14,11 +14,11 @@ use unify::unify;
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirPattern, HirStmt, ItemId, LocalId,
+    HirPattern, HirStmt, HirType, ItemId, LocalId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
+use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name};
 
 mod codes {
@@ -44,6 +44,23 @@ mod codes {
     pub const INCOMPATIBLE_PATTERN: &str = "T0021";
 }
 
+/// Which function(s), if any, must satisfy the executable entry
+/// signature (`main` takes no parameters) -- `rfcs/0006` scopes this to
+/// the entry module's own `main`, identified by `ItemId` before typeck
+/// ever runs, so `main` declared in a non-entry module of a project is
+/// just an ordinary function. Single-file compilation has no concept of
+/// an "entry module" at all (there's only one namespace), so it keeps
+/// checking any function literally named `main` -- the legacy Alpha 0.1
+/// behavior.
+#[derive(Clone, Copy)]
+pub enum EntryMain {
+    ByName,
+    /// `None` when the entry module has no `main` at all; the
+    /// project-level `M0010` check reports that separately, so nothing
+    /// here needs to also flag a missing entry point.
+    ByIdentity(Option<ItemId>),
+}
+
 /// Whether `check_match_exhaustiveness` actually completed. Kept
 /// distinct from a plain `Vec<usize>` (which an empty budget-exceeded
 /// result used to be indistinguishable from "analysis ran and found no
@@ -64,6 +81,13 @@ struct FunctionSig {
     params: Vec<Ty>,
     ret: Ty,
     span: Span,
+    /// Where this function was declared -- a different file than the
+    /// call site's, in every cross-module call. A diagnostic pointing at
+    /// `span` must always use this as that label's own `SourceId`
+    /// (`with_label_in`), never the caller's `self.source`: attaching one
+    /// source's span to a different source's id renders it against the
+    /// wrong file entirely.
+    source: SourceId,
 }
 
 #[derive(Clone)]
@@ -100,19 +124,12 @@ pub struct TypeckResult {
 /// visited (so later independent errors in the same function are still
 /// reported), and `Ty::Error`/`Ty::Never` unify with anything so one bad
 /// expression does not cascade into unrelated type mismatches.
-pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> TypeckResult {
-    // The module's type namespace: primitives (spec/0003) plus every
-    // declared `record`/`variant` name. A named type that resolves
-    // against neither is genuinely unknown and must be diagnosed at its
-    // own span, never silently treated as `Ty::Error` -- see
-    // `resolve_named_type`.
-    let type_names = hir
-        .records
-        .iter()
-        .map(|r| (r.name, r.id))
-        .chain(hir.variants.iter().map(|v| (v.name, v.id)))
-        .collect();
-
+pub fn check_module(
+    hir: &HirModule,
+    source: SourceId,
+    interner: &Interner,
+    entry_main: EntryMain,
+) -> TypeckResult {
     let mut checker = Checker {
         source,
         interner,
@@ -122,7 +139,6 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         locals: HashMap::new(),
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
-        type_names,
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
@@ -130,11 +146,13 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
         pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
+        entry_main,
     };
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
     checker.build_signatures(hir);
     for function in &hir.functions {
+        checker.source = function.source;
         checker.check_function(function);
     }
     checker.finalize_defaults();
@@ -173,9 +191,6 @@ struct Checker<'a> {
     locals: HashMap<LocalId, LocalInfo>,
     pending_defaults: Vec<(TyVar, Ty)>,
     current_return_type: Ty,
-    /// The module's named-type namespace: declared `record`/`variant`
-    /// names, by their surface name, to the item they refer to.
-    type_names: HashMap<Symbol, ItemId>,
     /// Every declared record's fields, resolved to `Ty` and in
     /// declaration order -- the layout NIR's `record.create`/
     /// `record.field` will follow.
@@ -206,12 +221,24 @@ struct Checker<'a> {
     /// `MatchCoverage::Failed` deterministically, without a fixture
     /// that actually consumes 100,000 steps.
     pattern_budget: usize,
+    /// Which function(s) must satisfy the executable entry signature --
+    /// see [`EntryMain`].
+    entry_main: EntryMain,
 }
 
 #[derive(Clone)]
 struct RecordInfo {
-    /// `(field name, declared type)`, in declaration order.
-    fields: Vec<(Symbol, Ty)>,
+    /// The record's own declaration symbol, carried so `Ty::Named` can
+    /// always be built with the declaration's own name (see
+    /// `named_record_ty`), the same reason `VariantInfo` carries one.
+    name: Symbol,
+    /// `(field name, declared type, is_public)`, in declaration order.
+    fields: Vec<(Symbol, Ty, bool)>,
+    /// Where this record was declared -- compared against `self.source`
+    /// (the module currently being checked) to tell an in-module field
+    /// access/construction (always allowed) apart from a cross-module
+    /// one (only ever allowed for a `public` field).
+    source: SourceId,
 }
 
 #[derive(Clone)]
@@ -231,14 +258,23 @@ impl<'a> Checker<'a> {
     /// payloads already resolved to `Ty`.
     fn build_aggregate_info(&mut self, hir: &HirModule) {
         for r in &hir.records {
+            self.source = r.source;
             let fields = r
                 .fields
                 .iter()
-                .map(|f| (f.name, self.resolve_named_type(&f.ty)))
+                .map(|f| (f.name, self.resolve_named_type(&f.ty), f.public))
                 .collect();
-            self.records.insert(r.id, RecordInfo { fields });
+            self.records.insert(
+                r.id,
+                RecordInfo {
+                    name: r.name,
+                    fields,
+                    source: r.source,
+                },
+            );
         }
         for v in &hir.variants {
+            self.source = v.source;
             let cases = v
                 .cases
                 .iter()
@@ -279,7 +315,12 @@ impl<'a> Checker<'a> {
         let field_types: HashMap<ItemId, Vec<Ty>> = self
             .records
             .iter()
-            .map(|(id, info)| (*id, info.fields.iter().map(|(_, ty)| ty.clone()).collect()))
+            .map(|(id, info)| {
+                (
+                    *id,
+                    info.fields.iter().map(|(_, ty, _)| ty.clone()).collect(),
+                )
+            })
             .collect();
         let payload_types: HashMap<ItemId, Vec<Vec<Ty>>> = self
             .variants
@@ -290,13 +331,13 @@ impl<'a> Checker<'a> {
             hir,
             &field_types,
             &payload_types,
-            self.source,
             self.interner,
         ));
     }
 
     fn build_signatures(&mut self, hir: &HirModule) {
         for f in &hir.functions {
+            self.source = f.source;
             let params = f
                 .params
                 .iter()
@@ -313,34 +354,42 @@ impl<'a> Checker<'a> {
                     params,
                     ret,
                     span: f.span,
+                    source: f.source,
                 },
             );
         }
     }
 
-    /// Resolves a written type name against the module's type namespace:
-    /// primitives first, then declared `record`/`variant` names. An
-    /// unknown name is a diagnostic at the type's own span -- `Ty::Error`
-    /// is only ever returned *after* recording why, never as a silent
-    /// wildcard for "some type we don't recognize".
-    fn resolve_named_type(&mut self, ty: &ast::Type) -> Ty {
-        let text = self.interner.resolve(ty.name.symbol);
-        if let Some(prim) = primitive_from_name(text) {
-            return prim;
+    /// Converts a type reference already resolved by `hir::lower`
+    /// against its *declaring module's own* namespace (see [`HirType`])
+    /// into the checker's internal `Ty` -- an aggregate reference is
+    /// already an exact `ItemId` by this point, never re-derived from a
+    /// surface name here. A name `hir::lower` couldn't resolve to a
+    /// locally-known aggregate is checked against the primitive
+    /// namespace; if it's not that either, it's genuinely unknown and is
+    /// a diagnostic at the type's own span -- `Ty::Error` is only ever
+    /// returned *after* recording why, never as a silent wildcard for
+    /// "some type we don't recognize".
+    fn resolve_named_type(&mut self, ty: &HirType) -> Ty {
+        match ty {
+            HirType::Aggregate { item, name, .. } => Ty::Named(*item, *name),
+            HirType::Unresolved { name, span } => {
+                let text = self.interner.resolve(*name);
+                if let Some(prim) = primitive_from_name(text) {
+                    return prim;
+                }
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_TYPE,
+                        self.source,
+                        *span,
+                        format!("cannot find type `{text}` in this scope"),
+                    )
+                    .with_primary_label("unknown type"),
+                );
+                Ty::Error
+            }
         }
-        if let Some(&item) = self.type_names.get(&ty.name.symbol) {
-            return Ty::Named(item, ty.name.symbol);
-        }
-        self.diagnostics.push(
-            Diagnostic::error(
-                codes::UNKNOWN_TYPE,
-                self.source,
-                ty.name.span,
-                format!("cannot find type `{text}` in this scope"),
-            )
-            .with_primary_label("unknown type"),
-        );
-        Ty::Error
     }
 
     fn check_function(&mut self, f: &HirFunction) {
@@ -367,12 +416,21 @@ impl<'a> Checker<'a> {
         if !f.uses.is_empty() || !f.raises.is_empty() {
             self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
         }
-        // `napitia run` always calls `main` with zero arguments (`cli.rs`
-        // hardcodes the entry point's name, not its arity), so a `main`
-        // declared with parameters can never actually receive them --
-        // that must be caught here, not discovered as missing values at
-        // interpretation time.
-        if self.interner.resolve(f.name) == "main" && !f.params.is_empty() {
+        // `napitia run` always calls the entry point with zero arguments,
+        // so a `main` declared with parameters can never actually
+        // receive them -- that must be caught here, not discovered as
+        // missing values at interpretation time. Which function this
+        // rule applies to depends on `entry_main`: single-file
+        // compilation has no module boundary to scope by identity, so it
+        // keeps checking any function named `main` (legacy behavior);
+        // project compilation scopes it to the entry module's own
+        // `main` by `ItemId`, so `main` declared in any other module is
+        // just an ordinary function (`rfcs/0006`).
+        let is_entry_main = match self.entry_main {
+            EntryMain::ByName => self.interner.resolve(f.name) == "main",
+            EntryMain::ByIdentity(entry) => entry == Some(f.id),
+        };
+        if is_entry_main && !f.params.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::INVALID_MAIN_SIGNATURE,
@@ -906,7 +964,7 @@ impl<'a> Checker<'a> {
                     ),
                 )
                 .with_primary_label("wrong number of arguments")
-                .with_label(sig.span, "function defined here"),
+                .with_label_in(sig.source, sig.span, "function defined here"),
             );
         } else {
             for (arg_ty, param_ty) in arg_tys.iter().zip(sig.params.iter()) {
@@ -1029,7 +1087,7 @@ impl<'a> Checker<'a> {
             if matches!(field_ty, Ty::Never) {
                 diverged = true;
             }
-            let (_, declared_ty) = &info.fields[f.field_index];
+            let (_, declared_ty, _) = &info.fields[f.field_index];
             self.unify_report(
                 declared_ty,
                 &field_ty,
@@ -1088,8 +1146,26 @@ impl<'a> Checker<'a> {
             );
             return Ty::Error;
         };
-        match info.fields.iter().find(|(n, _)| *n == name) {
-            Some((_, ty)) => ty.clone(),
+        match info.fields.iter().find(|(n, _, _)| *n == name) {
+            Some((_, ty, is_public)) => {
+                if !*is_public && info.source != self.source {
+                    let text = self.interner.resolve(name);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            crate::project::codes::INACCESSIBLE_FIELD,
+                            self.source,
+                            span,
+                            format!(
+                                "field `{text}` of `{}` is private to its declaring module",
+                                self.display_for_diagnostic(&base_ty)
+                            ),
+                        )
+                        .with_primary_label("cannot access a private field from here"),
+                    );
+                    return Ty::Error;
+                }
+                ty.clone()
+            }
             None => {
                 let text = self.interner.resolve(name);
                 self.diagnostics.push(
@@ -1114,17 +1190,15 @@ impl<'a> Checker<'a> {
         matches!(resolved, Ty::Named(item, _) if self.records.contains_key(&item) || self.variants.contains_key(&item))
     }
 
-    /// Builds `Ty::Named` for a record item, resolving a display symbol
-    /// from the module's type namespace (the same one `resolve_named_type`
-    /// already searches) rather than requiring every call site to thread
-    /// the record's own `Symbol` through separately.
+    /// Builds `Ty::Named` for a record item, using the record
+    /// declaration's own symbol (see `RecordInfo::name`) rather than
+    /// requiring every call site to thread it through separately.
     fn named_record_ty(&self, record: ItemId) -> Ty {
         let symbol = self
-            .type_names
-            .iter()
-            .find(|(_, id)| **id == record)
-            .map(|(name, _)| *name)
-            .expect("internal invariant: a resolved record ItemId is always in type_names");
+            .records
+            .get(&record)
+            .map(|info| info.name)
+            .expect("internal invariant: a resolved record ItemId is always in self.records");
         Ty::Named(record, symbol)
     }
 
@@ -1801,7 +1875,7 @@ mod tests {
             resolve_diags.is_empty(),
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
-        check_module(&hir, id, &interner).diagnostics
+        check_module(&hir, id, &interner, EntryMain::ByName).diagnostics
     }
 
     fn check_full(text: &str) -> TypeckResult {
@@ -1823,7 +1897,7 @@ mod tests {
             resolve_diags.is_empty(),
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
-        check_module(&hir, id, &interner)
+        check_module(&hir, id, &interner, EntryMain::ByName)
     }
 
     #[test]
@@ -2161,7 +2235,6 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
-            type_names: HashMap::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -2169,6 +2242,7 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
+            entry_main: EntryMain::ByName,
         };
         // A non-Ty::Named scrutinee (here Ty::Error) makes every level
         // take check_pattern's own "incompatible scrutinee" branch,
@@ -2202,7 +2276,6 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
-            type_names: HashMap::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -2210,6 +2283,7 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             pattern_budget: budget,
+            entry_main: EntryMain::ByName,
         }
     }
 
@@ -2902,7 +2976,7 @@ mod tests {
         let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_module(&module, id, &interner);
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected diagnostics: {:?}",
@@ -2968,6 +3042,109 @@ mod tests {
              func f(u: User) -> i64 { return u.id }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn accessing_a_private_field_from_a_different_declaring_module_is_m0011() {
+        // Hand-built: a record declared in one "module" (its own
+        // source) with a private field, accessed from a function whose
+        // own source differs -- the only way to exercise this without
+        // a full project compilation, which is exactly the scenario
+        // check_module now has to get right once modules are lowered
+        // separately and merged.
+        let mut map = SourceMap::new();
+        let record_source = map.add_file("point.npt", "");
+        let accessing_source = map.add_file("main.npt", "");
+        let mut interner = Interner::new();
+        let record_name = interner.intern("Point");
+        let field_x = interner.intern("x");
+        let field_y = interner.intern("y");
+        let param_name = interner.intern("p");
+        let fn_name = interner.intern("f");
+
+        let record = crate::hir::HirRecord {
+            id: ItemId(0),
+            name: record_name,
+            span: Span::dummy(),
+            source: record_source,
+            public: true,
+            fields: vec![
+                crate::hir::HirField {
+                    name: field_x,
+                    span: Span::dummy(),
+                    public: true,
+                    ty: HirType::Unresolved {
+                        name: interner.intern("i64"),
+                        span: Span::dummy(),
+                    },
+                },
+                crate::hir::HirField {
+                    name: field_y,
+                    span: Span::dummy(),
+                    public: false,
+                    ty: HirType::Unresolved {
+                        name: interner.intern("i64"),
+                        span: Span::dummy(),
+                    },
+                },
+            ],
+        };
+        let param_local = LocalId(0);
+        let function = HirFunction {
+            id: ItemId(1),
+            name: fn_name,
+            name_span: Span::dummy(),
+            source: accessing_source,
+            public: true,
+            params: vec![crate::hir::HirParam {
+                local: param_local,
+                name: param_name,
+                span: Span::dummy(),
+                ty: HirType::Aggregate {
+                    item: ItemId(0),
+                    kind: crate::hir::AggregateKind::Record,
+                    name: record_name,
+                    span: Span::dummy(),
+                },
+            }],
+            return_type: Some(HirType::Unresolved {
+                name: interner.intern("i64"),
+                span: Span::dummy(),
+            }),
+            uses: vec![],
+            raises: vec![],
+            body: crate::hir::HirBlock {
+                id: crate::hir::ExprId(0),
+                statements: vec![],
+                tail: Some(Box::new(HirExpr::Field {
+                    id: crate::hir::ExprId(1),
+                    base: Box::new(HirExpr::Local {
+                        id: crate::hir::ExprId(2),
+                        local: param_local,
+                        name: param_name,
+                        span: Span::dummy(),
+                    }),
+                    name: field_y,
+                    span: Span::dummy(),
+                })),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let hir = HirModule {
+            functions: vec![function],
+            records: vec![record],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let result = check_module(&hir, accessing_source, &interner, EntryMain::ByName);
+        assert_eq!(
+            result.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.diagnostics[0].code, "M0011");
     }
 
     #[test]

@@ -1,0 +1,3 @@
+public func helper() -> i64 {
+    return 99
+}

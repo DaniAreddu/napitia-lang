@@ -1,0 +1,6 @@
+import b.make_b;
+import a.make_a;
+
+func main() -> i64 {
+    return make_a() + make_b()
+}

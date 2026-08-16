@@ -10,12 +10,14 @@
 
 pub mod lower;
 
-pub use lower::lower_module;
+pub use lower::{
+    IdCursor, ImportedItem, ImportedItemKind, lower_module, lower_module_with_imports,
+};
 
 use crate::lexer::IntBase;
-use crate::source::Span;
+use crate::source::{SourceId, Span};
 use crate::symbol::Symbol;
-use crate::syntax::ast::{AssignOp, BinaryOp, Ident, Path, Type, UnaryOp};
+use crate::syntax::ast::{AssignOp, BinaryOp, Ident, Path, UnaryOp};
 
 /// Identifies a module-level item (function, record, variant, protocol,
 /// extend, or import) for the lifetime of one compilation session.
@@ -45,6 +47,47 @@ pub struct ExprId(pub(crate) u32);
 /// case/type, per-pattern local bindings) on identity rather than span.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PatternId(pub(crate) u32);
+
+/// Which kind of declaration an [`HirType::Aggregate`] reference
+/// resolved to -- carried so a diagnostic can say "record" or "variant"
+/// without a second identity lookup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AggregateKind {
+    Record,
+    Variant,
+}
+
+/// A type reference, resolved against the *declaring* module's own type
+/// namespace at HIR-lowering time -- before modules are merged, and
+/// never re-derived later from a project-global surface name
+/// (`rfcs/0006`'s module-namespace isolation). A name that matched a
+/// declared `record`/`variant` in this module's own namespace (declared
+/// locally, or reached via a successful `import`) resolves to the exact
+/// declaration's `ItemId` here; a name that didn't is left `Unresolved`
+/// for typeck to check against the primitive namespace, or reject as
+/// genuinely unknown (`T0006`) -- HIR lowering itself has no notion of
+/// primitive types.
+#[derive(Debug, Clone)]
+pub enum HirType {
+    Aggregate {
+        item: ItemId,
+        kind: AggregateKind,
+        name: Symbol,
+        span: Span,
+    },
+    Unresolved {
+        name: Symbol,
+        span: Span,
+    },
+}
+
+impl HirType {
+    pub fn span(&self) -> Span {
+        match self {
+            HirType::Aggregate { span, .. } | HirType::Unresolved { span, .. } => *span,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HirModule {
@@ -81,6 +124,17 @@ pub struct HirRecord {
     pub id: ItemId,
     pub name: Symbol,
     pub span: Span,
+    /// The module this record was declared in, always the source
+    /// `hir::lower_module` (or `lower_module_with_imports`) actually ran
+    /// against -- never the source of whatever other module a merged
+    /// multi-module compilation happens to be checking a reference from.
+    /// Every diagnostic about this record (a field-visibility
+    /// violation, a public-API leak) is reported against this source,
+    /// not the accessing site's.
+    pub source: SourceId,
+    /// Whether this record itself may be imported from another module
+    /// (`rfcs/0006`); irrelevant to single-file compilation.
+    pub public: bool,
     pub fields: Vec<HirField>,
 }
 
@@ -88,11 +142,13 @@ pub struct HirRecord {
 pub struct HirField {
     pub name: Symbol,
     pub span: Span,
-    /// Unresolved surface type; `typeck` resolves it against the
-    /// module's type namespace the same way it resolves a function
-    /// parameter's type, so an unknown field type gets its own
-    /// diagnostic rather than lowering silently defaulting it.
-    pub ty: Type,
+    /// Whether this field may be read or initialized from outside its
+    /// record's own declaring module (`rfcs/0006`); irrelevant to
+    /// single-file compilation, where every field is always accessible.
+    pub public: bool,
+    /// Resolved against this record's own declaring module's namespace
+    /// at HIR-lowering time -- see [`HirType`].
+    pub ty: HirType,
 }
 
 /// A resolved `variant` declaration: its full case list, in declaration
@@ -102,6 +158,10 @@ pub struct HirVariant {
     pub id: ItemId,
     pub name: Symbol,
     pub span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
+    /// See [`HirRecord::public`].
+    pub public: bool,
     pub cases: Vec<HirCase>,
 }
 
@@ -111,7 +171,7 @@ pub struct HirCase {
     pub span: Span,
     /// Positional payload types, in declaration order; empty for a
     /// payload-less (unit) case.
-    pub payload: Vec<Type>,
+    pub payload: Vec<HirType>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +179,12 @@ pub struct HirFunction {
     pub id: ItemId,
     pub name: Symbol,
     pub name_span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
+    /// See [`HirRecord::public`].
+    pub public: bool,
     pub params: Vec<HirParam>,
-    pub return_type: Option<Type>,
+    pub return_type: Option<HirType>,
     /// Effect/capability paths from a `uses` clause, preserved as-parsed.
     /// Not semantically checked (`spec/0005`): the checker only reports
     /// a function declaring a non-empty clause as using an unsupported
@@ -138,7 +202,7 @@ pub struct HirParam {
     pub local: LocalId,
     pub name: Symbol,
     pub span: Span,
-    pub ty: Type,
+    pub ty: HirType,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +237,7 @@ pub struct HirBinding {
     pub local: LocalId,
     pub name: Symbol,
     pub mutable: bool,
-    pub ty: Option<Type>,
+    pub ty: Option<HirType>,
     pub value: HirExpr,
     pub span: Span,
 }
@@ -272,7 +336,7 @@ pub enum HirExpr {
     Cast {
         id: ExprId,
         expr: Box<HirExpr>,
-        ty: Type,
+        ty: HirType,
         span: Span,
     },
     /// Postfix `?`. Parsed and resolved, not yet given propagation

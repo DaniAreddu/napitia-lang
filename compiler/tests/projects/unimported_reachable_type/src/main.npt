@@ -1,0 +1,9 @@
+import helper.ping;
+
+func uses_secret(s: Secret) -> i64 {
+    return ping()
+}
+
+func main() -> i64 {
+    return ping()
+}

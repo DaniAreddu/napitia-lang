@@ -1,0 +1,5 @@
+import a.thing;
+
+public func helper() -> i64 {
+    return thing()
+}

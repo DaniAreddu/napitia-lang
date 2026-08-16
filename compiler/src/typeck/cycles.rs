@@ -25,6 +25,14 @@ const INFINITE_AGGREGATE_LAYOUT: &str = "T0020";
 struct Node {
     name: Symbol,
     span: Span,
+    /// The declaring module -- a cycle spanning more than one module is
+    /// structurally impossible (it would require a module import cycle,
+    /// already rejected before typeck ever runs), so every node
+    /// actually reached by a single cycle always shares one `source`;
+    /// stored per-node anyway rather than threaded in from a single
+    /// external parameter, so that guarantee is never load-bearing for
+    /// correctness.
+    source: SourceId,
     edges: Vec<Edge>,
 }
 
@@ -46,7 +54,6 @@ pub fn check_cycles(
     hir: &HirModule,
     field_types: &HashMap<ItemId, Vec<Ty>>,
     payload_types: &HashMap<ItemId, Vec<Vec<Ty>>>,
-    source: SourceId,
     interner: &Interner,
 ) -> Vec<Diagnostic> {
     // Traversal order is exactly declaration order (records first, then
@@ -74,6 +81,7 @@ pub fn check_cycles(
             Node {
                 name: record.name,
                 span: record.span,
+                source: record.source,
                 edges,
             },
         );
@@ -98,6 +106,7 @@ pub fn check_cycles(
             Node {
                 name: variant.name,
                 span: variant.span,
+                source: variant.source,
                 edges,
             },
         );
@@ -159,7 +168,6 @@ pub fn check_cycles(
                             &path[start_idx..],
                             &nodes,
                             edge,
-                            source,
                             interner,
                         ));
                     }
@@ -176,9 +184,9 @@ fn cycle_diagnostic(
     cycle: &[ItemId],
     nodes: &HashMap<ItemId, Node>,
     closing_edge: &Edge,
-    source: SourceId,
     interner: &Interner,
 ) -> Diagnostic {
+    let source = nodes[&cycle[0]].source;
     let mut path_text = String::new();
     for id in cycle {
         if !path_text.is_empty() {
@@ -220,20 +228,27 @@ mod tests {
     use crate::hir::{HirCase, HirField, HirRecord, HirVariant};
     use crate::source::SourceMap;
 
-    fn record(id: u32, name: Symbol, field_name: Symbol, field_ty: Ty) -> (HirRecord, Ty) {
+    fn record(
+        id: u32,
+        name: Symbol,
+        field_name: Symbol,
+        field_ty: Ty,
+        source: SourceId,
+    ) -> (HirRecord, Ty) {
         (
             HirRecord {
                 id: ItemId(id),
                 name,
                 span: Span::dummy(),
+                source,
+                public: true,
                 fields: vec![HirField {
                     name: field_name,
                     span: Span::dummy(),
-                    ty: crate::syntax::ast::Type {
-                        name: crate::syntax::ast::Ident {
-                            symbol: name,
-                            span: Span::dummy(),
-                        },
+                    public: true,
+                    ty: crate::hir::HirType::Unresolved {
+                        name,
+                        span: Span::dummy(),
                     },
                 }],
             },
@@ -241,20 +256,26 @@ mod tests {
         )
     }
 
-    fn variant(id: u32, name: Symbol, case_name: Symbol, payload_ty: Ty) -> (HirVariant, Ty) {
+    fn variant(
+        id: u32,
+        name: Symbol,
+        case_name: Symbol,
+        payload_ty: Ty,
+        source: SourceId,
+    ) -> (HirVariant, Ty) {
         (
             HirVariant {
                 id: ItemId(id),
                 name,
                 span: Span::dummy(),
+                source,
+                public: true,
                 cases: vec![HirCase {
                     name: case_name,
                     span: Span::dummy(),
-                    payload: vec![crate::syntax::ast::Type {
-                        name: crate::syntax::ast::Ident {
-                            symbol: name,
-                            span: Span::dummy(),
-                        },
+                    payload: vec![crate::hir::HirType::Unresolved {
+                        name,
+                        span: Span::dummy(),
                     }],
                 }],
             },
@@ -269,13 +290,15 @@ mod tests {
     /// exactly the `Ty::Named` edges this test wants to exist.
     fn check_record_cycle(names: &[&str]) -> (Vec<Diagnostic>, Vec<String>, Interner) {
         let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
         let symbols: Vec<Symbol> = names.iter().map(|n| interner.intern(n)).collect();
         let mut records = Vec::new();
         let mut field_types = HashMap::new();
         for (i, &sym) in symbols.iter().enumerate() {
             let next = symbols[(i + 1) % symbols.len()];
             let next_id = ItemId((i as u32 + 1) % symbols.len() as u32);
-            let (r, ty) = record(i as u32, sym, next, Ty::Named(next_id, next));
+            let (r, ty) = record(i as u32, sym, next, Ty::Named(next_id, next), source);
             field_types.insert(r.id, vec![ty]);
             records.push(r);
         }
@@ -285,9 +308,7 @@ mod tests {
             variants: Vec::new(),
             other_items: Vec::new(),
         };
-        let mut map = SourceMap::new();
-        let source = map.add_file("t.npt", "");
-        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), source, &interner);
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
         (
             diagnostics,
             names.iter().map(|s| s.to_string()).collect(),
@@ -332,12 +353,14 @@ mod tests {
     #[test]
     fn mixed_record_and_variant_cycle_path_text_is_exact() {
         let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
         let a = interner.intern("A");
         let b = interner.intern("B");
         let field_name = interner.intern("next");
         let case_name = interner.intern("X");
-        let (record_a, record_ty) = record(0, a, field_name, Ty::Named(ItemId(1), b));
-        let (variant_b, variant_ty) = variant(1, b, case_name, Ty::Named(ItemId(0), a));
+        let (record_a, record_ty) = record(0, a, field_name, Ty::Named(ItemId(1), b), source);
+        let (variant_b, variant_ty) = variant(1, b, case_name, Ty::Named(ItemId(0), a), source);
         let mut field_types = HashMap::new();
         field_types.insert(record_a.id, vec![record_ty]);
         let mut payload_types = HashMap::new();
@@ -348,9 +371,7 @@ mod tests {
             variants: vec![variant_b],
             other_items: Vec::new(),
         };
-        let mut map = SourceMap::new();
-        let source = map.add_file("t.npt", "");
-        let diagnostics = check_cycles(&hir, &field_types, &payload_types, source, &interner);
+        let diagnostics = check_cycles(&hir, &field_types, &payload_types, &interner);
         assert_eq!(
             diagnostics.len(),
             1,

@@ -87,6 +87,29 @@ impl<'a> Interpreter<'a> {
         self.call_function(function, args)
     }
 
+    /// Calls the function identified by `item` with no arguments -- a
+    /// multi-module project's entry point, resolved by the caller to a
+    /// specific `ItemId` in the configured entry module, never by a
+    /// name lookup over the whole (merged) module: more than one
+    /// module could otherwise declare an unrelated function also named
+    /// `main`, and a name-based lookup could silently run the wrong
+    /// one.
+    pub fn run_item(&self, item: ItemId) -> Result<Value, InterpreterError> {
+        self.call_item(item, Vec::new())
+    }
+
+    pub fn call_item(&self, item: ItemId, args: Vec<Value>) -> Result<Value, InterpreterError> {
+        let function = self
+            .module
+            .functions
+            .iter()
+            .find(|f| f.id == item)
+            .ok_or_else(|| {
+                InterpreterError::InvalidOperation(format!("unknown function {item:?}"))
+            })?;
+        self.call_function(function, args)
+    }
+
     fn call_function(
         &self,
         function: &Function,
@@ -481,7 +504,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected type errors: {:?}",
@@ -747,7 +770,7 @@ mod tests {
         let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -762,6 +785,43 @@ mod tests {
             outcome,
             Err(InterpreterError::InvalidOperation(_))
         ));
+    }
+
+    #[test]
+    fn run_item_executes_the_function_with_that_id_not_by_name() {
+        // Two functions named `main` would be a duplicate-definition
+        // diagnostic within one real module, but a multi-module
+        // project's *merged* NIR can legitimately contain two
+        // functions that both happen to be named `main` (one per
+        // module) -- run_item must run the specific one the caller
+        // already resolved to, never search by name.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "func main() -> i64 { return 1 } func other_main() -> i64 { return 2 }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
+        let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
+        let (hir, _) = lower_hir(&module, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        let nir = lower_nir(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
+        let other_main_id = nir
+            .functions
+            .iter()
+            .find(|f| interner.resolve(f.name) == "other_main")
+            .expect("other_main should have lowered")
+            .id;
+        let outcome = Interpreter::new(&nir).run_item(other_main_id);
+        assert_eq!(outcome, Ok(Value::Int(2)));
     }
 
     #[test]

@@ -24,16 +24,22 @@ impl Severity {
 }
 
 /// A secondary span pointing at source code relevant to a diagnostic,
-/// distinct from the diagnostic's primary span.
+/// distinct from the diagnostic's primary span. Carries its own
+/// `SourceId` rather than assuming it belongs to the same file as the
+/// diagnostic's primary span -- a cross-module diagnostic (e.g. an
+/// import naming a private item) routinely needs to point at both the
+/// import site and the original declaration in a different file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Label {
+    pub source: SourceId,
     pub span: Span,
     pub message: String,
 }
 
 impl Label {
-    pub fn new(span: Span, message: impl Into<String>) -> Self {
+    pub fn new(source: SourceId, span: Span, message: impl Into<String>) -> Self {
         Label {
+            source,
             span,
             message: message.into(),
         }
@@ -106,8 +112,24 @@ impl Diagnostic {
         self
     }
 
+    /// Adds a secondary label in this diagnostic's own primary source
+    /// file -- the common, same-file case.
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.labels.push(Label::new(span, message));
+        self.labels.push(Label::new(self.source, span, message));
+        self
+    }
+
+    /// Adds a secondary label in a source file other than this
+    /// diagnostic's own primary one, e.g. pointing at an original
+    /// declaration in a different module than the one the error itself
+    /// is reported against.
+    pub fn with_label_in(
+        mut self,
+        source: SourceId,
+        span: Span,
+        message: impl Into<String>,
+    ) -> Self {
+        self.labels.push(Label::new(source, span, message));
         self
     }
 

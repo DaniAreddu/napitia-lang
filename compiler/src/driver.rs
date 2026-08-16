@@ -5,6 +5,7 @@
 //! stopping at the first one.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{self, HirModule, LocalId};
@@ -12,6 +13,7 @@ use crate::interpreter::{Interpreter, InterpreterError, Value};
 use crate::lexer::{self, Token};
 use crate::nir::{self, Module as NirModule};
 use crate::parser::Parser;
+use crate::project::{self, CompiledProject};
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
 use crate::syntax::ast;
@@ -60,7 +62,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
     let mut diagnostics = parsed.diagnostics;
     let (hir, resolve_diags) = hir::lower_module(&parsed.module, source, interner);
     diagnostics.extend(resolve_diags);
-    let typeck_result = typeck::check_module(&hir, source, interner);
+    let typeck_result = typeck::check_module(&hir, source, interner, typeck::EntryMain::ByName);
     diagnostics.extend(typeck_result.diagnostics);
     CheckOutput {
         hir,
@@ -126,6 +128,51 @@ pub fn run(map: &SourceMap, source: SourceId, interner: &mut Interner, entry: &s
             let result = Interpreter::new(&nir).run(entry, interner);
             RunOutput::Result(result)
         }
+    }
+}
+
+pub fn check_project(
+    manifest_path: &Path,
+    map: &mut SourceMap,
+    interner: &mut Interner,
+) -> Vec<Diagnostic> {
+    match project::compile_project(manifest_path, map, interner) {
+        Ok(_) => Vec::new(),
+        Err(diagnostics) => diagnostics,
+    }
+}
+
+pub enum ProjectIrOutput {
+    Ready { nir: NirModule },
+    Diagnostics(Vec<Diagnostic>),
+}
+
+pub fn ir_project(
+    manifest_path: &Path,
+    map: &mut SourceMap,
+    interner: &mut Interner,
+) -> ProjectIrOutput {
+    match project::compile_project(manifest_path, map, interner) {
+        Ok(CompiledProject { nir, .. }) => ProjectIrOutput::Ready { nir },
+        Err(diagnostics) => ProjectIrOutput::Diagnostics(diagnostics),
+    }
+}
+
+pub enum ProjectRunOutput {
+    Diagnostics(Vec<Diagnostic>),
+    Result(Result<Value, InterpreterError>),
+}
+
+pub fn run_project(
+    manifest_path: &Path,
+    map: &mut SourceMap,
+    interner: &mut Interner,
+) -> ProjectRunOutput {
+    match project::compile_project(manifest_path, map, interner) {
+        Ok(CompiledProject { nir, entry_item }) => {
+            ProjectRunOutput::Result(Interpreter::new(&nir).run_item(entry_item))
+        }
+        Err(diagnostics) => ProjectRunOutput::Diagnostics(diagnostics),
     }
 }
 

@@ -45,10 +45,29 @@ fn version_prints_a_version_and_succeeds() {
 }
 
 #[test]
-fn missing_file_argument_is_a_usage_error() {
+fn missing_file_argument_is_a_usage_error_for_lex_and_parse() {
+    for command in ["lex", "parse"] {
+        let output = napitia(&[command]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{command}` should require a path"
+        );
+        assert!(stderr(&output).contains("missing"));
+    }
+}
+
+#[test]
+fn run_with_no_path_defaults_to_the_current_directory_as_a_project() {
+    // `check`/`ir`/`run` accept an omitted path and default to the
+    // current directory, treating it as a project rather than requiring
+    // a `.npt` file. The test binary's working directory has no
+    // `napitia.toml`, so this must fail with an M0001 diagnostic rather
+    // than a usage error -- the important thing is it no longer treats
+    // a missing argument as a usage error for these three commands.
     let output = napitia(&["run"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("missing"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("M0001"));
 }
 
 #[test]
@@ -56,6 +75,29 @@ fn unreadable_file_is_a_usage_error() {
     let output = napitia(&["run", "does/not/exist.npt"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("could not read"));
+}
+
+#[test]
+fn extra_arguments_are_a_usage_error_not_silently_ignored() {
+    for args in [
+        vec!["lex", &fixture("valid.npt"), "extra"],
+        vec!["parse", &fixture("valid.npt"), "extra"],
+        vec!["check", &fixture("valid.npt"), "extra"],
+        vec!["ir", &fixture("valid.npt"), "extra"],
+        vec!["run", &fixture("valid.npt"), "extra"],
+    ] {
+        let output = napitia(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{args:?}` should reject the unexpected extra argument"
+        );
+        assert!(
+            stderr(&output).contains("unexpected extra argument"),
+            "`{args:?}` produced: {}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]

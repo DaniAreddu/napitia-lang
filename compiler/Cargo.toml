@@ -1,6 +1,6 @@
 [package]
 name = "compiler"
-version = "0.1.1-alpha.1"
+version = "0.1.2-alpha.1"
 edition = "2024"
 # `rust-version` is Cargo's MSRV field: it would claim a *guaranteed
 # minimum* rustc, which has never been established here (edition 2024
@@ -13,3 +13,14 @@ name = "napitia"
 path = "src/main.rs"
 
 [dependencies]
+# The only third-party dependency in this crate: parses napitia.toml
+# manifests. TOML has real, non-trivial syntax (quoting, multi-line
+# strings, dotted keys, escapes) that a bespoke partial parser would
+# risk getting subtly wrong in exactly the cases that matter --
+# silently accepting a malformed manifest the real format would
+# reject. `toml` is the standard, actively-maintained implementation
+# in the Rust ecosystem; used here only to parse into a generic
+# `toml::Value` tree, which this crate then validates field-by-field
+# itself (no `serde` derive, no schema magic) so every diagnostic stays
+# in Napitia's own error model.
+toml = "0.8"

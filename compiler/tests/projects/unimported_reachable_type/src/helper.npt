@@ -1,0 +1,7 @@
+public func ping() -> i64 {
+    return 1
+}
+
+public record Secret {
+    public x: i64,
+}

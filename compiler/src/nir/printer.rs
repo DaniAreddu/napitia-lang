@@ -285,7 +285,7 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty(), "{diags:?}");
-        let typeck_result = check_module(&hir, id, &interner);
+        let typeck_result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             typeck_result.diagnostics.is_empty(),
             "{:?}",

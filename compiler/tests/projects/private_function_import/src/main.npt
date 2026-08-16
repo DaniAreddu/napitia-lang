@@ -1,0 +1,5 @@
+import math.secret;
+
+func main() -> i64 {
+    return secret()
+}

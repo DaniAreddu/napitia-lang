@@ -1,0 +1,5 @@
+import shapes.Hidden;
+
+func main() -> i64 {
+    return 0
+}

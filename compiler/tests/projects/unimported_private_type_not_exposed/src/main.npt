@@ -1,0 +1,9 @@
+import helper.ping;
+
+public func leak() -> Secret {
+    return ping()
+}
+
+func main() -> i64 {
+    return ping()
+}

@@ -1,0 +1,549 @@
+//! Multi-file Napitia projects: manifests, module discovery, the
+//! module dependency graph, and cross-module import resolution
+//! (`rfcs/0006`).
+
+pub mod loader;
+pub mod manifest;
+pub mod module;
+pub mod resolve;
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::diagnostics::Diagnostic;
+use crate::hir::{self, HirModule, ItemId};
+use crate::nir::{self, Module as NirModule};
+use crate::source::{SourceId, SourceMap};
+use crate::symbol::Interner;
+use crate::syntax::ast;
+use crate::typeck;
+
+pub(crate) mod codes {
+    pub const INVALID_MANIFEST: &str = "M0001";
+    pub const INVALID_PROJECT_PATH: &str = "M0002";
+    pub const INVALID_IMPORT_PATH: &str = "M0003";
+    pub const MODULE_NOT_FOUND: &str = "M0004";
+    pub const ITEM_NOT_FOUND: &str = "M0005";
+    pub const ITEM_PRIVATE: &str = "M0006";
+    pub const DUPLICATE_IMPORT: &str = "M0007";
+    pub const IMPORT_CYCLE: &str = "M0008";
+    pub const MODULE_PATH_COLLISION: &str = "M0009";
+    pub const INVALID_ENTRY: &str = "M0010";
+    pub const INACCESSIBLE_FIELD: &str = "M0011";
+    pub const PRIVATE_TYPE_LEAKED: &str = "M0012";
+}
+
+/// A fully compiled, verified project, ready to print or execute.
+#[derive(Debug)]
+pub struct CompiledProject {
+    pub nir: NirModule,
+    /// The entry module's own `main`, resolved by identity -- never a
+    /// name lookup over the merged module, which a project with more
+    /// than one module could make ambiguous.
+    pub entry_item: ItemId,
+}
+
+/// Loads, resolves, and compiles the project rooted at `manifest_path`
+/// clear through to a single verified NIR module, atomically: any
+/// failure at any stage returns every diagnostic found so far, never a
+/// partial result.
+///
+/// Each module is parsed and HIR-lowered *separately*, in dependency
+/// order, with its own imports resolved against already-lowered
+/// dependency modules -- never by concatenating source text -- and
+/// only the resulting `HirModule`s are merged into one, after every
+/// module has its own globally-unique item ids (`hir::IdCursor`,
+/// threaded across the whole loop). Typeck and NIR lowering/
+/// verification then run exactly once, unchanged, over that merged
+/// module, since by construction it is already as internally
+/// consistent as a single hand-written file.
+pub fn compile_project(
+    manifest_path: &Path,
+    map: &mut SourceMap,
+    interner: &mut Interner,
+) -> Result<CompiledProject, Vec<Diagnostic>> {
+    let loaded = loader::load_project(manifest_path, map, interner)?;
+    validate_entry_main(&loaded, interner)?;
+
+    let module_path_by_dotted: HashMap<String, module::ModuleId> = loaded
+        .modules
+        .iter()
+        .map(|m| (m.path.dotted(), m.id))
+        .collect();
+    let mut imports_by_module: HashMap<module::ModuleId, Vec<&loader::ImportRef>> = HashMap::new();
+    for import in &loaded.imports {
+        imports_by_module
+            .entry(import.importing_module)
+            .or_default()
+            .push(import);
+    }
+
+    // Keyed by ModuleId so each module's imports can look up any
+    // dependency's already-lowered HirModule; `loaded.modules` is
+    // already in dependency-first order, so every module's own
+    // dependencies are guaranteed present by the time it's this
+    // module's turn -- *provided* every dependency actually succeeded.
+    // `failed_modules` tracks every module whose own import resolution
+    // failed (so it was never inserted into `lowered_by_module`), so a
+    // dependent can be skipped safely instead of asking
+    // `resolve_imports` to look up a dependency that was never lowered.
+    let mut lowered_by_module: HashMap<module::ModuleId, (HirModule, SourceId)> = HashMap::new();
+    let mut failed_modules: std::collections::HashSet<module::ModuleId> =
+        std::collections::HashSet::new();
+    let mut ids = hir::IdCursor::default();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    for module in &loaded.modules {
+        let owned_imports: Vec<loader::ImportRef> = imports_by_module
+            .get(&module.id)
+            .into_iter()
+            .flatten()
+            .map(|import_ref| (*import_ref).clone())
+            .collect();
+
+        // A module that imports from a dependency which itself already
+        // failed to lower cannot be resolved either -- skip it (and
+        // propagate the failure to whatever imports *this* module in
+        // turn) without manufacturing a second diagnostic on top of the
+        // root cause already recorded when the dependency failed. This
+        // is what keeps a cascading failure from ever reaching
+        // `resolve_imports` with a target module that was never
+        // actually lowered.
+        let depends_on_failed_module = owned_imports.iter().any(|import| {
+            module::ModulePath::split_import_path(&import.segments)
+                .and_then(|(path, _)| module_path_by_dotted.get(&path.dotted()))
+                .is_some_and(|target| failed_modules.contains(target))
+        });
+        if depends_on_failed_module {
+            failed_modules.insert(module.id);
+            continue;
+        }
+
+        let resolved_imports = match resolve::resolve_imports(
+            &owned_imports,
+            module.source,
+            &module_path_by_dotted,
+            &lowered_by_module,
+            interner,
+        ) {
+            Ok(resolved) => resolved,
+            Err(mut diags) => {
+                diagnostics.append(&mut diags);
+                failed_modules.insert(module.id);
+                continue;
+            }
+        };
+
+        let (module_hir, next_ids, mut lower_diagnostics) = hir::lower_module_with_imports(
+            &module.ast,
+            module.source,
+            interner,
+            ids,
+            resolved_imports,
+        );
+        ids = next_ids;
+        if !lower_diagnostics.is_empty() {
+            diagnostics.append(&mut lower_diagnostics);
+        }
+        lowered_by_module.insert(module.id, (module_hir, module.source));
+    }
+
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
+    // Merged in the same dependency-first order `loaded.modules` is
+    // already in -- deterministic, and never dependent on a HashMap's
+    // iteration order.
+    //
+    // The `expect` below is a genuine internal invariant, not a
+    // user-triggerable one: `diagnostics` was just checked non-empty
+    // above, and every module inserted into `failed_modules` -- whether
+    // directly (its own import resolution failed) or transitively (it
+    // depended on an already-failed module) -- always did so alongside
+    // pushing at least one diagnostic onto `diagnostics` first. So an
+    // empty `diagnostics` here implies an empty `failed_modules`, which
+    // implies every discovered module was actually lowered and inserted
+    // above. The three-module cascading-failure regression below
+    // (`fails_atomically_instead_of_panicking_on_a_transitively_failed_dependency`)
+    // is what enforces this at the public boundary.
+    let mut merged = HirModule::default();
+    let mut entry_source = None;
+    for module in &loaded.modules {
+        let (module_hir, source) = lowered_by_module
+            .remove(&module.id)
+            .expect("every discovered module was lowered above");
+        if module.id == loaded.entry_module {
+            entry_source = Some(source);
+        }
+        merged.functions.extend(module_hir.functions);
+        merged.records.extend(module_hir.records);
+        merged.variants.extend(module_hir.variants);
+        merged.other_items.extend(module_hir.other_items);
+    }
+    let entry_source = entry_source.expect("the entry module is always among loaded.modules");
+
+    // Identified by `ItemId` *before* typeck ever runs, so typeck's own
+    // entry-signature check (`EntryMain::ByIdentity`) can be scoped to
+    // this exact declaration -- never a global "any function named
+    // `main`" check, which would also wrongly flag an ordinary,
+    // differently-shaped `main` in a non-entry module (`rfcs/0006`).
+    // `validate_entry_main` already guaranteed, from the entry module's
+    // own AST, that it declares *exactly* one function named `main`
+    // before any lowering ran -- and every module lowered with zero
+    // diagnostics, checked just above -- so this lookup finding anything
+    // other than exactly one match here would mean lowering silently
+    // dropped or duplicated a declaration the AST preflight already
+    // counted, a genuine internal invariant rather than a user-facing
+    // condition.
+    let main_symbol = interner.intern("main");
+    let entry_item = merged
+        .functions
+        .iter()
+        .find(|f| f.source == entry_source && f.name == main_symbol)
+        .expect("validate_entry_main already guaranteed exactly one entry `main`")
+        .id;
+
+    let typeck_result = typeck::check_module(
+        &merged,
+        loaded.manifest_source,
+        interner,
+        typeck::EntryMain::ByIdentity(Some(entry_item)),
+    );
+    if !typeck_result.diagnostics.is_empty() {
+        return Err(typeck_result.diagnostics);
+    }
+
+    let nir_module = nir::lower_module(
+        &merged,
+        &typeck_result.local_types,
+        &typeck_result.expr_types,
+        &typeck_result.pattern_case,
+        interner,
+        loaded.manifest_source,
+    )?;
+
+    let verify_diagnostics = nir::verify_module(&nir_module, loaded.manifest_source, interner);
+    if !verify_diagnostics.is_empty() {
+        return Err(verify_diagnostics);
+    }
+
+    Ok(CompiledProject {
+        nir: nir_module,
+        entry_item,
+    })
+}
+
+/// Checks the configured entry module's own AST for exactly one
+/// function named `main`, *before* any HIR lowering runs -- so a
+/// project with two entry-module `main` declarations gets one
+/// deterministic `M0010`, anchored to the entry module's own source,
+/// rather than `hir::lower`'s ordinary same-name-collision `R0001`.
+/// `R0001` is still the right diagnostic for every *other* duplicate
+/// declaration (including a non-`main` name, or `main` colliding with a
+/// differently-kinded item like a `record`) -- this only ever looks at
+/// function items literally named `main`, and only within the entry
+/// module, so it never shadows `hir::lower`'s own check for anything
+/// else. A `main` declared in any other module is untouched by this at
+/// all (`rfcs/0006`).
+fn validate_entry_main(
+    loaded: &loader::LoadedProject,
+    interner: &mut Interner,
+) -> Result<(), Vec<Diagnostic>> {
+    let entry_module = loaded
+        .modules
+        .iter()
+        .find(|m| m.id == loaded.entry_module)
+        .expect("the entry module is always among loaded.modules");
+    let main_symbol = interner.intern("main");
+    let mains: Vec<crate::source::Span> = entry_module
+        .ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Function(f) if f.name.symbol == main_symbol => Some(f.name.span),
+            _ => None,
+        })
+        .collect();
+
+    match mains[..] {
+        [] => Err(vec![
+            Diagnostic::error(
+                codes::INVALID_ENTRY,
+                entry_module.source,
+                crate::source::Span::dummy(),
+                format!(
+                    "entry module `{}` has no `main` function",
+                    loaded.manifest.entry
+                ),
+            )
+            .with_primary_label("configured entry point"),
+        ]),
+        [_] => Ok(()),
+        [first, second, ..] => Err(vec![
+            Diagnostic::error(
+                codes::INVALID_ENTRY,
+                entry_module.source,
+                second,
+                format!(
+                    "entry module declares more than one `main` function ({} total)",
+                    mains.len()
+                ),
+            )
+            .with_primary_label("duplicate `main`")
+            .with_label(first, "first declared here"),
+        ]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::Interpreter;
+    use std::path::PathBuf;
+
+    struct TempProject {
+        dir: PathBuf,
+    }
+
+    impl TempProject {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "napitia_compile_test_{}_{name}_{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("failed to create scratch project dir");
+            TempProject { dir }
+        }
+
+        fn write(&self, relative: &str, content: &str) {
+            let path = self.dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create parent dir");
+            std::fs::write(path, content).expect("failed to write scratch file");
+        }
+
+        fn manifest_path(&self) -> PathBuf {
+            self.dir.join("napitia.toml")
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const MANIFEST: &str = "[package]\nname = \"hello\"\nversion = \"0.1.0\"\n\n\
+                             [project]\nsource-root = \"src\"\nentry = \"main.npt\"\n";
+
+    #[test]
+    fn compiles_and_runs_a_two_file_project() {
+        let project = TempProject::new("two_file_run");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add(20, 22) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(42)));
+    }
+
+    #[test]
+    fn compiles_a_nested_module_import() {
+        let project = TempProject::new("nested_run");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.user.User;\n\
+             func main() -> i64 { value u = User { id: 7 }; return u.id }\n",
+        );
+        project.write(
+            "src/models/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(7)));
+    }
+
+    #[test]
+    fn forward_reference_across_modules_works_regardless_of_discovery_order() {
+        // main imports from both b and a; a also imports from b, so b
+        // must be lowered before both -- this only works if module
+        // lowering order is dependency-first, not discovery order.
+        let project = TempProject::new("forward_ref");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nfunc main() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/a.npt",
+            "import b.helper;\npublic func thing() -> i64 { return helper() }\n",
+        );
+        project.write("src/b.npt", "public func helper() -> i64 { return 99 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(99)));
+    }
+
+    #[test]
+    fn private_function_import_is_rejected() {
+        let project = TempProject::new("private_fn");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.secret;\nfunc main() -> i64 { return secret() }\n",
+        );
+        project.write("src/math.npt", "func secret() -> i64 { return 1 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0006");
+    }
+
+    #[test]
+    fn missing_entry_main_is_m0010() {
+        let project = TempProject::new("missing_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write("src/main.npt", "func not_main() -> i64 { return 0 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0010");
+        // Must name the actual entry file (from the manifest's own
+        // `entry` key), never the manifest path itself.
+        assert_eq!(
+            diags[0].message,
+            "entry module `main.npt` has no `main` function"
+        );
+    }
+
+    #[test]
+    fn two_main_functions_in_the_entry_module_is_exactly_m0010_not_r0001() {
+        // `hir::lower`'s own same-name-collision check would otherwise
+        // fire first (R0001) -- the entry module's `main` is special
+        // enough (it decides the whole project's executable entry
+        // point) to get its own diagnostic instead, checked before any
+        // lowering runs at all.
+        let project = TempProject::new("duplicate_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "func main() -> i64 { return 1 } func main() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0010");
+    }
+
+    #[test]
+    fn a_duplicate_non_main_declaration_in_the_entry_module_is_still_r0001() {
+        // The entry-`main` preflight only ever looks at functions named
+        // `main` -- every other duplicate declaration (including one
+        // colliding on the entry module's own `main` name but as a
+        // *different* item kind, or a same-name/same-kind duplicate of
+        // anything else) is untouched, and still goes through
+        // `hir::lower`'s ordinary same-name-collision check.
+        let project = TempProject::new("duplicate_non_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "func main() -> i64 { return helper() } \
+             func helper() -> i64 { return 1 } \
+             func helper() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0001");
+    }
+
+    #[test]
+    fn a_parameterized_entry_main_still_produces_the_signature_diagnostic() {
+        let project = TempProject::new("parameterized_entry_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write("src/main.npt", "func main(n: i64) -> i64 { return n }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0012");
+    }
+
+    #[test]
+    fn main_in_a_non_entry_module_is_ignored() {
+        let project = TempProject::new("non_entry_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import helper.thing;\nfunc main() -> i64 { return thing() }\n",
+        );
+        // helper also declares its own (private) `main` -- must never
+        // be treated as the entry point.
+        project.write(
+            "src/helper.npt",
+            "public func thing() -> i64 { return 5 } \
+             func main() -> i64 { return 999 }",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(5)));
+    }
+
+    #[test]
+    fn repeated_compiles_produce_identical_nir_output() {
+        let project = TempProject::new("deterministic_nir");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add(1, 2) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let render = || {
+            let mut map = SourceMap::new();
+            let mut interner = Interner::new();
+            let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+                .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+            crate::nir::print_module(&compiled.nir, &interner)
+        };
+        assert_eq!(render(), render());
+    }
+}

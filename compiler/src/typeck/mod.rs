@@ -1722,7 +1722,7 @@ impl<'a> Checker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::lower_module;
+    use crate::hir::{PatternId, lower_module};
     use crate::lexer::tokenize;
     use crate::parser::Parser;
     use crate::source::SourceMap;
@@ -2071,28 +2071,64 @@ mod tests {
 
     #[test]
     fn a_pattern_nested_past_the_depth_limit_is_a_diagnostic_not_a_stack_overflow() {
-        // A chain of distinct (non-cyclic, so typeck's separate
-        // infinite-aggregate rejection never fires) variant
-        // declarations, each wrapping the last, with a single pattern
-        // nested exactly as deep -- the realistic shape of the attack
-        // `MAX_PATTERN_NESTING_DEPTH` exists to bound: check_pattern's
-        // own recursion, prior to and independent of the usefulness
-        // algorithm's work budget.
+        // check_pattern's own MAX_PATTERN_NESTING_DEPTH bound exists
+        // prior to and independent of the usefulness algorithm's work
+        // budget -- but the parser's own matching bound (`fix(parser):
+        // bound nested pattern parsing`) now rejects any source text
+        // nested this deep before typeck ever sees it, so the only way
+        // left to exercise check_pattern's bound directly is a
+        // hand-built HirPattern chain bypassing the parser (and
+        // hir::lower) entirely, calling the same public check_module
+        // entry point a real caller would.
         let depth = MAX_PATTERN_NESTING_DEPTH + 50;
-        let mut source = String::from("variant V0 { Leaf }\n");
-        for i in 1..=depth {
-            source.push_str(&format!("variant V{i} {{ Wrap(V{}) }}\n", i - 1));
+        let mut interner = Interner::new();
+        let case_name = interner.intern("Wrap");
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut pattern = HirPattern::Wildcard {
+            id: PatternId(0),
+            span: Span::dummy(),
+        };
+        for i in 0..depth {
+            pattern = HirPattern::Variant {
+                id: PatternId(i as u32 + 1),
+                name: case_name,
+                args: vec![pattern],
+                span: Span::dummy(),
+            };
         }
-        let mut pattern = "Leaf".to_string();
-        for _ in 0..depth {
-            pattern = format!("Wrap({pattern})");
-        }
-        source.push_str(&format!(
-            "func f(x: V{depth}) -> i64 {{ return match x {{ {pattern} => 1, _ => 0 }} }}"
-        ));
-        let diags = check(&source);
-        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
-        assert_eq!(diags[0].code, "T0019");
+        let mut checker = Checker {
+            source,
+            interner: &interner,
+            ctx: TypeContext::new(),
+            diagnostics: Vec::new(),
+            functions: HashMap::new(),
+            locals: HashMap::new(),
+            pending_defaults: Vec::new(),
+            current_return_type: Ty::Unit,
+            type_names: HashMap::new(),
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            variant_display: HashMap::new(),
+            loop_depth: 0,
+            expr_types: HashMap::new(),
+            pattern_case: HashMap::new(),
+        };
+        // A non-Ty::Named scrutinee (here Ty::Error) makes every level
+        // take check_pattern's own "incompatible scrutinee" branch,
+        // which suppresses that diagnostic for Ty::Error specifically
+        // (avoiding cascade) while still recursing into each Variant's
+        // args at depth + 1 -- exactly the recursion the depth bound
+        // exists to stop, with nothing else able to produce a
+        // diagnostic of its own along the way.
+        checker.check_pattern_at_depth(&pattern, &Ty::Error, 0);
+        assert_eq!(
+            checker.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            checker.diagnostics
+        );
+        assert_eq!(checker.diagnostics[0].code, "T0019");
     }
 
     #[test]

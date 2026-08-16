@@ -1532,9 +1532,28 @@ impl<'a> Lowering<'a> {
                         case,
                         args,
                     } if variant == variant_item && case == case_index => {
+                        // typeck's check_pattern (fix for malformed
+                        // variant-pattern arity) already rejects an
+                        // args-count/declared-arity mismatch before the
+                        // normal pipeline ever reaches lowering -- but a
+                        // caller that hand-builds HIR and calls this
+                        // module directly could still hand it one.
+                        // `Vec::resize` would otherwise silently
+                        // truncate extra sub-patterns (arity too small)
+                        // or accept too few as if the rest were
+                        // wildcards (arity too large), fabricating a
+                        // decision tree that doesn't match what was
+                        // actually written; a structured diagnostic is
+                        // required instead, matching this function's
+                        // existing unknown-case check just above.
+                        if args.len() != arity {
+                            return Err(self.internal_error(&format!(
+                                "variant pattern for case {case_index} of {variant_item:?} has {} sub-pattern(s), expected {arity}",
+                                args.len()
+                            )));
+                        }
                         let mut patterns: Vec<PatternSlot<'h>> =
                             args.iter().map(PatternSlot::Real).collect();
-                        patterns.resize(arity, PatternSlot::Wildcard);
                         patterns.extend(rest);
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
@@ -2697,6 +2716,35 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("missing field")),
             "expected a diagnostic mentioning the missing field, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn variant_pattern_arity_mismatch_fails_lowering_with_i0002_not_a_silent_truncation() {
+        // typeck reports T0002 for this arity mismatch and the normal
+        // driver never lowers past it, but a caller that lowers anyway
+        // (bypassing that diagnostic gate, like every test in this
+        // module using `lower_bypassing_typeck`) must not have the
+        // extra sub-pattern silently dropped by a bare `Vec::resize` --
+        // it must fail atomically with a structured diagnostic instead.
+        let text = "variant Pair { Two(i64, i64) } \
+                    func f(p: Pair) -> i64 { return match p { Two(a, b, c) => a } }";
+        assert_fails_with_i0002(text, "sub-pattern");
+    }
+
+    fn assert_fails_with_i0002(text: &str, expect_in_message: &str) {
+        let Err(diagnostics) = lower_bypassing_typeck(text) else {
+            panic!("expected lowering to fail for: {text:?}");
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic for {text:?}, got {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains(expect_in_message)),
+            "expected a diagnostic mentioning {expect_in_message:?} for {text:?}, got {diagnostics:?}"
         );
     }
 

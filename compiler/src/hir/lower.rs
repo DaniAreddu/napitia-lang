@@ -375,6 +375,15 @@ impl<'a> Lowering<'a> {
     /// variant case payload type naming a record/variant declared
     /// private in *this* module.
     fn check_public_api_leak(&mut self, ty: &ast::Type, local_public: &HashMap<Symbol, bool>) {
+        // Same primitive-first rule as `resolve_type_ref`: a primitive
+        // name always wins over a same-named local aggregate, so a
+        // private `record i64 { .. }` must never make `-> i64` look
+        // like it leaks a private type -- the annotation means the
+        // primitive, not the record, regardless of what else in this
+        // module happens to share its name.
+        if primitive_from_name(self.interner.resolve(ty.name.symbol)).is_some() {
+            return;
+        }
         if let Some(&is_public) = local_public.get(&ty.name.symbol)
             && !is_public
         {
@@ -1934,6 +1943,37 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0012");
+    }
+
+    #[test]
+    fn a_private_local_record_named_i64_does_not_leak_through_a_public_param_or_return() {
+        // `record i64 { .. }` is a private *local* record -- without the
+        // primitive-first rule, a public function's `i64` annotations
+        // would look like they leak it, even though they mean the
+        // primitive, not the record.
+        let (_, diags) = lower(
+            "record i64 { flag: bool } \
+             public func expose(x: i64) -> i64 { return x }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_private_local_record_named_bool_does_not_leak_through_a_public_field() {
+        let (_, diags) = lower(
+            "record bool { flag: bool } \
+             public record Holder { public active: bool }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_private_local_variant_named_i64_does_not_leak_through_a_public_case_payload() {
+        let (_, diags) = lower(
+            "variant i64 { A } \
+             public variant Wrapper { Case(i64) }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

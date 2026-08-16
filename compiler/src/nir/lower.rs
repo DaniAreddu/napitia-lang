@@ -51,6 +51,19 @@ mod codes {
     pub const INTERNAL_INVARIANT_VIOLATED: &str = "I0002";
 }
 
+/// `lower_decision` recurses (through `lower_bool_switch`/
+/// `lower_variant_switch`/`lower_literal_chain`, which call back into
+/// it) once per occurrence position it consumes -- for a single
+/// deeply-nested `Variant` pattern, that is once per nesting level, on
+/// this pass's own native call stack. `typeck::check_pattern`'s own
+/// bound already keeps every pattern the normal pipeline produces
+/// shallow enough that this can never fire there, but `lower_module` is
+/// a public entry point a direct caller can invoke with hand-built HIR
+/// bypassing typeck entirely, so this stage needs its own independent
+/// bound too, matching `hir::lower_pattern`'s and
+/// `typeck::exhaustive::is_useful`'s.
+const MAX_PATTERN_NESTING_DEPTH: usize = 200;
+
 // Boxed so a single-`Diagnostic` `Err` doesn't force every `LowerResult`
 // (including `LowerResult<()>`) to be as large as `Diagnostic` itself.
 type LowerResult<T> = Result<T, Box<Diagnostic>>;
@@ -1318,7 +1331,7 @@ impl<'a> Lowering<'a> {
             // Every arm diverges (typeck already proved this); no
             // result slot or merge block is ever created -- each arm's
             // own terminator is already a complete CFG on its own.
-            self.lower_decision(fb, rows, occurrences, arms, None)?;
+            self.lower_decision(fb, rows, occurrences, arms, None, 0)?;
             return Ok(LoweredExpr::Diverged);
         }
 
@@ -1333,6 +1346,7 @@ impl<'a> Lowering<'a> {
             occurrences,
             arms,
             Some((result_slot, after_block)),
+            0,
         )?;
 
         fb.switch_to(after_block);
@@ -1348,7 +1362,22 @@ impl<'a> Lowering<'a> {
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
         merge: Option<(ValueId, BlockId)>,
+        depth: usize,
     ) -> LowerResult<()> {
+        // Each round trip through lower_decision and one of
+        // lower_bool_switch/lower_variant_switch/lower_literal_chain
+        // consumes exactly one occurrence position -- one nesting
+        // level of the pattern(s) being decided between -- on this
+        // pass's own native call stack. typeck's check_pattern already
+        // keeps every pattern the normal pipeline produces shallow
+        // enough that this can never fire there, but lower_module is a
+        // public entry point a direct caller can invoke with hand-built
+        // HIR bypassing typeck entirely, so this needs its own
+        // independent bound too, matching hir::lower_pattern's and
+        // typeck::is_useful's.
+        if depth > MAX_PATTERN_NESTING_DEPTH {
+            return Err(self.internal_error("match decision tree is nested too deeply to lower"));
+        }
         if occurrences.is_empty() {
             let Some(winner) = rows.first() else {
                 return Err(self.internal_error(
@@ -1374,7 +1403,7 @@ impl<'a> Lowering<'a> {
         }
 
         if matches!(&occurrences[0].ty, Ty::Named(item, _) if self.variants.contains_key(item)) {
-            self.lower_variant_switch(fb, rows, occurrences, arms, merge)
+            self.lower_variant_switch(fb, rows, occurrences, arms, merge, depth)
         } else if matches!(&occurrences[0].ty, Ty::Bool) {
             // `bool` is a closed two-constructor domain (like a
             // variant's finite case set), so it is switched on
@@ -1382,12 +1411,13 @@ impl<'a> Lowering<'a> {
             // chain below -- an exhaustive `match true { true => ..,
             // false => .. }` (no wildcard at all) would otherwise have
             // no catch-all to terminate that chain's recursion on.
-            self.lower_bool_switch(fb, rows, occurrences, arms, merge)
+            self.lower_bool_switch(fb, rows, occurrences, arms, merge, depth)
         } else {
-            self.lower_literal_chain(fb, rows, occurrences, arms, merge)
+            self.lower_literal_chain(fb, rows, occurrences, arms, merge, depth)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_bool_switch<'h>(
         &mut self,
         fb: &mut FnBuilder,
@@ -1395,6 +1425,7 @@ impl<'a> Lowering<'a> {
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
         merge: Option<(ValueId, BlockId)>,
+        depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
         let rest_occ = occurrences[1..].to_vec();
@@ -1418,7 +1449,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
         }
 
         let then_block = fb.new_block();
@@ -1466,11 +1497,12 @@ impl<'a> Lowering<'a> {
                     self.internal_error("a match's bool switch left a branch with no covering arm")
                 );
             }
-            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge)?;
+            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge, depth + 1)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_variant_switch<'h>(
         &mut self,
         fb: &mut FnBuilder,
@@ -1478,6 +1510,7 @@ impl<'a> Lowering<'a> {
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
         merge: Option<(ValueId, BlockId)>,
+        depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
         let rest_occ = occurrences[1..].to_vec();
@@ -1501,7 +1534,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
         }
 
         let num_cases = self
@@ -1616,11 +1649,12 @@ impl<'a> Lowering<'a> {
 
             let mut new_occurrences = payload_occurrences;
             new_occurrences.extend(rest_occ.clone());
-            self.lower_decision(fb, new_rows, new_occurrences, arms, merge)?;
+            self.lower_decision(fb, new_rows, new_occurrences, arms, merge, depth + 1)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_literal_chain<'h>(
         &mut self,
         fb: &mut FnBuilder,
@@ -1628,6 +1662,7 @@ impl<'a> Lowering<'a> {
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
         merge: Option<(ValueId, BlockId)>,
+        depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
         let rest_occ = occurrences[1..].to_vec();
@@ -1642,7 +1677,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings: first.bindings.clone(),
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge)
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
             }
             Classified::Bind(local) => {
                 let mut bindings = first.bindings.clone();
@@ -1652,7 +1687,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings,
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge)
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
             }
             Classified::Literal(lit) => {
                 let const_value = literal_const(fb, &lit, &occ.ty);
@@ -1695,7 +1730,7 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 fb.switch_to(then_block);
-                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge)?;
+                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge, depth + 1)?;
 
                 let else_rows: Vec<MatrixRow<'h>> = rows
                     .into_iter()
@@ -1711,7 +1746,7 @@ impl<'a> Lowering<'a> {
                 }
                 let mut all_occ = vec![occ];
                 all_occ.extend(rest_occ);
-                self.lower_decision(fb, else_rows, all_occ, arms, merge)
+                self.lower_decision(fb, else_rows, all_occ, arms, merge, depth + 1)
             }
             Classified::Case { .. } => Err(self
                 .internal_error("a variant pattern was tested against a non-variant occurrence")),
@@ -2870,6 +2905,99 @@ mod tests {
         let result = lowering.lower_record_literal(&mut fb, record_item, &[bad_init], &probe);
         let Err(diagnostic) = result else {
             panic!("expected lowering to fail for an out-of-range field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn deeply_nested_hand_built_match_pattern_fails_lowering_with_i0002_not_a_stack_overflow() {
+        // The parser's own MAX_PATTERN_NESTING_DEPTH bound keeps any
+        // real parser output shallow enough that lower_decision's own
+        // bound can never fire through the normal pipeline (typeck's
+        // matching bound also stops it before NIR lowering is ever
+        // reached) -- so this exercises it the only way possible: a
+        // hand-built HirMatchArm chain that bypasses the parser,
+        // hir::lower, and typeck entirely, calling the same public
+        // lower_module machinery a direct caller would.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let wrap_name = interner.intern("Wrap");
+        let leaf_name = interner.intern("Leaf");
+        let variant_item = ItemId(0);
+        let variant_sym = interner.intern("Rec");
+        let variant_ty = Ty::Named(variant_item, variant_sym);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: variant_sym,
+                cases: vec![
+                    CaseLayout {
+                        name: wrap_name,
+                        payload: vec![variant_ty.clone()],
+                    },
+                    CaseLayout {
+                        name: leaf_name,
+                        payload: vec![],
+                    },
+                ],
+            },
+        );
+
+        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let mut pattern_case = HashMap::new();
+        let mut pattern = HirPattern::Wildcard {
+            id: PatternId(0),
+            span: Span::dummy(),
+        };
+        for i in 0..depth {
+            let id = PatternId(i as u32 + 1);
+            pattern_case.insert(id, (variant_item, 0usize));
+            pattern = HirPattern::Variant {
+                id,
+                name: wrap_name,
+                args: vec![pattern],
+                span: Span::dummy(),
+            };
+        }
+
+        let scrutinee_id = ExprId(0);
+        let mut expr_types = HashMap::new();
+        expr_types.insert(scrutinee_id, variant_ty.clone());
+        let local_types = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let placeholder = fb.push_value(variant_ty.clone(), ValueKind::Alloc);
+        fb.local_bindings
+            .insert(LocalId(0), LocalBinding::Direct(placeholder));
+        let scrutinee = HirExpr::Local {
+            id: scrutinee_id,
+            local: LocalId(0),
+            name: variant_sym,
+            span: Span::dummy(),
+        };
+        let arms = vec![HirMatchArm {
+            pattern,
+            body: HirMatchArmBody::Expr(HirExpr::Int {
+                id: ExprId(1),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            }),
+            span: Span::dummy(),
+        }];
+        let result = lowering.lower_match(&mut fb, &scrutinee, &arms, Ty::I64);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a match nested past the depth limit")
         };
         assert_eq!(diagnostic.code, "I0002");
     }

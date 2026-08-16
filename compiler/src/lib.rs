@@ -13,6 +13,7 @@ pub mod interpreter;
 pub mod lexer;
 pub(crate) mod limits;
 pub mod nir;
+pub mod project;
 pub mod resolve;
 pub mod source;
 pub mod symbol;

@@ -26,7 +26,7 @@ pub struct LoadedModule {
 /// separate from `ast::ImportDecl` so the loader can attach the
 /// resolved `(module path, item name)` split (or note that the path was
 /// too short to have one) without mutating the AST.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImportRef {
     pub importing_module: ModuleId,
     pub segments: Vec<String>,

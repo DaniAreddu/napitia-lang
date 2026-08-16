@@ -288,19 +288,35 @@ wildcard/binding — no or-patterns, guards, records, slices, or ranges):
   always required, matching this RFC's "unsupported: range patterns"
   scope cut (a range pattern would be the usual escape hatch here, and
   is deliberately not implemented yet).
-- **Work budget.** Both `is_useful` and witness expansion are naturally
-  bounded by the *product* of arm count and nesting depth actually
-  written in the source (there is no way to request superlinear work
-  without writing superlinearly more patterns) but Alpha 0.1.1 still
-  caps total recursive calls per `match` (`MAX_USEFULNESS_STEPS`) as a
-  hard backstop against pathological input; exceeding it is a dedicated
-  diagnostic (`T0019 pattern analysis budget exceeded`), never a stack
-  overflow or an unbounded hang. The implementation itself is native
-  recursion (`is_useful` calls itself once per specialize/default
-  step) -- recursion depth tracks pattern nesting depth linearly, and
-  the budget is what bounds it: a pathological match exhausts its
-  budget and is reported, rather than running long enough to actually
-  exhaust the Rust call stack.
+- **Work budget and stack safety are two separate mechanisms, not one.**
+  `is_useful` (and witness expansion) is native recursion -- it calls
+  itself once per specialize/default step, and recursion depth tracks
+  pattern nesting depth linearly. `MAX_USEFULNESS_STEPS` (100,000) caps
+  *total* recursive calls across an entire match's analysis, as a hard
+  backstop against pathological arm counts; it is **not**, on its own,
+  a safe bound on any single call's *stack depth* -- 100,000 native
+  stack frames is well past what a real call stack can hold. What
+  actually keeps a single deeply-nested pattern from ever exhausting
+  the stack is a second, much smaller, independent
+  `MAX_RECURSION_DEPTH` (200) that `is_useful` checks on every call,
+  regardless of remaining step budget. Both report the same diagnostic
+  either way (`T0019 pattern analysis budget exceeded`), so the
+  distinction is invisible to a program, but load-bearing for safety:
+  removing either bound (or widening `MAX_RECURSION_DEPTH` to
+  `MAX_USEFULNESS_STEPS`'s size) would reopen the stack-overflow this
+  RFC's exhaustiveness analysis exists to rule out.
+- **The same structural depth limit is enforced at every stage that
+  recurses per pattern nesting level**, not just `is_useful`: the
+  parser (`parse_pattern`), HIR lowering (`hir::lower_pattern`), and
+  NIR match-decision lowering (`nir::lower::lower_decision`) each track
+  their own nesting depth independently and fail with a stage-appropriate
+  diagnostic past the same 200-level bound, rather than relying on an
+  earlier stage to have already caught it. In the normal pipeline the
+  parser's bound is what actually fires first (source text nested this
+  deep never reaches HIR lowering, typeck, or NIR lowering at all); the
+  later stages' bounds exist as defense-in-depth for a caller invoking
+  `hir::lower_module`, `typeck::check_module`, or `nir::lower_module`
+  directly with hand-built input that bypasses an earlier stage.
 
 ## Recursive aggregate rejection
 
@@ -467,6 +483,10 @@ R0011  unknown variant type in a constructor path
 R0012  unknown variant case
 R0013  case belongs to a different variant than the one written
 R0014  duplicate binding within the same pattern
+R0015  pattern nested too deeply to resolve (hir::lower_pattern's own
+       structural depth bound; unreachable through the normal pipeline
+       since the parser's matching bound already stops it first, kept
+       as defense-in-depth for a direct hir::lower_module caller)
 
 T0013  field access on a non-record type
 T0014  unknown field (field access)

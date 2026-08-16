@@ -209,12 +209,25 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   `record.field`/`variant.payload` reference a valid field/payload
   index of the base's actual (not merely declared) nominal type;
   `switch` covers every one of its variant's cases exactly once with
-  valid, unique-per-case targets; and a `variant.payload` extraction is
-  only legal in a block reached through that exact case's own `switch`
-  edge — re-derived independently from the CFG's actual predecessors,
-  never trusted from how lowering happened to build it.
+  valid, unique-per-case targets, and its scrutinee's resolved type
+  agrees with the variant its cases belong to; and a `variant.payload`
+  extraction is only legal in a block where *every* incoming CFG edge
+  independently guarantees that exact case (an ordinary
+  branch/conditional-branch edge guarantees nothing at all, and two
+  different `switch` edges into the same block guarantee only their
+  intersection) — re-derived independently from the CFG's actual
+  predecessors, never trusted from how lowering happened to build it.
+- **Item identity** (Alpha 0.1.1): every function/record/variant's
+  `ItemId` is unique across the whole module, including across
+  different kinds of item (a record and a variant may never share an
+  id) — `Ty::Named` compares/hashes by `ItemId` alone, so a collision
+  here would let a value of one kind be silently accepted as another.
+  Every `Ty::Named` reachable from a function's signature, locals, or
+  instructions must also name an `ItemId` that actually resolves to a
+  declared record/variant in this module, and its carried display
+  symbol must match that declaration's own name.
 
-It reports structured diagnostics (`V0001`–`V0025` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0030` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

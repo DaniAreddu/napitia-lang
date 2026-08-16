@@ -1,0 +1,14 @@
+// `sales.user.User` and `admin.user.User` are two distinct types that
+// happen to share both a name and a field shape. Aliasing lets both
+// be named in the same scope at once without either one shadowing the
+// other -- each alias is only a local spelling, never a new type.
+import sales.user.User as SalesUser;
+import sales.user.user_id as sales_user_id;
+import admin.user.User as AdminUser;
+import admin.user.user_id as admin_user_id;
+
+func main() -> i64 {
+    value s = SalesUser { id: 40 };
+    value a = AdminUser { id: 2 };
+    return sales_user_id(s) + admin_user_id(a)
+}

@@ -1,0 +1,7 @@
+public record User {
+    public id: i64,
+}
+
+public func user_id(u: User) -> i64 {
+    u.id
+}

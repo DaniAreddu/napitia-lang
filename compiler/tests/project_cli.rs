@@ -469,3 +469,15 @@ fn backslash_paths_also_reach_the_project_on_windows() {
     assert!(via_windows.status.success(), "{}", stderr(&via_windows));
     assert_eq!(stdout(&via_windows).trim(), "42");
 }
+
+#[test]
+fn two_same_named_record_types_are_usable_together_through_aliases() {
+    // `sales.user.User` and `admin.user.User` share both a name and a
+    // field shape; only aliasing lets both be named in `main`'s scope
+    // at once. 40 (from the aliased `SalesUser`) + 2 (from the aliased
+    // `AdminUser`) is the exact worked example from `rfcs/0007`.
+    let dir = project("alias_same_named_records");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}

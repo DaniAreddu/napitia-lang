@@ -1,0 +1,7 @@
+public func other_thing() -> i64 {
+    return 42
+}
+
+func main(n: i64) -> i64 {
+    n
+}

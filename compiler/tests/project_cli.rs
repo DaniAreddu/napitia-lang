@@ -96,6 +96,27 @@ fn forward_reference_across_modules_resolves_regardless_of_discovery_order() {
 }
 
 #[test]
+fn a_parameterized_main_in_a_non_entry_module_is_an_ordinary_function() {
+    // The entry-signature check ("`main` takes no parameters") used to
+    // apply to *any* function literally named `main` anywhere in the
+    // merged project, rejecting a non-entry module's differently-shaped
+    // `main` with T0012. It must now be scoped to the entry module's own
+    // `main` by identity: a non-entry `main(n: i64)` is legal, and the
+    // entry module's own zero-argument `main` still runs.
+    let dir = project("non_entry_parameterized_main");
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
 fn main_defined_in_a_non_entry_module_is_never_the_entry_point() {
     let dir = project("main_in_non_entry_ignored");
     let ran = napitia(&["run", &dir]);

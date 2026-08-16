@@ -81,6 +81,13 @@ struct FunctionSig {
     params: Vec<Ty>,
     ret: Ty,
     span: Span,
+    /// Where this function was declared -- a different file than the
+    /// call site's, in every cross-module call. A diagnostic pointing at
+    /// `span` must always use this as that label's own `SourceId`
+    /// (`with_label_in`), never the caller's `self.source`: attaching one
+    /// source's span to a different source's id renders it against the
+    /// wrong file entirely.
+    source: SourceId,
 }
 
 #[derive(Clone)]
@@ -347,6 +354,7 @@ impl<'a> Checker<'a> {
                     params,
                     ret,
                     span: f.span,
+                    source: f.source,
                 },
             );
         }
@@ -956,7 +964,7 @@ impl<'a> Checker<'a> {
                     ),
                 )
                 .with_primary_label("wrong number of arguments")
-                .with_label(sig.span, "function defined here"),
+                .with_label_in(sig.source, sig.span, "function defined here"),
             );
         } else {
             for (arg_ty, param_ty) in arg_tys.iter().zip(sig.params.iter()) {

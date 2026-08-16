@@ -339,6 +339,34 @@ fn a_cross_file_diagnostic_names_both_the_importing_and_declaring_files() {
 }
 
 #[test]
+fn an_imported_function_arity_mismatch_labels_the_actual_declaration_not_the_import() {
+    // `FunctionSig` used to carry only a `Span`, so the "function
+    // defined here" label was always rendered against the *caller's*
+    // own `SourceId` -- pointing at the `import` statement in
+    // `main.npt` instead of `add`'s actual declaration in `math.npt`.
+    let dir = project("cross_file_arity_mismatch");
+    let output = napitia(&["check", &dir]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("error[T0002]"), "expected T0002, got: {err}");
+    assert!(
+        err.contains("main.npt") && err.contains("math.npt"),
+        "expected both files named: {err}"
+    );
+    // The secondary "function defined here" label must be the
+    // declaration's own signature line in math.npt, not the `import`
+    // line in main.npt.
+    assert!(
+        err.contains("func add(left: i64, right: i64)"),
+        "expected the label to point at add's real declaration: {err}"
+    );
+    assert!(
+        !err.contains("import math.add"),
+        "the import statement itself must not be labeled as the declaration: {err}"
+    );
+}
+
+#[test]
 fn an_npt_path_inside_a_project_directory_still_uses_legacy_single_file_mode() {
     // Explicit `.npt` paths always win over project discovery, even when
     // a `napitia.toml` sits right next to the file: `main.npt` alone,

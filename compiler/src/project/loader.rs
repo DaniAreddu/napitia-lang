@@ -182,14 +182,22 @@ pub fn load_project(
     let mut by_case_folded: BTreeMap<String, String> = BTreeMap::new();
     let mut imports: Vec<ImportRef> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let mut queue: Vec<ModulePath> = vec![entry_module_path.clone()];
+    // Each queued module path carries the `(source, span)` of the
+    // `import` statement that first requested it -- `None` only for the
+    // entry module itself, which nothing imports -- so a "module not
+    // found" diagnostic can point at the actual import site instead of
+    // the manifest's own first line.
+    let mut queue: Vec<(ModulePath, Option<(SourceId, Span)>)> =
+        vec![(entry_module_path.clone(), None)];
     let mut queued: BTreeSet<String> = BTreeSet::from([entry_module_path.dotted()]);
 
     // Breadth-first, but the *result* does not depend on this order:
     // only the reachable set and each module's own import list matter,
     // both of which are independent of visit order.
-    while let Some(module_path) = queue.pop() {
+    while let Some((module_path, requested_from)) = queue.pop() {
         let dotted = module_path.dotted();
+        let (not_found_source, not_found_span) =
+            requested_from.unwrap_or((manifest_source, Span::dummy()));
         let case_folded = module_path.case_folded();
         if let Some(existing) = by_case_folded.get(&case_folded)
             && *existing != dotted
@@ -219,8 +227,8 @@ pub fn load_project(
                 diagnostics.push(
                     Diagnostic::error(
                         codes::MODULE_NOT_FOUND,
-                        manifest_source,
-                        Span::dummy(),
+                        not_found_source,
+                        not_found_span,
                         format!(
                             "module `{dotted}` not found (expected `{}`)",
                             file_path.display()
@@ -249,8 +257,8 @@ pub fn load_project(
                 diagnostics.push(
                     Diagnostic::error(
                         codes::MODULE_NOT_FOUND,
-                        manifest_source,
-                        Span::dummy(),
+                        not_found_source,
+                        not_found_span,
                         format!(
                             "module `{dotted}` not found (expected `{}`)",
                             file_path.display()
@@ -281,7 +289,7 @@ pub fn load_project(
                     let target_dotted = target_module.dotted();
                     if !queued.contains(&target_dotted) {
                         queued.insert(target_dotted);
-                        queue.push(target_module);
+                        queue.push((target_module, Some((source, import.span))));
                     }
                 }
                 imports.push(ImportRef {
@@ -475,6 +483,10 @@ fn topological_order(
     };
 
     let mut witness: Option<Vec<u32>> = None;
+    // The actual `importer -> target` edge whose discovery closed the
+    // cycle -- a real import site to point the diagnostic at, never an
+    // arbitrary module chosen only because it happened to load first.
+    let mut closing_edge: Option<(u32, u32)> = None;
     'outer: for &start in &residual_by_path {
         if color[&start] != Color::White {
             continue;
@@ -505,6 +517,7 @@ fn topological_order(
                     // witness from its first occurrence back to itself.
                     if let Some(start_idx) = path.iter().position(|id| *id == target) {
                         witness = Some(path[start_idx..].to_vec());
+                        closing_edge = Some((current, target));
                         break 'outer;
                     }
                 }
@@ -521,21 +534,46 @@ fn topological_order(
     // guaranteed to find one, the same argument `typeck::cycles`
     // already relies on for its own iterative DFS.
     let witness_ids = witness.expect("the residual module set always contains a cycle");
+    let (closing_importer, closing_target) =
+        closing_edge.expect("witness and closing_edge are always set together");
     let mut witness_text: Vec<String> = witness_ids
         .iter()
         .map(|id| dotted_by_id[id].clone())
         .collect();
     witness_text.push(dotted_by_id[&witness_ids[0]].clone());
 
-    let any_source = modules
-        .first()
-        .expect("a cycle requires at least one module")
-        .source;
+    // Point the diagnostic at the real `import` statement that forms the
+    // closing edge -- the importing module's own source, and that
+    // specific import's span -- rather than an arbitrary module's
+    // source with a dummy span.
+    let target_dotted = &dotted_by_id[&closing_target];
+    let closing_import = imports.iter().find(|import| {
+        import.importing_module.0 == closing_importer
+            && ModulePath::split_import_path(&import.segments)
+                .is_some_and(|(module, _)| &module.dotted() == target_dotted)
+    });
+    let (cycle_source, cycle_span) = match closing_import {
+        Some(import) => (
+            modules
+                .iter()
+                .find(|m| m.id.0 == closing_importer)
+                .expect("importer module was discovered")
+                .source,
+            import.span,
+        ),
+        None => (
+            modules
+                .first()
+                .expect("a cycle requires at least one module")
+                .source,
+            Span::dummy(),
+        ),
+    };
     Err(Box::new(
         Diagnostic::error(
             codes::IMPORT_CYCLE,
-            any_source,
-            Span::dummy(),
+            cycle_source,
+            cycle_span,
             format!("module import cycle: {}", witness_text.join(" -> ")),
         )
         .with_primary_label("cyclic module dependency"),
@@ -658,6 +696,13 @@ mod tests {
         let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0004");
+        // Must point at the actual `import` statement that requested the
+        // missing module, not at line 1 of the manifest (a dummy span).
+        assert_ne!(
+            diags[0].primary_span,
+            Span::dummy(),
+            "expected the import statement's own span, not a dummy span"
+        );
     }
 
     #[test]
@@ -687,6 +732,10 @@ mod tests {
             "expected a deterministic cycle witness: {}",
             diags[0].message
         );
+        // Must point at a real `import` statement forming the cycle's
+        // closing edge, never an arbitrary module chosen only because it
+        // happened to be discovered first, and never a dummy span.
+        assert_ne!(diags[0].primary_span, Span::dummy());
     }
 
     #[test]

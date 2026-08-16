@@ -546,4 +546,182 @@ mod tests {
         };
         assert_eq!(render(), render());
     }
+
+    #[test]
+    fn a_function_alias_resolves_to_the_exact_original_item_id() {
+        let project = TempProject::new("alias_function");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add as plus;\nfunc main() -> i64 { return plus(1, 2) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(3)));
+    }
+
+    #[test]
+    fn a_record_alias_resolves_in_annotations_and_construction() {
+        let project = TempProject::new("alias_record");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             func id_of(a: Account) -> i64 { return a.id }\n\
+             func main() -> i64 { value a = Account { id: 9 }; return id_of(a) }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(9)));
+    }
+
+    #[test]
+    fn a_variant_alias_resolves_in_annotations_construction_and_patterns() {
+        let project = TempProject::new("alias_variant");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             func area(s: Figure) -> i64 { return match s { Circle(r) => r * r, Square(x) => x * x } }\n\
+             func main() -> i64 { value c = Figure.Circle(3); return area(c) }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(9)));
+    }
+
+    #[test]
+    fn the_original_name_is_unavailable_once_aliased() {
+        let project = TempProject::new("alias_hides_original");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             func main() -> i64 { value u = User { id: 1 }; return u.id }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0007");
+    }
+
+    #[test]
+    fn two_same_named_cross_module_records_coexist_through_aliases() {
+        let project = TempProject::new("alias_coexist");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func main() -> i64 {\n\
+             \x20   value s = SalesUser { id: 20 };\n\
+             \x20   value a = AdminUser { id: 22 };\n\
+             \x20   return sales_id(s) + admin_id(a)\n\
+             }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(42)));
+    }
+
+    #[test]
+    fn an_alias_does_not_create_a_new_nominal_type() {
+        // `SalesUser` and `AdminUser` are just local spellings for two
+        // still-genuinely-distinct declarations -- passing one where
+        // the other is expected must still be rejected.
+        let project = TempProject::new("alias_nominal_incompatible");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func main() -> i64 { value a = AdminUser { id: 22 }; return sales_id(a) }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn an_alias_named_after_a_primitive_never_shadows_it() {
+        let project = TempProject::new("alias_primitive_precedence");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as i64;\n\
+             func main() -> i64 { return 1 }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(1)));
+    }
+
+    #[test]
+    fn a_failed_import_leaves_no_partial_alias_in_the_namespace() {
+        // `helper.secret` is private, so this whole module's imports
+        // must fail atomically -- the earlier, individually-valid
+        // `helper.thing as greet` alias must never partially register
+        // before the later failure is discovered.
+        let project = TempProject::new("alias_partial_failure");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import helper.thing as greet;\n\
+             import helper.secret as whisper;\n\
+             func main() -> i64 { return greet() }\n",
+        );
+        project.write(
+            "src/helper.npt",
+            "public func thing() -> i64 { return 1 }\nfunc secret() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0006");
+    }
 }

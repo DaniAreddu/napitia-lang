@@ -1,0 +1,8 @@
+public record User {
+    public id: i64,
+}
+
+public func make_a() -> i64 {
+    value u = User { id: 111 };
+    return u.id
+}

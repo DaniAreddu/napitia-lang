@@ -62,7 +62,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
     let mut diagnostics = parsed.diagnostics;
     let (hir, resolve_diags) = hir::lower_module(&parsed.module, source, interner);
     diagnostics.extend(resolve_diags);
-    let typeck_result = typeck::check_module(&hir, source, interner);
+    let typeck_result = typeck::check_module(&hir, source, interner, typeck::EntryMain::ByName);
     diagnostics.extend(typeck_result.diagnostics);
     CheckOutput {
         hir,

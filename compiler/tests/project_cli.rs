@@ -179,6 +179,49 @@ fn a_local_declaration_conflicting_with_an_import_is_m0007() {
 }
 
 #[test]
+fn two_modules_declaring_the_same_type_name_do_not_collide() {
+    // `a` and `b` each declare their own, differently-shaped `User` --
+    // nominal identity is resolved against each module's own namespace
+    // before merging, so the two declarations must never collide into a
+    // single global `User`, regardless of which module's declaration a
+    // project-global symbol table would have kept.
+    let dir = project("duplicate_type_across_modules");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "340");
+}
+
+#[test]
+fn import_declaration_order_does_not_change_which_user_identity_is_used() {
+    // Same modules as above, but `main` imports `b` before `a` -- the
+    // result must be identical, proving type identity is resolved
+    // per-declaration, never re-derived from a project-global map whose
+    // final contents could depend on processing order.
+    let dir = project("duplicate_type_across_modules_reordered");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "340");
+}
+
+#[test]
+fn a_type_reachable_but_not_imported_is_t0006_not_a_successful_compile() {
+    // `main` imports `helper.ping` but never `helper.Secret` -- `Secret`
+    // being reachable (another item in the same module was successfully
+    // imported) must not make it usable; it is not in `main`'s own
+    // namespace, so it must be genuinely unknown there.
+    assert_project_check_fails_with("unimported_reachable_type", "T0006");
+}
+
+#[test]
+fn an_unimported_private_type_cannot_be_exposed_through_a_public_function() {
+    // `Secret` is private to `helper` *and* never imported into `main`
+    // -- it must be rejected as unknown (T0006), never silently resolved
+    // against a project-global symbol table that would let a public
+    // function leak a type its own module never imported.
+    assert_project_check_fails_with("unimported_private_type_not_exposed", "T0006");
+}
+
+#[test]
 fn a_module_import_cycle_is_m0008_with_a_deterministic_witness() {
     let dir = project("import_cycle");
     let output = napitia(&["check", &dir]);

@@ -504,7 +504,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected type errors: {:?}",
@@ -770,7 +770,7 @@ mod tests {
         let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -804,7 +804,7 @@ mod tests {
         let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         let nir = lower_nir(
             &hir,
             &result.local_types,

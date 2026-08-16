@@ -31,7 +31,7 @@ use crate::hir::{
 use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
+use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::{Ty, is_numeric, primitive_from_name};
 
 use super::block::BlockId;
@@ -86,27 +86,13 @@ pub fn lower_module(
         return Err(identity_diagnostics);
     }
 
-    // The same module-level type namespace typeck itself builds
-    // (`typeck::check_module`): primitives plus every declared
-    // `record`/`variant` name. Without this, a legitimately-declared
-    // named type would have no way to resolve to anything here and
-    // would silently fall back to `Ty::Error` -- exactly the kind of
-    // "unknown type becomes Error with no diagnostic" bug this whole
-    // pass exists to close.
-    let type_names: HashMap<Symbol, ItemId> = hir
-        .records
-        .iter()
-        .map(|r| (r.name, r.id))
-        .chain(hir.variants.iter().map(|v| (v.name, v.id)))
-        .collect();
-
     let mut record_layouts: HashMap<ItemId, RecordLayout> = HashMap::new();
     let mut record_order: Vec<ItemId> = Vec::new();
     for r in &hir.records {
         let fields = r
             .fields
             .iter()
-            .map(|f| (f.name, resolve_named_type(interner, &type_names, &f.ty)))
+            .map(|f| (f.name, resolve_named_type(interner, &f.ty)))
             .collect();
         record_order.push(r.id);
         record_layouts.insert(
@@ -128,7 +114,7 @@ pub fn lower_module(
                 payload: c
                     .payload
                     .iter()
-                    .map(|t| resolve_named_type(interner, &type_names, t))
+                    .map(|t| resolve_named_type(interner, t))
                     .collect(),
             })
             .collect();
@@ -147,12 +133,12 @@ pub fn lower_module(
         let params = f
             .params
             .iter()
-            .map(|p| resolve_named_type(interner, &type_names, &p.ty))
+            .map(|p| resolve_named_type(interner, &p.ty))
             .collect();
         let ret = f
             .return_type
             .as_ref()
-            .map(|t| resolve_named_type(interner, &type_names, t))
+            .map(|t| resolve_named_type(interner, t))
             .unwrap_or(Ty::Unit);
         function_sigs.insert(f.id, (params, ret));
     }
@@ -163,7 +149,6 @@ pub fn lower_module(
         pattern_case,
         interner,
         source,
-        type_names,
         records: record_layouts,
         variants: variant_layouts,
         function_sigs,
@@ -292,27 +277,23 @@ fn validate_item_identities(
     diagnostics
 }
 
-/// Resolves a written type name the same way `typeck::resolve_named_type`
-/// does: primitives first, then declared `record`/`variant` names,
-/// nominally by `ItemId`. Unlike typeck, an unknown name here is never
-/// reachable in the ordinary pipeline (typeck already rejected it with
-/// its own diagnostic before lowering ever ran), so falling back to
-/// `Ty::Error` is only ever exercised by a direct caller that bypasses
-/// that gate -- the same defense-in-depth posture as the rest of this
-/// module.
-fn resolve_named_type(
-    interner: &Interner,
-    type_names: &HashMap<Symbol, ItemId>,
-    ty: &ast::Type,
-) -> Ty {
-    let text = interner.resolve(ty.name.symbol);
-    if let Some(prim) = primitive_from_name(text) {
-        return prim;
+/// Converts a type reference already resolved by `hir::lower` against
+/// its *declaring module's own* namespace (see [`crate::hir::HirType`])
+/// into `Ty` -- an aggregate reference is already an exact `ItemId` by
+/// this point, no lookup needed. Unlike typeck, an `Unresolved` name
+/// that also isn't a primitive is never reachable in the ordinary
+/// pipeline (typeck already rejected it with its own `T0006` diagnostic
+/// before lowering ever ran), so falling back to `Ty::Error` here is
+/// only ever exercised by a direct caller that bypasses that gate -- the
+/// same defense-in-depth posture as the rest of this module.
+fn resolve_named_type(interner: &Interner, ty: &crate::hir::HirType) -> Ty {
+    match ty {
+        crate::hir::HirType::Aggregate { item, name, .. } => Ty::Named(*item, *name),
+        crate::hir::HirType::Unresolved { name, .. } => {
+            let text = interner.resolve(*name);
+            primitive_from_name(text).unwrap_or(Ty::Error)
+        }
     }
-    if let Some(&item) = type_names.get(&ty.name.symbol) {
-        return Ty::Named(item, ty.name.symbol);
-    }
-    Ty::Error
 }
 
 struct Lowering<'a> {
@@ -321,7 +302,6 @@ struct Lowering<'a> {
     pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
     interner: &'a Interner,
     source: SourceId,
-    type_names: HashMap<Symbol, ItemId>,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
@@ -549,8 +529,8 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    fn resolve_named_type(&self, ty: &ast::Type) -> Ty {
-        resolve_named_type(self.interner, &self.type_names, ty)
+    fn resolve_named_type(&self, ty: &crate::hir::HirType) -> Ty {
+        resolve_named_type(self.interner, ty)
     }
 
     // ---- reading typeck's already-resolved types ----
@@ -2016,7 +1996,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected type errors: {:?}",
@@ -2050,7 +2030,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected type errors: {:?}",
@@ -2083,7 +2063,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         assert!(
             result.diagnostics.is_empty(),
             "unexpected type errors: {:?}",
@@ -2812,7 +2792,7 @@ mod tests {
             diags.is_empty(),
             "unexpected resolve diagnostics: {diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         lower_module(
             &hir,
             &result.local_types,
@@ -2862,7 +2842,7 @@ mod tests {
             resolve_diags.iter().any(|d| d.code == "R0009"),
             "expected a missing-field diagnostic from hir::lower: {resolve_diags:?}"
         );
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         let outcome = lower_module(
             &hir,
             &result.local_types,
@@ -3109,11 +3089,9 @@ mod tests {
             cases: vec![crate::hir::HirCase {
                 name: case_name,
                 span: Span::dummy(),
-                payload: vec![ast::Type {
-                    name: ast::Ident {
-                        symbol: interner.intern("i64"),
-                        span: Span::dummy(),
-                    },
+                payload: vec![crate::hir::HirType::Unresolved {
+                    name: interner.intern("i64"),
+                    span: Span::dummy(),
                 }],
             }],
         };
@@ -3403,7 +3381,6 @@ mod tests {
             pattern_case,
             interner,
             source,
-            type_names: HashMap::new(),
             records,
             variants,
             function_sigs: HashMap::new(),
@@ -3776,17 +3753,15 @@ mod tests {
         let leaf_name = interner.intern("Leaf");
         let variant_item = ItemId(0);
         let variant_sym = interner.intern("Rec");
-        let variant_ty_name = ast::Type {
-            name: ast::Ident {
-                symbol: variant_sym,
-                span: Span::dummy(),
-            },
+        let variant_ty_name = crate::hir::HirType::Aggregate {
+            item: variant_item,
+            kind: crate::hir::AggregateKind::Variant,
+            name: variant_sym,
+            span: Span::dummy(),
         };
-        let i64_name = ast::Type {
-            name: ast::Ident {
-                symbol: interner.intern("i64"),
-                span: Span::dummy(),
-            },
+        let i64_name = crate::hir::HirType::Unresolved {
+            name: interner.intern("i64"),
+            span: Span::dummy(),
         };
         let variant = crate::hir::HirVariant {
             id: variant_item,
@@ -4028,7 +4003,7 @@ mod tests {
         assert!(diags.is_empty());
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty());
-        let result = check_module(&hir, id, &interner);
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
         let outcome = lower_module(
             &hir,
             &result.local_types,

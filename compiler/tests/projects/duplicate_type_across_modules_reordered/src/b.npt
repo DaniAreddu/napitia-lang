@@ -1,0 +1,9 @@
+public record User {
+    public id: i64,
+    public tag: i64,
+}
+
+public func make_b() -> i64 {
+    value u = User { id: 222, tag: 7 };
+    return u.id + u.tag
+}

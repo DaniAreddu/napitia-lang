@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 
 use super::{
-    ExprId, HirBinding, HirBlock, HirCase, HirElse, HirExpr, HirField, HirFieldInit, HirFunction,
-    HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirRecord, HirStmt, HirVariant,
-    ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
+    AggregateKind, ExprId, HirBinding, HirBlock, HirCase, HirElse, HirExpr, HirField, HirFieldInit,
+    HirFunction, HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirRecord, HirStmt,
+    HirType, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
 };
 use crate::diagnostics::Diagnostic;
 use crate::resolve::Scopes;
@@ -409,11 +409,12 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             seen.insert(field.name.symbol, fields.len());
+            let ty = self.resolve_type_ref(&field.ty);
             fields.push(HirField {
                 name: field.name.symbol,
                 span: field.span,
                 public: field.public,
-                ty: field.ty.clone(),
+                ty,
             });
         }
         self.record_fields.insert(id, seen);
@@ -451,10 +452,15 @@ impl<'a> Lowering<'a> {
                 .entry(case.name.symbol)
                 .or_default()
                 .push((id, index));
+            let payload = case
+                .payload
+                .iter()
+                .map(|t| self.resolve_type_ref(t))
+                .collect();
             cases.push(HirCase {
                 name: case.name.symbol,
                 span: case.span,
-                payload: case.payload.clone(),
+                payload,
             });
         }
         self.variant_cases.insert(id, seen);
@@ -536,6 +542,35 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Resolves a written type name against *this module's own*
+    /// type namespace (`self.type_names`, seeded with imports before any
+    /// local declaration is processed -- see `run_with_imports`) to an
+    /// exact declaration identity, before this module is ever merged
+    /// with any other. This is the one and only place an aggregate type
+    /// reference is resolved: it must never be re-derived later from a
+    /// project-global surface name, which is exactly what let two
+    /// modules' same-named types collide, or a module reach a type it
+    /// never imported (`rfcs/0006`). A name that isn't a locally-known
+    /// aggregate is left `Unresolved` -- it may still be a primitive, or
+    /// genuinely unknown, neither of which HIR lowering itself decides.
+    fn resolve_type_ref(&self, ty: &ast::Type) -> HirType {
+        match self.type_names.get(&ty.name.symbol) {
+            Some(&(item, kind)) => HirType::Aggregate {
+                item,
+                kind: match kind {
+                    TypeNameKind::Record => AggregateKind::Record,
+                    TypeNameKind::Variant => AggregateKind::Variant,
+                },
+                name: ty.name.symbol,
+                span: ty.name.span,
+            },
+            None => HirType::Unresolved {
+                name: ty.name.symbol,
+                span: ty.name.span,
+            },
+        }
+    }
+
     fn fresh_item(&mut self) -> ItemId {
         let id = ItemId(self.next_item_id);
         self.next_item_id += 1;
@@ -584,14 +619,16 @@ impl<'a> Lowering<'a> {
                 }
                 let local = self.fresh_local();
                 scopes.define(p.name.symbol, local);
+                let ty = self.resolve_type_ref(&p.ty);
                 HirParam {
                     local,
                     name: p.name.symbol,
                     span: p.span,
-                    ty: p.ty.clone(),
+                    ty,
                 }
             })
             .collect();
+        let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
         let body = self.lower_block(&f.body, &mut scopes);
         HirFunction {
             id,
@@ -600,7 +637,7 @@ impl<'a> Lowering<'a> {
             source: self.source,
             public: f.public,
             params,
-            return_type: f.return_type.clone(),
+            return_type,
             uses: f.uses.clone(),
             raises: f.raises.clone(),
             body,
@@ -634,11 +671,12 @@ impl<'a> Lowering<'a> {
                 let value = self.lower_expr(&b.value, scopes);
                 let local = self.fresh_local();
                 scopes.define(b.name.symbol, local);
+                let ty = b.ty.as_ref().map(|t| self.resolve_type_ref(t));
                 HirStmt::Binding(HirBinding {
                     local,
                     name: b.name.symbol,
                     mutable: b.mutable,
-                    ty: b.ty.clone(),
+                    ty,
                     value,
                     span: b.span,
                 })
@@ -734,7 +772,7 @@ impl<'a> Lowering<'a> {
             ast::Expr::Cast { expr, ty, span } => HirExpr::Cast {
                 id: self.fresh_expr_id(),
                 expr: Box::new(self.lower_expr(expr, scopes)),
-                ty: ty.clone(),
+                ty: self.resolve_type_ref(ty),
                 span: *span,
             },
             ast::Expr::Try { expr, span } => HirExpr::Try {

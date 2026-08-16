@@ -143,25 +143,11 @@ pub fn compile_project(
     }
     let entry_source = entry_source.expect("the entry module is always among loaded.modules");
 
-    let typeck_result = typeck::check_module(&merged, loaded.manifest_source, interner);
-    if !typeck_result.diagnostics.is_empty() {
-        return Err(typeck_result.diagnostics);
-    }
-
-    let nir_module = nir::lower_module(
-        &merged,
-        &typeck_result.local_types,
-        &typeck_result.expr_types,
-        &typeck_result.pattern_case,
-        interner,
-        loaded.manifest_source,
-    )?;
-
-    let verify_diagnostics = nir::verify_module(&nir_module, loaded.manifest_source, interner);
-    if !verify_diagnostics.is_empty() {
-        return Err(verify_diagnostics);
-    }
-
+    // Identified by `ItemId` *before* typeck ever runs, so typeck's own
+    // entry-signature check (`EntryMain::ByIdentity`) can be scoped to
+    // this exact declaration -- never a global "any function named
+    // `main`" check, which would also wrongly flag an ordinary,
+    // differently-shaped `main` in a non-entry module (`rfcs/0006`).
     let main_symbol = interner.intern("main");
     let mut entry_candidates = merged
         .functions
@@ -196,6 +182,30 @@ pub fn compile_project(
             ]);
         }
     };
+
+    let typeck_result = typeck::check_module(
+        &merged,
+        loaded.manifest_source,
+        interner,
+        typeck::EntryMain::ByIdentity(Some(entry_item)),
+    );
+    if !typeck_result.diagnostics.is_empty() {
+        return Err(typeck_result.diagnostics);
+    }
+
+    let nir_module = nir::lower_module(
+        &merged,
+        &typeck_result.local_types,
+        &typeck_result.expr_types,
+        &typeck_result.pattern_case,
+        interner,
+        loaded.manifest_source,
+    )?;
+
+    let verify_diagnostics = nir::verify_module(&nir_module, loaded.manifest_source, interner);
+    if !verify_diagnostics.is_empty() {
+        return Err(verify_diagnostics);
+    }
 
     Ok(CompiledProject {
         nir: nir_module,

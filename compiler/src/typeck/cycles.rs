@@ -246,11 +246,9 @@ mod tests {
                     name: field_name,
                     span: Span::dummy(),
                     public: true,
-                    ty: crate::syntax::ast::Type {
-                        name: crate::syntax::ast::Ident {
-                            symbol: name,
-                            span: Span::dummy(),
-                        },
+                    ty: crate::hir::HirType::Unresolved {
+                        name,
+                        span: Span::dummy(),
                     },
                 }],
             },
@@ -275,11 +273,9 @@ mod tests {
                 cases: vec![HirCase {
                     name: case_name,
                     span: Span::dummy(),
-                    payload: vec![crate::syntax::ast::Type {
-                        name: crate::syntax::ast::Ident {
-                            symbol: name,
-                            span: Span::dummy(),
-                        },
+                    payload: vec![crate::hir::HirType::Unresolved {
+                        name,
+                        span: Span::dummy(),
                     }],
                 }],
             },

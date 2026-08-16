@@ -5,6 +5,7 @@
 pub mod loader;
 pub mod manifest;
 pub mod module;
+pub mod resolve;
 
 pub(crate) mod codes {
     pub const INVALID_MANIFEST: &str = "M0001";

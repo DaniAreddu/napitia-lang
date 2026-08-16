@@ -1,6 +1,6 @@
 # Spec 0002: Syntax
 
-- Status: Partially implemented (Alpha 0.1.2)
+- Status: Partially implemented (Alpha 0.1.3)
 
 The grammar below uses the provisional vocabulary accepted in
 `rfcs/0004-language-independence.md`. It replaces an earlier version of
@@ -44,19 +44,26 @@ already-imported name in the same module is not enough (`rfcs/0006`).
 ### Imports
 
 ```text
-ImportDecl = "import" Path ";" ;
+ImportDecl = "import" Path [ "as" IDENT ] ";" ;
 Path       = IDENT { "." IDENT } ;
 ```
 
 In project (multi-file) compilation, `import a.b.c;` brings the single
 public item `c`, declared in module `a.b`, into the importing module's
 own namespace by that unqualified name — every segment before the last is
-the module path, the last is the imported item (`rfcs/0006`). In legacy
-single-file compilation an `import` is accepted syntactically but has
-nothing to resolve against, since there is only ever the one module being
-compiled. Paths are dotted (`a.b.c`), not double-colon-separated, matching
-the dotted capability paths used by `uses` (see below) rather than Rust's
-`::` path syntax.
+the module path, the last is the imported item (`rfcs/0006`). An optional
+`as <alias>` (Alpha 0.1.3, `rfcs/0007`) binds the item under `<alias>`
+instead of `c`: a purely local rename that never changes the item's own
+declared name or identity, needed to bring two same-named items from
+different modules into one scope at once (`import a.User as A; import
+b.User as B;`). There is no wildcard (`import a.*;`), grouped
+(`import a.{b, c};`), package-alias, or module-alias (aliasing `a.b`
+itself rather than one item in it) form, and no re-export — every one of
+these is rejected with a diagnostic. In legacy single-file compilation an
+`import` is accepted syntactically but has nothing to resolve against,
+since there is only ever the one module being compiled. Paths are dotted
+(`a.b.c`), not double-colon-separated, matching the dotted capability
+paths used by `uses` (see below) rather than Rust's `::` path syntax.
 
 ### Functions
 

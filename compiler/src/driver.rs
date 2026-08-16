@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{self, HirModule, LocalId};
+use crate::hir::{self, HirModule, ItemRegistry, LocalId};
 use crate::interpreter::{Interpreter, InterpreterError, Value};
 use crate::lexer::{self, Token};
 use crate::nir::{self, Module as NirModule};
@@ -77,8 +77,14 @@ pub enum IrOutput {
     /// The program type-checked cleanly, every function lowered to NIR
     /// (atomically -- `nir::lower_module`), and the result passed the
     /// NIR verifier: this is never a partial or internally inconsistent
-    /// module.
-    Ready { nir: NirModule },
+    /// module. `registry` is built with an empty module-path map --
+    /// single-file compilation has no project-level module path at all,
+    /// so every item's canonical qualified name is just its own
+    /// declared name (`rfcs/0007`).
+    Ready {
+        nir: NirModule,
+        registry: ItemRegistry,
+    },
     /// Lexing, parsing, resolution, or type-checking failed (NIR
     /// lowering never ran), lowering itself failed, or lowering
     /// succeeded but produced NIR the verifier rejected. Either way,
@@ -102,16 +108,20 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         Ok(nir_module) => nir_module,
         Err(diagnostics) => return IrOutput::Diagnostics(diagnostics),
     };
+    let registry = hir::registry::build(&checked.hir, &HashMap::new());
     // A module lowering itself considers well-formed is still checked
     // independently before interpretation ever sees it: the verifier
     // does not trust lowering's own bookkeeping, so a bug in `lower.rs`
     // surfaces as a diagnostic here rather than a panic or silent
     // misbehavior in the interpreter.
-    let verify_diagnostics = nir::verify_module(&nir_module, source, interner);
+    let verify_diagnostics = nir::verify_module(&nir_module, source, interner, &registry);
     if !verify_diagnostics.is_empty() {
         return IrOutput::Diagnostics(verify_diagnostics);
     }
-    IrOutput::Ready { nir: nir_module }
+    IrOutput::Ready {
+        nir: nir_module,
+        registry,
+    }
 }
 
 pub enum RunOutput {
@@ -124,7 +134,7 @@ pub enum RunOutput {
 pub fn run(map: &SourceMap, source: SourceId, interner: &mut Interner, entry: &str) -> RunOutput {
     match ir(map, source, interner) {
         IrOutput::Diagnostics(diags) => RunOutput::Diagnostics(diags),
-        IrOutput::Ready { nir } => {
+        IrOutput::Ready { nir, .. } => {
             let result = Interpreter::new(&nir).run(entry, interner);
             RunOutput::Result(result)
         }
@@ -143,7 +153,10 @@ pub fn check_project(
 }
 
 pub enum ProjectIrOutput {
-    Ready { nir: NirModule },
+    Ready {
+        nir: NirModule,
+        registry: ItemRegistry,
+    },
     Diagnostics(Vec<Diagnostic>),
 }
 
@@ -153,7 +166,7 @@ pub fn ir_project(
     interner: &mut Interner,
 ) -> ProjectIrOutput {
     match project::compile_project(manifest_path, map, interner) {
-        Ok(CompiledProject { nir, .. }) => ProjectIrOutput::Ready { nir },
+        Ok(CompiledProject { nir, registry, .. }) => ProjectIrOutput::Ready { nir, registry },
         Err(diagnostics) => ProjectIrOutput::Diagnostics(diagnostics),
     }
 }
@@ -169,9 +182,9 @@ pub fn run_project(
     interner: &mut Interner,
 ) -> ProjectRunOutput {
     match project::compile_project(manifest_path, map, interner) {
-        Ok(CompiledProject { nir, entry_item }) => {
-            ProjectRunOutput::Result(Interpreter::new(&nir).run_item(entry_item))
-        }
+        Ok(CompiledProject {
+            nir, entry_item, ..
+        }) => ProjectRunOutput::Result(Interpreter::new(&nir).run_item(entry_item)),
         Err(diagnostics) => ProjectRunOutput::Diagnostics(diagnostics),
     }
 }

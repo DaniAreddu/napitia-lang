@@ -17,21 +17,39 @@ use std::fmt::Write as _;
 use super::block::{BasicBlock, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
 use super::{Function, Module};
+use crate::hir::{ItemId, ItemRegistry};
 use crate::symbol::Interner;
 use crate::types::{Ty, display_ty};
 
-pub fn print_module(module: &Module, interner: &Interner) -> String {
+/// Every declaration and reference to `id` renders through this one
+/// helper, so the two can never drift into different formats
+/// (`rfcs/0007`): the registry's own canonical, module-qualified name
+/// (empty module path -> no prefix, matching single-file compilation),
+/// suffixed with the bare `ItemId` itself -- which alone already makes
+/// two distinct items impossible to confuse, even before the name is
+/// considered, and remains stable however a future change reshapes
+/// qualified-name formatting.
+fn qualified_ref(id: ItemId, registry: &ItemRegistry, interner: &Interner) -> String {
+    format!("{}#{}", registry.qualified_name(id, interner), id.0)
+}
+
+pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistry) -> String {
     let mut out = String::new();
     for (i, function) in module.functions.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        print_function(&mut out, function, interner);
+        print_function(&mut out, function, interner, registry);
     }
     out
 }
 
-fn print_function(out: &mut String, function: &Function, interner: &Interner) {
+fn print_function(
+    out: &mut String,
+    function: &Function,
+    interner: &Interner,
+    registry: &ItemRegistry,
+) {
     let params = function
         .params
         .iter()
@@ -41,7 +59,7 @@ fn print_function(out: &mut String, function: &Function, interner: &Interner) {
     let _ = writeln!(
         out,
         "func @{}({params}) -> {} {{",
-        interner.resolve(function.name),
+        qualified_ref(function.id, registry, interner),
         display_ty(&function.return_type, interner)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
@@ -50,7 +68,7 @@ fn print_function(out: &mut String, function: &Function, interner: &Interner) {
     // it, since a comparison instruction's own declared `ty` is `bool`.
     let value_types = collect_value_types(function);
     for block in &function.blocks {
-        print_block(out, block, &value_types, interner);
+        print_block(out, block, &value_types, interner, registry);
     }
     out.push_str("}\n");
 }
@@ -75,29 +93,35 @@ fn print_block(
     block: &BasicBlock,
     value_types: &HashMap<ValueId, Ty>,
     interner: &Interner,
+    registry: &ItemRegistry,
 ) {
     let _ = writeln!(out, "bb{}:", block.id.0);
     for instruction in &block.instructions {
         let _ = writeln!(
             out,
             "    {}",
-            format_instruction(instruction, value_types, interner)
+            format_instruction(instruction, value_types, interner, registry)
         );
     }
-    let _ = writeln!(out, "    {}", format_terminator(&block.terminator));
+    let _ = writeln!(
+        out,
+        "    {}",
+        format_terminator(&block.terminator, interner, registry)
+    );
 }
 
 fn format_instruction(
     instruction: &Instruction,
     value_types: &HashMap<ValueId, Ty>,
     interner: &Interner,
+    registry: &ItemRegistry,
 ) -> String {
     match instruction {
         Instruction::Value { result, ty, kind } => {
             format!(
                 "%{} = {}",
                 result.0,
-                format_value_kind(kind, ty, value_types, interner)
+                format_value_kind(kind, ty, value_types, interner, registry)
             )
         }
         Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
@@ -116,6 +140,7 @@ fn format_value_kind(
     ty: &Ty,
     value_types: &HashMap<ValueId, Ty>,
     interner: &Interner,
+    registry: &ItemRegistry,
 ) -> String {
     let ty_name = display_ty(ty, interner);
     match kind {
@@ -188,7 +213,10 @@ fn format_value_kind(
                 .map(|v: &ValueId| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("call @{}({args})", function.0)
+            format!(
+                "call @{}({args})",
+                qualified_ref(*function, registry, interner)
+            )
         }
         ValueKind::RecordCreate(record, fields) => {
             let fields = fields
@@ -196,13 +224,20 @@ fn format_value_kind(
                 .map(|v| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("record.create @{}({fields})", record.0)
+            format!(
+                "record.create @{}({fields})",
+                qualified_ref(*record, registry, interner)
+            )
         }
         ValueKind::RecordField {
             base,
             record,
             field,
-        } => format!("record.field @{}.{field} %{}", record.0, base.0),
+        } => format!(
+            "record.field @{}.{field} %{}",
+            qualified_ref(*record, registry, interner),
+            base.0
+        ),
         ValueKind::VariantCreate {
             variant,
             case,
@@ -213,14 +248,21 @@ fn format_value_kind(
                 .map(|v| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("variant.create @{}.{case}({payload})", variant.0)
+            format!(
+                "variant.create @{}.{case}({payload})",
+                qualified_ref(*variant, registry, interner)
+            )
         }
         ValueKind::VariantPayload {
             base,
             variant,
             case,
             index,
-        } => format!("variant.payload @{}.{case}.{index} %{}", variant.0, base.0),
+        } => format!(
+            "variant.payload @{}.{case}.{index} %{}",
+            qualified_ref(*variant, registry, interner),
+            base.0
+        ),
     }
 }
 
@@ -235,7 +277,7 @@ fn format_const(c: &Const) -> String {
     }
 }
 
-fn format_terminator(term: &Terminator) -> String {
+fn format_terminator(term: &Terminator, interner: &Interner, registry: &ItemRegistry) -> String {
     match term {
         Terminator::Return(Some(v)) => format!("ret %{}", v.0),
         Terminator::Return(None) => "ret".to_string(),
@@ -260,7 +302,11 @@ fn format_terminator(term: &Terminator) -> String {
                 .map(|b| format!("bb{}", b.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("switch %{} : @{} {{{targets}}}", scrutinee.0, variant.0)
+            format!(
+                "switch %{} : @{} {{{targets}}}",
+                scrutinee.0,
+                qualified_ref(*variant, registry, interner)
+            )
         }
     }
 }
@@ -300,13 +346,18 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        print_module(&nir, &interner)
+        let registry = crate::hir::registry::build(&hir, &HashMap::new());
+        print_module(&nir, &interner, &registry)
     }
 
     #[test]
     fn prints_add_function_matching_the_spec_example() {
+        // Single-file compilation has no module path to qualify with
+        // (`rfcs/0007`), so the declaration is just its own name plus
+        // its `ItemId` (`#0`, the first and only function here) -- the
+        // same `#id` suffix a multi-module project's declarations get.
         let text = print("func add(left: i64, right: i64) -> i64 { return left + right }");
-        assert!(text.starts_with("func @add(%0: i64, %1: i64) -> i64 {\n"));
+        assert!(text.starts_with("func @add#0(%0: i64, %1: i64) -> i64 {\n"));
         assert!(text.contains("bb0:\n"));
         assert!(text.contains("add.i64"));
         assert!(text.contains("ret"));

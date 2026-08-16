@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::ItemId;
+use crate::hir::{ItemId, ItemRegistry};
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::{Ty, is_integer, is_numeric};
@@ -109,7 +109,12 @@ struct AggregateContext<'a> {
 /// Verifies every function in `module`, collecting every diagnostic it
 /// can rather than stopping at the first problem (mirroring `typeck`'s
 /// own style) -- an empty result means the module is safe to interpret.
-pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> Vec<Diagnostic> {
+pub fn verify_module(
+    module: &Module,
+    source: SourceId,
+    interner: &Interner,
+    registry: &ItemRegistry,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // `ItemId` is required to be globally unique across every
@@ -149,7 +154,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
     let mut known_functions: HashMap<ItemId, KnownFunction> = HashMap::new();
     let mut seen_function_ids = HashSet::new();
     for function in &module.functions {
-        let name = interner.resolve(function.name);
+        let name = registry.qualified_name(function.id, interner);
         if !seen_function_ids.insert(function.id) {
             diagnostics.push(Diagnostic::error(
                 codes::DUPLICATE_FUNCTION_ID,
@@ -160,7 +165,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
                 ),
             ));
         }
-        check_item_identity(function.id, ItemRole::Function, name, &mut diagnostics);
+        check_item_identity(function.id, ItemRole::Function, &name, &mut diagnostics);
         known_functions.insert(
             function.id,
             KnownFunction {
@@ -171,8 +176,8 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
     }
 
     let mut seen_record_ids = HashSet::new();
-    for (id, record) in &module.records {
-        let name = interner.resolve(record.name);
+    for (id, _record) in &module.records {
+        let name = registry.qualified_name(*id, interner);
         if !seen_record_ids.insert(*id) {
             diagnostics.push(Diagnostic::error(
                 codes::DUPLICATE_RECORD_ID,
@@ -183,11 +188,11 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
                 ),
             ));
         }
-        check_item_identity(*id, ItemRole::Record, name, &mut diagnostics);
+        check_item_identity(*id, ItemRole::Record, &name, &mut diagnostics);
     }
     let mut seen_variant_ids = HashSet::new();
-    for (id, variant) in &module.variants {
-        let name = interner.resolve(variant.name);
+    for (id, _variant) in &module.variants {
+        let name = registry.qualified_name(*id, interner);
         if !seen_variant_ids.insert(*id) {
             diagnostics.push(Diagnostic::error(
                 codes::DUPLICATE_VARIANT_ID,
@@ -198,7 +203,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
                 ),
             ));
         }
-        check_item_identity(*id, ItemRole::Variant, name, &mut diagnostics);
+        check_item_identity(*id, ItemRole::Variant, &name, &mut diagnostics);
     }
 
     let agg = AggregateContext {
@@ -211,16 +216,24 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
     // erroneous, or dangling-named types are never allowed to hide
     // inside an aggregate's layout just because nothing ever
     // constructs one.
-    for (_, record) in &module.records {
-        let context = format!("record `{}`", interner.resolve(record.name));
+    for (id, record) in &module.records {
+        let context = format!("record `{}`", registry.qualified_name(*id, interner));
         for (field_name, ty) in &record.fields {
             let field_context = format!("{context}'s field `{}`", interner.resolve(*field_name));
             check_no_bad_type(ty, source, &field_context, &mut diagnostics);
-            check_named_type_identity(ty, &agg, source, interner, &field_context, &mut diagnostics);
+            check_named_type_identity(
+                ty,
+                &agg,
+                source,
+                interner,
+                registry,
+                &field_context,
+                &mut diagnostics,
+            );
         }
     }
-    for (_, variant) in &module.variants {
-        let context = format!("variant `{}`", interner.resolve(variant.name));
+    for (id, variant) in &module.variants {
+        let context = format!("variant `{}`", registry.qualified_name(*id, interner));
         for case in &variant.cases {
             for (i, ty) in case.payload.iter().enumerate() {
                 let payload_context = format!(
@@ -233,6 +246,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
                     &agg,
                     source,
                     interner,
+                    registry,
                     &payload_context,
                     &mut diagnostics,
                 );
@@ -247,6 +261,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
             &agg,
             source,
             interner,
+            registry,
             &mut diagnostics,
         );
     }
@@ -260,9 +275,16 @@ fn verify_function(
     agg: &AggregateContext,
     source: SourceId,
     interner: &Interner,
+    registry: &ItemRegistry,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let name = interner.resolve(function.name);
+    // Computed once, as the item's canonical qualified name
+    // (`rfcs/0007`) -- every message below that names this function
+    // (including the ones built deeper in verify_dominance/
+    // verify_payload_refinement/verify_value_kind, which only ever see
+    // this same string) automatically stays qualified and alias-
+    // independent without needing its own registry lookup.
+    let name = registry.qualified_name(function.id, interner);
 
     if function.blocks.is_empty() {
         diagnostics.push(Diagnostic::error(
@@ -294,12 +316,21 @@ fn verify_function(
         agg,
         source,
         interner,
+        registry,
         &fn_context,
         diagnostics,
     );
     for param in &function.params {
         check_no_bad_type(&param.ty, source, &fn_context, diagnostics);
-        check_named_type_identity(&param.ty, agg, source, interner, &fn_context, diagnostics);
+        check_named_type_identity(
+            &param.ty,
+            agg,
+            source,
+            interner,
+            registry,
+            &fn_context,
+            diagnostics,
+        );
     }
 
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
@@ -388,7 +419,15 @@ fn verify_function(
             match instruction {
                 Instruction::Value { result, ty, kind } => {
                     check_no_bad_type(ty, source, &fn_context, diagnostics);
-                    check_named_type_identity(ty, agg, source, interner, &fn_context, diagnostics);
+                    check_named_type_identity(
+                        ty,
+                        agg,
+                        source,
+                        interner,
+                        registry,
+                        &fn_context,
+                        diagnostics,
+                    );
                     verify_value_kind(
                         *result,
                         ty,
@@ -398,8 +437,9 @@ fn verify_function(
                         known_functions,
                         agg,
                         source,
-                        name,
+                        &name,
                         interner,
+                        registry,
                         diagnostics,
                         &mut require_value,
                     );
@@ -551,7 +591,7 @@ fn verify_function(
                         Span::dummy(),
                         format!(
                             "function `{name}` switches on `{}` with {} target(s), but it has {} case(s)",
-                            interner.resolve(layout.name),
+                            registry.qualified_name(*variant, interner),
                             cases.len(),
                             layout.cases.len()
                         ),
@@ -574,8 +614,8 @@ fn verify_function(
         }
     }
 
-    verify_payload_refinement(function, agg, source, name, diagnostics);
-    verify_dominance(function, &param_values, source, name, diagnostics);
+    verify_payload_refinement(function, agg, source, &name, diagnostics);
+    verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
 /// A value used anywhere in `function` must be either a parameter, or
@@ -858,6 +898,7 @@ fn check_named_type_identity(
     agg: &AggregateContext,
     source: SourceId,
     interner: &Interner,
+    registry: &ItemRegistry,
     context: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -885,7 +926,7 @@ fn check_named_type_identity(
             format!(
                 "{context} names its type `{}`, but its declaration is actually named `{}`",
                 interner.resolve(*symbol),
-                interner.resolve(name)
+                registry.qualified_name(*item, interner)
             ),
         )),
         Some(_) => {}
@@ -904,6 +945,7 @@ fn verify_value_kind(
     source: SourceId,
     function_name: &str,
     interner: &Interner,
+    registry: &ItemRegistry,
     diagnostics: &mut Vec<Diagnostic>,
     require_value: &mut impl FnMut(ValueId, &mut Vec<Diagnostic>),
 ) {
@@ -1155,7 +1197,7 @@ fn verify_value_kind(
                     diagnostics,
                     format!(
                         "constructs record `{}` but is declared `{}`",
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*record, interner),
                         ty_name(result_ty)
                     ),
                 );
@@ -1168,7 +1210,7 @@ fn verify_value_kind(
                     format!(
                         "function `{function_name}`: %{} constructs `{}` with {} field value(s), but it has {} field(s)",
                         result.0,
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*record, interner),
                         fields.len(),
                         layout.fields.len()
                     ),
@@ -1217,7 +1259,7 @@ fn verify_value_kind(
                     diagnostics,
                     format!(
                         "projects a field of `{}` from a base of type `{}`",
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*record, interner),
                         ty_name(&base_ty)
                     ),
                 );
@@ -1239,7 +1281,7 @@ fn verify_value_kind(
                     format!(
                         "function `{function_name}`: %{} projects field index {field} of `{}`, which has {} field(s)",
                         result.0,
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*record, interner),
                         layout.fields.len()
                     ),
                 )),
@@ -1270,7 +1312,7 @@ fn verify_value_kind(
                     diagnostics,
                     format!(
                         "constructs variant `{}` but is declared `{}`",
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*variant, interner),
                         ty_name(result_ty)
                     ),
                 );
@@ -1283,7 +1325,7 @@ fn verify_value_kind(
                     format!(
                         "function `{function_name}`: %{} constructs unknown case index {case} of `{}`",
                         result.0,
-                        interner.resolve(layout.name)
+                        registry.qualified_name(*variant, interner)
                     ),
                 ));
                 return;
@@ -1346,7 +1388,7 @@ fn verify_value_kind(
                     diagnostics,
                     format!(
                         "projects a payload of `{}` from a base of type `{}`",
-                        interner.resolve(layout.name),
+                        registry.qualified_name(*variant, interner),
                         ty_name(&base_ty)
                     ),
                 );
@@ -1368,7 +1410,7 @@ fn verify_value_kind(
                     format!(
                         "function `{function_name}`: %{} projects payload index {index} of case {case} of `{}`, which does not have it",
                         result.0,
-                        interner.resolve(layout.name)
+                        registry.qualified_name(*variant, interner)
                     ),
                 )),
             }
@@ -1552,7 +1594,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
@@ -1571,7 +1613,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_FUNCTION_ID));
     }
 
@@ -1592,7 +1634,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_BLOCK_ID));
     }
 
@@ -1609,7 +1651,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert_eq!(codes_of(&diagnostics), vec![codes::EMPTY_FUNCTION]);
     }
 
@@ -1626,7 +1668,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_BRANCH_TARGET));
     }
 
@@ -1647,7 +1689,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_FUNCTION_REF));
     }
 
@@ -1665,7 +1707,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_VALUE));
     }
 
@@ -1687,7 +1729,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_SLOT));
     }
 
@@ -1720,7 +1762,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::STORE_TYPE_MISMATCH));
     }
 
@@ -1741,7 +1783,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::NON_BOOL_CONDITION));
     }
 
@@ -1758,7 +1800,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::RETURN_TYPE_MISMATCH));
     }
 
@@ -1793,7 +1835,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
     }
 
@@ -1810,7 +1852,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE));
     }
 
@@ -1827,7 +1869,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
     }
 
@@ -1851,7 +1893,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let diagnostics = verify_module(&module, source, &interner);
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
     }
 
@@ -1872,7 +1914,7 @@ mod tests {
             records,
             variants,
         };
-        verify_module(&module, source, interner)
+        verify_module(&module, source, interner, &ItemRegistry::default())
     }
 
     /// A `record Point { x: i64 }` layout, and a matching `func f() ->

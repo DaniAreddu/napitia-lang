@@ -41,6 +41,11 @@ pub struct CompiledProject {
     /// name lookup over the merged module, which a project with more
     /// than one module could make ambiguous.
     pub entry_item: ItemId,
+    /// Canonical module-qualified identity for every item in `nir`
+    /// (`rfcs/0007`) -- what `nir::print_module`/`nir::verify_module`
+    /// and any future qualified diagnostic read from, rather than each
+    /// keeping its own name lookup that could drift from this one.
+    pub registry: hir::ItemRegistry,
 }
 
 /// Loads, resolves, and compiles the project rooted at `manifest_path`
@@ -183,6 +188,18 @@ pub fn compile_project(
     }
     let entry_source = entry_source.expect("the entry module is always among loaded.modules");
 
+    // Canonical module-qualified identity for every item, built once
+    // from the already-merged HIR (`rfcs/0007`) -- the single source of
+    // truth `nir::print_module`/`nir::verify_module` and any future
+    // qualified diagnostic read from, never a second name map that
+    // could disagree with it.
+    let module_path_of: HashMap<SourceId, String> = loaded
+        .modules
+        .iter()
+        .map(|m| (m.source, m.path.dotted()))
+        .collect();
+    let registry = hir::registry::build(&merged, &module_path_of);
+
     // Identified by `ItemId` *before* typeck ever runs, so typeck's own
     // entry-signature check (`EntryMain::ByIdentity`) can be scoped to
     // this exact declaration -- never a global "any function named
@@ -223,7 +240,8 @@ pub fn compile_project(
         loaded.manifest_source,
     )?;
 
-    let verify_diagnostics = nir::verify_module(&nir_module, loaded.manifest_source, interner);
+    let verify_diagnostics =
+        nir::verify_module(&nir_module, loaded.manifest_source, interner, &registry);
     if !verify_diagnostics.is_empty() {
         return Err(verify_diagnostics);
     }
@@ -231,6 +249,7 @@ pub fn compile_project(
     Ok(CompiledProject {
         nir: nir_module,
         entry_item,
+        registry,
     })
 }
 
@@ -542,7 +561,7 @@ mod tests {
             let mut interner = Interner::new();
             let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
                 .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
-            crate::nir::print_module(&compiled.nir, &interner)
+            crate::nir::print_module(&compiled.nir, &interner, &compiled.registry)
         };
         assert_eq!(render(), render());
     }

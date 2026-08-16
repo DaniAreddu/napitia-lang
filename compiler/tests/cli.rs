@@ -345,3 +345,47 @@ fn invalid_aggregate_fixtures_fail_at_check_with_no_leaked_internal_diagnostic()
         );
     }
 }
+
+/// A pattern nested far past the compiler's structural depth limit,
+/// generated here rather than committed as a giant fixture file. Every
+/// stage that could ever see it (parsing, then -- if it somehow got
+/// past that -- checking, IR lowering, and running) must terminate
+/// with an ordinary diagnostic and a non-zero exit code, never a panic,
+/// a Rust backtrace, or a hang.
+#[test]
+fn deeply_nested_pattern_terminates_diagnostically_at_every_stage() {
+    let depth = 300;
+    let mut pattern = "Leaf".to_string();
+    for _ in 0..depth {
+        pattern = format!("Wrap({pattern})");
+    }
+    let source = format!(
+        "variant Rec {{ Wrap(Rec), Leaf }}\n\
+         func f(x: Rec) -> i64 {{ return match x {{ {pattern} => 1, _ => 0 }} }}\n\
+         func main() -> i64 {{ return 0 }}\n"
+    );
+    let path =
+        std::env::temp_dir().join(format!("napitia_deep_pattern_{}.npt", std::process::id()));
+    std::fs::write(&path, &source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            !output.status.success(),
+            "`{cmd}` unexpectedly succeeded on a pattern nested {depth} levels deep"
+        );
+        assert_ne!(
+            output.status.code(),
+            None,
+            "`{cmd}` was killed by a signal (likely a stack overflow), not a clean exit"
+        );
+        let err = stderr(&output);
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

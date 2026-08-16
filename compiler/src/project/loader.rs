@@ -300,9 +300,11 @@ fn topological_order(
     let dotted_by_id: BTreeMap<u32, String> =
         modules.iter().map(|m| (m.id.0, m.path.dotted())).collect();
 
+    // `edges[m]` is every module `m` itself imports (`m`'s own
+    // dependencies) -- deduplicated, so importing the same module twice
+    // under different item names is still exactly one graph edge.
     let mut edges: BTreeMap<u32, BTreeSet<u32>> =
         modules.iter().map(|m| (m.id.0, BTreeSet::new())).collect();
-    let mut in_degree: BTreeMap<u32, usize> = modules.iter().map(|m| (m.id.0, 0)).collect();
     for import in imports {
         let Some((target_module, _)) = ModulePath::split_import_path(&import.segments) else {
             continue;
@@ -310,85 +312,154 @@ fn topological_order(
         let Some(&target_id) = by_path.get(&target_module.dotted()) else {
             continue;
         };
-        if edges
+        edges
             .get_mut(&import.importing_module.0)
             .expect("importing module was discovered")
-            .insert(target_id.0)
-        {
-            *in_degree
-                .get_mut(&target_id.0)
-                .expect("target module was discovered") += 1;
+            .insert(target_id.0);
+    }
+    // The reverse adjacency: `importers_of[m]` is every module that
+    // imports `m`, used below to advance a module's *importers* once
+    // `m` itself is placed.
+    let mut importers_of: BTreeMap<u32, BTreeSet<u32>> =
+        modules.iter().map(|m| (m.id.0, BTreeSet::new())).collect();
+    for (&importer, targets) in &edges {
+        for &target in targets {
+            importers_of
+                .get_mut(&target)
+                .expect("target module was discovered")
+                .insert(importer);
         }
     }
 
-    // `order` accumulates dependencies before dependents: a module is
-    // only ready to be placed once every module it depends on already
-    // has been.
-    let mut ready: BTreeSet<u32> = in_degree
+    // `order` accumulates dependencies before dependents directly (no
+    // reverse-then-flip trick): a module is ready once every module it
+    // itself imports has already been placed, and ties among
+    // simultaneously-ready modules are broken by dotted module path,
+    // never by numeric `ModuleId` (assigned in file-discovery order,
+    // which carries no semantic meaning) -- keying `ready` on `(dotted
+    // path, id)` makes a plain `BTreeSet`'s own ordering pick the
+    // lexicographically smallest ready module, with `.next()`
+    // (smallest).
+    let mut remaining_deps: BTreeMap<u32, usize> = edges
+        .iter()
+        .map(|(&id, targets)| (id, targets.len()))
+        .collect();
+    let mut ready: BTreeSet<(String, u32)> = remaining_deps
         .iter()
         .filter(|&(_, &deg)| deg == 0)
-        .map(|(&id, _)| id)
+        .map(|(&id, _)| (dotted_by_id[&id].clone(), id))
         .collect();
-    let mut remaining_in_degree = in_degree.clone();
     let mut order = Vec::with_capacity(modules.len());
 
-    while let Some(&next) = ready.iter().next_back() {
-        ready.remove(&next);
+    while let Some((path, next)) = ready.iter().next().cloned() {
+        ready.remove(&(path, next));
         order.push(ModuleId(next));
-        if let Some(dependents) = edges.get(&next) {
-            for &dependent in dependents {
-                let deg = remaining_in_degree
-                    .get_mut(&dependent)
-                    .expect("dependent module was discovered");
+        if let Some(importers) = importers_of.get(&next) {
+            for &importer in importers {
+                let deg = remaining_deps
+                    .get_mut(&importer)
+                    .expect("importer module was discovered");
                 *deg -= 1;
                 if *deg == 0 {
-                    ready.insert(dependent);
+                    ready.insert((dotted_by_id[&importer].clone(), importer));
                 }
             }
         }
     }
 
     if order.len() == modules.len() {
-        // Kahn's algorithm places dependencies before dependents, but
-        // this project wants dependents *lowered* after their
-        // dependencies, which is the same order -- a module's imports
-        // must already be lowered before the module itself is.
-        order.reverse();
         return Ok(order);
     }
 
-    // Every module still missing from `order` is part of (or reaches
-    // into) a cycle. Build one deterministic witness path: start from
-    // the lexicographically-smallest cyclic module and iteratively
-    // follow an edge back into the cyclic set (always the
-    // lexicographically-smallest such edge) until a module repeats.
+    // Every module still missing from `order` reaches into a cycle, but
+    // is not necessarily itself a cycle member (e.g. an acyclic leaf
+    // only reachable *from* a cycle). Extracting a witness must isolate
+    // the actual cycle, never wander into such a leaf and assume it has
+    // an edge back into the residual set, which is exactly what used to
+    // panic. An iterative DFS (explicit stack, no native recursion) over
+    // the residual subgraph -- choosing both the start node and each
+    // node's own edges by dotted path, never numeric `ModuleId` -- finds
+    // one closed cycle deterministically.
     let placed: BTreeSet<u32> = order.iter().map(|id| id.0).collect();
-    let cyclic: BTreeSet<u32> = modules
+    let residual: BTreeSet<u32> = modules
         .iter()
         .map(|m| m.id.0)
         .filter(|id| !placed.contains(id))
         .collect();
-    let mut witness = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut current = *cyclic
-        .iter()
-        .next()
-        .expect("order is short, so a cycle exists");
-    loop {
-        let dotted = dotted_by_id.get(&current).cloned().unwrap_or_default();
-        if !visited.insert(current) {
-            witness.push(dotted);
-            break;
-        }
-        witness.push(dotted);
-        current = *edges
-            .get(&current)
+    let mut residual_by_path: Vec<u32> = residual.iter().copied().collect();
+    residual_by_path.sort_by(|a, b| dotted_by_id[a].cmp(&dotted_by_id[b]));
+
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color: BTreeMap<u32, Color> = residual.iter().map(|&id| (id, Color::White)).collect();
+    let sorted_residual_edges = |node: u32| -> Vec<u32> {
+        let mut targets: Vec<u32> = edges
+            .get(&node)
             .into_iter()
             .flatten()
-            .filter(|next| cyclic.contains(next))
-            .min()
-            .expect("a cyclic module has at least one edge back into the cycle");
+            .copied()
+            .filter(|target| residual.contains(target))
+            .collect();
+        targets.sort_by(|a, b| dotted_by_id[a].cmp(&dotted_by_id[b]));
+        targets
+    };
+
+    let mut witness: Option<Vec<u32>> = None;
+    'outer: for &start in &residual_by_path {
+        if color[&start] != Color::White {
+            continue;
+        }
+        // Each stack frame: the node being visited, and an index into
+        // its (dotted-path-sorted) edge list of which edge to try next.
+        let mut stack: Vec<(u32, usize)> = vec![(start, 0)];
+        color.insert(start, Color::Gray);
+        let mut path: Vec<u32> = vec![start];
+
+        while let Some((current, edge_idx)) = stack.pop() {
+            let targets = sorted_residual_edges(current);
+            if edge_idx >= targets.len() {
+                color.insert(current, Color::Black);
+                path.pop();
+                continue;
+            }
+            stack.push((current, edge_idx + 1));
+            let target = targets[edge_idx];
+            match color.get(&target).copied().unwrap_or(Color::Black) {
+                Color::White => {
+                    color.insert(target, Color::Gray);
+                    path.push(target);
+                    stack.push((target, 0));
+                }
+                Color::Gray => {
+                    // `target` is still on the current path -- close the
+                    // witness from its first occurrence back to itself.
+                    if let Some(start_idx) = path.iter().position(|id| *id == target) {
+                        witness = Some(path[start_idx..].to_vec());
+                        break 'outer;
+                    }
+                }
+                Color::Black => {}
+            }
+        }
     }
+
+    // Every residual node has in-degree >= 1 *within the residual
+    // subgraph* (that's exactly why Kahn's algorithm never placed it) --
+    // a finite graph where every node has in-degree >= 1 always
+    // contains a cycle, and a DFS covering every node (as this loop
+    // does, restarting from each not-yet-visited residual node) is
+    // guaranteed to find one, the same argument `typeck::cycles`
+    // already relies on for its own iterative DFS.
+    let witness_ids = witness.expect("the residual module set always contains a cycle");
+    let mut witness_text: Vec<String> = witness_ids
+        .iter()
+        .map(|id| dotted_by_id[id].clone())
+        .collect();
+    witness_text.push(dotted_by_id[&witness_ids[0]].clone());
 
     let any_source = modules
         .first()
@@ -399,7 +470,7 @@ fn topological_order(
             codes::IMPORT_CYCLE,
             any_source,
             Span::dummy(),
-            format!("module import cycle: {}", witness.join(" -> ")),
+            format!("module import cycle: {}", witness_text.join(" -> ")),
         )
         .with_primary_label("cyclic module dependency"),
     ))
@@ -550,6 +621,212 @@ mod tests {
             "expected a deterministic cycle witness: {}",
             diags[0].message
         );
+    }
+
+    #[test]
+    fn cycle_with_an_acyclic_outbound_leaf_excludes_the_leaf_and_does_not_panic() {
+        // a <-> b is a real cycle; a also imports the acyclic leaf `c`,
+        // which the old witness-extraction code could wander into and
+        // panic on (it has no edge back into the residual set). The
+        // witness must name only the actual cycle members.
+        let project = TempProject::new("cycle_with_leaf");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        project.write(
+            "src/a.npt",
+            "import b.helper;\nimport c.leaf;\n\
+             public func thing() -> i64 { return helper() + leaf() }\n",
+        );
+        project.write(
+            "src/b.npt",
+            "import a.thing;\npublic func helper() -> i64 { return thing() }\n",
+        );
+        project.write("src/c.npt", "public func leaf() -> i64 { return 1 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0008");
+        assert!(
+            diags[0].message.contains("cycle: a -> b -> a"),
+            "expected the cycle witness to be exactly a -> b -> a: {}",
+            diags[0].message
+        );
+        // Checking for a bare `'c'` char would false-positive on the
+        // word "cycle" itself -- the witness has exactly two arrows
+        // (`a -> b -> a`); a third module would add a third.
+        assert_eq!(
+            diags[0].message.matches("->").count(),
+            2,
+            "acyclic leaf `c` must never appear in the witness: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn longer_cycle_path_text_is_exact() {
+        let project = TempProject::new("longer_cycle");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        project.write(
+            "src/a.npt",
+            "import b.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/b.npt",
+            "import c.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/c.npt",
+            "import a.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0008");
+        assert!(
+            diags[0].message.contains("a -> b -> c -> a"),
+            "unexpected witness: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn multiple_disjoint_cycles_select_the_lexicographically_smallest_deterministically() {
+        // Two entirely disjoint cycles (a <-> b, and y <-> z) both reach
+        // into the residual set. The witness must always be the one
+        // starting from the lexicographically smallest residual module
+        // (`a`), never `y`, and never depend on which happens to be
+        // discovered first.
+        let project = TempProject::new("multiple_cycles");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nimport y.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        project.write(
+            "src/a.npt",
+            "import b.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/b.npt",
+            "import a.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/y.npt",
+            "import z.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/z.npt",
+            "import y.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0008");
+        assert!(
+            diags[0].message.contains("cycle: a -> b -> a"),
+            "expected the a<->b cycle to be selected: {}",
+            diags[0].message
+        );
+        assert_eq!(
+            diags[0].message.matches("->").count(),
+            2,
+            "the y<->z cycle must not be selected: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn repeated_cycle_detection_is_byte_identical() {
+        let project = TempProject::new("cycle_deterministic");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        project.write(
+            "src/a.npt",
+            "import b.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+        project.write(
+            "src/b.npt",
+            "import a.thing;\npublic func thing() -> i64 { return thing() }\n",
+        );
+
+        let message_of = || {
+            let mut map = SourceMap::new();
+            let mut interner = Interner::new();
+            load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err()[0]
+                .message
+                .clone()
+        };
+        assert_eq!(message_of(), message_of());
+    }
+
+    #[test]
+    fn a_deep_cyclic_chain_does_not_overflow_the_native_stack() {
+        // A single long cycle through many modules -- the witness
+        // extraction is an explicit-stack iterative DFS, so this must
+        // not blow the native call stack the way a recursive
+        // implementation would.
+        const DEPTH: usize = 3000;
+        let project = TempProject::new("deep_cycle");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import m0.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        for i in 0..DEPTH {
+            let next = (i + 1) % DEPTH;
+            project.write(
+                &format!("src/m{i}.npt"),
+                &format!(
+                    "import m{next}.thing;\npublic func thing() -> i64 {{ return thing() }}\n"
+                ),
+            );
+        }
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0008");
+    }
+
+    #[test]
+    fn simultaneously_ready_modules_are_placed_in_lexical_path_order() {
+        // `main` imports three mutually-independent leaf modules -- all
+        // three become ready at the same Kahn step, so only the
+        // lexical-path tie-break decides their relative order.
+        let project = TempProject::new("lexical_order");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import z.thing;\nimport m.thing;\nimport a.thing;\n\
+             func main() -> i64 { return 0 }\n",
+        );
+        project.write("src/a.npt", "public func thing() -> i64 { return 1 }\n");
+        project.write("src/m.npt", "public func thing() -> i64 { return 1 }\n");
+        project.write("src/z.npt", "public func thing() -> i64 { return 1 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let loaded = load_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let paths: Vec<String> = loaded.modules.iter().map(|m| m.path.dotted()).collect();
+        assert_eq!(paths, vec!["a", "m", "z", "main"]);
     }
 
     #[test]

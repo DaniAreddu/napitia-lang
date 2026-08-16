@@ -213,6 +213,27 @@ fn a_type_reachable_but_not_imported_is_t0006_not_a_successful_compile() {
 }
 
 #[test]
+fn a_cycle_with_an_acyclic_outbound_leaf_is_m0008_not_a_panic_through_the_real_binary() {
+    // `a <-> b` is a real cycle; `a` also imports the acyclic leaf `c`.
+    // The old witness-extraction code could wander from `a` into `c`
+    // (which has no edge back into the residual set) and panic. Exercise
+    // the actual built binary, not just the unit-level algorithm.
+    let dir = project("import_cycle_with_acyclic_leaf");
+    let checked = napitia(&["check", &dir]);
+    assert_eq!(checked.status.code(), Some(1), "expected exit code 1");
+    let err = stderr(&checked);
+    assert!(
+        !err.contains("panicked at"),
+        "expected no panic, got: {err}"
+    );
+    assert!(err.contains("error[M0008]"), "expected M0008, got: {err}");
+    assert!(
+        err.contains("cycle: a -> b -> a"),
+        "unexpected witness: {err}"
+    );
+}
+
+#[test]
 fn a_failed_transitive_dependency_fails_atomically_instead_of_panicking() {
     // `main` imports `a`, which imports `b.secret` (private) -- `a`'s
     // own import resolution fails, so `a` is never lowered. `main`

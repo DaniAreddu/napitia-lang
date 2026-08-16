@@ -83,6 +83,18 @@ pub fn load_project(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    // Canonicalized once, up front, so every later containment check
+    // (source-root inside the project directory, the entry file inside
+    // source-root, every discovered module inside source-root) compares
+    // against a single resolved-symlinks-and-`..` baseline -- never a
+    // path that might itself still be a symlink.
+    let canonical_project_dir = project_dir.canonicalize().map_err(|_| {
+        vec![invalid_path_diagnostic(
+            manifest_source,
+            "project directory",
+            &format!("could not resolve `{}`", project_dir.display()),
+        )]
+    })?;
 
     let source_root =
         resolve_relative_path(&project_dir, &manifest.source_root).map_err(|reason| {
@@ -97,6 +109,20 @@ pub fn load_project(
             manifest_source,
             "project.source-root",
             &format!("`{}` is not a directory", source_root.display()),
+        )]);
+    }
+    let canonical_source_root = source_root.canonicalize().map_err(|_| {
+        vec![invalid_path_diagnostic(
+            manifest_source,
+            "project.source-root",
+            &format!("could not resolve `{}`", source_root.display()),
+        )]
+    })?;
+    if !canonical_source_root.starts_with(&canonical_project_dir) {
+        return Err(vec![invalid_path_diagnostic(
+            manifest_source,
+            "project.source-root",
+            "source-root resolves outside of the project directory",
         )]);
     }
 
@@ -123,14 +149,20 @@ pub fn load_project(
             .with_primary_label("configured entry point"),
         ]);
     }
-    // Defense in depth against a symlink inside source-root resolving
-    // outside the project directory: resolve_relative_path already
-    // rejects textual `..` traversal, but a symlink can still escape
-    // without ever writing `..` in the manifest itself.
-    if let (Ok(canonical_root), Ok(canonical_entry)) =
-        (source_root.canonicalize(), entry_path.canonicalize())
-        && !canonical_entry.starts_with(&canonical_root)
-    {
+    // A symlinked entry file can escape source-root without ever
+    // writing `..` in the manifest itself -- `resolve_relative_path`
+    // only rejects *textual* traversal, so containment is only truly
+    // established once the entry's canonical form is compared against
+    // source-root's own canonical form. A canonicalization failure here
+    // is itself a containment failure, never silently ignored.
+    let canonical_entry = entry_path.canonicalize().map_err(|_| {
+        vec![invalid_path_diagnostic(
+            manifest_source,
+            "project.entry",
+            &format!("could not resolve `{}`", entry_path.display()),
+        )]
+    })?;
+    if !canonical_entry.starts_with(&canonical_source_root) {
         return Err(vec![invalid_path_diagnostic(
             manifest_source,
             "project.entry",
@@ -177,7 +209,41 @@ pub fn load_project(
 
         let relative_file = module_path.to_relative_npt_path();
         let file_path = source_root.join(&relative_file);
-        let content = match std::fs::read_to_string(&file_path) {
+        // Canonicalized -- and its containment established -- *before*
+        // ever reading the file, so a module path that resolves to a
+        // symlink escaping source-root is never followed at all, not
+        // even to find out it doesn't parse.
+        let canonical_file = match file_path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        codes::MODULE_NOT_FOUND,
+                        manifest_source,
+                        Span::dummy(),
+                        format!(
+                            "module `{dotted}` not found (expected `{}`)",
+                            file_path.display()
+                        ),
+                    )
+                    .with_primary_label("referenced but not found"),
+                );
+                continue;
+            }
+        };
+        if !canonical_file.starts_with(&canonical_source_root) {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::INVALID_PROJECT_PATH,
+                    manifest_source,
+                    Span::dummy(),
+                    format!("module `{dotted}` resolves outside of source-root"),
+                )
+                .with_primary_label("escapes the project's source boundary"),
+            );
+            continue;
+        }
+        let content = match std::fs::read_to_string(&canonical_file) {
             Ok(content) => content,
             Err(_) => {
                 diagnostics.push(
@@ -888,5 +954,172 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(order_of(), order_of());
+    }
+
+    #[test]
+    fn an_absolute_source_root_is_rejected() {
+        let project = TempProject::new("absolute_source_root");
+        let absolute = if cfg!(windows) { "C:/Windows" } else { "/etc" };
+        project.write(
+            "napitia.toml",
+            &format!(
+                "[package]\nname = \"hello\"\nversion = \"0.1.0\"\n\n\
+                 [project]\nsource-root = \"{absolute}\"\nentry = \"main.npt\"\n"
+            ),
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0002");
+    }
+
+    #[test]
+    fn a_unc_style_entry_path_is_rejected_even_on_a_non_windows_host() {
+        let project = TempProject::new("unc_entry");
+        project.write("napitia.toml", MANIFEST);
+        // A napitia.toml written on any platform must not be able to
+        // smuggle a UNC path in as `entry` and have it silently
+        // reinterpreted as relative.
+        // Raw string so the TOML source text has exactly the backslash
+        // characters shown (TOML's own `\\` escape then decodes each
+        // pair to one literal backslash in the parsed value, giving a
+        // value that starts with `\\server\...`).
+        let toml = r#"[package]
+name = "hello"
+version = "0.1.0"
+
+[project]
+source-root = "src"
+entry = "\\\\server\\share\\main.npt"
+"#;
+        project.write("napitia.toml", toml);
+        project.write("src/main.npt", "func main() -> i64 { return 0 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_root_escaping_the_project_directory_is_rejected() {
+        let project = TempProject::new("symlink_source_root");
+        // `outside/` sits next to the project directory, not under it;
+        // `src` is a symlink pointing there instead of a real
+        // subdirectory.
+        let outside = project.dir.parent().unwrap().join(format!(
+            "napitia_loader_symlink_outside_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("main.npt"),
+            "func main() -> i64 { return 0 }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, project.dir.join("src")).unwrap();
+        project.write("napitia.toml", MANIFEST);
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_entry_escaping_source_root_is_rejected() {
+        let project = TempProject::new("symlink_entry");
+        let outside = project.dir.parent().unwrap().join(format!(
+            "napitia_loader_symlink_entry_outside_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("real_main.npt"),
+            "func main() -> i64 { return 0 }\n",
+        )
+        .unwrap();
+        project.write("napitia.toml", MANIFEST);
+        std::fs::create_dir_all(project.dir.join("src")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("real_main.npt"),
+            project.dir.join("src/main.npt"),
+        )
+        .unwrap();
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_imported_module_escaping_source_root_is_rejected() {
+        let project = TempProject::new("symlink_module");
+        let outside = project.dir.parent().unwrap().join(format!(
+            "napitia_loader_symlink_module_outside_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("real_math.npt"),
+            "public func add() -> i64 { return 1 }\n",
+        )
+        .unwrap();
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add() }\n",
+        );
+        std::os::unix::fs::symlink(
+            outside.join("real_math.npt"),
+            project.dir.join("src/math.npt"),
+        )
+        .unwrap();
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_stays_inside_source_root_still_works() {
+        let project = TempProject::new("symlink_inside");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add() }\n",
+        );
+        project.write(
+            "src/real_math.npt",
+            "public func add() -> i64 { return 1 }\n",
+        );
+        std::os::unix::fs::symlink(
+            project.dir.join("src/real_math.npt"),
+            project.dir.join("src/math.npt"),
+        )
+        .unwrap();
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let loaded = load_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let mut paths: Vec<String> = loaded.modules.iter().map(|m| m.path.dotted()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["main".to_string(), "math".to_string()]);
     }
 }

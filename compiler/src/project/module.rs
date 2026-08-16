@@ -97,17 +97,50 @@ impl ModulePath {
 /// offending reason as `Err(String)` rather than a full `Diagnostic` --
 /// the caller already knows which manifest key this path came from and
 /// builds the `M0002` diagnostic itself.
+///
+/// Every check here works on `relative`'s own text, never on the
+/// `PathBuf` `std::path` would parse it into -- `PathBuf::push` treats
+/// an absolute/rooted/drive-qualified pushed path specially (on
+/// Windows, it can *replace* everything already pushed onto `base`
+/// rather than append to it), so a manifest-supplied absolute path must
+/// never reach `push` at all. Unix absolute paths, Windows
+/// drive-qualified paths (`C:...`), and UNC paths (`\\server\share`)
+/// are all rejected here regardless of which platform the compiler
+/// itself is running on, so a manifest can't smuggle one past a build
+/// on the other platform.
 pub fn resolve_relative_path(base: &Path, relative: &str) -> Result<PathBuf, String> {
     if relative.is_empty() {
         return Err("path must not be empty".to_string());
     }
+    if relative.starts_with('/') || relative.starts_with('\\') {
+        return Err(format!(
+            "path `{relative}` must be relative, not absolute/rooted"
+        ));
+    }
+    let bytes = relative.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(format!(
+            "path `{relative}` must be relative, not drive-qualified"
+        ));
+    }
+
     let mut resolved = base.to_path_buf();
+    let mut any_segment = false;
     for part in relative.split(['/', '\\']) {
         match part {
             "" | "." => continue,
             ".." => return Err(format!("path `{relative}` may not contain `..`")),
-            _ => resolved.push(part),
+            _ if part.contains(':') => {
+                return Err(format!("path `{relative}` must not contain `:`"));
+            }
+            _ => {
+                resolved.push(part);
+                any_segment = true;
+            }
         }
+    }
+    if !any_segment {
+        return Err(format!("path `{relative}` has no path segments"));
     }
     Ok(resolved)
 }
@@ -168,5 +201,54 @@ mod tests {
         let forward = resolve_relative_path(base, "src/models/user.npt").unwrap();
         let back = resolve_relative_path(base, "src\\models\\user.npt").unwrap();
         assert_eq!(forward, back);
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_an_empty_path() {
+        assert!(resolve_relative_path(Path::new("/project"), "").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_a_unix_absolute_path() {
+        // Must be rejected outright, not silently reinterpreted as
+        // relative (the leading `/` used to just be skipped as an empty
+        // split segment, joining it onto `base` as if it were relative).
+        let base = Path::new("/project");
+        assert!(resolve_relative_path(base, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_a_windows_drive_qualified_path_even_on_unix() {
+        // Rejected regardless of host platform -- a manifest can't
+        // smuggle a drive-qualified path past a build on the other OS.
+        let base = Path::new("/project");
+        assert!(resolve_relative_path(base, "C:\\Windows\\System32").is_err());
+        assert!(resolve_relative_path(base, "C:relative-to-drive").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_a_unc_path_even_on_unix() {
+        let base = Path::new("/project");
+        assert!(resolve_relative_path(base, "\\\\server\\share\\file.npt").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_a_path_containing_a_colon_mid_segment() {
+        let base = Path::new("/project");
+        assert!(resolve_relative_path(base, "src/C:foo.npt").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_rejects_a_path_with_no_real_segments() {
+        let base = Path::new("/project");
+        assert!(resolve_relative_path(base, ".").is_err());
+        assert!(resolve_relative_path(base, "///").is_err());
+    }
+
+    #[test]
+    fn resolve_relative_path_accepts_a_normal_nested_relative_path() {
+        let base = Path::new("/project");
+        let resolved = resolve_relative_path(base, "src/models/user.npt").unwrap();
+        assert_eq!(resolved, Path::new("/project/src/models/user.npt"));
     }
 }

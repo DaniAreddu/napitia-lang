@@ -19,6 +19,7 @@ use crate::resolve::Scopes;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast;
+use crate::types::primitive_from_name;
 
 mod codes {
     pub const DUPLICATE_DEFINITION: &str = "R0001";
@@ -554,6 +555,20 @@ impl<'a> Lowering<'a> {
     /// aggregate is left `Unresolved` -- it may still be a primitive, or
     /// genuinely unknown, neither of which HIR lowering itself decides.
     fn resolve_type_ref(&self, ty: &ast::Type) -> HirType {
+        // Primitive names take precedence over an aggregate of the same
+        // name, matching the pre-project-era rule (typeck always checked
+        // its primitive namespace first): a local or imported `record`/
+        // `variant` literally named `i64`/`bool`/etc. must never steal a
+        // primitive type annotation out from under it. Left `Unresolved`
+        // here (HIR itself has no notion of primitives) so typeck's own
+        // `resolve_named_type` -- which already checks primitives first
+        // -- resolves it the same way it always has.
+        if primitive_from_name(self.interner.resolve(ty.name.symbol)).is_some() {
+            return HirType::Unresolved {
+                name: ty.name.symbol,
+                span: ty.name.span,
+            };
+        }
         match self.type_names.get(&ty.name.symbol) {
             Some(&(item, kind)) => HirType::Aggregate {
                 item,
@@ -1337,6 +1352,73 @@ mod tests {
             "unexpected parser diagnostics: {parse_diags:?}"
         );
         lower_module(&module, id, &interner)
+    }
+
+    #[test]
+    fn a_local_record_named_i64_does_not_shadow_the_primitive_in_a_return_type() {
+        let (hir, diags) = lower("record i64 { flag: bool } func f() -> i64 { return 1 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert!(
+            matches!(
+                hir.functions[0].return_type,
+                Some(HirType::Unresolved { .. })
+            ),
+            "expected the primitive-shaped Unresolved form, got {:?}",
+            hir.functions[0].return_type
+        );
+    }
+
+    #[test]
+    fn a_local_variant_named_bool_does_not_shadow_the_primitive_in_a_param_type() {
+        let (hir, diags) = lower("variant bool { A } func f(x: bool) -> i64 { return 1 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert!(
+            matches!(hir.functions[0].params[0].ty, HirType::Unresolved { .. }),
+            "expected the primitive-shaped Unresolved form, got {:?}",
+            hir.functions[0].params[0].ty
+        );
+    }
+
+    #[test]
+    fn an_imported_record_named_i64_does_not_shadow_the_primitive_in_a_return_type() {
+        let (hir, diags) =
+            lower_with_imports("func f() -> i64 { return 1 }", |interner, other_source| {
+                let i64_symbol = interner.intern("i64");
+                vec![ImportedItem {
+                    local_name: i64_symbol,
+                    kind: ImportedItemKind::Record {
+                        item: ItemId(0),
+                        fields: Vec::new(),
+                    },
+                    import_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            });
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert!(
+            matches!(
+                hir.functions[0].return_type,
+                Some(HirType::Unresolved { .. })
+            ),
+            "expected the primitive-shaped Unresolved form, got {:?}",
+            hir.functions[0].return_type
+        );
+    }
+
+    #[test]
+    fn a_genuine_aggregate_return_type_still_resolves_to_its_exact_item_id() {
+        let (hir, diags) =
+            lower("record Point { x: i64 } func f() -> Point { return Point { x: 1 } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let record_id = hir.records[0].id;
+        match &hir.functions[0].return_type {
+            Some(HirType::Aggregate { item, kind, .. }) => {
+                assert_eq!(*item, record_id);
+                assert_eq!(*kind, AggregateKind::Record);
+            }
+            other => panic!("expected an Aggregate return type, got {other:?}"),
+        }
     }
 
     #[test]

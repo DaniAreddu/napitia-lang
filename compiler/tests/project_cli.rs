@@ -71,8 +71,8 @@ fn a_bare_relative_manifest_path_works_from_inside_the_project_directory() {
     let ir = napitia_in_dir(&dir, &["ir", "napitia.toml"]);
     assert!(ir.status.success(), "ir failed: {}", stderr(&ir));
     let ir_text = stdout(&ir);
-    assert!(ir_text.contains("func @main"));
-    assert!(ir_text.contains("func @add"));
+    assert!(ir_text.contains("func @main.main#"));
+    assert!(ir_text.contains("func @math.add#"));
 
     let ran = napitia_in_dir(&dir, &["run", "napitia.toml"]);
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
@@ -102,8 +102,10 @@ fn ir_prints_nir_for_a_project_naming_both_modules() {
     let output = napitia(&["ir", &dir]);
     assert!(output.status.success(), "ir failed: {}", stderr(&output));
     let text = stdout(&output);
-    assert!(text.contains("func @main"));
-    assert!(text.contains("func @add"));
+    // Module-qualified (rfcs/0007): `main.npt`'s own `main` is module
+    // `main`, `math.npt`'s `add` is module `math`.
+    assert!(text.contains("func @main.main#"));
+    assert!(text.contains("func @math.add#"));
 }
 
 #[test]

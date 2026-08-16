@@ -297,12 +297,12 @@ wildcard/binding — no or-patterns, guards, records, slices, or ranges):
   a safe bound on any single call's *stack depth* -- 100,000 native
   stack frames is well past what a real call stack can hold. What
   actually keeps a single deeply-nested pattern from ever exhausting
-  the stack is a second, much smaller, independent
-  `MAX_RECURSION_DEPTH` (200) that `is_useful` checks on every call,
-  regardless of remaining step budget. Both report the same diagnostic
-  either way (`T0019 pattern analysis budget exceeded`), so the
-  distinction is invisible to a program, but load-bearing for safety:
-  removing either bound (or widening `MAX_RECURSION_DEPTH` to
+  the stack is a second, much smaller, independent bound
+  (`limits::MAX_PATTERN_DEPTH`, 200) that `is_useful` checks on every
+  call, regardless of remaining step budget. Both report the same
+  diagnostic either way (`T0019 pattern analysis budget exceeded`), so
+  the distinction is invisible to a program, but load-bearing for
+  safety: removing either bound (or widening `MAX_PATTERN_DEPTH` to
   `MAX_USEFULNESS_STEPS`'s size) would reopen the stack-overflow this
   RFC's exhaustiveness analysis exists to rule out.
 - **The same structural depth limit is enforced at every stage that
@@ -310,11 +310,13 @@ wildcard/binding — no or-patterns, guards, records, slices, or ranges):
   parser (`parse_pattern`), HIR lowering (`hir::lower_pattern`), and
   NIR match-decision lowering (`nir::lower::lower_decision`) each track
   their own nesting depth independently and fail with a stage-appropriate
-  diagnostic past the same 200-level bound, rather than relying on an
-  earlier stage to have already caught it. In the normal pipeline the
-  parser's bound is what actually fires first (source text nested this
-  deep never reaches HIR lowering, typeck, or NIR lowering at all); the
-  later stages' bounds exist as defense-in-depth for a caller invoking
+  diagnostic past the same shared `limits::MAX_PATTERN_DEPTH` bound,
+  rather than relying on an earlier stage to have already caught it --
+  a single constant, not four independently-maintained copies claimed
+  to stay in lockstep. In the normal pipeline the parser's bound is
+  what actually fires first (source text nested this deep never
+  reaches HIR lowering, typeck, or NIR lowering at all); the later
+  stages' bounds exist as defense-in-depth for a caller invoking
   `hir::lower_module`, `typeck::check_module`, or `nir::lower_module`
   directly with hand-built input that bypasses an earlier stage.
 

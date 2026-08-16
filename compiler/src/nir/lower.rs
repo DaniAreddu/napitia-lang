@@ -1003,6 +1003,16 @@ impl<'a> Lowering<'a> {
         }
 
         let HirExpr::Function { item, .. } = callee else {
+            // typeck already rejects a call whose callee doesn't
+            // resolve to an actual function (Napitia has no first-class
+            // function values); reaching here means a caller lowered
+            // hand-built HIR bypassing that check. The callee and
+            // arguments are still checked for their own divergence (a
+            // diverging callee/argument really would make the whole
+            // call unreachable), but the call itself must never
+            // fabricate a successful `Ty::Error`/`Const::Unit` result --
+            // that would silently invent a value nothing in the source
+            // actually produced.
             if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
                 return Ok(LoweredExpr::Diverged);
             }
@@ -1011,9 +1021,7 @@ impl<'a> Lowering<'a> {
                     return Ok(LoweredExpr::Diverged);
                 }
             }
-            return Ok(LoweredExpr::Value(
-                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
-            ));
+            return Err(self.internal_error("call target does not resolve to a function"));
         };
         let (param_tys, ret_ty) = self
             .function_sigs
@@ -1054,6 +1062,18 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
+        // The complete shape is validated before a single argument is
+        // evaluated: too few arguments would otherwise leave `payload`
+        // shorter than the case's declared arity, and too many would
+        // leave it longer, either way fabricating a `variant.create`
+        // whose payload count doesn't match its own declared case.
+        if args.len() != payload_tys.len() {
+            return Err(self.internal_error(&format!(
+                "variant construction for case {case} of {variant:?} has {} argument(s), expected {}",
+                args.len(),
+                payload_tys.len()
+            )));
+        }
         let mut payload = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = payload_tys.get(i).cloned().unwrap_or(Ty::Error);
@@ -1085,49 +1105,60 @@ impl<'a> Lowering<'a> {
         fields: &[HirFieldInit],
         literal_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
-        let field_count = self
-            .records
-            .get(&record)
-            .map(|r| r.fields.len())
-            .unwrap_or(fields.len());
+        // typeck/hir::lower already reject a source-level unknown
+        // record, out-of-range/duplicate field index, or missing field;
+        // reaching any of these means a caller lowered a
+        // HirExpr::RecordLiteral built by hand (or otherwise bypassing
+        // those checks). The complete shape is validated up front,
+        // before a single field is evaluated, so lowering never
+        // silently drops an out-of-range field into nowhere or lets a
+        // duplicate index overwrite an earlier field's already-lowered
+        // value in its temporary slot -- either would fabricate a
+        // `record.create` that doesn't reflect what was actually
+        // written.
+        let Some(layout) = self.records.get(&record) else {
+            return Err(self.internal_error(&format!(
+                "record construction references unknown record {record:?}"
+            )));
+        };
+        let field_count = layout.fields.len();
+        let mut seen = vec![false; field_count];
+        for f in fields {
+            let Some(slot_seen) = seen.get_mut(f.field_index) else {
+                return Err(self.internal_error(&format!(
+                    "record construction's field index {} is out of range for {record:?}'s {field_count} declared field(s)",
+                    f.field_index
+                )));
+            };
+            if *slot_seen {
+                return Err(self.internal_error(&format!(
+                    "record construction reuses field index {} more than once",
+                    f.field_index
+                )));
+            }
+            *slot_seen = true;
+        }
+        if let Some(missing) = seen.iter().position(|&s| !s) {
+            return Err(
+                self.internal_error(&format!("record construction is missing field {missing}"))
+            );
+        }
+
         let mut by_index: Vec<Option<ValueId>> = vec![None; field_count];
         for f in fields {
-            let hint = self
-                .records
-                .get(&record)
-                .and_then(|r| r.fields.get(f.field_index))
-                .map(|(_, ty)| ty.clone())
-                .unwrap_or(Ty::Error);
+            let hint = self.records[&record].fields[f.field_index].1.clone();
             match self.lower_expr_hinted(fb, &f.value, &hint)? {
-                LoweredExpr::Value(v) => {
-                    if let Some(slot) = by_index.get_mut(f.field_index) {
-                        *slot = Some(v);
-                    }
-                }
+                LoweredExpr::Value(v) => by_index[f.field_index] = Some(v),
                 // A diverging initializer means the whole construction
                 // never completes; no field written after it in source
                 // order is lowered as reachable work.
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        let mut ordered: Vec<ValueId> = Vec::with_capacity(by_index.len());
-        for (i, v) in by_index.into_iter().enumerate() {
-            match v {
-                Some(v) => ordered.push(v),
-                // typeck/hir::lower already reject a source-level missing
-                // field; reaching here means a caller lowered a
-                // HirExpr::RecordLiteral built by hand (or otherwise
-                // bypassing those checks). Lowering must never fabricate a
-                // value for the missing slot, so the whole construction
-                // fails atomically with a structured diagnostic instead of
-                // panicking.
-                None => {
-                    return Err(
-                        self.internal_error(&format!("record construction is missing field {i}"))
-                    );
-                }
-            }
-        }
+        let ordered: Vec<ValueId> = by_index
+            .into_iter()
+            .map(|v| v.expect("every index was already proven present above"))
+            .collect();
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(literal_expr),
             ValueKind::RecordCreate(record, ordered),
@@ -2882,12 +2913,9 @@ mod tests {
             HashMap::new(),
         );
         let mut fb = FnBuilder::new(Ty::I64);
-        // Field index 9 does not exist on a record with a single field;
-        // its initializer's value is silently unused rather than
-        // written out of bounds, so the record's one real field (index
-        // 0) is left unset -- exercising the same missing-field
-        // diagnostic path as the source-level test above, but reached
-        // through a fabricated out-of-range index instead.
+        // Field index 9 does not exist on a record with a single field
+        // -- rejected up front, before its initializer is ever
+        // evaluated, rather than silently dropped into nowhere.
         let bad_init = HirFieldInit {
             field_index: 9,
             value: HirExpr::Bool {
@@ -2905,6 +2933,259 @@ mod tests {
         let result = lowering.lower_record_literal(&mut fb, record_item, &[bad_init], &probe);
         let Err(diagnostic) = result else {
             panic!("expected lowering to fail for an out-of-range field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+        assert!(
+            diagnostic.message.contains("out of range"),
+            "expected an out-of-range diagnostic, got: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn all_valid_record_fields_plus_one_out_of_range_field_fails_atomically() {
+        // Every genuinely declared field is present and correct; the
+        // one extra field beyond the record's own layout must still
+        // reject the whole construction, not just be ignored while the
+        // rest lowers successfully.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![
+                    (interner.intern("x"), Ty::I64),
+                    (interner.intern("y"), Ty::I64),
+                ],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let init = |field_index: usize, id: u32| HirFieldInit {
+            field_index,
+            value: HirExpr::Int {
+                id: ExprId(id),
+                value: 1,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let fields = vec![init(0, 1), init(1, 2), init(2, 3)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &fields, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an extra out-of-range field")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn duplicate_field_index_with_every_other_field_present_fails_atomically() {
+        // Every field index the record actually declares is covered --
+        // 0 is just covered twice, at the cost of 1 never being
+        // written -- so this can't be caught as "missing" without also
+        // catching the duplicate itself; the second write to index 0
+        // must never silently overwrite the first's already-lowered
+        // value in its temporary slot.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![
+                    (interner.intern("x"), Ty::I64),
+                    (interner.intern("y"), Ty::I64),
+                ],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let init = |field_index: usize, id: u32| HirFieldInit {
+            field_index,
+            value: HirExpr::Int {
+                id: ExprId(id),
+                value: 1,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let fields = vec![init(0, 1), init(0, 2)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &fields, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a duplicate field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+        assert!(
+            diagnostic.message.contains("more than once"),
+            "expected a duplicate-index diagnostic, got: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn unknown_record_id_fails_lowering_instead_of_using_the_provided_field_count() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let interner = Interner::new();
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, ItemId(0), &[], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an unknown record")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn too_many_variant_payload_arguments_fails_lowering_instead_of_a_longer_payload() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let arg = |id: u32| HirExpr::Int {
+            id: ExprId(id),
+            value: 1,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        };
+        let args = vec![arg(1), arg(2)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 0, &args, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for too many payload arguments")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn too_few_variant_payload_arguments_fails_lowering_instead_of_a_shorter_payload() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64, Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let args = vec![HirExpr::Int {
+            id: ExprId(1),
+            value: 1,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        }];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 0, &args, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for too few payload arguments")
         };
         assert_eq!(diagnostic.code, "I0002");
     }
@@ -3041,6 +3322,52 @@ mod tests {
     #[test]
     fn defer_fails_lowering_instead_of_being_silently_dropped() {
         assert_fails_with_i0001("func f() { value x = 1; defer x + 1; }", "defer");
+    }
+
+    #[test]
+    fn calling_a_non_function_value_fails_lowering_instead_of_a_fabricated_error_value() {
+        // typeck already rejects a call whose callee isn't an actual
+        // function reference; reaching lower_call with one anyway (a
+        // hand-built HirExpr::Call over a plain Local, bypassing
+        // typeck) must fail atomically rather than silently return a
+        // fabricated Ty::Error/Const::Unit value as if the call had
+        // "succeeded".
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let x_name = interner.intern("x");
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let placeholder = fb.push_value(Ty::I64, ValueKind::Alloc);
+        fb.local_bindings
+            .insert(LocalId(0), LocalBinding::Direct(placeholder));
+        let callee = HirExpr::Local {
+            id: ExprId(1),
+            local: LocalId(0),
+            name: x_name,
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a call to a non-function value")
+        };
+        assert_eq!(diagnostic.code, "I0002");
     }
 
     #[test]

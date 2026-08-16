@@ -135,6 +135,11 @@ pub struct ExtendDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportDecl {
     pub path: Path,
+    /// The optional `as <alias>` clause -- a local name for the
+    /// importing module only (`rfcs/0007`), carrying its own span
+    /// distinct from `path`'s last segment (the imported item's own
+    /// declared name).
+    pub alias: Option<Ident>,
     pub span: Span,
 }
 

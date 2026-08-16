@@ -44,6 +44,14 @@ mod codes {
     pub const INCOMPATIBLE_PATTERN: &str = "T0021";
 }
 
+/// `check_pattern` recurses once per nested `Variant` sub-pattern, on
+/// the native Rust call stack -- independent of, and prior to,
+/// `exhaustive::MAX_USEFULNESS_STEPS` (which only bounds usefulness
+/// analysis over already-resolved patterns). Without its own bound
+/// here, a pattern nested deep enough could overflow the stack while
+/// still being *resolved*, before analysis is ever reached.
+const MAX_PATTERN_NESTING_DEPTH: usize = 200;
+
 #[derive(Clone)]
 struct FunctionSig {
     params: Vec<Ty>,
@@ -1350,6 +1358,32 @@ impl<'a> Checker<'a> {
         pattern: &HirPattern,
         scrutinee_ty: &Ty,
     ) -> (ResolvedPattern, bool) {
+        self.check_pattern_at_depth(pattern, scrutinee_ty, 0)
+    }
+
+    /// `depth` counts `Variant` sub-pattern nesting only (matching what
+    /// actually grows the call stack here); at `MAX_PATTERN_NESTING_DEPTH`
+    /// this stops recursing into further sub-patterns entirely rather
+    /// than merely reporting the overflow after the fact -- the whole
+    /// point is to never let the stack grow past this depth.
+    fn check_pattern_at_depth(
+        &mut self,
+        pattern: &HirPattern,
+        scrutinee_ty: &Ty,
+        depth: usize,
+    ) -> (ResolvedPattern, bool) {
+        if depth > MAX_PATTERN_NESTING_DEPTH {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PATTERN_BUDGET_EXCEEDED,
+                    self.source,
+                    pattern.span(),
+                    "pattern is nested too deeply to analyze",
+                )
+                .with_primary_label("pattern is too complex"),
+            );
+            return (ResolvedPattern::Wildcard, false);
+        }
         let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
         match pattern {
             HirPattern::Wildcard { .. } => (ResolvedPattern::Wildcard, true),
@@ -1393,7 +1427,7 @@ impl<'a> Checker<'a> {
                         self.push_incompatible_pattern(*span, &resolved_scrutinee);
                     }
                     for a in args {
-                        self.check_pattern(a, &Ty::Error);
+                        self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
                     }
                     return (ResolvedPattern::Wildcard, false);
                 };
@@ -1409,7 +1443,7 @@ impl<'a> Checker<'a> {
                     // later has nothing to classify it by.
                     self.push_incompatible_pattern(*span, &resolved_scrutinee);
                     for a in args {
-                        self.check_pattern(a, &Ty::Error);
+                        self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
                     }
                     return (ResolvedPattern::Wildcard, false);
                 };
@@ -1428,7 +1462,7 @@ impl<'a> Checker<'a> {
                         .with_primary_label("unknown case in this pattern"),
                     );
                     for a in args {
-                        self.check_pattern(a, &Ty::Error);
+                        self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
                     }
                     return (ResolvedPattern::Wildcard, false);
                 };
@@ -1465,7 +1499,8 @@ impl<'a> Checker<'a> {
                 for (i, payload_ty) in payload.iter().enumerate() {
                     match args.get(i) {
                         Some(a) => {
-                            let (resolved, arg_valid) = self.check_pattern(a, payload_ty);
+                            let (resolved, arg_valid) =
+                                self.check_pattern_at_depth(a, payload_ty, depth + 1);
                             valid &= arg_valid;
                             resolved_args.push(resolved);
                         }
@@ -1473,7 +1508,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 for extra in args.iter().skip(payload.len()) {
-                    self.check_pattern(extra, &Ty::Error);
+                    self.check_pattern_at_depth(extra, &Ty::Error, depth + 1);
                 }
                 (
                     ResolvedPattern::Variant {
@@ -2032,6 +2067,32 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn a_pattern_nested_past_the_depth_limit_is_a_diagnostic_not_a_stack_overflow() {
+        // A chain of distinct (non-cyclic, so typeck's separate
+        // infinite-aggregate rejection never fires) variant
+        // declarations, each wrapping the last, with a single pattern
+        // nested exactly as deep -- the realistic shape of the attack
+        // `MAX_PATTERN_NESTING_DEPTH` exists to bound: check_pattern's
+        // own recursion, prior to and independent of the usefulness
+        // algorithm's work budget.
+        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let mut source = String::from("variant V0 { Leaf }\n");
+        for i in 1..=depth {
+            source.push_str(&format!("variant V{i} {{ Wrap(V{}) }}\n", i - 1));
+        }
+        let mut pattern = "Leaf".to_string();
+        for _ in 0..depth {
+            pattern = format!("Wrap({pattern})");
+        }
+        source.push_str(&format!(
+            "func f(x: V{depth}) -> i64 {{ return match x {{ {pattern} => 1, _ => 0 }} }}"
+        ));
+        let diags = check(&source);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0019");
     }
 
     #[test]

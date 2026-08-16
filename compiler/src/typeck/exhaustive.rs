@@ -635,4 +635,42 @@ mod tests {
             Usefulness::Useful(_) | Usefulness::NotUseful | Usefulness::BudgetExceeded
         ));
     }
+
+    /// `Rec { Cons(Rec), Nil }` nested 50 levels deep against a budget
+    /// far smaller than that -- `is_useful` recurses once per nesting
+    /// level (each `Cons` descends into its own payload), consuming one
+    /// unit of budget per level, so this deterministically runs out
+    /// partway through a single row's descent rather than merely
+    /// "maybe" exceeding depending on incidental recursion elsewhere.
+    /// This is the real analogue of a deeply-nested source pattern:
+    /// the budget must be what stops it, never the Rust call stack.
+    fn nested_cons_pattern(item: ItemId, depth: usize) -> ResolvedPattern {
+        if depth == 0 {
+            ResolvedPattern::Variant {
+                variant: item,
+                case: 1,
+                args: vec![],
+            }
+        } else {
+            ResolvedPattern::Variant {
+                variant: item,
+                case: 0,
+                args: vec![nested_cons_pattern(item, depth - 1)],
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_pattern_genuinely_exhausts_the_budget() {
+        let item = ItemId(0);
+        let ty = Ty::Named(item, crate::symbol::Symbol(0));
+        let space = variant_space(vec![(item, vec![vec![ty.clone()], vec![]])]);
+        let pattern = nested_cons_pattern(item, 50);
+        let mut budget = 10usize;
+        let outcome = is_useful(&[], &[pattern], &[ty], &space, &mut budget);
+        assert!(
+            matches!(outcome, Usefulness::BudgetExceeded),
+            "expected the budget to be exhausted by depth 50 with only 10 steps allowed"
+        );
+    }
 }

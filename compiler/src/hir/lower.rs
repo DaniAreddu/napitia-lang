@@ -48,11 +48,94 @@ enum TypeNameKind {
     Variant,
 }
 
+/// The four counters `Lowering` mints fresh ids from, threaded across
+/// every module in a project compilation (`rfcs/0006`) so two items in
+/// different modules can never collide by reusing the same numeric id.
+/// Single-file compilation just starts and discards one of these per
+/// call, same as before this type existed.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IdCursor {
+    pub next_item_id: u32,
+    pub next_local_id: u32,
+    pub next_expr_id: u32,
+    pub next_pattern_id: u32,
+}
+
+/// One item made visible to a module via `import`, already resolved to
+/// a concrete declaration in another (already-lowered) module. Built by
+/// `project::resolve`, which is the only place that knows how to turn
+/// an `import` statement's dotted path into one of these.
+pub struct ImportedItem {
+    pub local_name: Symbol,
+    pub kind: ImportedItemKind,
+    /// The `import` statement's own span, in the *importing* module --
+    /// used both as this name's "declared here" location for further
+    /// collision diagnostics, and as a diagnostic's own primary
+    /// location when the import itself is what's rejected.
+    pub import_span: Span,
+    /// Where the imported item was actually declared -- a different
+    /// file than the importing module's own, in every real case. Used
+    /// for a cross-file "declared here" label when this import
+    /// conflicts with something else.
+    pub declared_source: SourceId,
+    pub declared_span: Span,
+}
+
+pub enum ImportedItemKind {
+    Function(ItemId),
+    Record {
+        item: ItemId,
+        /// `(field name, declaration index, is_public)`, in declaration
+        /// order.
+        fields: Vec<(Symbol, usize, bool)>,
+    },
+    Variant {
+        item: ItemId,
+        /// `(case name, declaration index)`, in declaration order.
+        cases: Vec<(Symbol, usize)>,
+    },
+}
+
+/// Where a name in this module's namespace came from -- needed to
+/// choose the right diagnostic (and labeling) when a second name
+/// collides with it: two same-file declarations is `R0001`, anything
+/// touching an import is `M0007`.
+#[derive(Clone)]
+enum NameOrigin {
+    Local(Span),
+    Imported {
+        import_span: Span,
+        declared_source: SourceId,
+        declared_span: Span,
+    },
+}
+
 pub fn lower_module(
     module: &ast::Module,
     source: SourceId,
     interner: &Interner,
 ) -> (HirModule, Vec<Diagnostic>) {
+    let (hir, _cursor, diagnostics) =
+        lower_module_with_imports(module, source, interner, IdCursor::default(), Vec::new());
+    (hir, diagnostics)
+}
+
+/// Like [`lower_module`], but for one module in a multi-module project:
+/// `ids` is where this module's own fresh ids start counting from
+/// (threaded in from whatever the previously-lowered module in
+/// dependency order left off at), and `imports` is every name this
+/// module's own `import` statements successfully resolved to elsewhere
+/// in the project, seeded into this module's namespaces before its own
+/// declarations are processed -- so a local declaration reusing an
+/// imported name is caught the same way a same-file duplicate already
+/// is, just with a different diagnostic and a cross-file label.
+pub fn lower_module_with_imports(
+    module: &ast::Module,
+    source: SourceId,
+    interner: &Interner,
+    ids: IdCursor,
+    imports: Vec<ImportedItem>,
+) -> (HirModule, IdCursor, Vec<Diagnostic>) {
     let mut lowering = Lowering {
         source,
         interner,
@@ -62,13 +145,20 @@ pub fn lower_module(
         record_fields: HashMap::new(),
         variant_cases: HashMap::new(),
         case_lookup: HashMap::new(),
-        next_item_id: 0,
-        next_local_id: 0,
-        next_expr_id: 0,
-        next_pattern_id: 0,
+        imported_record_field_public: HashMap::new(),
+        next_item_id: ids.next_item_id,
+        next_local_id: ids.next_local_id,
+        next_expr_id: ids.next_expr_id,
+        next_pattern_id: ids.next_pattern_id,
     };
-    let hir = lowering.run(module);
-    (hir, lowering.diagnostics)
+    let hir = lowering.run_with_imports(module, imports);
+    let cursor = IdCursor {
+        next_item_id: lowering.next_item_id,
+        next_local_id: lowering.next_local_id,
+        next_expr_id: lowering.next_expr_id,
+        next_pattern_id: lowering.next_pattern_id,
+    };
+    (hir, cursor, lowering.diagnostics)
 }
 
 struct Lowering<'a> {
@@ -90,6 +180,12 @@ struct Lowering<'a> {
     /// the module, for resolving an *unqualified* constructor reference
     /// and detecting ambiguity when it names more than one variant.
     case_lookup: HashMap<Symbol, Vec<(ItemId, usize)>>,
+    /// Field-name -> public/private, but *only* for records reaching
+    /// this module via `import` -- a record declared locally never
+    /// needs this (its fields are always accessible from inside its own
+    /// module), so this map staying empty for a purely single-file
+    /// compilation costs nothing.
+    imported_record_field_public: HashMap<ItemId, HashMap<Symbol, bool>>,
     next_item_id: u32,
     next_local_id: u32,
     next_expr_id: u32,
@@ -97,8 +193,61 @@ struct Lowering<'a> {
 }
 
 impl<'a> Lowering<'a> {
-    fn run(&mut self, module: &ast::Module) -> HirModule {
-        let mut names: HashMap<Symbol, Span> = HashMap::new();
+    fn run_with_imports(&mut self, module: &ast::Module, imports: Vec<ImportedItem>) -> HirModule {
+        let mut names: HashMap<Symbol, NameOrigin> = HashMap::new();
+
+        // Imported names are seeded *before* this module's own
+        // declarations are processed, so a local declaration reusing
+        // one is caught by the same collision check below, and so is a
+        // second import introducing a name this module already
+        // imported once.
+        for imported in imports {
+            if let Some(existing) = names.get(&imported.local_name).cloned() {
+                self.diagnostics.push(self.import_collision_diagnostic(
+                    imported.local_name,
+                    imported.import_span,
+                    &existing,
+                ));
+                continue;
+            }
+            let origin = NameOrigin::Imported {
+                import_span: imported.import_span,
+                declared_source: imported.declared_source,
+                declared_span: imported.declared_span,
+            };
+            names.insert(imported.local_name, origin);
+            match imported.kind {
+                ImportedItemKind::Function(item) => {
+                    self.functions_by_name.insert(imported.local_name, item);
+                }
+                ImportedItemKind::Record { item, fields } => {
+                    self.type_names
+                        .insert(imported.local_name, (item, TypeNameKind::Record));
+                    let mut field_indices = HashMap::new();
+                    let mut field_public = HashMap::new();
+                    for (name, index, is_public) in fields {
+                        field_indices.insert(name, index);
+                        field_public.insert(name, is_public);
+                    }
+                    self.record_fields.insert(item, field_indices);
+                    self.imported_record_field_public.insert(item, field_public);
+                }
+                ImportedItemKind::Variant { item, cases } => {
+                    self.type_names
+                        .insert(imported.local_name, (item, TypeNameKind::Variant));
+                    let mut case_indices = HashMap::new();
+                    for (name, index) in cases {
+                        case_indices.insert(name, index);
+                        self.case_lookup
+                            .entry(name)
+                            .or_default()
+                            .push((item, index));
+                    }
+                    self.variant_cases.insert(item, case_indices);
+                }
+            }
+        }
+
         let mut function_decls: Vec<(ItemId, &ast::FunctionDecl)> = Vec::new();
         let mut record_decls: Vec<(ItemId, &ast::RecordDecl)> = Vec::new();
         let mut variant_decls: Vec<(ItemId, &ast::VariantDecl)> = Vec::new();
@@ -154,6 +303,50 @@ impl<'a> Lowering<'a> {
             }
         }
 
+        // A public function/record field/variant case payload naming a
+        // *locally-declared* private record/variant leaks a type
+        // nothing outside this module can ever refer to -- any type
+        // name that instead resolves to something imported must already
+        // be public (a successful import guarantees that), so this
+        // check only ever needs to look at this module's own
+        // declarations.
+        let local_public: HashMap<Symbol, bool> = record_decls
+            .iter()
+            .map(|(_, r)| (r.name.symbol, r.public))
+            .chain(variant_decls.iter().map(|(_, v)| (v.name.symbol, v.public)))
+            .collect();
+        for (_, f) in &function_decls {
+            if !f.public {
+                continue;
+            }
+            for param in &f.params {
+                self.check_public_api_leak(&param.ty, &local_public);
+            }
+            if let Some(ret) = &f.return_type {
+                self.check_public_api_leak(ret, &local_public);
+            }
+        }
+        for (_, r) in &record_decls {
+            if !r.public {
+                continue;
+            }
+            for field in &r.fields {
+                if field.public {
+                    self.check_public_api_leak(&field.ty, &local_public);
+                }
+            }
+        }
+        for (_, v) in &variant_decls {
+            if !v.public {
+                continue;
+            }
+            for case in &v.cases {
+                for payload_ty in &case.payload {
+                    self.check_public_api_leak(payload_ty, &local_public);
+                }
+            }
+        }
+
         let records: Vec<HirRecord> = record_decls
             .into_iter()
             .map(|(id, r)| self.lower_record(id, r))
@@ -172,6 +365,26 @@ impl<'a> Lowering<'a> {
             records,
             variants,
             other_items,
+        }
+    }
+
+    /// `M0012`: a public function signature, public field type, or
+    /// variant case payload type naming a record/variant declared
+    /// private in *this* module.
+    fn check_public_api_leak(&mut self, ty: &ast::Type, local_public: &HashMap<Symbol, bool>) {
+        if let Some(&is_public) = local_public.get(&ty.name.symbol)
+            && !is_public
+        {
+            let text = self.interner.resolve(ty.name.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    crate::project::codes::PRIVATE_TYPE_LEAKED,
+                    self.source,
+                    ty.name.span,
+                    format!("`{text}` is private, but is exposed here through a public API"),
+                )
+                .with_primary_label("private type used in a public signature"),
+            );
         }
     }
 
@@ -255,24 +468,69 @@ impl<'a> Lowering<'a> {
 
     fn check_duplicate(
         &mut self,
-        names: &mut HashMap<Symbol, Span>,
+        names: &mut HashMap<Symbol, NameOrigin>,
         name: ast::Ident,
         _id: ItemId,
     ) {
-        if let Some(&first_span) = names.get(&name.symbol) {
-            let text = self.interner.resolve(name.symbol);
-            self.diagnostics.push(
-                Diagnostic::error(
-                    codes::DUPLICATE_DEFINITION,
-                    self.source,
+        match names.get(&name.symbol).cloned() {
+            None => {
+                names.insert(name.symbol, NameOrigin::Local(name.span));
+            }
+            Some(NameOrigin::Local(first_span)) => {
+                let text = self.interner.resolve(name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_DEFINITION,
+                        self.source,
+                        name.span,
+                        format!("`{text}` is defined multiple times"),
+                    )
+                    .with_primary_label("redefined here")
+                    .with_label(first_span, "first defined here"),
+                );
+            }
+            Some(imported @ NameOrigin::Imported { .. }) => {
+                self.diagnostics.push(self.import_collision_diagnostic(
+                    name.symbol,
                     name.span,
-                    format!("`{text}` is defined multiple times"),
-                )
-                .with_primary_label("redefined here")
-                .with_label(first_span, "first defined here"),
-            );
+                    &imported,
+                ));
+            }
+        }
+    }
+
+    /// Builds the `M0007` diagnostic for a name that collides with an
+    /// already-known import -- whether the new name is itself another
+    /// import (two imports naming the same local name) or a local
+    /// declaration reusing an imported name. `existing` is always
+    /// `NameOrigin::Imported`; the caller already checked that.
+    fn import_collision_diagnostic(
+        &self,
+        symbol: Symbol,
+        new_span: Span,
+        existing: &NameOrigin,
+    ) -> Diagnostic {
+        let NameOrigin::Imported {
+            import_span,
+            declared_source,
+            declared_span,
+        } = existing
+        else {
+            unreachable!("caller only passes an Imported origin")
+        };
+        let text = self.interner.resolve(symbol);
+        let diag = Diagnostic::error(
+            crate::project::codes::DUPLICATE_IMPORT,
+            self.source,
+            new_span,
+            format!("`{text}` conflicts with a name already imported into this module"),
+        )
+        .with_primary_label("conflicting name")
+        .with_label(*import_span, "already imported here");
+        if *declared_source == self.source && *import_span == *declared_span {
+            diag
         } else {
-            names.insert(name.symbol, name.span);
+            diag.with_label_in(*declared_source, *declared_span, "declared here")
         }
     }
 
@@ -779,6 +1037,27 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             seen.insert(f.name.symbol, f.name.span);
+            let is_private_imported_field = self
+                .imported_record_field_public
+                .get(&record)
+                .and_then(|fields| fields.get(&f.name.symbol))
+                .is_some_and(|&is_public| !is_public);
+            if is_private_imported_field {
+                let text = self.interner.resolve(f.name.symbol);
+                let record_text = self.interner.resolve(type_name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        crate::project::codes::INACCESSIBLE_FIELD,
+                        self.source,
+                        f.name.span,
+                        format!(
+                            "field `{text}` of `{record_text}` is private to its declaring module"
+                        ),
+                    )
+                    .with_primary_label("cannot initialize a private field from here"),
+                );
+                continue;
+            }
             match field_indices.get(&f.name.symbol) {
                 Some(&field_index) => resolved.push(HirFieldInit {
                     field_index,
@@ -1360,6 +1639,7 @@ mod tests {
             record_fields: HashMap::new(),
             variant_cases: HashMap::new(),
             case_lookup: HashMap::new(),
+            imported_record_field_public: HashMap::new(),
             next_item_id: 0,
             next_local_id: 0,
             next_expr_id: 0,
@@ -1406,5 +1686,164 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         assert_eq!(hir.records.len(), 1);
         assert_eq!(hir.functions[0].params.len(), 1);
+    }
+
+    /// `build_imports` receives the *same* interner the source text is
+    /// parsed with, so a symbol it interns for an import's local name
+    /// (e.g. `"add"`) is guaranteed to be the same `Symbol` the parsed
+    /// source text's own references resolve to -- two separate
+    /// `Interner`s would each hand out unrelated ids starting from the
+    /// same small integers, so precomputing a symbol from a *different*
+    /// interner and passing it in would silently collide with whatever
+    /// symbol the real source text happened to get instead.
+    fn lower_with_imports(
+        text: &str,
+        build_imports: impl FnOnce(&mut Interner, SourceId) -> Vec<ImportedItem>,
+    ) -> (HirModule, Vec<Diagnostic>) {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let other_source = map.add_file("other.npt", "");
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let imports = build_imports(&mut interner, other_source);
+        let (hir, _cursor, diags) =
+            lower_module_with_imports(&module, id, &interner, IdCursor::default(), imports);
+        (hir, diags)
+    }
+
+    #[test]
+    fn an_imported_function_call_resolves_to_its_real_item_id() {
+        let mut map = SourceMap::new();
+        let other_source = map.add_file("math.npt", "");
+        let mut interner = Interner::new();
+        let add_name = interner.intern("add");
+        let target = ItemId(42);
+        let (hir, _cursor, diags) = {
+            let mut m = map;
+            let id = m.add_file("t.npt", "func f() -> i64 { return add() }");
+            let (tokens, lex_diags) = tokenize(m.get(id).content(), id, &mut interner);
+            assert!(lex_diags.is_empty());
+            let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+            assert!(parse_diags.is_empty());
+            lower_module_with_imports(
+                &module,
+                id,
+                &interner,
+                IdCursor::default(),
+                vec![ImportedItem {
+                    local_name: add_name,
+                    kind: ImportedItemKind::Function(target),
+                    import_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }],
+            )
+        };
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let tail = hir.functions[0].body.tail.as_deref().unwrap();
+        let HirExpr::Return { value, .. } = tail else {
+            panic!("expected return")
+        };
+        let HirExpr::Call { callee, .. } = value.as_deref().unwrap() else {
+            panic!("expected a call")
+        };
+        assert!(matches!(**callee, HirExpr::Function { item, .. } if item == target));
+    }
+
+    #[test]
+    fn two_imports_introducing_the_same_local_name_is_m0007() {
+        let (_, diags) =
+            lower_with_imports("func f() -> i64 { return 0 }", |interner, other_source| {
+                let name = interner.intern("thing");
+                vec![
+                    ImportedItem {
+                        local_name: name,
+                        kind: ImportedItemKind::Function(ItemId(1)),
+                        import_span: Span::new(0, 1),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                    ImportedItem {
+                        local_name: name,
+                        kind: ImportedItemKind::Function(ItemId(2)),
+                        import_span: Span::new(1, 2),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                ]
+            });
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+    }
+
+    #[test]
+    fn a_local_declaration_conflicting_with_an_import_is_m0007() {
+        let (_, diags) = lower_with_imports(
+            "func add() -> i64 { return 0 }",
+            |interner, other_source| {
+                let name = interner.intern("add");
+                vec![ImportedItem {
+                    local_name: name,
+                    kind: ImportedItemKind::Function(ItemId(1)),
+                    import_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            },
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+    }
+
+    #[test]
+    fn public_function_exposing_a_private_local_record_is_m0012() {
+        let (_, diags) = lower(
+            "record Secret { x: i64 } \
+             public func f(s: Secret) -> i64 { return 0 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0012");
+    }
+
+    #[test]
+    fn private_function_may_use_a_private_local_record_freely() {
+        let (_, diags) = lower(
+            "record Secret { x: i64 } \
+             func f(s: Secret) -> i64 { return 0 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn constructing_a_private_imported_field_is_m0011() {
+        let (_, diags) = lower_with_imports(
+            "func f() -> i64 { value p = Point { x: 1, y: 2 }; return 0 }",
+            |interner, other_source| {
+                let record_name = interner.intern("Point");
+                let field_x = interner.intern("x");
+                let field_y = interner.intern("y");
+                vec![ImportedItem {
+                    local_name: record_name,
+                    kind: ImportedItemKind::Record {
+                        item: ItemId(1),
+                        fields: vec![(field_x, 0, true), (field_y, 1, false)],
+                    },
+                    import_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            },
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0011");
     }
 }

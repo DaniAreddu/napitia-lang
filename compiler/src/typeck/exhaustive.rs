@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::hir::ItemId;
+use crate::limits::MAX_PATTERN_DEPTH;
 use crate::types::Ty;
 
 /// A pattern with every name resolved: a `Bind`/`Wildcard` HIR pattern
@@ -60,11 +61,10 @@ pub const MAX_USEFULNESS_STEPS: usize = 100_000;
 /// ever reaches zero, which is nowhere near a safe call-stack depth.
 /// `typeck::check_pattern`'s own bound already keeps every
 /// `ResolvedPattern` this module receives through the normal pipeline
-/// within this same limit, but `is_useful` is a public function a
-/// caller can invoke directly with a hand-built row bypassing that
-/// protection, so it needs its own independent depth bound too.
-const MAX_RECURSION_DEPTH: usize = 200;
-
+/// within `crate::limits::MAX_PATTERN_DEPTH`, but `is_useful` is a
+/// public function a caller can invoke directly with a hand-built row
+/// bypassing that protection, so it checks the same shared bound
+/// itself, independent of the step budget above.
 pub struct VariantSpace {
     /// Case index -> that case's payload types, in declaration order.
     pub payloads: HashMap<ItemId, Vec<Vec<Ty>>>,
@@ -120,7 +120,7 @@ fn is_useful_at_depth(
     budget: &mut usize,
     depth: usize,
 ) -> Usefulness {
-    if depth > MAX_RECURSION_DEPTH {
+    if depth > MAX_PATTERN_DEPTH {
         return Usefulness::BudgetExceeded;
     }
     if *budget == 0 {
@@ -711,16 +711,16 @@ mod tests {
 
     #[test]
     fn deeply_nested_pattern_hits_the_recursion_depth_bound_not_the_step_budget() {
-        // Nested past MAX_RECURSION_DEPTH but with a step budget large
-        // enough that it would never run out first -- isolates
-        // is_useful's own stack-safety bound (independent of, and much
-        // smaller than, MAX_USEFULNESS_STEPS) as what actually stops
-        // this, the same defense a direct caller bypassing
+        // Nested past crate::limits::MAX_PATTERN_DEPTH but with a step
+        // budget large enough that it would never run out first --
+        // isolates is_useful's own stack-safety bound (independent of,
+        // and much smaller than, MAX_USEFULNESS_STEPS) as what actually
+        // stops this, the same defense a direct caller bypassing
         // typeck::check_pattern's own bound would otherwise be missing.
         let item = ItemId(0);
         let ty = Ty::Named(item, crate::symbol::Symbol(0));
         let space = variant_space(vec![(item, vec![vec![ty.clone()], vec![]])]);
-        let pattern = nested_cons_pattern(item, MAX_RECURSION_DEPTH + 50);
+        let pattern = nested_cons_pattern(item, MAX_PATTERN_DEPTH + 50);
         let mut budget = MAX_USEFULNESS_STEPS;
         let outcome = is_useful(&[], &[pattern], &[ty], &space, &mut budget);
         assert!(
@@ -728,7 +728,7 @@ mod tests {
             "expected the recursion-depth bound to stop this before the step budget ever could"
         );
         assert!(
-            budget > MAX_USEFULNESS_STEPS - MAX_RECURSION_DEPTH - 10,
+            budget > MAX_USEFULNESS_STEPS - MAX_PATTERN_DEPTH - 10,
             "the step budget barely moved; the depth bound, not step exhaustion, must be what fired"
         );
     }

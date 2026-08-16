@@ -410,12 +410,12 @@ impl<'a> Parser<'a> {
     /// that grows this parser's own native call stack per level of
     /// source nesting. A malformed-looking but syntactically valid
     /// chain like `A(A(A(A(...))))` must fail with a diagnostic at
-    /// `MAX_PATTERN_NESTING_DEPTH`, never recurse past it -- typeck's
-    /// own `MAX_PATTERN_NESTING_DEPTH` bound only protects pattern
-    /// *resolution*, which never even runs if parsing itself already
-    /// overflowed the stack first.
+    /// `crate::limits::MAX_PATTERN_DEPTH`, never recurse past it --
+    /// typeck's own bound only protects pattern *resolution*, which
+    /// never even runs if parsing itself already overflowed the stack
+    /// first.
     fn parse_pattern_at_depth(&mut self, depth: usize) -> Option<Pattern> {
-        if depth > super::MAX_PATTERN_NESTING_DEPTH {
+        if depth > crate::limits::MAX_PATTERN_DEPTH {
             let span = self.current_span();
             self.error_pattern_too_deep(span);
             return None;
@@ -710,10 +710,10 @@ mod tests {
     fn a_pattern_nested_past_the_depth_limit_fails_parsing_not_the_process() {
         // Built programmatically, never committed as a giant fixture:
         // a chain of `Wrap(...)` nested well past
-        // `MAX_PATTERN_NESTING_DEPTH`, which recurses once per level on
-        // the parser's own native call stack. Must fail with a
-        // deterministic diagnostic, never overflow the stack.
-        let depth = super::super::MAX_PATTERN_NESTING_DEPTH + 50;
+        // `crate::limits::MAX_PATTERN_DEPTH`, which recurses once per
+        // level on the parser's own native call stack. Must fail with
+        // a deterministic diagnostic, never overflow the stack.
+        let depth = crate::limits::MAX_PATTERN_DEPTH + 50;
         let mut pattern = "Leaf".to_string();
         for _ in 0..depth {
             pattern = format!("Wrap({pattern})");

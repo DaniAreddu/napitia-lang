@@ -38,16 +38,6 @@ mod codes {
     pub const PATTERN_TOO_DEEP: &str = "R0015";
 }
 
-/// `lower_pattern` recurses once per `Variant(...)` sub-pattern nesting
-/// level, on this pass's own native call stack. The parser's own
-/// `MAX_PATTERN_NESTING_DEPTH` bound already keeps any real parser
-/// output shallow enough that this can never fire in the normal
-/// pipeline -- but `lower_module` is a public entry point a caller can
-/// invoke directly with a hand-built `ast::Module` bypassing the parser
-/// entirely, so this stage needs its own independent bound rather than
-/// trusting that guarantee from a stage it doesn't call.
-const MAX_PATTERN_NESTING_DEPTH: usize = 200;
-
 /// Which kind of item a name in the type namespace refers to -- needed
 /// to tell "unknown record type" (named a variant, or nothing) apart
 /// from "unknown variant type" (named a record, or nothing) with an
@@ -909,7 +899,7 @@ impl<'a> Lowering<'a> {
         bound: &mut HashMap<Symbol, Span>,
         depth: usize,
     ) -> HirPattern {
-        if depth > MAX_PATTERN_NESTING_DEPTH {
+        if depth > crate::limits::MAX_PATTERN_DEPTH {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::PATTERN_TOO_DEEP,
@@ -1343,12 +1333,13 @@ mod tests {
 
     #[test]
     fn deeply_nested_hand_built_pattern_fails_lowering_with_r0015_not_a_stack_overflow() {
-        // The parser's own MAX_PATTERN_NESTING_DEPTH bound keeps any
-        // real parser output shallow enough that lower_pattern's own
-        // bound can never fire through the normal pipeline -- so this
-        // exercises it the only way possible: a hand-built ast::Pattern
-        // that bypasses the parser entirely, the same defense-in-depth
-        // posture nir::lower's tests already use for hand-built HIR.
+        // The parser's own crate::limits::MAX_PATTERN_DEPTH bound keeps
+        // any real parser output shallow enough that lower_pattern's
+        // own bound can never fire through the normal pipeline -- so
+        // this exercises it the only way possible: a hand-built
+        // ast::Pattern that bypasses the parser entirely, the same
+        // defense-in-depth posture nir::lower's tests already use for
+        // hand-built HIR.
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let mut interner = Interner::new();
@@ -1367,7 +1358,7 @@ mod tests {
             next_expr_id: 0,
             next_pattern_id: 0,
         };
-        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let depth = crate::limits::MAX_PATTERN_DEPTH + 50;
         let mut pattern = ast::Pattern::Wildcard {
             span: Span::dummy(),
         };

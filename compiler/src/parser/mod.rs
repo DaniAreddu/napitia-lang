@@ -12,17 +12,6 @@ use crate::syntax::ast::{Ident, Module};
 
 const ERROR_CODE: &str = "P0001";
 
-/// `parse_pattern` recurses once per `Variant(...)` sub-pattern nesting
-/// level, on this parser's own native call stack -- the first and most
-/// directly source-reachable of every recursive pattern-processing
-/// boundary in the pipeline (parsing runs before HIR lowering, typeck,
-/// or NIR lowering ever see the pattern at all). Kept in lockstep with
-/// `typeck::MAX_PATTERN_NESTING_DEPTH` so a pattern that parses
-/// successfully is always shallow enough for every later stage to
-/// resolve too, but defined independently since the parser has no
-/// dependency on `typeck`.
-pub(crate) const MAX_PATTERN_NESTING_DEPTH: usize = 200;
-
 /// Parses a token stream (already produced by [`crate::lexer::tokenize`])
 /// into a [`Module`], plus every diagnostic encountered along the way. A
 /// syntax error never aborts parsing: the parser records a diagnostic,

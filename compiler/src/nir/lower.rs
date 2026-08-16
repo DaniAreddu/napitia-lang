@@ -28,6 +28,7 @@ use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
     HirModule, HirPattern, HirStmt, ItemId, LocalId, PatternId,
 };
+use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
@@ -50,19 +51,6 @@ mod codes {
     /// normal compiler error rather than crashing the process.
     pub const INTERNAL_INVARIANT_VIOLATED: &str = "I0002";
 }
-
-/// `lower_decision` recurses (through `lower_bool_switch`/
-/// `lower_variant_switch`/`lower_literal_chain`, which call back into
-/// it) once per occurrence position it consumes -- for a single
-/// deeply-nested `Variant` pattern, that is once per nesting level, on
-/// this pass's own native call stack. `typeck::check_pattern`'s own
-/// bound already keeps every pattern the normal pipeline produces
-/// shallow enough that this can never fire there, but `lower_module` is
-/// a public entry point a direct caller can invoke with hand-built HIR
-/// bypassing typeck entirely, so this stage needs its own independent
-/// bound too, matching `hir::lower_pattern`'s and
-/// `typeck::exhaustive::is_useful`'s.
-const MAX_PATTERN_NESTING_DEPTH: usize = 200;
 
 // Boxed so a single-`Diagnostic` `Err` doesn't force every `LowerResult`
 // (including `LowerResult<()>`) to be as large as `Diagnostic` itself.
@@ -1405,8 +1393,8 @@ impl<'a> Lowering<'a> {
         // public entry point a direct caller can invoke with hand-built
         // HIR bypassing typeck entirely, so this needs its own
         // independent bound too, matching hir::lower_pattern's and
-        // typeck::is_useful's.
-        if depth > MAX_PATTERN_NESTING_DEPTH {
+        // typeck::is_useful's -- all sharing crate::limits::MAX_PATTERN_DEPTH.
+        if depth > MAX_PATTERN_DEPTH {
             return Err(self.internal_error("match decision tree is nested too deeply to lower"));
         }
         if occurrences.is_empty() {
@@ -3192,14 +3180,16 @@ mod tests {
 
     #[test]
     fn deeply_nested_hand_built_match_pattern_fails_lowering_with_i0002_not_a_stack_overflow() {
-        // The parser's own MAX_PATTERN_NESTING_DEPTH bound keeps any
-        // real parser output shallow enough that lower_decision's own
-        // bound can never fire through the normal pipeline (typeck's
-        // matching bound also stops it before NIR lowering is ever
-        // reached) -- so this exercises it the only way possible: a
-        // hand-built HirMatchArm chain that bypasses the parser,
-        // hir::lower, and typeck entirely, calling the same public
-        // lower_module machinery a direct caller would.
+        // The parser's own crate::limits::MAX_PATTERN_DEPTH bound keeps
+        // any real parser output shallow enough that lower_decision's
+        // own bound can never fire through the normal pipeline
+        // (typeck's matching bound also stops it before NIR lowering is
+        // ever reached) -- so this exercises it the only way possible:
+        // a hand-built HirModule that bypasses the parser, hir::lower,
+        // and typeck entirely, calling the public nir::lower_module
+        // entry point a direct caller would, and asserting the whole
+        // module fails atomically rather than calling only the private
+        // lower_match helper.
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let mut interner = Interner::new();
@@ -3207,26 +3197,37 @@ mod tests {
         let leaf_name = interner.intern("Leaf");
         let variant_item = ItemId(0);
         let variant_sym = interner.intern("Rec");
-        let variant_ty = Ty::Named(variant_item, variant_sym);
-        let mut variants = HashMap::new();
-        variants.insert(
-            variant_item,
-            VariantLayout {
-                name: variant_sym,
-                cases: vec![
-                    CaseLayout {
-                        name: wrap_name,
-                        payload: vec![variant_ty.clone()],
-                    },
-                    CaseLayout {
-                        name: leaf_name,
-                        payload: vec![],
-                    },
-                ],
+        let variant_ty_name = ast::Type {
+            name: ast::Ident {
+                symbol: variant_sym,
+                span: Span::dummy(),
             },
-        );
+        };
+        let i64_name = ast::Type {
+            name: ast::Ident {
+                symbol: interner.intern("i64"),
+                span: Span::dummy(),
+            },
+        };
+        let variant = crate::hir::HirVariant {
+            id: variant_item,
+            name: variant_sym,
+            span: Span::dummy(),
+            cases: vec![
+                crate::hir::HirCase {
+                    name: wrap_name,
+                    span: Span::dummy(),
+                    payload: vec![variant_ty_name.clone()],
+                },
+                crate::hir::HirCase {
+                    name: leaf_name,
+                    span: Span::dummy(),
+                    payload: vec![],
+                },
+            ],
+        };
 
-        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let depth = MAX_PATTERN_DEPTH + 50;
         let mut pattern_case = HashMap::new();
         let mut pattern = HirPattern::Wildcard {
             id: PatternId(0),
@@ -3243,26 +3244,11 @@ mod tests {
             };
         }
 
+        let param_local = LocalId(0);
         let scrutinee_id = ExprId(0);
-        let mut expr_types = HashMap::new();
-        expr_types.insert(scrutinee_id, variant_ty.clone());
-        let local_types = HashMap::new();
-        let mut lowering = direct_lowering(
-            source,
-            &interner,
-            &local_types,
-            &expr_types,
-            &pattern_case,
-            HashMap::new(),
-            variants,
-        );
-        let mut fb = FnBuilder::new(Ty::I64);
-        let placeholder = fb.push_value(variant_ty.clone(), ValueKind::Alloc);
-        fb.local_bindings
-            .insert(LocalId(0), LocalBinding::Direct(placeholder));
         let scrutinee = HirExpr::Local {
             id: scrutinee_id,
-            local: LocalId(0),
+            local: param_local,
             name: variant_sym,
             span: Span::dummy(),
         };
@@ -3276,11 +3262,62 @@ mod tests {
             }),
             span: Span::dummy(),
         }];
-        let result = lowering.lower_match(&mut fb, &scrutinee, &arms, Ty::I64);
-        let Err(diagnostic) = result else {
-            panic!("expected lowering to fail for a match nested past the depth limit")
+        let match_expr = HirExpr::Match {
+            id: ExprId(2),
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: Span::dummy(),
         };
-        assert_eq!(diagnostic.code, "I0002");
+        let function = HirFunction {
+            id: ItemId(1),
+            name: interner.intern("f"),
+            name_span: Span::dummy(),
+            params: vec![crate::hir::HirParam {
+                local: param_local,
+                name: variant_sym,
+                span: Span::dummy(),
+                ty: variant_ty_name,
+            }],
+            return_type: Some(i64_name),
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(3),
+                statements: vec![],
+                tail: Some(Box::new(match_expr)),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let module = HirModule {
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+
+        let mut local_types = HashMap::new();
+        local_types.insert(param_local, Ty::Named(variant_item, variant_sym));
+        let mut expr_types = HashMap::new();
+        expr_types.insert(scrutinee_id, Ty::Named(variant_item, variant_sym));
+
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!(
+                "expected the whole module to fail lowering for a match nested past the depth limit"
+            )
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic, got {diagnostics:?}"
+        );
     }
 
     #[test]

@@ -44,14 +44,6 @@ mod codes {
     pub const INCOMPATIBLE_PATTERN: &str = "T0021";
 }
 
-/// `check_pattern` recurses once per nested `Variant` sub-pattern, on
-/// the native Rust call stack -- independent of, and prior to,
-/// `exhaustive::MAX_USEFULNESS_STEPS` (which only bounds usefulness
-/// analysis over already-resolved patterns). Without its own bound
-/// here, a pattern nested deep enough could overflow the stack while
-/// still being *resolved*, before analysis is ever reached.
-const MAX_PATTERN_NESTING_DEPTH: usize = 200;
-
 #[derive(Clone)]
 struct FunctionSig {
     params: Vec<Ty>,
@@ -1371,17 +1363,18 @@ impl<'a> Checker<'a> {
     }
 
     /// `depth` counts `Variant` sub-pattern nesting only (matching what
-    /// actually grows the call stack here); at `MAX_PATTERN_NESTING_DEPTH`
-    /// this stops recursing into further sub-patterns entirely rather
-    /// than merely reporting the overflow after the fact -- the whole
-    /// point is to never let the stack grow past this depth.
+    /// actually grows the call stack here); at
+    /// `crate::limits::MAX_PATTERN_DEPTH` this stops recursing into
+    /// further sub-patterns entirely rather than merely reporting the
+    /// overflow after the fact -- the whole point is to never let the
+    /// stack grow past this depth.
     fn check_pattern_at_depth(
         &mut self,
         pattern: &HirPattern,
         scrutinee_ty: &Ty,
         depth: usize,
     ) -> (ResolvedPattern, bool) {
-        if depth > MAX_PATTERN_NESTING_DEPTH {
+        if depth > crate::limits::MAX_PATTERN_DEPTH {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::PATTERN_BUDGET_EXCEEDED,
@@ -2090,16 +2083,16 @@ mod tests {
 
     #[test]
     fn a_pattern_nested_past_the_depth_limit_is_a_diagnostic_not_a_stack_overflow() {
-        // check_pattern's own MAX_PATTERN_NESTING_DEPTH bound exists
-        // prior to and independent of the usefulness algorithm's work
-        // budget -- but the parser's own matching bound (`fix(parser):
+        // check_pattern's own crate::limits::MAX_PATTERN_DEPTH bound
+        // exists prior to and independent of the usefulness algorithm's
+        // work budget -- but the parser's own matching bound (`fix(parser):
         // bound nested pattern parsing`) now rejects any source text
         // nested this deep before typeck ever sees it, so the only way
         // left to exercise check_pattern's bound directly is a
         // hand-built HirPattern chain bypassing the parser (and
         // hir::lower) entirely, calling the same public check_module
         // entry point a real caller would.
-        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let depth = crate::limits::MAX_PATTERN_DEPTH + 50;
         let mut interner = Interner::new();
         let case_name = interner.intern("Wrap");
         let mut map = SourceMap::new();

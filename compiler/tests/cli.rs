@@ -48,7 +48,11 @@ fn version_prints_a_version_and_succeeds() {
 fn missing_file_argument_is_a_usage_error_for_lex_and_parse() {
     for command in ["lex", "parse"] {
         let output = napitia(&[command]);
-        assert_eq!(output.status.code(), Some(2), "`{command}` should require a path");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{command}` should require a path"
+        );
         assert!(stderr(&output).contains("missing"));
     }
 }

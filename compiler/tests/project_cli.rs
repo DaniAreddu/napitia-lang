@@ -31,7 +31,11 @@ fn a_two_file_project_compiles_and_runs_through_the_directory_path() {
     let dir = project("basic_two_file");
 
     let checked = napitia(&["check", &dir]);
-    assert!(checked.status.success(), "check failed: {}", stderr(&checked));
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
     assert!(stdout(&checked).contains("no errors"));
 
     let ran = napitia(&["run", &dir]);

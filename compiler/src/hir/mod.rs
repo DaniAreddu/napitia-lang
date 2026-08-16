@@ -9,10 +9,12 @@
 //! module.
 
 pub mod lower;
+pub mod registry;
 
 pub use lower::{
     IdCursor, ImportedItem, ImportedItemKind, lower_module, lower_module_with_imports,
 };
+pub use registry::{ItemIdentity, ItemKind, ItemRegistry};
 
 use crate::lexer::IntBase;
 use crate::source::{SourceId, Span};

@@ -13,7 +13,7 @@ pub mod lower;
 pub use lower::lower_module;
 
 use crate::lexer::IntBase;
-use crate::source::Span;
+use crate::source::{SourceId, Span};
 use crate::symbol::Symbol;
 use crate::syntax::ast::{AssignOp, BinaryOp, Ident, Path, Type, UnaryOp};
 
@@ -81,6 +81,17 @@ pub struct HirRecord {
     pub id: ItemId,
     pub name: Symbol,
     pub span: Span,
+    /// The module this record was declared in, always the source
+    /// `hir::lower_module` (or `lower_module_with_imports`) actually ran
+    /// against -- never the source of whatever other module a merged
+    /// multi-module compilation happens to be checking a reference from.
+    /// Every diagnostic about this record (a field-visibility
+    /// violation, a public-API leak) is reported against this source,
+    /// not the accessing site's.
+    pub source: SourceId,
+    /// Whether this record itself may be imported from another module
+    /// (`rfcs/0006`); irrelevant to single-file compilation.
+    pub public: bool,
     pub fields: Vec<HirField>,
 }
 
@@ -88,6 +99,10 @@ pub struct HirRecord {
 pub struct HirField {
     pub name: Symbol,
     pub span: Span,
+    /// Whether this field may be read or initialized from outside its
+    /// record's own declaring module (`rfcs/0006`); irrelevant to
+    /// single-file compilation, where every field is always accessible.
+    pub public: bool,
     /// Unresolved surface type; `typeck` resolves it against the
     /// module's type namespace the same way it resolves a function
     /// parameter's type, so an unknown field type gets its own
@@ -102,6 +117,10 @@ pub struct HirVariant {
     pub id: ItemId,
     pub name: Symbol,
     pub span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
+    /// See [`HirRecord::public`].
+    pub public: bool,
     pub cases: Vec<HirCase>,
 }
 
@@ -119,6 +138,10 @@ pub struct HirFunction {
     pub id: ItemId,
     pub name: Symbol,
     pub name_span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
+    /// See [`HirRecord::public`].
+    pub public: bool,
     pub params: Vec<HirParam>,
     pub return_type: Option<Type>,
     /// Effect/capability paths from a `uses` clause, preserved as-parsed.

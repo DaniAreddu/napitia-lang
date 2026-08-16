@@ -197,6 +197,7 @@ impl<'a> Lowering<'a> {
             fields.push(HirField {
                 name: field.name.symbol,
                 span: field.span,
+                public: field.public,
                 ty: field.ty.clone(),
             });
         }
@@ -205,6 +206,8 @@ impl<'a> Lowering<'a> {
             id,
             name: r.name.symbol,
             span: r.span,
+            source: self.source,
+            public: r.public,
             fields,
         }
     }
@@ -244,6 +247,8 @@ impl<'a> Lowering<'a> {
             id,
             name: v.name.symbol,
             span: v.span,
+            source: self.source,
+            public: v.public,
             cases,
         }
     }
@@ -332,6 +337,8 @@ impl<'a> Lowering<'a> {
             id,
             name: f.name.symbol,
             name_span: f.name.span,
+            source: self.source,
+            public: f.public,
             params,
             return_type: f.return_type.clone(),
             uses: f.uses.clone(),

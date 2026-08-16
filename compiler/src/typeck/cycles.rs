@@ -220,15 +220,24 @@ mod tests {
     use crate::hir::{HirCase, HirField, HirRecord, HirVariant};
     use crate::source::SourceMap;
 
-    fn record(id: u32, name: Symbol, field_name: Symbol, field_ty: Ty) -> (HirRecord, Ty) {
+    fn record(
+        id: u32,
+        name: Symbol,
+        field_name: Symbol,
+        field_ty: Ty,
+        source: SourceId,
+    ) -> (HirRecord, Ty) {
         (
             HirRecord {
                 id: ItemId(id),
                 name,
                 span: Span::dummy(),
+                source,
+                public: true,
                 fields: vec![HirField {
                     name: field_name,
                     span: Span::dummy(),
+                    public: true,
                     ty: crate::syntax::ast::Type {
                         name: crate::syntax::ast::Ident {
                             symbol: name,
@@ -241,12 +250,20 @@ mod tests {
         )
     }
 
-    fn variant(id: u32, name: Symbol, case_name: Symbol, payload_ty: Ty) -> (HirVariant, Ty) {
+    fn variant(
+        id: u32,
+        name: Symbol,
+        case_name: Symbol,
+        payload_ty: Ty,
+        source: SourceId,
+    ) -> (HirVariant, Ty) {
         (
             HirVariant {
                 id: ItemId(id),
                 name,
                 span: Span::dummy(),
+                source,
+                public: true,
                 cases: vec![HirCase {
                     name: case_name,
                     span: Span::dummy(),
@@ -269,13 +286,15 @@ mod tests {
     /// exactly the `Ty::Named` edges this test wants to exist.
     fn check_record_cycle(names: &[&str]) -> (Vec<Diagnostic>, Vec<String>, Interner) {
         let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
         let symbols: Vec<Symbol> = names.iter().map(|n| interner.intern(n)).collect();
         let mut records = Vec::new();
         let mut field_types = HashMap::new();
         for (i, &sym) in symbols.iter().enumerate() {
             let next = symbols[(i + 1) % symbols.len()];
             let next_id = ItemId((i as u32 + 1) % symbols.len() as u32);
-            let (r, ty) = record(i as u32, sym, next, Ty::Named(next_id, next));
+            let (r, ty) = record(i as u32, sym, next, Ty::Named(next_id, next), source);
             field_types.insert(r.id, vec![ty]);
             records.push(r);
         }
@@ -285,8 +304,6 @@ mod tests {
             variants: Vec::new(),
             other_items: Vec::new(),
         };
-        let mut map = SourceMap::new();
-        let source = map.add_file("t.npt", "");
         let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), source, &interner);
         (
             diagnostics,
@@ -332,12 +349,14 @@ mod tests {
     #[test]
     fn mixed_record_and_variant_cycle_path_text_is_exact() {
         let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
         let a = interner.intern("A");
         let b = interner.intern("B");
         let field_name = interner.intern("next");
         let case_name = interner.intern("X");
-        let (record_a, record_ty) = record(0, a, field_name, Ty::Named(ItemId(1), b));
-        let (variant_b, variant_ty) = variant(1, b, case_name, Ty::Named(ItemId(0), a));
+        let (record_a, record_ty) = record(0, a, field_name, Ty::Named(ItemId(1), b), source);
+        let (variant_b, variant_ty) = variant(1, b, case_name, Ty::Named(ItemId(0), a), source);
         let mut field_types = HashMap::new();
         field_types.insert(record_a.id, vec![record_ty]);
         let mut payload_types = HashMap::new();
@@ -348,8 +367,6 @@ mod tests {
             variants: vec![variant_b],
             other_items: Vec::new(),
         };
-        let mut map = SourceMap::new();
-        let source = map.add_file("t.npt", "");
         let diagnostics = check_cycles(&hir, &field_types, &payload_types, source, &interner);
         assert_eq!(
             diagnostics.len(),

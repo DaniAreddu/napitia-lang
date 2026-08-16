@@ -2919,11 +2919,13 @@ mod tests {
     /// type, an empty body) -- only its own `id`/`name` matter for the
     /// item-identity tests below, which fail before this function's
     /// body is ever lowered.
-    fn minimal_function(id: ItemId, name: Symbol) -> HirFunction {
+    fn minimal_function(id: ItemId, name: Symbol, source: SourceId) -> HirFunction {
         HirFunction {
             id,
             name,
             name_span: Span::dummy(),
+            source,
+            public: true,
             params: vec![],
             return_type: None,
             uses: vec![],
@@ -2938,20 +2940,24 @@ mod tests {
         }
     }
 
-    fn minimal_record(id: ItemId, name: Symbol) -> crate::hir::HirRecord {
+    fn minimal_record(id: ItemId, name: Symbol, source: SourceId) -> crate::hir::HirRecord {
         crate::hir::HirRecord {
             id,
             name,
             span: Span::dummy(),
+            source,
+            public: true,
             fields: vec![],
         }
     }
 
-    fn minimal_variant(id: ItemId, name: Symbol) -> crate::hir::HirVariant {
+    fn minimal_variant(id: ItemId, name: Symbol, source: SourceId) -> crate::hir::HirVariant {
         crate::hir::HirVariant {
             id,
             name,
             span: Span::dummy(),
+            source,
+            public: true,
             cases: vec![],
         }
     }
@@ -2968,11 +2974,18 @@ mod tests {
     /// A trivial function whose body's tail is `tail_expr` -- used by
     /// the bare-`CaseRef` tests below, which need a real function body
     /// to place a hand-built `HirExpr::CaseRef` in.
-    fn function_with_tail(id: ItemId, name: Symbol, tail_expr: HirExpr) -> HirFunction {
+    fn function_with_tail(
+        id: ItemId,
+        name: Symbol,
+        tail_expr: HirExpr,
+        source: SourceId,
+    ) -> HirFunction {
         HirFunction {
             id,
             name,
             name_span: Span::dummy(),
+            source,
+            public: true,
             params: vec![],
             return_type: None,
             uses: vec![],
@@ -3010,6 +3023,7 @@ mod tests {
                 ItemId(1),
                 f,
                 case_ref(unknown_variant, 0, case_name),
+                source,
             )],
             records: vec![],
             variants: vec![],
@@ -3042,7 +3056,7 @@ mod tests {
         let variant_sym = interner.intern("Shape");
         let case_name = interner.intern("Empty");
         let variant_item = ItemId(0);
-        let variant = minimal_variant(variant_item, variant_sym);
+        let variant = minimal_variant(variant_item, variant_sym, source);
         // Case index 7 does not exist -- the variant declares no cases
         // at all.
         let module = HirModule {
@@ -3050,6 +3064,7 @@ mod tests {
                 ItemId(1),
                 f,
                 case_ref(variant_item, 7, case_name),
+                source,
             )],
             records: vec![],
             variants: vec![variant],
@@ -3089,6 +3104,8 @@ mod tests {
             id: variant_item,
             name: variant_sym,
             span: Span::dummy(),
+            source,
+            public: true,
             cases: vec![crate::hir::HirCase {
                 name: case_name,
                 span: Span::dummy(),
@@ -3105,6 +3122,7 @@ mod tests {
                 ItemId(1),
                 f,
                 case_ref(variant_item, 0, case_name),
+                source,
             )],
             records: vec![],
             variants: vec![variant],
@@ -3137,7 +3155,10 @@ mod tests {
         let b = interner.intern("B");
         let module = HirModule {
             functions: vec![],
-            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
+            records: vec![
+                minimal_record(ItemId(0), a, source),
+                minimal_record(ItemId(0), b, source),
+            ],
             variants: vec![],
             other_items: vec![],
         };
@@ -3172,7 +3193,10 @@ mod tests {
         let module = HirModule {
             functions: vec![],
             records: vec![],
-            variants: vec![minimal_variant(ItemId(0), a), minimal_variant(ItemId(0), b)],
+            variants: vec![
+                minimal_variant(ItemId(0), a, source),
+                minimal_variant(ItemId(0), b, source),
+            ],
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
@@ -3205,8 +3229,8 @@ mod tests {
         let g = interner.intern("g");
         let module = HirModule {
             functions: vec![
-                minimal_function(ItemId(0), f),
-                minimal_function(ItemId(0), g),
+                minimal_function(ItemId(0), f, source),
+                minimal_function(ItemId(0), g, source),
             ],
             records: vec![],
             variants: vec![],
@@ -3242,8 +3266,8 @@ mod tests {
         let b = interner.intern("B");
         let module = HirModule {
             functions: vec![],
-            records: vec![minimal_record(ItemId(0), a)],
-            variants: vec![minimal_variant(ItemId(0), b)],
+            records: vec![minimal_record(ItemId(0), a, source)],
+            variants: vec![minimal_variant(ItemId(0), b, source)],
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
@@ -3277,8 +3301,8 @@ mod tests {
         let a = interner.intern("A");
         let f = interner.intern("f");
         let module = HirModule {
-            functions: vec![minimal_function(ItemId(0), f)],
-            records: vec![minimal_record(ItemId(0), a)],
+            functions: vec![minimal_function(ItemId(0), f, source)],
+            records: vec![minimal_record(ItemId(0), a, source)],
             variants: vec![],
             other_items: vec![],
         };
@@ -3318,8 +3342,14 @@ mod tests {
         // Two independent collisions: records 0/0, then variants 1/1.
         let module = HirModule {
             functions: vec![],
-            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
-            variants: vec![minimal_variant(ItemId(1), c), minimal_variant(ItemId(1), d)],
+            records: vec![
+                minimal_record(ItemId(0), a, source),
+                minimal_record(ItemId(0), b, source),
+            ],
+            variants: vec![
+                minimal_variant(ItemId(1), c, source),
+                minimal_variant(ItemId(1), d, source),
+            ],
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
@@ -3762,6 +3792,8 @@ mod tests {
             id: variant_item,
             name: variant_sym,
             span: Span::dummy(),
+            source,
+            public: true,
             cases: vec![
                 crate::hir::HirCase {
                     name: wrap_name,
@@ -3821,6 +3853,8 @@ mod tests {
             id: ItemId(1),
             name: interner.intern("f"),
             name_span: Span::dummy(),
+            source,
+            public: true,
             params: vec![crate::hir::HirParam {
                 local: param_local,
                 name: variant_sym,

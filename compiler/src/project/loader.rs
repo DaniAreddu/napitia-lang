@@ -241,7 +241,7 @@ pub fn load_project(
 
     let ordered = match topological_order(&modules, &imports, &by_path) {
         Ok(order) => order,
-        Err(cycle_diagnostic) => return Err(vec![cycle_diagnostic]),
+        Err(cycle_diagnostic) => return Err(vec![*cycle_diagnostic]),
     };
     let modules = reorder(modules, &ordered);
     let entry_module = *by_path
@@ -296,7 +296,7 @@ fn topological_order(
     modules: &[LoadedModule],
     imports: &[ImportRef],
     by_path: &BTreeMap<String, ModuleId>,
-) -> Result<Vec<ModuleId>, Diagnostic> {
+) -> Result<Vec<ModuleId>, Box<Diagnostic>> {
     let dotted_by_id: BTreeMap<u32, String> =
         modules.iter().map(|m| (m.id.0, m.path.dotted())).collect();
 
@@ -394,13 +394,15 @@ fn topological_order(
         .first()
         .expect("a cycle requires at least one module")
         .source;
-    Err(Diagnostic::error(
-        codes::IMPORT_CYCLE,
-        any_source,
-        Span::dummy(),
-        format!("module import cycle: {}", witness.join(" -> ")),
-    )
-    .with_primary_label("cyclic module dependency"))
+    Err(Box::new(
+        Diagnostic::error(
+            codes::IMPORT_CYCLE,
+            any_source,
+            Span::dummy(),
+            format!("module import cycle: {}", witness.join(" -> ")),
+        )
+        .with_primary_label("cyclic module dependency"),
+    ))
 }
 
 #[cfg(test)]

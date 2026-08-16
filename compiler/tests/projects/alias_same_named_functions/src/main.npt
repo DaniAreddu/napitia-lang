@@ -1,0 +1,9 @@
+// `ops_a.calculate` and `ops_b.calculate` are two distinct functions
+// that happen to share a name -- aliasing brings both into scope at
+// once under distinct local names.
+import ops_a.calculate as inc;
+import ops_b.calculate as double;
+
+func main() -> i64 {
+    return inc(10) + double(10)
+}

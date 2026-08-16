@@ -491,3 +491,14 @@ fn an_alias_never_makes_two_same_named_types_nominally_compatible() {
     // this must still be rejected as an ordinary type mismatch.
     assert_project_check_fails_with("alias_nominal_mismatch", "T0001");
 }
+
+#[test]
+fn two_same_named_functions_are_callable_together_through_aliases() {
+    // `ops_a.calculate` and `ops_b.calculate` share a name; aliasing
+    // brings both into scope under distinct local names and each still
+    // calls its own, exact declaration (11 + 20).
+    let dir = project("alias_same_named_functions");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "31");
+}

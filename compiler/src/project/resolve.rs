@@ -78,9 +78,23 @@ fn resolve_one_import(
             .with_primary_label("no such module"),
         ));
     };
-    let (target_hir, target_source) = lowered_by_module
-        .get(&target_module)
-        .expect("dependency modules are lowered before the modules that import them");
+    // Ordinarily unreachable: `project::compile_project` never calls
+    // this with an import whose target module already failed to lower
+    // (it skips the whole importing module first, propagating the
+    // failure instead) -- but this is the one place a caller-side gap
+    // in that pre-check would otherwise turn into a panic on user input,
+    // so it fails as a diagnostic here too, defense in depth.
+    let Some((target_hir, target_source)) = lowered_by_module.get(&target_module) else {
+        return Err(Box::new(
+            Diagnostic::error(
+                codes::MODULE_NOT_FOUND,
+                importing_source,
+                import.span,
+                format!("module `{dotted}` could not be loaded"),
+            )
+            .with_primary_label("dependency failed to compile"),
+        ));
+    };
 
     let local_name = interner.intern(item_name);
 
@@ -318,6 +332,34 @@ mod tests {
         .unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0005");
+    }
+
+    #[test]
+    fn importing_from_a_discovered_but_never_lowered_module_is_a_diagnostic_not_a_panic() {
+        // Simulates the gap `project::compile_project`'s own pre-check
+        // now closes: `math` is discovered (present in `module_paths`)
+        // but never actually lowered (absent from `lowered`) -- e.g.
+        // because its own imports failed to resolve. Resolving an
+        // import that targets it must never panic, even if some future
+        // caller forgets that pre-check.
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let importing_source = map.add_file("main.npt", "");
+        let mut module_paths = HashMap::new();
+        module_paths.insert("math".to_string(), ModuleId(0));
+        let lowered = HashMap::new();
+
+        let imports = vec![import_ref(&["math", "add"], Span::dummy())];
+        let diags = resolve_imports(
+            &imports,
+            importing_source,
+            &module_paths,
+            &lowered,
+            &mut interner,
+        )
+        .unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0004");
     }
 
     #[test]

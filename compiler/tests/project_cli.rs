@@ -213,6 +213,47 @@ fn a_type_reachable_but_not_imported_is_t0006_not_a_successful_compile() {
 }
 
 #[test]
+fn a_failed_transitive_dependency_fails_atomically_instead_of_panicking() {
+    // `main` imports `a`, which imports `b.secret` (private) -- `a`'s
+    // own import resolution fails, so `a` is never lowered. `main`
+    // importing a *public* item from `a` used to reach `resolve_imports`
+    // with a target module that was never inserted into
+    // `lowered_by_module`, panicking instead of failing as a
+    // diagnostic. Must fail atomically: exit code 1, exactly the root
+    // M0006 diagnostic (no cascade, no panic, no partial NIR), and
+    // byte-identical across repeated runs.
+    let dir = project("failed_transitive_dependency");
+
+    let checked = napitia(&["check", &dir]);
+    assert_eq!(checked.status.code(), Some(1), "expected exit code 1");
+    let err = stderr(&checked);
+    assert!(
+        !err.contains("panicked at") && !err.contains("RUST_BACKTRACE"),
+        "expected no panic, got: {err}"
+    );
+    assert!(
+        err.contains("error[M0006]"),
+        "expected the root M0006 diagnostic, got: {err}"
+    );
+    assert_eq!(
+        err.matches("error[").count(),
+        1,
+        "expected exactly one diagnostic (no cascade), got: {err}"
+    );
+
+    let ir_output = napitia(&["ir", &dir]);
+    assert_eq!(ir_output.status.code(), Some(1));
+    assert!(
+        stdout(&ir_output).trim().is_empty(),
+        "expected no partial NIR on stdout, got: {}",
+        stdout(&ir_output)
+    );
+
+    let second = napitia(&["check", &dir]);
+    assert_eq!(stderr(&second), err, "expected byte-identical diagnostics");
+}
+
+#[test]
 fn an_unimported_private_type_cannot_be_exposed_through_a_public_function() {
     // `Secret` is private to `helper` *and* never imported into `main`
     // -- it must be rejected as unknown (T0006), never silently resolved

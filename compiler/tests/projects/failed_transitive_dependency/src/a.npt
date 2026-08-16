@@ -1,0 +1,5 @@
+import b.secret;
+
+public func thing() -> i64 {
+    return secret()
+}

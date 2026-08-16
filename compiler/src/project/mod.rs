@@ -80,8 +80,14 @@ pub fn compile_project(
     // dependency's already-lowered HirModule; `loaded.modules` is
     // already in dependency-first order, so every module's own
     // dependencies are guaranteed present by the time it's this
-    // module's turn.
+    // module's turn -- *provided* every dependency actually succeeded.
+    // `failed_modules` tracks every module whose own import resolution
+    // failed (so it was never inserted into `lowered_by_module`), so a
+    // dependent can be skipped safely instead of asking
+    // `resolve_imports` to look up a dependency that was never lowered.
     let mut lowered_by_module: HashMap<module::ModuleId, (HirModule, SourceId)> = HashMap::new();
+    let mut failed_modules: std::collections::HashSet<module::ModuleId> =
+        std::collections::HashSet::new();
     let mut ids = hir::IdCursor::default();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
@@ -92,6 +98,25 @@ pub fn compile_project(
             .flatten()
             .map(|import_ref| (*import_ref).clone())
             .collect();
+
+        // A module that imports from a dependency which itself already
+        // failed to lower cannot be resolved either -- skip it (and
+        // propagate the failure to whatever imports *this* module in
+        // turn) without manufacturing a second diagnostic on top of the
+        // root cause already recorded when the dependency failed. This
+        // is what keeps a cascading failure from ever reaching
+        // `resolve_imports` with a target module that was never
+        // actually lowered.
+        let depends_on_failed_module = owned_imports.iter().any(|import| {
+            module::ModulePath::split_import_path(&import.segments)
+                .and_then(|(path, _)| module_path_by_dotted.get(&path.dotted()))
+                .is_some_and(|target| failed_modules.contains(target))
+        });
+        if depends_on_failed_module {
+            failed_modules.insert(module.id);
+            continue;
+        }
+
         let resolved_imports = match resolve::resolve_imports(
             &owned_imports,
             module.source,
@@ -102,6 +127,7 @@ pub fn compile_project(
             Ok(resolved) => resolved,
             Err(mut diags) => {
                 diagnostics.append(&mut diags);
+                failed_modules.insert(module.id);
                 continue;
             }
         };
@@ -127,6 +153,18 @@ pub fn compile_project(
     // Merged in the same dependency-first order `loaded.modules` is
     // already in -- deterministic, and never dependent on a HashMap's
     // iteration order.
+    //
+    // The `expect` below is a genuine internal invariant, not a
+    // user-triggerable one: `diagnostics` was just checked non-empty
+    // above, and every module inserted into `failed_modules` -- whether
+    // directly (its own import resolution failed) or transitively (it
+    // depended on an already-failed module) -- always did so alongside
+    // pushing at least one diagnostic onto `diagnostics` first. So an
+    // empty `diagnostics` here implies an empty `failed_modules`, which
+    // implies every discovered module was actually lowered and inserted
+    // above. The three-module cascading-failure regression below
+    // (`fails_atomically_instead_of_panicking_on_a_transitively_failed_dependency`)
+    // is what enforces this at the public boundary.
     let mut merged = HirModule::default();
     let mut entry_source = None;
     for module in &loaded.modules {

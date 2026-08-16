@@ -35,7 +35,18 @@ mod codes {
     pub const UNKNOWN_VARIANT_CASE: &str = "R0012";
     pub const WRONG_VARIANT: &str = "R0013";
     pub const DUPLICATE_PATTERN_BINDING: &str = "R0014";
+    pub const PATTERN_TOO_DEEP: &str = "R0015";
 }
+
+/// `lower_pattern` recurses once per `Variant(...)` sub-pattern nesting
+/// level, on this pass's own native call stack. The parser's own
+/// `MAX_PATTERN_NESTING_DEPTH` bound already keeps any real parser
+/// output shallow enough that this can never fire in the normal
+/// pipeline -- but `lower_module` is a public entry point a caller can
+/// invoke directly with a hand-built `ast::Module` bypassing the parser
+/// entirely, so this stage needs its own independent bound rather than
+/// trusting that guarantee from a stage it doesn't call.
+const MAX_PATTERN_NESTING_DEPTH: usize = 200;
 
 /// Which kind of item a name in the type namespace refers to -- needed
 /// to tell "unknown record type" (named a variant, or nothing) apart
@@ -888,6 +899,31 @@ impl<'a> Lowering<'a> {
         scopes: &mut Scopes,
         bound: &mut HashMap<Symbol, Span>,
     ) -> HirPattern {
+        self.lower_pattern_at_depth(pattern, scopes, bound, 0)
+    }
+
+    fn lower_pattern_at_depth(
+        &mut self,
+        pattern: &ast::Pattern,
+        scopes: &mut Scopes,
+        bound: &mut HashMap<Symbol, Span>,
+        depth: usize,
+    ) -> HirPattern {
+        if depth > MAX_PATTERN_NESTING_DEPTH {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PATTERN_TOO_DEEP,
+                    self.source,
+                    pattern.span(),
+                    "pattern is nested too deeply to resolve",
+                )
+                .with_primary_label("pattern is too complex"),
+            );
+            return HirPattern::Wildcard {
+                id: self.fresh_pattern_id(),
+                span: pattern.span(),
+            };
+        }
         match pattern {
             ast::Pattern::Wildcard { span } => HirPattern::Wildcard {
                 id: self.fresh_pattern_id(),
@@ -921,7 +957,7 @@ impl<'a> Lowering<'a> {
             ast::Pattern::Variant { name, args, span } => {
                 let args = args
                     .iter()
-                    .map(|a| self.lower_pattern(a, scopes, bound))
+                    .map(|a| self.lower_pattern_at_depth(a, scopes, bound, depth + 1))
                     .collect();
                 HirPattern::Variant {
                     id: self.fresh_pattern_id(),
@@ -1303,6 +1339,63 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "R0014");
+    }
+
+    #[test]
+    fn deeply_nested_hand_built_pattern_fails_lowering_with_r0015_not_a_stack_overflow() {
+        // The parser's own MAX_PATTERN_NESTING_DEPTH bound keeps any
+        // real parser output shallow enough that lower_pattern's own
+        // bound can never fire through the normal pipeline -- so this
+        // exercises it the only way possible: a hand-built ast::Pattern
+        // that bypasses the parser entirely, the same defense-in-depth
+        // posture nir::lower's tests already use for hand-built HIR.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let case_name = interner.intern("Wrap");
+        let mut lowering = Lowering {
+            source,
+            interner: &interner,
+            diagnostics: Vec::new(),
+            functions_by_name: HashMap::new(),
+            type_names: HashMap::new(),
+            record_fields: HashMap::new(),
+            variant_cases: HashMap::new(),
+            case_lookup: HashMap::new(),
+            next_item_id: 0,
+            next_local_id: 0,
+            next_expr_id: 0,
+            next_pattern_id: 0,
+        };
+        let depth = MAX_PATTERN_NESTING_DEPTH + 50;
+        let mut pattern = ast::Pattern::Wildcard {
+            span: Span::dummy(),
+        };
+        for _ in 0..depth {
+            pattern = ast::Pattern::Variant {
+                name: ast::Ident {
+                    symbol: case_name,
+                    span: Span::dummy(),
+                },
+                args: vec![pattern],
+                span: Span::dummy(),
+            };
+        }
+        let mut scopes = Scopes::new();
+        let mut bound = HashMap::new();
+        // The diagnostic is what signals the real problem -- the
+        // deepest call's Wildcard fallback only ever becomes one arg
+        // deep inside the still-Variant-shaped result the outer,
+        // within-limit levels legitimately produce, exactly like
+        // typeck's check_pattern_at_depth.
+        let _ = lowering.lower_pattern(&pattern, &mut scopes, &mut bound);
+        assert_eq!(
+            lowering.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            lowering.diagnostics
+        );
+        assert_eq!(lowering.diagnostics[0].code, "R0015");
     }
 
     #[test]

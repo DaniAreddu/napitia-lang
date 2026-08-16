@@ -671,25 +671,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn budget_exceeded_is_reported_not_hung() {
-        let mut budget = 2usize;
-        let outcome = is_useful(
-            &[],
-            &[ResolvedPattern::Wildcard],
-            &[Ty::Bool],
-            &variant_space(vec![]),
-            &mut budget,
-        );
-        // With a tiny budget this may or may not exceed depending on
-        // recursion depth for this trivial case; assert it never panics
-        // and returns one of the three defined outcomes.
-        assert!(matches!(
-            outcome,
-            Usefulness::Useful(_) | Usefulness::NotUseful | Usefulness::BudgetExceeded
-        ));
-    }
-
     /// `Rec { Cons(Rec), Nil }` nested 50 levels deep against a budget
     /// far smaller than that -- `is_useful` recurses once per nesting
     /// level (each `Cons` descends into its own payload), consuming one

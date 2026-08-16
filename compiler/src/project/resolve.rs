@@ -96,9 +96,18 @@ fn resolve_one_import(
         ));
     };
 
-    let local_name = interner.intern(item_name);
+    // The target module is always searched by the item's own *declared*
+    // name. `local_name` (what the importing module will call it) is
+    // the same thing for now; a future change lets an `as` clause make
+    // them differ.
+    let declared_name = interner.intern(item_name);
+    let local_name = declared_name;
 
-    if let Some(function) = target_hir.functions.iter().find(|f| f.name == local_name) {
+    if let Some(function) = target_hir
+        .functions
+        .iter()
+        .find(|f| f.name == declared_name)
+    {
         if !function.public {
             return Err(Box::new(private_item_diagnostic(
                 importing_source,
@@ -117,7 +126,7 @@ fn resolve_one_import(
             declared_span: function.name_span,
         });
     }
-    if let Some(record) = target_hir.records.iter().find(|r| r.name == local_name) {
+    if let Some(record) = target_hir.records.iter().find(|r| r.name == declared_name) {
         if !record.public {
             return Err(Box::new(private_item_diagnostic(
                 importing_source,
@@ -138,6 +147,7 @@ fn resolve_one_import(
             local_name,
             kind: ImportedItemKind::Record {
                 item: record.id,
+                declared_name: record.name,
                 fields,
             },
             import_span: import.span,
@@ -145,7 +155,7 @@ fn resolve_one_import(
             declared_span: record.span,
         });
     }
-    if let Some(variant) = target_hir.variants.iter().find(|v| v.name == local_name) {
+    if let Some(variant) = target_hir.variants.iter().find(|v| v.name == declared_name) {
         if !variant.public {
             return Err(Box::new(private_item_diagnostic(
                 importing_source,
@@ -166,6 +176,7 @@ fn resolve_one_import(
             local_name,
             kind: ImportedItemKind::Variant {
                 item: variant.id,
+                declared_name: variant.name,
                 cases,
             },
             import_span: import.span,
@@ -173,7 +184,11 @@ fn resolve_one_import(
             declared_span: variant.span,
         });
     }
-    if let Some(other) = target_hir.other_items.iter().find(|o| o.name == local_name) {
+    if let Some(other) = target_hir
+        .other_items
+        .iter()
+        .find(|o| o.name == declared_name)
+    {
         let kind_text = match other.kind {
             OtherItemKind::Protocol => "protocol",
             OtherItemKind::Extend => "extend block",

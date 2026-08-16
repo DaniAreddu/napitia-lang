@@ -88,12 +88,22 @@ pub enum ImportedItemKind {
     Function(ItemId),
     Record {
         item: ItemId,
+        /// The record's own declared name -- e.g. `User`, never a local
+        /// `as` alias -- carried so a `HirType::Aggregate` reference
+        /// through this import can be tagged with the *canonical* name
+        /// (see `resolve_type_ref`), never the alias it happened to be
+        /// spelled with at this particular annotation. `Ty::Named`'s own
+        /// display symbol, and every diagnostic/textual-NIR name, must
+        /// stay alias-independent (`rfcs/0007`).
+        declared_name: Symbol,
         /// `(field name, declaration index, is_public)`, in declaration
         /// order.
         fields: Vec<(Symbol, usize, bool)>,
     },
     Variant {
         item: ItemId,
+        /// See `Record::declared_name`.
+        declared_name: Symbol,
         /// `(case name, declaration index)`, in declaration order.
         cases: Vec<(Symbol, usize)>,
     },
@@ -170,9 +180,14 @@ struct Lowering<'a> {
     diagnostics: Vec<Diagnostic>,
     functions_by_name: HashMap<Symbol, ItemId>,
     /// The module's type namespace: every declared `record`/`variant`
-    /// name (primitives live entirely in `typeck`/`nir::lower`'s own
-    /// copy of this concept, since they need no `ItemId`).
-    type_names: HashMap<Symbol, (ItemId, TypeNameKind)>,
+    /// name, or the local (possibly aliased) name of one imported --
+    /// primitives live entirely in `typeck`/`nir::lower`'s own copy of
+    /// this concept, since they need no `ItemId`. The third element is
+    /// the item's own canonical declared name (identical to the key
+    /// unless this entry came from an aliased import), used to build
+    /// every `HirType::Aggregate` so `Ty::Named`'s display symbol never
+    /// depends on which local spelling resolved it (`rfcs/0007`).
+    type_names: HashMap<Symbol, (ItemId, TypeNameKind, Symbol)>,
     /// Per-record field name -> declaration index, for resolving a
     /// record literal's field initializers.
     record_fields: HashMap<ItemId, HashMap<Symbol, usize>>,
@@ -223,9 +238,15 @@ impl<'a> Lowering<'a> {
                 ImportedItemKind::Function(item) => {
                     self.functions_by_name.insert(imported.local_name, item);
                 }
-                ImportedItemKind::Record { item, fields } => {
-                    self.type_names
-                        .insert(imported.local_name, (item, TypeNameKind::Record));
+                ImportedItemKind::Record {
+                    item,
+                    declared_name,
+                    fields,
+                } => {
+                    self.type_names.insert(
+                        imported.local_name,
+                        (item, TypeNameKind::Record, declared_name),
+                    );
                     let mut field_indices = HashMap::new();
                     let mut field_public = HashMap::new();
                     for (name, index, is_public) in fields {
@@ -235,9 +256,15 @@ impl<'a> Lowering<'a> {
                     self.record_fields.insert(item, field_indices);
                     self.imported_record_field_public.insert(item, field_public);
                 }
-                ImportedItemKind::Variant { item, cases } => {
-                    self.type_names
-                        .insert(imported.local_name, (item, TypeNameKind::Variant));
+                ImportedItemKind::Variant {
+                    item,
+                    declared_name,
+                    cases,
+                } => {
+                    self.type_names.insert(
+                        imported.local_name,
+                        (item, TypeNameKind::Variant, declared_name),
+                    );
                     let mut case_indices = HashMap::new();
                     for (name, index) in cases {
                         case_indices.insert(name, index);
@@ -275,14 +302,14 @@ impl<'a> Lowering<'a> {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, r.name, id);
                     self.type_names
-                        .insert(r.name.symbol, (id, TypeNameKind::Record));
+                        .insert(r.name.symbol, (id, TypeNameKind::Record, r.name.symbol));
                     record_decls.push((id, r));
                 }
                 ast::Item::Variant(v) => {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, v.name, id);
                     self.type_names
-                        .insert(v.name.symbol, (id, TypeNameKind::Variant));
+                        .insert(v.name.symbol, (id, TypeNameKind::Variant, v.name.symbol));
                     variant_decls.push((id, v));
                 }
                 ast::Item::Protocol(p) => {
@@ -579,13 +606,17 @@ impl<'a> Lowering<'a> {
             };
         }
         match self.type_names.get(&ty.name.symbol) {
-            Some(&(item, kind)) => HirType::Aggregate {
+            Some(&(item, kind, declared_name)) => HirType::Aggregate {
                 item,
                 kind: match kind {
                     TypeNameKind::Record => AggregateKind::Record,
                     TypeNameKind::Variant => AggregateKind::Variant,
                 },
-                name: ty.name.symbol,
+                // The item's own canonical name, never the local
+                // (possibly aliased) spelling this annotation happened
+                // to use -- `Ty::Named`'s display symbol must be
+                // alias-independent (`rfcs/0007`).
+                name: declared_name,
                 span: ty.name.span,
             },
             None => HirType::Unresolved {
@@ -917,10 +948,15 @@ impl<'a> Lowering<'a> {
     /// from this module's own `type_names`/`case_lookup` tables, so the
     /// name is always present.
     fn variant_name(&self, item: ItemId) -> &'a str {
+        // The *local* name (the map's own key -- an alias if this
+        // variant was imported under one), not the canonical declared
+        // name: this is used to tell the user what to write in a
+        // qualified path (`Variant.Case`) right here in this module, and
+        // the original name may not even be in scope if it was aliased.
         let symbol = self
             .type_names
             .iter()
-            .find(|(_, (id, kind))| *id == item && *kind == TypeNameKind::Variant)
+            .find(|(_, (id, kind, _))| *id == item && *kind == TypeNameKind::Variant)
             .map(|(name, _)| *name)
             .expect("internal invariant: every case_lookup entry names a known variant");
         self.interner.resolve(symbol)
@@ -940,7 +976,7 @@ impl<'a> Lowering<'a> {
         if let ast::Expr::Ident(base_ident) = base
             && scopes.lookup(base_ident.symbol).is_none()
             && !self.functions_by_name.contains_key(&base_ident.symbol)
-            && let Some(&(item, kind)) = self.type_names.get(&base_ident.symbol)
+            && let Some(&(item, kind, _)) = self.type_names.get(&base_ident.symbol)
         {
             return match kind {
                 TypeNameKind::Variant => self.resolve_qualified_case(item, *base_ident, name),
@@ -1038,8 +1074,8 @@ impl<'a> Lowering<'a> {
         scopes: &mut Scopes,
     ) -> HirExpr {
         let record = match self.type_names.get(&type_name.symbol) {
-            Some(&(item, TypeNameKind::Record)) => item,
-            Some(&(_, TypeNameKind::Variant)) => {
+            Some(&(item, TypeNameKind::Record, _)) => item,
+            Some(&(_, TypeNameKind::Variant, _)) => {
                 let text = self.interner.resolve(type_name.symbol);
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1397,6 +1433,7 @@ mod tests {
                     local_name: i64_symbol,
                     kind: ImportedItemKind::Record {
                         item: ItemId(0),
+                        declared_name: interner.intern("Something"),
                         fields: Vec::new(),
                     },
                     import_span: Span::dummy(),
@@ -1997,6 +2034,7 @@ mod tests {
                     local_name: record_name,
                     kind: ImportedItemKind::Record {
                         item: ItemId(1),
+                        declared_name: record_name,
                         fields: vec![(field_x, 0, true), (field_y, 1, false)],
                     },
                     import_span: Span::dummy(),

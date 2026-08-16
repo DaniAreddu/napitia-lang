@@ -1238,16 +1238,25 @@ impl<'a> Checker<'a> {
         }
 
         // A pattern whose declared shape didn't match its scrutinee (an
-        // arity mismatch, an unknown case, ...) already has its own
-        // diagnostic; the coverage matrix built from a fabricated
-        // stand-in for it can't be trusted to prove exhaustiveness or
-        // unreachability, so that analysis -- and its own diagnostics --
-        // are skipped entirely rather than risk a misleading cascade.
-        let unreachable: Vec<usize> = if any_pattern_invalid {
-            Vec::new()
-        } else {
-            self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span)
-        };
+        // arity mismatch, an unknown case, a mismatched literal, ...)
+        // already has its own diagnostic; the coverage matrix built
+        // from a fabricated stand-in for it can't be trusted to prove
+        // exhaustiveness or unreachability, so that analysis -- and its
+        // own diagnostics -- are skipped entirely rather than risk a
+        // misleading cascade.
+        // Exhaustiveness/unreachability analysis is skipped entirely
+        // (never even called) whenever any pattern is invalid -- and so
+        // is the result-type join below: an arm whose own pattern is
+        // already known-invalid tells us nothing trustworthy about
+        // which arms genuinely belong together, so joining their body
+        // types anyway could report a second, misleading T0001 on top
+        // of the pattern's own diagnostic for what is really one
+        // problem.
+        if any_pattern_invalid {
+            return Ty::Error;
+        }
+        let unreachable =
+            self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
 
         let mut arm_result: Option<Ty> = None;
         for (i, body_ty) in body_types.into_iter().enumerate() {
@@ -1521,16 +1530,16 @@ impl<'a> Checker<'a> {
             }
             HirPattern::Int { value, span, .. } => {
                 let literal_ty = self.fresh_default(Ty::I64, VarKind::Integer);
-                self.unify_report(
+                let valid = self.unify_report(
                     &resolved_scrutinee,
                     &literal_ty,
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                (ResolvedPattern::Literal(LiteralKey::Int(*value)), true)
+                (ResolvedPattern::Literal(LiteralKey::Int(*value)), valid)
             }
             HirPattern::Str { value, span, .. } => {
-                self.unify_report(
+                let valid = self.unify_report(
                     &resolved_scrutinee,
                     &Ty::Str,
                     *span,
@@ -1538,26 +1547,26 @@ impl<'a> Checker<'a> {
                 );
                 (
                     ResolvedPattern::Literal(LiteralKey::Str(value.clone())),
-                    true,
+                    valid,
                 )
             }
             HirPattern::Char { value, span, .. } => {
-                self.unify_report(
+                let valid = self.unify_report(
                     &resolved_scrutinee,
                     &Ty::Char,
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                (ResolvedPattern::Literal(LiteralKey::Char(*value)), true)
+                (ResolvedPattern::Literal(LiteralKey::Char(*value)), valid)
             }
             HirPattern::Bool { value, span, .. } => {
-                self.unify_report(
+                let valid = self.unify_report(
                     &resolved_scrutinee,
                     &Ty::Bool,
                     *span,
                     "pattern does not match the scrutinee's type",
                 );
-                (ResolvedPattern::Bool(*value), true)
+                (ResolvedPattern::Bool(*value), valid)
             }
         }
     }
@@ -1605,7 +1614,14 @@ impl<'a> Checker<'a> {
     /// found Y" message. Callers comparing two peer values with no
     /// canonical direction (binary operator operands, if/else branches,
     /// match arms) may pass either order.
-    fn unify_report(&mut self, expected: &Ty, actual: &Ty, span: Span, message: &str) {
+    /// Returns whether unification succeeded -- most callers only need
+    /// the diagnostic-on-mismatch side effect and ignore this, but a
+    /// pattern's own literal arms need to know a failure occurred so a
+    /// mismatched literal pattern can mark itself invalid the same way
+    /// an arity mismatch or unknown case already does, rather than
+    /// reporting T0001 while still being treated as a fully valid,
+    /// analyzable pattern.
+    fn unify_report(&mut self, expected: &Ty, actual: &Ty, span: Span, message: &str) -> bool {
         let (a, b) = (expected, actual);
         if let Err((ra, rb)) = unify(&mut self.ctx, a, b) {
             self.diagnostics.push(Diagnostic::error(
@@ -1618,6 +1634,9 @@ impl<'a> Checker<'a> {
                     self.display_for_diagnostic(&rb)
                 ),
             ));
+            false
+        } else {
+            true
         }
     }
 
@@ -2148,6 +2167,85 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0002");
+    }
+
+    #[test]
+    fn integer_pattern_against_a_bool_scrutinee_invalidates_the_pattern() {
+        // A literal pattern's own unify_report failing must mark it
+        // invalid -- not just report T0001 while still being treated as
+        // a fully analyzable pattern.
+        let diags = check("func f(x: bool) -> i64 { return match x { 1 => 10, _ => 0 } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn bool_pattern_against_an_integer_scrutinee_invalidates_the_pattern() {
+        let diags = check("func f(x: i64) -> i64 { return match x { true => 1, _ => 0 } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn string_pattern_against_a_char_scrutinee_invalidates_the_pattern() {
+        let diags = check("func f(x: char) -> i64 { return match x { \"y\" => 1, _ => 0 } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn char_pattern_against_a_string_scrutinee_invalidates_the_pattern() {
+        let diags = check("func f(x: str) -> i64 { return match x { 'y' => 1, _ => 0 } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn invalid_literal_pattern_with_a_mismatched_arm_body_reports_only_its_own_diagnostic() {
+        // The first arm's mismatched literal pattern (bool vs. the i64
+        // scrutinee) invalidates the whole match, so the second arm's
+        // bool body -- which would otherwise mismatch the third arm's
+        // i64 body if joined -- must never also produce its own
+        // "match arms must have the same type" T0001 on top of the
+        // pattern's.
+        let diags = check(
+            "func f(x: i64) -> i64 { \
+                 return match x { true => false, 2 => 2, _ => 0 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+    }
+
+    #[test]
+    fn invalid_literal_pattern_with_no_catch_all_suppresses_exhaustiveness_cascade() {
+        // No wildcard arm at all would ordinarily be non-exhaustive
+        // (T0017) -- but the coverage matrix built from this mismatched
+        // literal pattern can't be trusted, so exhaustiveness analysis
+        // must be skipped entirely rather than report a misleading
+        // T0017 on top of the pattern's own T0001.
+        let diags = check("func f(x: bool) -> i64 { return match x { 1 => 10 } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(!diags.iter().any(|d| d.code == "T0017"));
+        assert!(!diags.iter().any(|d| d.code == "T0018"));
+    }
+
+    #[test]
+    fn nested_mismatched_literal_pattern_is_a_diagnostic_not_a_panic() {
+        let diags = check(
+            "variant Outer { A(bool) } \
+             func test(o: Outer) -> i64 { \
+                 return match o { \
+                     A(1) => 0, \
+                     _ => 1 \
+                 } \
+             }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert!(!diags.iter().any(|d| d.code == "T0017"));
+        assert!(!diags.iter().any(|d| d.code == "T0018"));
     }
 
     #[test]

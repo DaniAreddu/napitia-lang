@@ -481,3 +481,13 @@ fn two_same_named_record_types_are_usable_together_through_aliases() {
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "42");
 }
+
+#[test]
+fn an_alias_never_makes_two_same_named_types_nominally_compatible() {
+    // Same two same-named, same-shaped `User` types as above, but this
+    // time a value of the aliased `SalesUser` is passed where
+    // `admin.user`'s own `user_id` expects its own `User` -- aliasing is
+    // only a local spelling, never a bridge between distinct types, so
+    // this must still be rejected as an ordinary type mismatch.
+    assert_project_check_fails_with("alias_nominal_mismatch", "T0001");
+}

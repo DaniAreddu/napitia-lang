@@ -1,0 +1,11 @@
+// `sales.user.User` (aliased as `SalesUser`) and `admin.user.User` have
+// an identical name and an identical field shape, but are still two
+// distinct nominal types -- passing a `SalesUser` where `admin.user`'s
+// own `user_id` expects its own `User` must be rejected, alias or not.
+import sales.user.User as SalesUser;
+import admin.user.user_id;
+
+func main() -> i64 {
+    value s = SalesUser { id: 40 };
+    return user_id(s)
+}

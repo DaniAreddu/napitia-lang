@@ -655,6 +655,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_alias_identifier_is_a_diagnostic_not_a_panic() {
+        let (module, diags) = parse("import sales.user.User as; func f() -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic");
+        assert_eq!(diags[0].code, "P0001");
+        // Recovery must still reach the function after the malformed
+        // import, not abandon the rest of the file.
+        assert!(
+            module
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(_))),
+            "expected recovery to still parse the function: {module:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_alias_token_recovers() {
+        let (module, diags) = parse("import sales.user.User as 42; func f() -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic");
+        assert_eq!(diags[0].code, "P0001");
+        assert!(
+            module
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(_))),
+            "expected recovery to still parse the function: {module:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_tokens_after_an_alias_are_rejected_not_silently_accepted() {
+        let (module, diags) =
+            parse("import sales.user.User as SalesUser extra; func f() -> i64 { return 0 }");
+        assert!(
+            !diags.is_empty(),
+            "a trailing token after the alias must be diagnosed"
+        );
+        assert!(diags.iter().all(|d| d.code == "P0001"));
+        // The import itself, alias included, must still have parsed --
+        // only the unexpected trailing token (and whatever follows it
+        // until recovery resynchronizes) is rejected.
+        let Item::Import(i) = &module.items[0] else {
+            panic!("expected import")
+        };
+        assert!(i.alias.is_some(), "expected the alias to still parse");
+    }
+
+    #[test]
     fn parses_value_and_mutable_bindings() {
         let (module, diags) = parse("func f() { value a = 1; mutable b = 2; }");
         assert!(diags.is_empty());

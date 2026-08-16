@@ -225,3 +225,13 @@ unchanged.
   is nothing meaningful an import could resolve to.
 - A project is still flattened into one NIR module before verification and
   execution; there is no per-module incremental compilation or caching.
+- NIR lowering's own internal-invariant diagnostics (`I0001`/`I0002`) are not
+  individually source-tracked across a merged multi-module HIR the way
+  `typeck`'s are; this is safe only because those codes are defense-in-depth
+  checks that typeck already guarantees can never fire on a project that
+  reached NIR lowering with zero diagnostics.
+- The case-only module path collision check (`M0009`) is exercised by a unit
+  test constructing `ModulePath`s directly, not by an end-to-end fixture with
+  two files differing only by case — on a case-insensitive filesystem (the
+  default on Windows and macOS), such a fixture cannot exist on disk in the
+  first place.

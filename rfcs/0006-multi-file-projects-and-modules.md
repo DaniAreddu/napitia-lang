@@ -71,9 +71,17 @@ already-lowered `HirModule`s afterward.
   types (two different `User` records, say) resolve to two different
   `ItemId`s without collision: nothing downstream ever re-derives an
   `ItemId` from a bare surface name against a project-wide table.
-  `typeck`/`nir::lower` consult `HirType` directly (an `Unresolved` name
-  is checked against the primitive namespace, or reported `T0006`) —
-  neither stage keeps its own name-to-`ItemId` map at all.
+  Primitive names take precedence: `hir::lower` checks the primitive
+  namespace *before* the module's own aggregate namespace, so a local or
+  imported `record`/`variant` literally named `i64`, `bool`, etc. never
+  shadows the primitive in a type position — matching the rule typeck
+  itself always applied before project support existed. (Construction
+  syntax — `TypeName { .. }`, `Variant.Case` — is a separate lookup and
+  unaffected by this; there is no primitive record/variant construction
+  to shadow.) `typeck`/`nir::lower` consult `HirType` directly (an
+  `Unresolved` name is checked against the primitive namespace, or
+  reported `T0006`) — neither stage keeps its own name-to-`ItemId` map at
+  all.
 - **Cross-file definition locations**: `Diagnostic::Label` gains its own
   `SourceId` (previously implicitly the diagnostic's own source), so an
   import diagnostic can point at both the import site and the original
@@ -86,20 +94,34 @@ already-lowered `HirModule`s afterward.
 2. Discover every module reachable from the entry module: parse it, scan
    its `import` declarations, resolve each import's module path to a file
    path, parse that file if not already loaded, repeat until no new module
-   is discovered. This is a breadth-first walk, but the *set* of modules it
-   finds is order-independent — only the reachable set matters, not the
-   order modules were visited in.
+   is discovered. This is a worklist traversal (LIFO, so depth-first in
+   practice, not breadth-first), but the *set* of modules it finds is
+   order-independent — only the reachable set matters, not the order
+   modules were visited in.
 3. Compute a deterministic topological order over the discovered module
    graph directly (a module is ready once every module *it* imports has
    already been placed — no reverse-then-flip pass), always advancing the
    lexicographically-smallest ready module path when more than one is
-   ready. Any module left over is part of, or only reachable from, a
-   cycle; an iterative DFS (explicit stack, choosing both the start node
-   and each node's edges by dotted path) isolates the actual cycle
-   members — never a module merely reachable *from* one — and reports one
+   ready. Any module left over still has positive out-degree into the
+   residual set (at least one of its own imports never resolves either),
+   and is either itself part of a cycle or a tail feeding into one; an
+   iterative DFS (explicit stack, choosing both the start node and each
+   node's edges by dotted path) isolates the actual cycle members — never
+   a tail module merely reachable *from* one — and reports one
    deterministic witness path, pointing at the real `import` statement
    that closes it.
-4. Lower modules **in that topological order**. Before lowering a module,
+4. Before any module is lowered (so before step 5 below), the configured
+   entry module's own AST is preflighted for exactly one function item
+   named `main`: zero is `M0010` ("no `main` function"), more than one is
+   a single deterministic `M0010` (anchored to the entry module's own
+   source, labeling both the duplicate and the first declaration) — never
+   `hir::lower`'s ordinary same-name-collision `R0001`, and never two
+   diagnostics for the same condition. This check only ever looks at
+   functions literally named `main` *in the entry module*; every other
+   duplicate declaration (a different name, `main` colliding with a
+   differently-kinded item, or `main` declared in a non-entry module) is
+   untouched and still goes through `hir::lower`'s own `R0001` check.
+5. Lower modules **in that topological order**. Before lowering a module,
    resolve every one of its `import` statements against the
    *already-lowered* HIR of the modules it depends on (which, by
    construction, were all lowered earlier — and a module that failed to
@@ -118,12 +140,12 @@ already-lowered `HirModule`s afterward.
    *reference* in this module's own declarations (`hir::HirType`, above)
    is also resolved against this same just-seeded namespace, right here,
    before this module is merged with any other.
-5. Concatenate every module's already-lowered `HirModule` (functions,
+6. Concatenate every module's already-lowered `HirModule` (functions,
    records, variants, other-items) into one combined `HirModule`, in the
    same topological order, and feed that unchanged into the existing
    `typeck::check_module` and `nir::lower_module`. Because every item's
    `ItemId` is already globally unique, every cross-module *name*
-   reference was already resolved to a real `ItemId` during step 4, and
+   reference was already resolved to a real `ItemId` during step 5, and
    every aggregate *type* reference was too (via `HirType`), the merged
    module is exactly as self-consistent as a single hand-written file —
    typeck and NIR lowering consult that already-resolved identity
@@ -132,9 +154,9 @@ already-lowered `HirModule`s afterward.
    modules' declarations through. This is the "flattening the final
    project into one verified NIR module" option the milestone brief
    explicitly allows.
-6. The entry point is the `main` function declared in the **entry
-   module's own** `HirFunction` list, found by `ItemId` once step 5
-   completes — never a name lookup over the merged module, which would
+7. Since step 4 already guaranteed the entry module declares exactly one
+   `main`, the entry point is that function, found by `ItemId` once step
+   6 completes — never a name lookup over the merged module, which would
    silently accept a `main` in the wrong module. `typeck`'s own
    entry-signature check (`main` takes no parameters) is scoped to this
    same `ItemId`, so a differently-shaped `main` declared in any other
@@ -145,7 +167,7 @@ already-lowered `HirModule`s afterward.
 ### Visibility
 
 - Item-level (`public func`/`record`/`variant`): checked once, at import
-  resolution (step 4 above) — an import naming a private item never
+  resolution (step 5 above) — an import naming a private item never
   reaches HIR lowering at all, so "private access is rejected before NIR
   lowering" holds trivially.
 - Field-level: `HirField` now carries its own `public` flag (previously
@@ -183,6 +205,13 @@ partial TOML parser risks silently accepting malformed manifests the real
 format would reject, which is exactly the failure mode this milestone
 must not introduce).
 
+`manifest_path` may be a bare relative path (`napitia.toml`, run from
+inside the project directory), `./napitia.toml`, an absolute path, or a
+directory (in which case `napitia.toml` inside it is used) — `Path::parent`
+returns an *empty*, not absent, parent for a bare relative path, which is
+normalized to the current directory the same way a genuinely parent-less
+path already was, before canonicalization ever runs.
+
 Path containment is canonical, not textual: the project directory,
 `source-root`, the entry file, and every individually discovered module
 file are each canonicalized (resolving `..` and any symlink) and checked
@@ -214,12 +243,12 @@ final segment is always the imported item, every segment before it is the
 module path. An import needs at least two segments (one module segment,
 one item segment) — `import math;` alone is `M0003`.
 
-Module paths are normalized (path separators, not `\`/`/` directly) before
-comparison so a project behaves identically built from a Windows or Unix
-checkout. Two distinct files whose module paths differ only by ASCII case
-(`Math.npt` vs `math.npt`) are `M0009` — real on case-sensitive filesystems,
-and exactly the ambiguity that would silently corrupt on a case-insensitive
-one.
+Module paths are compared by their normalized dotted form, never by the
+literal file path text, so a project behaves identically whether checked
+out on Windows or Unix. Two distinct files whose module paths differ only
+by ASCII case (`Math.npt` vs `math.npt`) are `M0009` — real on
+case-sensitive filesystems, and exactly the ambiguity that would silently
+corrupt on a case-insensitive one.
 
 ## Diagnostic codes
 
@@ -236,8 +265,8 @@ M0007  duplicate or conflicting import (same import twice, two imports
        conflicting with an imported name)
 M0008  module import cycle
 M0009  duplicate/case-colliding module path
-M0010  invalid or missing project entry point (no `main` in the entry
-       module, or more than one)
+M0010  invalid entry point: the entry module declares zero, or more than
+       one, function named `main` (checked before any lowering runs)
 M0011  inaccessible record field (construction or access, from outside
        the declaring module)
 M0012  private type leaked through a public API
@@ -249,10 +278,15 @@ M0012  private type leaked through a public API
 `run` now accept an optional path:
 
 - omitted → current directory;
-- a path ending `.npt` → legacy single-file mode, byte-for-byte the same
-  pipeline as before;
+- a path ending `.npt` → legacy single-file mode: the same
+  lex/parse/`hir::lower`/`typeck`/`nir` pipeline single-file compilation
+  always used, observably unchanged for any program that predates project
+  support (this milestone's own regressions confirm it, including the
+  primitive-precedence fix above, which single-file mode goes through the
+  same code path for);
 - a directory → look for `napitia.toml` inside it;
-- any other path → treated as a manifest file directly.
+- any other path → treated as a manifest file directly (see above for the
+  forms this path itself may take).
 
 `run` executes the entry module's `main`; exit codes (`0`/`1`/`2`) are
 unchanged.
@@ -277,3 +311,14 @@ unchanged.
   two files differing only by case — on a case-insensitive filesystem (the
   default on Windows and macOS), such a fixture cannot exist on disk in the
   first place.
+- Two legal, differently-declared cross-module items sharing a surface
+  name (two modules each declaring their own `User` record, say) are
+  fully distinct by `ItemId` for every purpose that matters at
+  compile/run time: typeck, NIR lowering, and the interpreter all key on
+  identity, never on the name. The current *textual* NIR printer (`nir
+  ir`, debugging output only) has no notion of cross-module qualification
+  in its display format, though, so it can print the same surface name
+  for two genuinely distinct items — a cosmetic ambiguity in debug output
+  only, not a soundness gap. Fixing it needs a deliberate NIR-printer
+  display-format decision (e.g. qualifying by declaring module or by
+  `ItemId`) that is out of scope for this milestone.

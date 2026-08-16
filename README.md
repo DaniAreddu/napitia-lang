@@ -162,9 +162,14 @@ cargo run --manifest-path compiler/Cargo.toml -- run path/to/project/napitia.tom
 cargo run --manifest-path compiler/Cargo.toml -- run path/to/project/src/main.npt
 ```
 
+The manifest path itself can also be a bare relative path — `cd` into a
+project directory and run `napitia check napitia.toml` — or `./napitia.toml`,
+not just an absolute path.
+
 The third form is legacy single-file mode: an explicit `.npt` path always
-compiles just that one file, byte-for-byte the same pipeline as before
-this milestone, even if a `napitia.toml` happens to sit next to it.
+compiles just that one file through the same lex/parse/HIR/typeck/NIR
+pipeline single-file compilation always used, even if a `napitia.toml`
+happens to sit next to it.
 
 See `rfcs/0006-multi-file-projects-and-modules.md` for the full
 architecture and the complete list of project-level diagnostic codes.

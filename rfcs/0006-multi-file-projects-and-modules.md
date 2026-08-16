@@ -315,10 +315,10 @@ unchanged.
   name (two modules each declaring their own `User` record, say) are
   fully distinct by `ItemId` for every purpose that matters at
   compile/run time: typeck, NIR lowering, and the interpreter all key on
-  identity, never on the name. The current *textual* NIR printer (`nir
-  ir`, debugging output only) has no notion of cross-module qualification
-  in its display format, though, so it can print the same surface name
-  for two genuinely distinct items — a cosmetic ambiguity in debug output
-  only, not a soundness gap. Fixing it needs a deliberate NIR-printer
-  display-format decision (e.g. qualifying by declaring module or by
-  `ItemId`) that is out of scope for this milestone.
+  identity, never on the name. The current *textual* NIR printer
+  (`napitia ir`, debugging output only) has no notion of cross-module
+  qualification in its display format, though, so it can print the same
+  surface name for two genuinely distinct items — a cosmetic ambiguity in
+  debug output only, not a soundness gap. Fixing it needs a deliberate
+  NIR-printer display-format decision (e.g. qualifying by declaring
+  module or by `ItemId`) that is out of scope for this milestone.

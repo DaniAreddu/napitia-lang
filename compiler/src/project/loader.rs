@@ -957,7 +957,7 @@ mod tests {
         );
         // Each `w{i}` exports a distinctly-named item (`thing{i}`) --
         // `import` brings an item in under its own name with no
-        // aliasing, so importing 2000 different modules' *same* name
+        // aliasing, so importing WIDTH different modules' *same* name
         // into one importing module would just be a separate `M0007`
         // diagnostic instead of exercising the cycle logic at all.
         let mut a_source = String::new();

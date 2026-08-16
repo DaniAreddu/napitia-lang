@@ -31,6 +31,12 @@ pub struct ImportRef {
     pub importing_module: ModuleId,
     pub segments: Vec<String>,
     pub span: Span,
+    /// The `as <alias>` clause's own name and span, if the import wrote
+    /// one (`rfcs/0007`) -- `project::resolve` uses this text as the
+    /// item's local name instead of its last path segment. Kept as
+    /// resolved text (like `segments`), not a raw `Symbol`, so this type
+    /// stays decoupled from any one `Interner` instance.
+    pub alias: Option<(String, Span)>,
 }
 
 /// Every module reachable from the entry module, in a deterministic
@@ -299,10 +305,14 @@ pub fn load_project(
                         queue.push((target_module, Some((source, import.span))));
                     }
                 }
+                let alias = import
+                    .alias
+                    .map(|a| (interner.resolve(a.symbol).to_string(), a.span));
                 imports.push(ImportRef {
                     importing_module: id,
                     segments,
                     span: import.span,
+                    alias,
                 });
             }
         }

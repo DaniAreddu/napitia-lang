@@ -97,11 +97,20 @@ fn resolve_one_import(
     };
 
     // The target module is always searched by the item's own *declared*
-    // name. `local_name` (what the importing module will call it) is
-    // the same thing for now; a future change lets an `as` clause make
-    // them differ.
+    // name -- an alias never changes what a dotted import path actually
+    // names in the target module, only what the importing module calls
+    // it afterward.
     let declared_name = interner.intern(item_name);
-    let local_name = declared_name;
+    // An `as <alias>` clause makes the alias the item's local name in
+    // the importing module instead of its own declared name (rfcs/0007)
+    // -- the declaration itself, and its identity, are untouched; only
+    // the name this module refers to it by changes. Without an alias,
+    // behavior is exactly Alpha 0.1.2's: the local name is the item's
+    // own declared name.
+    let local_name = match &import.alias {
+        Some((alias_text, _)) => interner.intern(alias_text),
+        None => declared_name,
+    };
 
     if let Some(function) = target_hir
         .functions
@@ -271,6 +280,14 @@ mod tests {
             importing_module: ModuleId(1),
             segments: segments.iter().map(|s| s.to_string()).collect(),
             span,
+            alias: None,
+        }
+    }
+
+    fn aliased_import_ref(segments: &[&str], alias: &str, span: Span) -> ImportRef {
+        ImportRef {
+            alias: Some((alias.to_string(), span)),
+            ..import_ref(segments, span)
         }
     }
 
@@ -297,6 +314,32 @@ mod tests {
         .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved[0].kind, ImportedItemKind::Function(_)));
+    }
+
+    #[test]
+    fn an_aliased_import_uses_the_alias_as_its_local_name() {
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let (target_hir, target_source) =
+            lowered_target(&mut map, &mut interner, "public func add() -> i64 { 0 }");
+        let importing_source = map.add_file("main.npt", "");
+        let mut module_paths = HashMap::new();
+        module_paths.insert("math".to_string(), ModuleId(0));
+        let mut lowered = HashMap::new();
+        lowered.insert(ModuleId(0), (target_hir, target_source));
+
+        let imports = vec![aliased_import_ref(&["math", "add"], "plus", Span::dummy())];
+        let resolved = resolve_imports(
+            &imports,
+            importing_source,
+            &module_paths,
+            &lowered,
+            &mut interner,
+        )
+        .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].local_name, interner.intern("plus"));
+        assert_ne!(resolved[0].local_name, interner.intern("add"));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+[package]
+name = "hello"
+
+[project]
+source-root = "src"
+entry = "main.npt"

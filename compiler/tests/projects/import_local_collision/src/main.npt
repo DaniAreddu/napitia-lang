@@ -1,0 +1,9 @@
+import math.add;
+
+func add(left: i64, right: i64) -> i64 {
+    return 0
+}
+
+func main() -> i64 {
+    return add(1, 2)
+}

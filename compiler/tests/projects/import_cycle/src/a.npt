@@ -1,0 +1,5 @@
+import b.helper;
+
+public func thing() -> i64 {
+    return helper()
+}

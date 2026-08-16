@@ -1,0 +1,6 @@
+import math.add;
+import math.add;
+
+func main() -> i64 {
+    return add(1, 2)
+}

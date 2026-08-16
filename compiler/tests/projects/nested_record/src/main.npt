@@ -1,0 +1,9 @@
+import models.user.User;
+import models.user.make_user;
+import models.user.user_id;
+
+func main() -> i64 {
+    value direct = User { id: 3 };
+    value made = make_user(9);
+    return user_id(direct) + user_id(made)
+}

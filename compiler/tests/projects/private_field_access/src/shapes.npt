@@ -1,0 +1,8 @@
+public record Point {
+    public x: i64,
+    y: i64,
+}
+
+public func make_point() -> Point {
+    Point { x: 1, y: 2 }
+}

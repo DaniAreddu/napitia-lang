@@ -1,0 +1,11 @@
+public variant Shape {
+    Circle(i64),
+    Square(i64),
+}
+
+public func area(s: Shape) -> i64 {
+    match s {
+        Circle(r) => r * r,
+        Square(side) => side * side,
+    }
+}

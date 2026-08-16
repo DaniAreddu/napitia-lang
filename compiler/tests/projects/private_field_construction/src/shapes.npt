@@ -1,0 +1,4 @@
+public record Point {
+    public x: i64,
+    y: i64,
+}

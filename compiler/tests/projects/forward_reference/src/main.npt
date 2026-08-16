@@ -1,0 +1,5 @@
+import a.thing;
+
+func main() -> i64 {
+    return thing()
+}

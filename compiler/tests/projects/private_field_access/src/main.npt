@@ -1,0 +1,7 @@
+import shapes.Point;
+import shapes.make_point;
+
+func main() -> i64 {
+    value p = make_point();
+    return p.y
+}

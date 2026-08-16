@@ -488,6 +488,16 @@ V0023  variant.switch does not cover every case exactly once, or targets
        an invalid block
 V0024  variant.payload used outside its case's refinement, or its
        resolved type disagrees with the case's declared payload type
+V0025  variant.switch scrutinee's resolved type disagrees with the
+       variant its cases belong to
+V0026  two records in the same module declare the same ItemId
+V0027  two variants in the same module declare the same ItemId
+V0028  the same ItemId is used by two different kinds of module-level
+       item (e.g. a function and a record)
+V0029  a Ty::Named refers to an ItemId matching no declared record or
+       variant in this module
+V0030  a Ty::Named's carried display symbol disagrees with its own
+       declaration's name
 ```
 
 Record-field-type, payload-arity, and payload-type errors are reported
@@ -505,8 +515,8 @@ that list, not merged into it.
 Kept out deliberately, each with its own rejection rather than silent
 partial support:
 
-- **Field mutation** (`user.age = 20;`) — `T0019`.
-- **Record/variant equality** (`==`/`!=`) — `T0024`.
+- **Field mutation** (`user.age = 20;`) — `T0015`.
+- **Record/variant equality** (`==`/`!=`) — `T0016`.
 - **Pattern guards**, **or-patterns**, **record destructuring patterns**,
   **slice patterns**, **range patterns**, **mutable pattern bindings** —
   none of these have surface grammar in Alpha 0.1.1 at all (the parser

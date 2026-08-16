@@ -31,6 +31,7 @@ pub(crate) mod codes {
     pub const INVALID_ENTRY: &str = "M0010";
     pub const INACCESSIBLE_FIELD: &str = "M0011";
     pub const PRIVATE_TYPE_LEAKED: &str = "M0012";
+    pub const DUPLICATE_PHYSICAL_MODULE: &str = "M0013";
 }
 
 /// A fully compiled, verified project, ready to print or execute.

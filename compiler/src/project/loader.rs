@@ -191,6 +191,14 @@ pub fn load_project(
     let mut modules: Vec<LoadedModule> = Vec::new();
     let mut by_path: BTreeMap<String, ModuleId> = BTreeMap::new();
     let mut by_case_folded: BTreeMap<String, String> = BTreeMap::new();
+    // Maps each module's canonical (symlinks-resolved) file to the first
+    // module path discovered at that file, plus where that discovery
+    // came from -- so a second, different module path resolving to the
+    // very same physical file (a symlink, a junction, or two import
+    // paths that both happen to land on it) is caught even though
+    // neither `by_path` nor `by_case_folded` would ever notice: both are
+    // keyed by the *logical* path string, not the file it resolves to.
+    let mut by_canonical_file: BTreeMap<PathBuf, (String, SourceId, Span)> = BTreeMap::new();
     let mut imports: Vec<ImportRef> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     // Each queued module path carries the `(source, span)` of the
@@ -264,6 +272,43 @@ pub fn load_project(
             );
             continue;
         }
+        if let Some((existing_dotted, existing_source, existing_span)) =
+            by_canonical_file.get(&canonical_file)
+            && *existing_dotted != dotted
+        {
+            // Named in a fixed (alphabetical) order in the message text
+            // itself, regardless of which of the two was actually
+            // discovered first -- traversal is depth-first over
+            // whichever import statement happened to be written first,
+            // so "first discovered" is not a stable notion to report by.
+            let (first, second) = if *existing_dotted < dotted {
+                (existing_dotted.as_str(), dotted.as_str())
+            } else {
+                (dotted.as_str(), existing_dotted.as_str())
+            };
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::DUPLICATE_PHYSICAL_MODULE,
+                    not_found_source,
+                    not_found_span,
+                    format!(
+                        "modules `{first}` and `{second}` both load the same physical file `{}`",
+                        canonical_file.display()
+                    ),
+                )
+                .with_primary_label("also loaded under a different module path here")
+                .with_label_in(
+                    *existing_source,
+                    *existing_span,
+                    format!("`{existing_dotted}` already loaded from here"),
+                ),
+            );
+            continue;
+        }
+        by_canonical_file.insert(
+            canonical_file.clone(),
+            (dotted.clone(), not_found_source, not_found_span),
+        );
         let content = match std::fs::read_to_string(&canonical_file) {
             Ok(content) => content,
             Err(_) => {
@@ -1245,5 +1290,111 @@ entry = "\\\\server\\share\\main.npt"
         let mut paths: Vec<String> = loaded.modules.iter().map(|m| m.path.dotted()).collect();
         paths.sort();
         assert_eq!(paths, vec!["main".to_string(), "math".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_making_two_module_paths_load_the_same_physical_file_is_m0013() {
+        // `admin/user.npt` is a real file; `sales/user.npt` is a symlink
+        // to that very same file, so both `admin.user` and `sales.user`
+        // are discovered as *different logical modules* that would
+        // silently share one physical source -- exactly the identity
+        // hazard `rfcs/0007` requires be rejected, not just the
+        // unrelated "escapes source-root" containment check.
+        let project = TempProject::new("symlink_duplicate_physical_module");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import admin.user.User;\nimport sales.user.User as SalesUser;\n\
+             func main() -> i64 { return 0 }\n",
+        );
+        project.write(
+            "src/admin/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+        std::fs::create_dir_all(project.dir.join("src/sales")).unwrap();
+        std::os::unix::fs::symlink(
+            project.dir.join("src/admin/user.npt"),
+            project.dir.join("src/sales/user.npt"),
+        )
+        .unwrap();
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0013");
+        assert!(diags[0].message.contains("admin.user"));
+        assert!(diags[0].message.contains("sales.user"));
+        assert_eq!(diags[0].labels.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_duplicate_physical_module_diagnostic_names_the_same_pair_regardless_of_which_import_is_discovered_first()
+     {
+        // Traversal is depth-first from `main.npt`'s own import list, so
+        // swapping which import is written first changes *discovery
+        // order* -- the reported pair of module names must not change
+        // with it.
+        let first = TempProject::new("symlink_duplicate_order_a");
+        first.write("napitia.toml", MANIFEST);
+        first.write(
+            "src/main.npt",
+            "import admin.user.User;\nimport sales.user.User as SalesUser;\n\
+             func main() -> i64 { return 0 }\n",
+        );
+        first.write(
+            "src/admin/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+        std::fs::create_dir_all(first.dir.join("src/sales")).unwrap();
+        std::os::unix::fs::symlink(
+            first.dir.join("src/admin/user.npt"),
+            first.dir.join("src/sales/user.npt"),
+        )
+        .unwrap();
+
+        let second = TempProject::new("symlink_duplicate_order_b");
+        second.write("napitia.toml", MANIFEST);
+        second.write(
+            "src/main.npt",
+            "import sales.user.User as SalesUser;\nimport admin.user.User;\n\
+             func main() -> i64 { return 0 }\n",
+        );
+        second.write(
+            "src/admin/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+        std::fs::create_dir_all(second.dir.join("src/sales")).unwrap();
+        std::os::unix::fs::symlink(
+            second.dir.join("src/admin/user.npt"),
+            second.dir.join("src/sales/user.npt"),
+        )
+        .unwrap();
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags_a = load_project(&first.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let diags_b = load_project(&second.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags_a.len(), 1);
+        assert_eq!(diags_b.len(), 1);
+        assert_eq!(diags_a[0].code, "M0013");
+        assert_eq!(diags_b[0].code, "M0013");
+        // Compare only the module-name pairing, not the full message --
+        // the two projects live under different temp directories, so
+        // the physical file path embedded in each message legitimately
+        // differs even though the reported pairing must not.
+        let prefix = "modules `admin.user` and `sales.user` both load the same physical file";
+        assert!(
+            diags_a[0].message.starts_with(prefix),
+            "unexpected message: {}",
+            diags_a[0].message
+        );
+        assert!(
+            diags_b[0].message.starts_with(prefix),
+            "unexpected message: {}",
+            diags_b[0].message
+        );
     }
 }

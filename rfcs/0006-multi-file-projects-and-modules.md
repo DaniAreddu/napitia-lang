@@ -59,10 +59,21 @@ already-lowered `HirModule`s afterward.
   their existing flat `u32` shape (no crate-wide type change), but a
   project compilation threads one shared counter across every module's HIR
   lowering pass, in dependency (topological) order, so two items in
-  different modules can never collide by reusing the same numeric id. This
-  is "the smallest architecture that preserves invariant 1" the milestone
-  brief asks for: no new wrapper type, no per-module id namespace to keep
-  in sync, just a counter that is never reset between modules.
+  different modules can never collide by reusing the same numeric id.
+- **`hir::HirType`**: every aggregate type *reference* (a record/variant
+  named in a function parameter, return type, record field, variant case
+  payload, `value`/`mutable` binding annotation, or cast target) is
+  resolved to this — either `Aggregate { item: ItemId, .. }` or
+  `Unresolved { name, .. }` — by `hir::lower` itself, against the
+  *declaring* module's own namespace (locally declared names plus
+  whatever it successfully imported), before that module is ever merged
+  with any other. This is what makes two modules' identically-named
+  types (two different `User` records, say) resolve to two different
+  `ItemId`s without collision: nothing downstream ever re-derives an
+  `ItemId` from a bare surface name against a project-wide table.
+  `typeck`/`nir::lower` consult `HirType` directly (an `Unresolved` name
+  is checked against the primitive namespace, or reported `T0006`) —
+  neither stage keeps its own name-to-`ItemId` map at all.
 - **Cross-file definition locations**: `Diagnostic::Label` gains its own
   `SourceId` (previously implicitly the diagnostic's own source), so an
   import diagnostic can point at both the import site and the original
@@ -79,36 +90,55 @@ already-lowered `HirModule`s afterward.
    finds is order-independent — only the reachable set matters, not the
    order modules were visited in.
 3. Compute a deterministic topological order over the discovered module
-   graph (Kahn's algorithm, always picking the lexicographically-smallest
-   ready module path when more than one is ready) and reject any module
-   left over as a cycle, reporting one deterministic witness path.
+   graph directly (a module is ready once every module *it* imports has
+   already been placed — no reverse-then-flip pass), always advancing the
+   lexicographically-smallest ready module path when more than one is
+   ready. Any module left over is part of, or only reachable from, a
+   cycle; an iterative DFS (explicit stack, choosing both the start node
+   and each node's edges by dotted path) isolates the actual cycle
+   members — never a module merely reachable *from* one — and reports one
+   deterministic witness path, pointing at the real `import` statement
+   that closes it.
 4. Lower modules **in that topological order**. Before lowering a module,
    resolve every one of its `import` statements against the
    *already-lowered* HIR of the modules it depends on (which, by
-   construction, were all lowered earlier): look up the target module,
-   look up the item by name (regardless of visibility, to distinguish
-   "not found" from "private"), check it is `public` and an importable
-   kind (function/record/variant — protocols and extensions are
-   explicitly rejected, not silently ignored), and seed the importing
-   module's own name/type/field/case namespaces with the resolved
-   `ItemId` before that module's own declarations are processed — so a
-   local declaration reusing an imported name is caught by the same
-   duplicate-detection path a same-file duplicate already goes through,
-   just with a different diagnostic code and a cross-file label.
+   construction, were all lowered earlier — and a module that failed to
+   lower is tracked explicitly, so a dependent is skipped safely instead
+   of being asked to resolve against a dependency that was never actually
+   lowered): look up the target module, look up the item by name
+   (regardless of visibility, to distinguish "not found" from "private"),
+   check it is `public` and an importable kind (function/record/variant —
+   protocols and extensions are explicitly rejected, not silently
+   ignored), and seed the importing module's own name/type/field/case
+   namespaces with the resolved `ItemId` before that module's own
+   declarations are processed — so a local declaration reusing an
+   imported name is caught by the same duplicate-detection path a
+   same-file duplicate already goes through, just with a different
+   diagnostic code and a cross-file label. Every aggregate type
+   *reference* in this module's own declarations (`hir::HirType`, above)
+   is also resolved against this same just-seeded namespace, right here,
+   before this module is merged with any other.
 5. Concatenate every module's already-lowered `HirModule` (functions,
    records, variants, other-items) into one combined `HirModule`, in the
    same topological order, and feed that unchanged into the existing
    `typeck::check_module` and `nir::lower_module`. Because every item's
-   `ItemId` is already globally unique and every cross-module reference
-   was already resolved to a real `ItemId` during step 4, the merged
+   `ItemId` is already globally unique, every cross-module *name*
+   reference was already resolved to a real `ItemId` during step 4, and
+   every aggregate *type* reference was too (via `HirType`), the merged
    module is exactly as self-consistent as a single hand-written file —
-   typeck and NIR lowering need no project-awareness of their own. This is
-   the "flattening the final project into one verified NIR module" option
-   the milestone brief explicitly allows.
+   typeck and NIR lowering consult that already-resolved identity
+   directly and keep no name-to-`ItemId` table of their own, so there is
+   nothing left for a project-wide symbol table to silently collide two
+   modules' declarations through. This is the "flattening the final
+   project into one verified NIR module" option the milestone brief
+   explicitly allows.
 6. The entry point is the `main` function declared in the **entry
    module's own** `HirFunction` list, found by `ItemId` once step 5
    completes — never a name lookup over the merged module, which would
-   silently accept a `main` in the wrong module. The interpreter gained
+   silently accept a `main` in the wrong module. `typeck`'s own
+   entry-signature check (`main` takes no parameters) is scoped to this
+   same `ItemId`, so a differently-shaped `main` declared in any other
+   module is just an ordinary function. The interpreter gained
    `run_item`/`call_item` (by `ItemId`) alongside its existing name-based
    `run`/`call`, which single-file compilation keeps using unchanged.
 
@@ -151,9 +181,21 @@ wrong-typed fields are all `M0001`. Parsing uses the `toml` crate (a
 single, standard, actively-maintained dependency — writing a bespoke
 partial TOML parser risks silently accepting malformed manifests the real
 format would reject, which is exactly the failure mode this milestone
-must not introduce). `entry` is resolved relative to `source-root`; `..`
-segments and any path canonicalizing outside the project directory are
-`M0002`.
+must not introduce).
+
+Path containment is canonical, not textual: the project directory,
+`source-root`, the entry file, and every individually discovered module
+file are each canonicalized (resolving `..` and any symlink) and checked
+against their required container's own canonical form — `source-root`
+inside the project directory, the entry file inside `source-root`, every
+module file inside `source-root` — *before* that file is ever read, so a
+symlink can't be followed to find out what it points to before its
+containment is established. `source-root`/`entry` text is also rejected
+outright (never silently reinterpreted as relative) if it is a Unix
+absolute path, a Windows drive-qualified path, or a UNC path, regardless
+of which platform the compiler itself is running on. Any of these
+failures is `M0002`; a module that is contained but genuinely does not
+exist on disk is `M0004`.
 
 ## Module paths
 

@@ -1,6 +1,6 @@
 # Spec 0002: Syntax
 
-- Status: Partially implemented (Alpha 0.1.1)
+- Status: Partially implemented (Alpha 0.1.2)
 
 The grammar below uses the provisional vocabulary accepted in
 `rfcs/0004-language-independence.md`. It replaces an earlier version of
@@ -29,10 +29,17 @@ Item = FunctionDecl
      ;
 ```
 
-A source file is one module. Multi-file modules (`module` declarations
-spanning files, visibility enforcement across files) are not implemented
-in this milestone; `public`/`private` are parsed but only checked as
-placeholders (see `spec/0003`).
+A source file is one module — there is no `module` declaration, and one
+module never spans multiple files. As of Alpha 0.1.2, a `napitia.toml`
+manifest can name a `source-root` and an `entry` file so a compilation
+spans every `.npt` file reachable by `import` from the entry module (see
+`rfcs/0006` for the full multi-file architecture); legacy single-file
+compilation still works unchanged by naming a `.npt` file directly.
+`public`/`private` are enforced for real, both within a module (see
+`spec/0003`) and across modules: an item, and each record field
+independently, is only reachable from another module if it is `public`
+*and* that module actually imported it — reachability through some other
+already-imported name in the same module is not enough (`rfcs/0006`).
 
 ### Imports
 
@@ -41,10 +48,14 @@ ImportDecl = "import" Path ";" ;
 Path       = IDENT { "." IDENT } ;
 ```
 
-`import` is parsed but does not yet resolve to real module contents in
-this milestone — there is only ever one module (the file being compiled).
-Paths are dotted (`a.b.c`), not double-colon-separated, matching the
-dotted capability paths used by `uses` (see below) rather than Rust's
+In project (multi-file) compilation, `import a.b.c;` brings the single
+public item `c`, declared in module `a.b`, into the importing module's
+own namespace by that unqualified name — every segment before the last is
+the module path, the last is the imported item (`rfcs/0006`). In legacy
+single-file compilation an `import` is accepted syntactically but has
+nothing to resolve against, since there is only ever the one module being
+compiled. Paths are dotted (`a.b.c`), not double-colon-separated, matching
+the dotted capability paths used by `uses` (see below) rather than Rust's
 `::` path syntax.
 
 ### Functions

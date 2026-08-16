@@ -56,6 +56,20 @@ Compiler stages, in pipeline order:
 source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> (interpreter | future backend)
 ```
 
+Each `.npt` file goes through that pipeline once. A multi-file project
+(`project/`, `rfcs/0006`) is a layer in front of it, not a replacement:
+`project::loader` discovers and parses every module reachable from the
+manifest's entry point and orders them dependency-first; `project::resolve`
+resolves one module's `import`s against its already-lowered dependencies;
+`hir::lower` then runs once per module (resolving every aggregate type
+*reference* — not just names — against that module's own namespace,
+before it is ever merged with another); only after every module is
+individually lowered are they concatenated into one `HirModule` and fed,
+unchanged, into the same `typeck`/`nir` stages single-file compilation
+already uses. Anything that needs to know "which file did this come from"
+belongs in `project::mod`'s orchestration, never smuggled into
+`typeck`/`nir` as project-awareness they don't otherwise need.
+
 Each stage lives in its own module and communicates failure through
 `diagnostics`, never through panics. A panic in any stage given arbitrary
 user input is a bug. Reserve `panic!`/`unreachable!`/`.expect(...)` for

@@ -1398,6 +1398,16 @@ impl<'a> Checker<'a> {
                     return (ResolvedPattern::Wildcard, false);
                 };
                 let Some(info) = self.variants.get(item).cloned() else {
+                    // `resolved_scrutinee` is `Ty::Named` but names a
+                    // *record*, not a variant (e.g. a variant pattern
+                    // written against a record-typed scrutinee) -- just
+                    // as incompatible as the non-`Ty::Named` case just
+                    // above, and must be diagnosed here too: silently
+                    // returning `valid: false` with no diagnostic would
+                    // let `check` report zero errors while `pattern_case`
+                    // stays unpopulated for this pattern, so NIR lowering
+                    // later has nothing to classify it by.
+                    self.push_incompatible_pattern(*span, &resolved_scrutinee);
                     for a in args {
                         self.check_pattern(a, &Ty::Error);
                     }
@@ -1959,6 +1969,21 @@ mod tests {
     #[test]
     fn variant_pattern_against_a_non_variant_scrutinee_is_a_diagnostic() {
         let diags = check("func f(x: i64) -> i64 { return match x { Found(v) => v } }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0021");
+    }
+
+    #[test]
+    fn variant_pattern_against_a_record_scrutinee_is_a_diagnostic() {
+        // A record is `Ty::Named` too, so this must not silently fall
+        // through the `Ty::Named`-but-not-a-variant branch of
+        // `check_pattern` with no diagnostic at all -- that would let
+        // `check` report zero errors for a construct that can never
+        // reach the interpreter (there's no case to classify it by).
+        let diags = check(
+            "record Point { x: i64 } \
+             func f(p: Point) -> i64 { return match p { Found(v) => v } }",
+        );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0021");
     }

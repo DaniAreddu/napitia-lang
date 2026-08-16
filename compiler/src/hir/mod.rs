@@ -10,7 +10,9 @@
 
 pub mod lower;
 
-pub use lower::lower_module;
+pub use lower::{
+    IdCursor, ImportedItem, ImportedItemKind, lower_module, lower_module_with_imports,
+};
 
 use crate::lexer::IntBase;
 use crate::source::{SourceId, Span};

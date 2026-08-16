@@ -65,6 +65,7 @@ pub struct IdCursor {
 /// a concrete declaration in another (already-lowered) module. Built by
 /// `project::resolve`, which is the only place that knows how to turn
 /// an `import` statement's dotted path into one of these.
+#[derive(Debug)]
 pub struct ImportedItem {
     pub local_name: Symbol,
     pub kind: ImportedItemKind,
@@ -81,6 +82,7 @@ pub struct ImportedItem {
     pub declared_span: Span,
 }
 
+#[derive(Debug)]
 pub enum ImportedItemKind {
     Function(ItemId),
     Record {

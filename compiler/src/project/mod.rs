@@ -3,6 +3,7 @@
 //! (`rfcs/0006`).
 
 pub mod manifest;
+pub mod module;
 
 pub(crate) mod codes {
     pub const INVALID_MANIFEST: &str = "M0001";

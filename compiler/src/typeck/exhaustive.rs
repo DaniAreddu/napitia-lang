@@ -50,6 +50,21 @@ type Row = Vec<ResolvedPattern>;
 /// diagnostic (`T0019`), never a hang or a stack overflow.
 pub const MAX_USEFULNESS_STEPS: usize = 100_000;
 
+/// `is_useful` recurses once per occurrence position it consumes from
+/// `row` -- for a single deeply-nested `Variant` pattern, that is once
+/// per nesting level, on this function's own native call stack.
+/// `MAX_USEFULNESS_STEPS` bounds total *work* across an entire match's
+/// analysis, not any one call's recursion *depth*: a single
+/// pathologically nested row could still recurse up to
+/// `MAX_USEFULNESS_STEPS` native stack frames deep before that counter
+/// ever reaches zero, which is nowhere near a safe call-stack depth.
+/// `typeck::check_pattern`'s own bound already keeps every
+/// `ResolvedPattern` this module receives through the normal pipeline
+/// within this same limit, but `is_useful` is a public function a
+/// caller can invoke directly with a hand-built row bypassing that
+/// protection, so it needs its own independent depth bound too.
+const MAX_RECURSION_DEPTH: usize = 200;
+
 pub struct VariantSpace {
     /// Case index -> that case's payload types, in declaration order.
     pub payloads: HashMap<ItemId, Vec<Vec<Ty>>>,
@@ -93,6 +108,21 @@ pub fn is_useful(
     variants: &VariantSpace,
     budget: &mut usize,
 ) -> Usefulness {
+    is_useful_at_depth(matrix, row, occurrence_types, variants, budget, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_useful_at_depth(
+    matrix: &[Row],
+    row: &[ResolvedPattern],
+    occurrence_types: &[Ty],
+    variants: &VariantSpace,
+    budget: &mut usize,
+    depth: usize,
+) -> Usefulness {
+    if depth > MAX_RECURSION_DEPTH {
+        return Usefulness::BudgetExceeded;
+    }
     if *budget == 0 {
         return Usefulness::BudgetExceeded;
     }
@@ -135,7 +165,14 @@ pub fn is_useful(
                 .unwrap_or_default();
             let mut new_tys = payload_tys;
             new_tys.extend_from_slice(rest_tys);
-            match is_useful(&specialized, &new_row, &new_tys, variants, budget) {
+            match is_useful_at_depth(
+                &specialized,
+                &new_row,
+                &new_tys,
+                variants,
+                budget,
+                depth + 1,
+            ) {
                 Usefulness::Useful(mut witness) => {
                     // `witness` always has at least `arity` leading
                     // entries in the well-formed case (one per payload
@@ -156,7 +193,7 @@ pub fn is_useful(
         }
         ResolvedPattern::Bool(b) => {
             let specialized = specialize_bool(matrix, *b);
-            match is_useful(&specialized, rest, rest_tys, variants, budget) {
+            match is_useful_at_depth(&specialized, rest, rest_tys, variants, budget, depth + 1) {
                 Usefulness::Useful(mut witness) => {
                     witness.insert(0, ResolvedPattern::Bool(*b));
                     Usefulness::Useful(witness)
@@ -166,7 +203,7 @@ pub fn is_useful(
         }
         ResolvedPattern::Literal(lit) => {
             let specialized = specialize_literal(matrix, lit);
-            match is_useful(&specialized, rest, rest_tys, variants, budget) {
+            match is_useful_at_depth(&specialized, rest, rest_tys, variants, budget, depth + 1) {
                 Usefulness::Useful(mut witness) => {
                     witness.insert(0, ResolvedPattern::Literal(lit.clone()));
                     Usefulness::Useful(witness)
@@ -185,13 +222,13 @@ pub fn is_useful(
         // An entirely-absent constructor's specialized matrix is empty,
         // so it is immediately found useful with no wasted work.
         ResolvedPattern::Wildcard => match space(ty0, variants) {
-            Space::Bool => try_each_bool(matrix, rest, rest_tys, variants, budget),
+            Space::Bool => try_each_bool(matrix, rest, rest_tys, variants, budget, depth),
             Space::Variant(item, cases) => {
-                try_each_case(matrix, item, cases, rest, rest_tys, variants, budget)
+                try_each_case(matrix, item, cases, rest, rest_tys, variants, budget, depth)
             }
             Space::Open => {
                 let defaulted = default_matrix(matrix);
-                match is_useful(&defaulted, rest, rest_tys, variants, budget) {
+                match is_useful_at_depth(&defaulted, rest, rest_tys, variants, budget, depth + 1) {
                     Usefulness::Useful(mut witness) => {
                         witness.insert(0, ResolvedPattern::Wildcard);
                         Usefulness::Useful(witness)
@@ -203,18 +240,27 @@ pub fn is_useful(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_each_bool(
     matrix: &[Row],
     rest: &[ResolvedPattern],
     rest_tys: &[Ty],
     variants: &VariantSpace,
     budget: &mut usize,
+    depth: usize,
 ) -> Usefulness {
     for b in [false, true] {
         let specialized = specialize_bool(matrix, b);
         let mut new_row = vec![];
         new_row.extend_from_slice(rest);
-        match is_useful(&specialized, &new_row, rest_tys, variants, budget) {
+        match is_useful_at_depth(
+            &specialized,
+            &new_row,
+            rest_tys,
+            variants,
+            budget,
+            depth + 1,
+        ) {
             Usefulness::Useful(mut witness) => {
                 witness.insert(0, ResolvedPattern::Bool(b));
                 return Usefulness::Useful(witness);
@@ -236,6 +282,7 @@ fn try_each_case(
     rest_tys: &[Ty],
     variants: &VariantSpace,
     budget: &mut usize,
+    depth: usize,
 ) -> Usefulness {
     for (case, payload_tys) in cases.iter().enumerate() {
         let specialized = specialize_variant(matrix, item, case, payload_tys.len());
@@ -243,7 +290,14 @@ fn try_each_case(
         new_row.extend_from_slice(rest);
         let mut new_tys = payload_tys.clone();
         new_tys.extend_from_slice(rest_tys);
-        match is_useful(&specialized, &new_row, &new_tys, variants, budget) {
+        match is_useful_at_depth(
+            &specialized,
+            &new_row,
+            &new_tys,
+            variants,
+            budget,
+            depth + 1,
+        ) {
             Usefulness::Useful(mut witness) => {
                 let split = payload_tys.len().min(witness.len());
                 let args: Vec<_> = witness.drain(0..split).collect();
@@ -671,6 +725,30 @@ mod tests {
         assert!(
             matches!(outcome, Usefulness::BudgetExceeded),
             "expected the budget to be exhausted by depth 50 with only 10 steps allowed"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_pattern_hits_the_recursion_depth_bound_not_the_step_budget() {
+        // Nested past MAX_RECURSION_DEPTH but with a step budget large
+        // enough that it would never run out first -- isolates
+        // is_useful's own stack-safety bound (independent of, and much
+        // smaller than, MAX_USEFULNESS_STEPS) as what actually stops
+        // this, the same defense a direct caller bypassing
+        // typeck::check_pattern's own bound would otherwise be missing.
+        let item = ItemId(0);
+        let ty = Ty::Named(item, crate::symbol::Symbol(0));
+        let space = variant_space(vec![(item, vec![vec![ty.clone()], vec![]])]);
+        let pattern = nested_cons_pattern(item, MAX_RECURSION_DEPTH + 50);
+        let mut budget = MAX_USEFULNESS_STEPS;
+        let outcome = is_useful(&[], &[pattern], &[ty], &space, &mut budget);
+        assert!(
+            matches!(outcome, Usefulness::BudgetExceeded),
+            "expected the recursion-depth bound to stop this before the step budget ever could"
+        );
+        assert!(
+            budget > MAX_USEFULNESS_STEPS - MAX_RECURSION_DEPTH - 10,
+            "the step budget barely moved; the depth bound, not step exhaustion, must be what fired"
         );
     }
 }

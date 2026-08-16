@@ -274,11 +274,11 @@ wildcard/binding — no or-patterns, guards, records, slices, or ranges):
   matrix built from every actual arm? If yes, that witness is
   systematically expanded back into a concrete missing pattern (e.g.
   `LookupResult.Missing`, or `Outer.A(Inner.Y)` for a nested miss) and
-  reported (`T0025 non-exhaustive match`) with that pattern printed
+  reported (`T0017 non-exhaustive match`) with that pattern printed
   verbatim — never merely "not exhaustive" with no example.
 - **Unreachability** asks, per arm in source order: is this arm's
   pattern useful against the matrix of every *earlier* arm? If not,
-  it's dead — reported as `T0026 unreachable pattern`, still with the
+  it's dead — reported as `T0018 unreachable pattern`, still with the
   arm's own body separately checked for independent diagnostics (dead
   code is not silently skipped).
 - **Booleans**: a closed two-constructor domain (`true`/`false`);
@@ -294,13 +294,13 @@ wildcard/binding — no or-patterns, guards, records, slices, or ranges):
   without writing superlinearly more patterns) but Alpha 0.1.1 still
   caps total recursive calls per `match` (`MAX_USEFULNESS_STEPS`) as a
   hard backstop against pathological input; exceeding it is a dedicated
-  diagnostic (`T0027 pattern analysis budget exceeded`), never a stack
-  overflow or an unbounded hang. The implementation itself is iterative
-  where recursion depth would otherwise track pattern nesting depth
-  linearly (bounded by input size) and uses an explicit work-list for
-  the recursive specialize/default steps, not unbounded native
-  recursion, so a deeply nested pattern cannot itself blow the Rust
-  stack before the counter trips.
+  diagnostic (`T0019 pattern analysis budget exceeded`), never a stack
+  overflow or an unbounded hang. The implementation itself is native
+  recursion (`is_useful` calls itself once per specialize/default
+  step) -- recursion depth tracks pattern nesting depth linearly, and
+  the budget is what bounds it: a pathological match exhausts its
+  budget and is reported, rather than running long enough to actually
+  exhaust the Rust call stack.
 
 ## Recursive aggregate rejection
 
@@ -320,7 +320,7 @@ type. This is checked with a **deterministic dependency graph** keyed by
   in (their `ItemId` order), and each node's outgoing edges are visited
   in field/case declaration order — never a `HashMap`'s iteration order
   — so the reported cycle and its path are identical across runs.
-- Diagnostic (`T0028 infinite aggregate layout`) names every declaration
+- Diagnostic (`T0020 infinite aggregate layout`) names every declaration
   on the cycle, shows the containment path (`Node.next: Node`, or
   `First.second: Second` → `Second.first: First`), and explains that
   Napitia has no indirection feature yet to break the cycle with.

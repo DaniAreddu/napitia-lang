@@ -196,9 +196,11 @@ pub fn load_project(
         vec![(entry_module_path.clone(), None)];
     let mut queued: BTreeSet<String> = BTreeSet::from([entry_module_path.dotted()]);
 
-    // Breadth-first, but the *result* does not depend on this order:
-    // only the reachable set and each module's own import list matter,
-    // both of which are independent of visit order.
+    // A worklist traversal (`queue` is popped LIFO, so this is
+    // depth-first in practice, not breadth-first), but the *result*
+    // does not depend on this order: only the reachable set and each
+    // module's own import list matter, both of which are independent of
+    // visit order.
     while let Some((module_path, requested_from)) = queue.pop() {
         let dotted = module_path.dotted();
         let (not_found_source, not_found_span) =
@@ -475,17 +477,25 @@ fn topological_order(
         Black,
     }
     let mut color: BTreeMap<u32, Color> = residual.iter().map(|&id| (id, Color::White)).collect();
-    let sorted_residual_edges = |node: u32| -> Vec<u32> {
-        let mut targets: Vec<u32> = edges
-            .get(&node)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|target| residual.contains(target))
-            .collect();
-        targets.sort_by(|a, b| dotted_by_id[a].cmp(&dotted_by_id[b]));
-        targets
-    };
+    // Computed once per node, before the DFS below ever runs, rather
+    // than re-filtering and re-sorting a node's whole adjacency list
+    // every time its stack frame is revisited (which a wide residual
+    // graph could do once per outgoing edge, making the traversal
+    // quadratic in that node's out-degree).
+    let sorted_residual_edges: BTreeMap<u32, Vec<u32>> = residual
+        .iter()
+        .map(|&node| {
+            let mut targets: Vec<u32> = edges
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|target| residual.contains(target))
+                .collect();
+            targets.sort_by(|a, b| dotted_by_id[a].cmp(&dotted_by_id[b]));
+            (node, targets)
+        })
+        .collect();
 
     let mut witness: Option<Vec<u32>> = None;
     // The actual `importer -> target` edge whose discovery closed the
@@ -503,7 +513,7 @@ fn topological_order(
         let mut path: Vec<u32> = vec![start];
 
         while let Some((current, edge_idx)) = stack.pop() {
-            let targets = sorted_residual_edges(current);
+            let targets = &sorted_residual_edges[&current];
             if edge_idx >= targets.len() {
                 color.insert(current, Color::Black);
                 path.pop();
@@ -531,9 +541,10 @@ fn topological_order(
         }
     }
 
-    // Every residual node has in-degree >= 1 *within the residual
-    // subgraph* (that's exactly why Kahn's algorithm never placed it) --
-    // a finite graph where every node has in-degree >= 1 always
+    // Every residual node has positive remaining out-degree (at least
+    // one of its own import dependencies is *also* residual, which is
+    // exactly why `remaining_deps` never reached zero for it above) --
+    // a finite graph where every node has out-degree >= 1 always
     // contains a cycle, and a DFS covering every node (as this loop
     // does, restarting from each not-yet-visited residual node) is
     // guaranteed to find one, the same argument `typeck::cycles`
@@ -923,6 +934,55 @@ mod tests {
         let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0008");
+    }
+
+    #[test]
+    fn a_wide_residual_graph_resolves_a_cycle_without_reprocessing_the_same_adjacency() {
+        // `a` imports a large number of other modules, each of which
+        // imports `a` right back (so every one of them stays part of
+        // the residual set, and `a`'s own residual adjacency list is
+        // wide) -- the witness-extraction DFS used to re-filter and
+        // re-sort a node's *entire* adjacency list every time its stack
+        // frame was revisited, which a wide residual graph could make
+        // quadratic. This exercises that wide-adjacency shape and
+        // confirms the result is still exactly one deterministic `M0008`
+        // (no timing assertion -- the point is correctness at scale, not
+        // measuring speed).
+        const WIDTH: usize = 500;
+        let project = TempProject::new("wide_cycle");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import a.thing;\nfunc main() -> i64 { return 0 }\n",
+        );
+        // Each `w{i}` exports a distinctly-named item (`thing{i}`) --
+        // `import` brings an item in under its own name with no
+        // aliasing, so importing 2000 different modules' *same* name
+        // into one importing module would just be a separate `M0007`
+        // diagnostic instead of exercising the cycle logic at all.
+        let mut a_source = String::new();
+        for i in 0..WIDTH {
+            a_source.push_str(&format!("import w{i}.thing{i};\n"));
+        }
+        a_source.push_str("public func thing() -> i64 { return thing() }\n");
+        project.write("src/a.npt", &a_source);
+        for i in 0..WIDTH {
+            project.write(
+                &format!("src/w{i}.npt"),
+                &format!("import a.thing;\npublic func thing{i}() -> i64 {{ return thing() }}\n"),
+            );
+        }
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = load_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0008");
+        assert!(
+            diags[0].message.contains(" a "),
+            "expected `a` (the shared wide node) in the witness: {}",
+            diags[0].message
+        );
     }
 
     #[test]

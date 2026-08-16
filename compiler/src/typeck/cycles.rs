@@ -25,6 +25,14 @@ const INFINITE_AGGREGATE_LAYOUT: &str = "T0020";
 struct Node {
     name: Symbol,
     span: Span,
+    /// The declaring module -- a cycle spanning more than one module is
+    /// structurally impossible (it would require a module import cycle,
+    /// already rejected before typeck ever runs), so every node
+    /// actually reached by a single cycle always shares one `source`;
+    /// stored per-node anyway rather than threaded in from a single
+    /// external parameter, so that guarantee is never load-bearing for
+    /// correctness.
+    source: SourceId,
     edges: Vec<Edge>,
 }
 
@@ -46,7 +54,6 @@ pub fn check_cycles(
     hir: &HirModule,
     field_types: &HashMap<ItemId, Vec<Ty>>,
     payload_types: &HashMap<ItemId, Vec<Vec<Ty>>>,
-    source: SourceId,
     interner: &Interner,
 ) -> Vec<Diagnostic> {
     // Traversal order is exactly declaration order (records first, then
@@ -74,6 +81,7 @@ pub fn check_cycles(
             Node {
                 name: record.name,
                 span: record.span,
+                source: record.source,
                 edges,
             },
         );
@@ -98,6 +106,7 @@ pub fn check_cycles(
             Node {
                 name: variant.name,
                 span: variant.span,
+                source: variant.source,
                 edges,
             },
         );
@@ -159,7 +168,6 @@ pub fn check_cycles(
                             &path[start_idx..],
                             &nodes,
                             edge,
-                            source,
                             interner,
                         ));
                     }
@@ -176,9 +184,9 @@ fn cycle_diagnostic(
     cycle: &[ItemId],
     nodes: &HashMap<ItemId, Node>,
     closing_edge: &Edge,
-    source: SourceId,
     interner: &Interner,
 ) -> Diagnostic {
+    let source = nodes[&cycle[0]].source;
     let mut path_text = String::new();
     for id in cycle {
         if !path_text.is_empty() {
@@ -304,7 +312,7 @@ mod tests {
             variants: Vec::new(),
             other_items: Vec::new(),
         };
-        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), source, &interner);
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
         (
             diagnostics,
             names.iter().map(|s| s.to_string()).collect(),
@@ -367,7 +375,7 @@ mod tests {
             variants: vec![variant_b],
             other_items: Vec::new(),
         };
-        let diagnostics = check_cycles(&hir, &field_types, &payload_types, source, &interner);
+        let diagnostics = check_cycles(&hir, &field_types, &payload_types, &interner);
         assert_eq!(
             diagnostics.len(),
             1,

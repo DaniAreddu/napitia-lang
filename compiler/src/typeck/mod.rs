@@ -135,6 +135,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
     checker.check_aggregate_cycles(hir);
     checker.build_signatures(hir);
     for function in &hir.functions {
+        checker.source = function.source;
         checker.check_function(function);
     }
     checker.finalize_defaults();
@@ -210,8 +211,13 @@ struct Checker<'a> {
 
 #[derive(Clone)]
 struct RecordInfo {
-    /// `(field name, declared type)`, in declaration order.
-    fields: Vec<(Symbol, Ty)>,
+    /// `(field name, declared type, is_public)`, in declaration order.
+    fields: Vec<(Symbol, Ty, bool)>,
+    /// Where this record was declared -- compared against `self.source`
+    /// (the module currently being checked) to tell an in-module field
+    /// access/construction (always allowed) apart from a cross-module
+    /// one (only ever allowed for a `public` field).
+    source: SourceId,
 }
 
 #[derive(Clone)]
@@ -231,14 +237,22 @@ impl<'a> Checker<'a> {
     /// payloads already resolved to `Ty`.
     fn build_aggregate_info(&mut self, hir: &HirModule) {
         for r in &hir.records {
+            self.source = r.source;
             let fields = r
                 .fields
                 .iter()
-                .map(|f| (f.name, self.resolve_named_type(&f.ty)))
+                .map(|f| (f.name, self.resolve_named_type(&f.ty), f.public))
                 .collect();
-            self.records.insert(r.id, RecordInfo { fields });
+            self.records.insert(
+                r.id,
+                RecordInfo {
+                    fields,
+                    source: r.source,
+                },
+            );
         }
         for v in &hir.variants {
+            self.source = v.source;
             let cases = v
                 .cases
                 .iter()
@@ -279,7 +293,12 @@ impl<'a> Checker<'a> {
         let field_types: HashMap<ItemId, Vec<Ty>> = self
             .records
             .iter()
-            .map(|(id, info)| (*id, info.fields.iter().map(|(_, ty)| ty.clone()).collect()))
+            .map(|(id, info)| {
+                (
+                    *id,
+                    info.fields.iter().map(|(_, ty, _)| ty.clone()).collect(),
+                )
+            })
             .collect();
         let payload_types: HashMap<ItemId, Vec<Vec<Ty>>> = self
             .variants
@@ -290,13 +309,13 @@ impl<'a> Checker<'a> {
             hir,
             &field_types,
             &payload_types,
-            self.source,
             self.interner,
         ));
     }
 
     fn build_signatures(&mut self, hir: &HirModule) {
         for f in &hir.functions {
+            self.source = f.source;
             let params = f
                 .params
                 .iter()
@@ -1029,7 +1048,7 @@ impl<'a> Checker<'a> {
             if matches!(field_ty, Ty::Never) {
                 diverged = true;
             }
-            let (_, declared_ty) = &info.fields[f.field_index];
+            let (_, declared_ty, _) = &info.fields[f.field_index];
             self.unify_report(
                 declared_ty,
                 &field_ty,
@@ -1088,8 +1107,26 @@ impl<'a> Checker<'a> {
             );
             return Ty::Error;
         };
-        match info.fields.iter().find(|(n, _)| *n == name) {
-            Some((_, ty)) => ty.clone(),
+        match info.fields.iter().find(|(n, _, _)| *n == name) {
+            Some((_, ty, is_public)) => {
+                if !*is_public && info.source != self.source {
+                    let text = self.interner.resolve(name);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            crate::project::codes::INACCESSIBLE_FIELD,
+                            self.source,
+                            span,
+                            format!(
+                                "field `{text}` of `{}` is private to its declaring module",
+                                self.display_for_diagnostic(&base_ty)
+                            ),
+                        )
+                        .with_primary_label("cannot access a private field from here"),
+                    );
+                    return Ty::Error;
+                }
+                ty.clone()
+            }
             None => {
                 let text = self.interner.resolve(name);
                 self.diagnostics.push(
@@ -2968,6 +3005,115 @@ mod tests {
              func f(u: User) -> i64 { return u.id }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn accessing_a_private_field_from_a_different_declaring_module_is_m0011() {
+        // Hand-built: a record declared in one "module" (its own
+        // source) with a private field, accessed from a function whose
+        // own source differs -- the only way to exercise this without
+        // a full project compilation, which is exactly the scenario
+        // check_module now has to get right once modules are lowered
+        // separately and merged.
+        let mut map = SourceMap::new();
+        let record_source = map.add_file("point.npt", "");
+        let accessing_source = map.add_file("main.npt", "");
+        let mut interner = Interner::new();
+        let record_name = interner.intern("Point");
+        let field_x = interner.intern("x");
+        let field_y = interner.intern("y");
+        let param_name = interner.intern("p");
+        let fn_name = interner.intern("f");
+
+        let record = crate::hir::HirRecord {
+            id: ItemId(0),
+            name: record_name,
+            span: Span::dummy(),
+            source: record_source,
+            public: true,
+            fields: vec![
+                crate::hir::HirField {
+                    name: field_x,
+                    span: Span::dummy(),
+                    public: true,
+                    ty: ast::Type {
+                        name: ast::Ident {
+                            symbol: interner.intern("i64"),
+                            span: Span::dummy(),
+                        },
+                    },
+                },
+                crate::hir::HirField {
+                    name: field_y,
+                    span: Span::dummy(),
+                    public: false,
+                    ty: ast::Type {
+                        name: ast::Ident {
+                            symbol: interner.intern("i64"),
+                            span: Span::dummy(),
+                        },
+                    },
+                },
+            ],
+        };
+        let param_local = LocalId(0);
+        let function = HirFunction {
+            id: ItemId(1),
+            name: fn_name,
+            name_span: Span::dummy(),
+            source: accessing_source,
+            public: true,
+            params: vec![crate::hir::HirParam {
+                local: param_local,
+                name: param_name,
+                span: Span::dummy(),
+                ty: ast::Type {
+                    name: ast::Ident {
+                        symbol: record_name,
+                        span: Span::dummy(),
+                    },
+                },
+            }],
+            return_type: Some(ast::Type {
+                name: ast::Ident {
+                    symbol: interner.intern("i64"),
+                    span: Span::dummy(),
+                },
+            }),
+            uses: vec![],
+            raises: vec![],
+            body: crate::hir::HirBlock {
+                id: crate::hir::ExprId(0),
+                statements: vec![],
+                tail: Some(Box::new(HirExpr::Field {
+                    id: crate::hir::ExprId(1),
+                    base: Box::new(HirExpr::Local {
+                        id: crate::hir::ExprId(2),
+                        local: param_local,
+                        name: param_name,
+                        span: Span::dummy(),
+                    }),
+                    name: field_y,
+                    span: Span::dummy(),
+                })),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let hir = HirModule {
+            functions: vec![function],
+            records: vec![record],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let result = check_module(&hir, accessing_source, &interner);
+        assert_eq!(
+            result.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.diagnostics[0].code, "M0011");
     }
 
     #[test]

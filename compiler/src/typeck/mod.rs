@@ -44,6 +44,21 @@ mod codes {
     pub const INCOMPATIBLE_PATTERN: &str = "T0021";
 }
 
+/// Whether `check_match_exhaustiveness` actually completed. Kept
+/// distinct from a plain `Vec<usize>` (which an empty budget-exceeded
+/// result used to be indistinguishable from "analysis ran and found no
+/// unreachable arms") so `check_match` cannot accidentally treat a
+/// failed analysis as if every arm were proven reachable.
+enum MatchCoverage {
+    /// Analysis ran to completion; `unreachable` names every arm index
+    /// it proved unreachable (possibly empty).
+    Complete { unreachable: Vec<usize> },
+    /// The work budget or recursion-depth bound was exceeded -- nothing
+    /// the analysis might otherwise have found, including reachability,
+    /// can be trusted.
+    Failed,
+}
+
 #[derive(Clone)]
 struct FunctionSig {
     params: Vec<Ty>,
@@ -114,6 +129,7 @@ pub fn check_module(hir: &HirModule, source: SourceId, interner: &Interner) -> T
         loop_depth: 0,
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
+        pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
     };
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
@@ -184,6 +200,12 @@ struct Checker<'a> {
     expr_types: HashMap<ExprId, Ty>,
     /// See [`TypeckResult::pattern_case`].
     pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
+    /// Starting work budget for each match's exhaustiveness analysis.
+    /// Always `exhaustive::MAX_USEFULNESS_STEPS` in `check_module`; a
+    /// smaller value is a controlled test seam for exercising
+    /// `MatchCoverage::Failed` deterministically, without a fixture
+    /// that actually consumes 100,000 steps.
+    pattern_budget: usize,
 }
 
 #[derive(Clone)]
@@ -1247,8 +1269,18 @@ impl<'a> Checker<'a> {
         if any_pattern_invalid {
             return Ty::Error;
         }
-        let unreachable =
+        let coverage =
             self.check_match_exhaustiveness(&scrutinee_ty, &resolved_patterns, arms, span);
+        // A failed analysis (work-budget or recursion-depth exceeded)
+        // means reachability is simply unknown -- joining arm body
+        // types anyway, as if every arm were reachable, could report a
+        // second, misleading "match arms must have the same type" on
+        // top of the budget diagnostic for what analysis never actually
+        // proved was even a real mismatch between arms that matter.
+        let unreachable = match coverage {
+            MatchCoverage::Complete { unreachable } => unreachable,
+            MatchCoverage::Failed => return Ty::Error,
+        };
 
         let mut arm_result: Option<Ty> = None;
         for (i, body_ty) in body_types.into_iter().enumerate() {
@@ -1269,19 +1301,23 @@ impl<'a> Checker<'a> {
     }
 
     /// Runs exhaustiveness/unreachable-arm analysis and reports its
-    /// diagnostics, returning the indices of unreachable arms (empty if
-    /// the budget was exceeded, since nothing it found can be trusted
-    /// either).
+    /// diagnostics, returning whether it actually completed. A failed
+    /// analysis (`MatchCoverage::Failed`) means nothing it might have
+    /// found -- including which arms are unreachable -- can be trusted,
+    /// so the caller must not use it to drive the result-type join
+    /// either.
     fn check_match_exhaustiveness(
         &mut self,
         scrutinee_ty: &Ty,
         resolved_patterns: &[ResolvedPattern],
         arms: &[HirMatchArm],
         span: Span,
-    ) -> Vec<usize> {
+    ) -> MatchCoverage {
         let resolved_scrutinee = self.ctx.resolve(scrutinee_ty);
         if matches!(resolved_scrutinee, Ty::Error) {
-            return Vec::new();
+            return MatchCoverage::Complete {
+                unreachable: Vec::new(),
+            };
         }
         let variant_payloads: HashMap<ItemId, Vec<Vec<Ty>>> = self
             .variants
@@ -1291,7 +1327,12 @@ impl<'a> Checker<'a> {
         let space = VariantSpace {
             payloads: variant_payloads,
         };
-        let analysis = exhaustive::analyze_match(&resolved_scrutinee, resolved_patterns, &space);
+        let analysis = exhaustive::analyze_match_with_budget(
+            &resolved_scrutinee,
+            resolved_patterns,
+            &space,
+            self.pattern_budget,
+        );
 
         if analysis.budget_exceeded {
             self.diagnostics.push(
@@ -1303,7 +1344,7 @@ impl<'a> Checker<'a> {
                 )
                 .with_primary_label("match is too complex to analyze"),
             );
-            return Vec::new();
+            return MatchCoverage::Failed;
         }
 
         if let Some(witness) = analysis.missing {
@@ -1331,7 +1372,9 @@ impl<'a> Checker<'a> {
             );
         }
 
-        analysis.unreachable
+        MatchCoverage::Complete {
+            unreachable: analysis.unreachable,
+        }
     }
 
     /// Checks one pattern against its scrutinee's type, binding any
@@ -2125,6 +2168,7 @@ mod tests {
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
+            pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
         };
         // A non-Ty::Named scrutinee (here Ty::Error) makes every level
         // take check_pattern's own "incompatible scrutinee" branch,
@@ -2141,6 +2185,152 @@ mod tests {
             checker.diagnostics
         );
         assert_eq!(checker.diagnostics[0].code, "T0019");
+    }
+
+    /// A minimal `Checker` with `pattern_budget` set to `budget` instead
+    /// of the real `exhaustive::MAX_USEFULNESS_STEPS` -- the controlled
+    /// test seam for exercising `MatchCoverage::Failed` deterministically
+    /// against a trivial match, never a fixture that actually consumes
+    /// 100,000 steps.
+    fn checker_with_budget(interner: &Interner, source: SourceId, budget: usize) -> Checker<'_> {
+        Checker {
+            source,
+            interner,
+            ctx: TypeContext::new(),
+            diagnostics: Vec::new(),
+            functions: HashMap::new(),
+            locals: HashMap::new(),
+            pending_defaults: Vec::new(),
+            current_return_type: Ty::Unit,
+            type_names: HashMap::new(),
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            variant_display: HashMap::new(),
+            loop_depth: 0,
+            expr_types: HashMap::new(),
+            pattern_case: HashMap::new(),
+            pattern_budget: budget,
+        }
+    }
+
+    #[test]
+    fn budget_failure_stops_the_match_result_join() {
+        // Two wildcard arms with genuinely different, non-diverging
+        // body types (i64 vs bool) -- if the join ran anyway, this
+        // would report its own T0001. A budget of 1 exhausts on the
+        // very first arm's own reachability check (a Wildcard against
+        // an open/Bool-less scrutinee type still recurses one level
+        // into the default matrix), so analysis never determines
+        // reachability for either arm.
+        let interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut checker = checker_with_budget(&interner, source, 1);
+        let scrutinee = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let arms = vec![
+            HirMatchArm {
+                pattern: HirPattern::Wildcard {
+                    id: crate::hir::PatternId(0),
+                    span: Span::dummy(),
+                },
+                body: HirMatchArmBody::Expr(HirExpr::Int {
+                    id: ExprId(1),
+                    value: 1,
+                    base: crate::lexer::IntBase::Decimal,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+            HirMatchArm {
+                pattern: HirPattern::Wildcard {
+                    id: crate::hir::PatternId(1),
+                    span: Span::dummy(),
+                },
+                body: HirMatchArmBody::Expr(HirExpr::Bool {
+                    id: ExprId(2),
+                    value: true,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+        ];
+        let result_ty = checker.check_match(&scrutinee, &arms, Span::dummy());
+
+        assert_eq!(
+            result_ty,
+            Ty::Error,
+            "expected a failed analysis to make the match type Ty::Error"
+        );
+        assert_eq!(
+            checker.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            checker.diagnostics
+        );
+        assert_eq!(checker.diagnostics[0].code, "T0019");
+        assert!(!checker.diagnostics.iter().any(|d| d.code == "T0001"));
+        assert!(!checker.diagnostics.iter().any(|d| d.code == "T0017"));
+        assert!(!checker.diagnostics.iter().any(|d| d.code == "T0018"));
+    }
+
+    #[test]
+    fn diverging_scrutinee_stays_never_even_with_a_tiny_budget() {
+        // The scrutinee-diverges early return in check_match happens
+        // before check_match_exhaustiveness is ever called, so an
+        // exhausted budget must never change this: `return` always
+        // diverges, regardless of how little budget remains for
+        // analysis that never runs.
+        let interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut checker = checker_with_budget(&interner, source, 1);
+        let scrutinee = HirExpr::Return {
+            id: ExprId(0),
+            value: Some(Box::new(HirExpr::Int {
+                id: ExprId(1),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        };
+        checker.current_return_type = Ty::I64;
+        let arms = vec![
+            HirMatchArm {
+                pattern: HirPattern::Bool {
+                    id: crate::hir::PatternId(0),
+                    value: true,
+                    span: Span::dummy(),
+                },
+                body: HirMatchArmBody::Expr(HirExpr::Int {
+                    id: ExprId(2),
+                    value: 1,
+                    base: crate::lexer::IntBase::Decimal,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+            HirMatchArm {
+                pattern: HirPattern::Bool {
+                    id: crate::hir::PatternId(1),
+                    value: false,
+                    span: Span::dummy(),
+                },
+                body: HirMatchArmBody::Expr(HirExpr::Bool {
+                    id: ExprId(3),
+                    value: true,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+        ];
+        let result_ty = checker.check_match(&scrutinee, &arms, Span::dummy());
+        assert_eq!(result_ty, Ty::Never);
+        assert!(!checker.diagnostics.iter().any(|d| d.code == "T0019"));
     }
 
     #[test]

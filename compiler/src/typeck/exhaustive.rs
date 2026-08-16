@@ -400,7 +400,21 @@ pub fn analyze_match(
     patterns: &[ResolvedPattern],
     variants: &VariantSpace,
 ) -> MatchAnalysis {
-    let mut budget = MAX_USEFULNESS_STEPS;
+    analyze_match_with_budget(scrutinee_ty, patterns, variants, MAX_USEFULNESS_STEPS)
+}
+
+/// Same as [`analyze_match`], but with an explicit starting budget
+/// instead of the real `MAX_USEFULNESS_STEPS` -- a controlled test
+/// seam for exercising `Usefulness::BudgetExceeded` deterministically
+/// with a trivial match, rather than needing a fixture that actually
+/// consumes 100,000 steps.
+pub(crate) fn analyze_match_with_budget(
+    scrutinee_ty: &Ty,
+    patterns: &[ResolvedPattern],
+    variants: &VariantSpace,
+    budget: usize,
+) -> MatchAnalysis {
+    let mut budget = budget;
     let occurrence_types = [scrutinee_ty.clone()];
     let mut matrix: Vec<Row> = Vec::new();
     let mut unreachable = Vec::new();

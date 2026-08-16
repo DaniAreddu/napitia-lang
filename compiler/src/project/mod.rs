@@ -15,6 +15,7 @@ use crate::hir::{self, HirModule, ItemId};
 use crate::nir::{self, Module as NirModule};
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
+use crate::syntax::ast;
 use crate::typeck;
 
 pub(crate) mod codes {
@@ -62,6 +63,7 @@ pub fn compile_project(
     interner: &mut Interner,
 ) -> Result<CompiledProject, Vec<Diagnostic>> {
     let loaded = loader::load_project(manifest_path, map, interner)?;
+    validate_entry_main(&loaded, manifest_path, interner)?;
 
     let module_path_by_dotted: HashMap<String, module::ModuleId> = loaded
         .modules
@@ -186,40 +188,21 @@ pub fn compile_project(
     // this exact declaration -- never a global "any function named
     // `main`" check, which would also wrongly flag an ordinary,
     // differently-shaped `main` in a non-entry module (`rfcs/0006`).
+    // `validate_entry_main` already guaranteed, from the entry module's
+    // own AST, that it declares *exactly* one function named `main`
+    // before any lowering ran -- and every module lowered with zero
+    // diagnostics, checked just above -- so this lookup finding anything
+    // other than exactly one match here would mean lowering silently
+    // dropped or duplicated a declaration the AST preflight already
+    // counted, a genuine internal invariant rather than a user-facing
+    // condition.
     let main_symbol = interner.intern("main");
-    let mut entry_candidates = merged
+    let entry_item = merged
         .functions
         .iter()
-        .filter(|f| f.source == entry_source && f.name == main_symbol);
-    let entry_hir = entry_candidates.next();
-    let entry_item = match (entry_hir, entry_candidates.next()) {
-        (Some(entry), None) => entry.id,
-        (None, _) => {
-            return Err(vec![
-                Diagnostic::error(
-                    codes::INVALID_ENTRY,
-                    loaded.manifest_source,
-                    crate::source::Span::dummy(),
-                    format!(
-                        "entry module `{}` has no `main` function",
-                        manifest_path.display()
-                    ),
-                )
-                .with_primary_label("configured entry point"),
-            ]);
-        }
-        (Some(_), Some(_)) => {
-            return Err(vec![
-                Diagnostic::error(
-                    codes::INVALID_ENTRY,
-                    loaded.manifest_source,
-                    crate::source::Span::dummy(),
-                    "entry module declares more than one `main` function",
-                )
-                .with_primary_label("configured entry point"),
-            ]);
-        }
-    };
+        .find(|f| f.source == entry_source && f.name == main_symbol)
+        .expect("validate_entry_main already guaranteed exactly one entry `main`")
+        .id;
 
     let typeck_result = typeck::check_module(
         &merged,
@@ -249,6 +232,69 @@ pub fn compile_project(
         nir: nir_module,
         entry_item,
     })
+}
+
+/// Checks the configured entry module's own AST for exactly one
+/// function named `main`, *before* any HIR lowering runs -- so a
+/// project with two entry-module `main` declarations gets one
+/// deterministic `M0010`, anchored to the entry module's own source,
+/// rather than `hir::lower`'s ordinary same-name-collision `R0001`.
+/// `R0001` is still the right diagnostic for every *other* duplicate
+/// declaration (including a non-`main` name, or `main` colliding with a
+/// differently-kinded item like a `record`) -- this only ever looks at
+/// function items literally named `main`, and only within the entry
+/// module, so it never shadows `hir::lower`'s own check for anything
+/// else. A `main` declared in any other module is untouched by this at
+/// all (`rfcs/0006`).
+fn validate_entry_main(
+    loaded: &loader::LoadedProject,
+    manifest_path: &Path,
+    interner: &mut Interner,
+) -> Result<(), Vec<Diagnostic>> {
+    let entry_module = loaded
+        .modules
+        .iter()
+        .find(|m| m.id == loaded.entry_module)
+        .expect("the entry module is always among loaded.modules");
+    let main_symbol = interner.intern("main");
+    let mains: Vec<crate::source::Span> = entry_module
+        .ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Function(f) if f.name.symbol == main_symbol => Some(f.name.span),
+            _ => None,
+        })
+        .collect();
+
+    match mains[..] {
+        [] => Err(vec![
+            Diagnostic::error(
+                codes::INVALID_ENTRY,
+                entry_module.source,
+                crate::source::Span::dummy(),
+                format!(
+                    "entry module `{}` has no `main` function",
+                    manifest_path.display()
+                ),
+            )
+            .with_primary_label("configured entry point"),
+        ]),
+        [_] => Ok(()),
+        [first, second, ..] => Err(vec![
+            Diagnostic::error(
+                codes::INVALID_ENTRY,
+                entry_module.source,
+                second,
+                format!(
+                    "entry module declares more than one `main` function ({} total)",
+                    mains.len()
+                ),
+            )
+            .with_primary_label("duplicate `main`")
+            .with_label(first, "first declared here"),
+        ]),
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +435,64 @@ mod tests {
         let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0010");
+    }
+
+    #[test]
+    fn two_main_functions_in_the_entry_module_is_exactly_m0010_not_r0001() {
+        // `hir::lower`'s own same-name-collision check would otherwise
+        // fire first (R0001) -- the entry module's `main` is special
+        // enough (it decides the whole project's executable entry
+        // point) to get its own diagnostic instead, checked before any
+        // lowering runs at all.
+        let project = TempProject::new("duplicate_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "func main() -> i64 { return 1 } func main() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0010");
+    }
+
+    #[test]
+    fn a_duplicate_non_main_declaration_in_the_entry_module_is_still_r0001() {
+        // The entry-`main` preflight only ever looks at functions named
+        // `main` -- every other duplicate declaration (including one
+        // colliding on the entry module's own `main` name but as a
+        // *different* item kind, or a same-name/same-kind duplicate of
+        // anything else) is untouched, and still goes through
+        // `hir::lower`'s ordinary same-name-collision check.
+        let project = TempProject::new("duplicate_non_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "func main() -> i64 { return helper() } \
+             func helper() -> i64 { return 1 } \
+             func helper() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0001");
+    }
+
+    #[test]
+    fn a_parameterized_entry_main_still_produces_the_signature_diagnostic() {
+        let project = TempProject::new("parameterized_entry_main");
+        project.write("napitia.toml", MANIFEST);
+        project.write("src/main.npt", "func main(n: i64) -> i64 { return n }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0012");
     }
 
     #[test]

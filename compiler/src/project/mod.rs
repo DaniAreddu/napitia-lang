@@ -2,6 +2,7 @@
 //! module dependency graph, and cross-module import resolution
 //! (`rfcs/0006`).
 
+pub mod loader;
 pub mod manifest;
 pub mod module;
 

@@ -1,24 +1,31 @@
 //! Command-line entry point. Kept free of compiler logic: it only parses
 //! arguments and delegates to [`crate::driver`].
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::diagnostics::{self, Diagnostic};
-use crate::driver::{self, IrOutput, RunOutput};
+use crate::driver::{self, IrOutput, ProjectIrOutput, ProjectRunOutput, RunOutput};
 use crate::interpreter::Value;
 use crate::lexer::Token;
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
 
+const MANIFEST_FILE_NAME: &str = "napitia.toml";
+
 const USAGE: &str = "\
-Usage: napitia <command> <file>
+Usage: napitia <command> [path]
 
 Commands:
     lex <file>      Tokenize a .npt file and print its tokens
     parse <file>    Parse a .npt file and print its AST
-    check <file>    Type-check a .npt file and report every diagnostic
-    ir <file>       Print the typed Napitia IR (NIR) for a file
-    run <file>      Compile and execute a file's `main` function
+    check [path]    Type-check a file or project and report every diagnostic
+    ir [path]       Print the typed Napitia IR (NIR) for a file or project
+    run [path]      Compile and execute a file's or project's `main` function
+
+For `check`, `ir`, and `run`: `path` may be a `.npt` file (single-file mode),
+a directory containing a `napitia.toml` manifest, or a manifest path
+directly. It defaults to the current directory when omitted.
 
 Options:
     -h, --help      Print this help message
@@ -43,23 +50,30 @@ pub fn run(args: Vec<String>) -> ExitCode {
         }
         Some(command) => {
             let command = command.to_string();
-            let Some(path) = args.next() else {
-                eprintln!("error: missing <file> argument for `{command}`\n");
-                eprint!("{USAGE}");
-                return ExitCode::from(USAGE_ERROR);
-            };
-            dispatch(&command, &path)
+            match command.as_str() {
+                "lex" | "parse" => {
+                    let Some(path) = args.next() else {
+                        eprintln!("error: missing <file> argument for `{command}`\n");
+                        eprint!("{USAGE}");
+                        return ExitCode::from(USAGE_ERROR);
+                    };
+                    dispatch_single_file(&command, &path)
+                }
+                "check" | "ir" | "run" => {
+                    let path = args.next().unwrap_or_else(|| ".".to_string());
+                    dispatch_check_ir_run(&command, &path)
+                }
+                _ => {
+                    eprintln!("error: unknown command `{command}`\n");
+                    eprint!("{USAGE}");
+                    ExitCode::from(USAGE_ERROR)
+                }
+            }
         }
     }
 }
 
-fn dispatch(command: &str, path: &str) -> ExitCode {
-    if !matches!(command, "lex" | "parse" | "check" | "ir" | "run") {
-        eprintln!("error: unknown command `{command}`\n");
-        eprint!("{USAGE}");
-        return ExitCode::from(USAGE_ERROR);
-    }
-
+fn dispatch_single_file(command: &str, path: &str) -> ExitCode {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
@@ -79,6 +93,68 @@ fn dispatch(command: &str, path: &str) -> ExitCode {
         "ir" => ir_command(&map, source, &mut interner),
         "run" => run_command(&map, source, &mut interner),
         _ => unreachable!("validated above"),
+    }
+}
+
+/// Classifies `path` per the CLI's documented rules and dispatches
+/// `check`/`ir`/`run` to either legacy single-file compilation or
+/// project compilation. A `.npt` path is always single-file, regardless
+/// of whether a manifest happens to sit alongside it -- explicit beats
+/// implicit.
+fn dispatch_check_ir_run(command: &str, path: &str) -> ExitCode {
+    let candidate = Path::new(path);
+
+    if candidate.extension().and_then(|ext| ext.to_str()) == Some("npt") {
+        return dispatch_single_file(command, path);
+    }
+
+    let manifest_path: PathBuf = if candidate.is_dir() {
+        candidate.join(MANIFEST_FILE_NAME)
+    } else {
+        candidate.to_path_buf()
+    };
+
+    dispatch_project(command, &manifest_path)
+}
+
+fn dispatch_project(command: &str, manifest_path: &Path) -> ExitCode {
+    let mut map = SourceMap::new();
+    let mut interner = Interner::new();
+
+    match command {
+        "check" => {
+            let diagnostics = driver::check_project(manifest_path, &mut map, &mut interner);
+            if diagnostics.is_empty() {
+                println!("no errors");
+            }
+            print_diagnostics(&diagnostics, &map);
+            exit_for(&diagnostics)
+        }
+        "ir" => match driver::ir_project(manifest_path, &mut map, &mut interner) {
+            ProjectIrOutput::Diagnostics(diagnostics) => {
+                print_diagnostics(&diagnostics, &map);
+                exit_for(&diagnostics)
+            }
+            ProjectIrOutput::Ready { nir } => {
+                print!("{}", crate::nir::print_module(&nir, &interner));
+                ExitCode::SUCCESS
+            }
+        },
+        "run" => match driver::run_project(manifest_path, &mut map, &mut interner) {
+            ProjectRunOutput::Diagnostics(diagnostics) => {
+                print_diagnostics(&diagnostics, &map);
+                exit_for(&diagnostics)
+            }
+            ProjectRunOutput::Result(Ok(value)) => {
+                println!("{}", format_value(&value));
+                ExitCode::SUCCESS
+            }
+            ProjectRunOutput::Result(Err(err)) => {
+                eprintln!("error: runtime error: {err:?}");
+                ExitCode::from(1)
+            }
+        },
+        _ => unreachable!("validated by dispatch_check_ir_run's caller"),
     }
 }
 

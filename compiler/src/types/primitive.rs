@@ -45,12 +45,11 @@ pub enum Ty {
     /// Two `Named` types are the same type iff they carry the same
     /// `ItemId` — nominal comparison, matching RFC 0001's rejection of
     /// structural typing. The `Symbol` is carried only so diagnostics
-    /// can print the name without a separate lookup table; it is not
-    /// itself part of the type's identity for comparison purposes,
-    /// since it is always the declaration's own name. Field access and
-    /// construction are not executable yet (`spec/0003`); a `Named`
-    /// type may be name-resolved and compared, but NIR lowering
-    /// rejects it explicitly rather than guessing a representation.
+    /// and textual NIR can print the name without a separate lookup
+    /// table; it is not itself part of the type's identity for
+    /// comparison purposes, and every construction site is required to
+    /// carry the declaration's own symbol, never one of its field/case
+    /// names.
     Named(ItemId, Symbol),
     /// An unknown named type, or the result of an earlier error, is not
     /// allowed to *silently* become `Error`: every `Error` a program can

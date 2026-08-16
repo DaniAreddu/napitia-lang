@@ -1,7 +1,8 @@
 # Spec 0003: Type System
 
-- Status: Partially implemented (Alpha 0.1) — primitive types and local
-  inference only.
+- Status: Partially implemented (Alpha 0.1.1) — primitive types, local
+  inference, and nominal record/variant aggregates with pattern
+  matching.
 
 ## Implemented features
 
@@ -75,7 +76,80 @@ inference, without introducing a separate compile-time-only numeric type.
   the same numeric type (integer types for bitwise/shift; integer or float
   for arithmetic). Comparison and equality operators require both operands
   to unify with the same type and produce `bool`. Logical `&&`/`||` require
-  both operands to be `bool`.
+  both operands to be `bool`. Equality (`==`/`!=`) on a record/variant
+  value is rejected outright (see "Aggregate equality" below) rather than
+  being partially implemented.
+
+### Records and variants (Alpha 0.1.1)
+
+- **Nominal identity**: two `record`/`variant` declarations are distinct
+  types even with identical fields/cases — comparison is always by
+  declaration identity (`ItemId`), never by name or structure
+  (`rfcs/0001`).
+- **Record construction** (`TypeName { field: expr, ... }`): the type
+  name must resolve to a declared record; every field must appear
+  exactly once; each field's initializer must unify with that field's
+  declared type. Field name/presence checking happens during name
+  resolution (it needs no inference); the type-compatibility check
+  happens here.
+- **Field access** (`base.field`): the base's inferred type must be a
+  declared record, and the field must exist on it — field access on a
+  non-record type, or a field not declared on that record, is a checked
+  error. **Field mutation** (`base.field = expr`) is parsed as an
+  ordinary assignment but is a dedicated, checked error in this
+  milestone (there is no lowering for it yet).
+- **Variant constructors** (`Variant.Case(...)`, or an unqualified case
+  name when unambiguous): payload arity and each payload expression's
+  type are checked against the case's declared payload types; a
+  payload-less case referenced bare (no call) is itself a complete
+  value.
+- **Aggregate equality**: `==`/`!=` between two record or variant
+  values is rejected outright, not partially implemented — deciding
+  what "equal" means once a payload can itself be a record is exactly
+  the kind of scope this milestone avoids taking on early.
+- **Infinite aggregate layout**: since Napitia has no indirection/
+  ownership feature yet (`rfcs/0002`), a direct or indirect cycle in the
+  field/payload graph (`record Node { next: Node }`, or the indirect
+  `First -> Second -> First`) is rejected before any function body is
+  checked, via a deterministic (declaration-order, not hash-order)
+  dependency-graph cycle check.
+
+### `match` and pattern matching (Alpha 0.1.1)
+
+`match` is a real expression: the scrutinee is checked exactly once,
+each pattern is checked against the scrutinee's type (a pattern whose
+shape is incompatible with that type — e.g. a variant pattern against
+a `bool` scrutinee — is a checked error), and pattern-bound locals
+receive their *exact* resolved payload type, never an approximation.
+Supported pattern forms: wildcard (`_`), an immutable binding, a
+boolean/integer/string/char literal, a variant case without payload, a
+variant case with positional sub-patterns, and nested variant patterns
+(a case's payload position may itself be matched by a variant
+pattern). A pattern-bound name may not be duplicated within one
+pattern.
+
+- **Exhaustiveness**: checked with a pattern-matrix usefulness
+  algorithm (Maranget-style, specialized to this closed pattern
+  grammar), not a fragile "every case name appears once" check — it
+  correctly handles nested variant patterns, a wildcard/binding arm
+  covering the remaining space, and an open literal domain (`int`/
+  `str`/`char`) always requiring a catch-all (an integer match can
+  never be proven exhaustive by literals alone). A non-exhaustive match
+  is a checked error carrying a concrete example of a missing pattern
+  (e.g. `LookupResult.Missing`, or a nested `Outer.A(Inner.Y)`), never
+  just "not exhaustive" with no witness.
+- **Unreachable arms**: an arm whose pattern is not "useful" against
+  every earlier arm (i.e. it can never match anything an earlier arm
+  didn't already match) is a checked error, in source order; its body
+  is still checked for its own independent diagnostics.
+- **Result type**: every reachable arm's body participates in the same
+  `never`-aware join `if`/`else` branches already use (see below); a
+  diverging scrutinee makes the whole `match` `never` without
+  analyzing exhaustiveness at all (no arm is ever reachable).
+- **Work budget**: pattern analysis is capped by a hard recursive-step
+  budget per `match`, so pathologically nested patterns are a checked
+  error ("pattern analysis exceeded its work budget"), never an
+  unbounded hang or stack overflow.
 
 ### Control-flow divergence (`never`)
 

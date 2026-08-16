@@ -19,12 +19,16 @@
 
 use std::collections::HashMap;
 
-use super::{BasicBlock, Const, Function, Module, Param, Terminator, ValueId, ValueKind};
+use super::{
+    BasicBlock, CaseLayout, Const, Function, Module, Param, RecordLayout, Terminator, ValueId,
+    ValueKind, VariantLayout,
+};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirModule, HirStmt, ItemId, LocalId,
-    OtherItemKind,
+    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
+    HirModule, HirPattern, HirStmt, ItemId, LocalId, PatternId,
 };
+use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{self, AssignOp, BinaryOp, UnaryOp};
@@ -60,9 +64,28 @@ pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
+    // Every module-level item's ItemId must be globally unique across
+    // records, variants, and functions alike -- not just unique within
+    // its own kind. hir::lower's own name resolution already keeps this
+    // true for any HIR it produces, but this is a public entry point a
+    // caller can invoke directly with a hand-built HirModule bypassing
+    // that guarantee. Without this check, a duplicate id would make
+    // record_layouts/variant_layouts silently overwrite the first
+    // entry on insert, then panic on the second of two removals below
+    // ("just inserted" no longer holds); a cross-kind collision would
+    // let records/variants/function_sigs disagree about what the same
+    // id names. Checked here, before any layout is built or any
+    // function is lowered, so a malformed module fails atomically
+    // rather than reaching either failure mode.
+    let identity_diagnostics = validate_item_identities(hir, interner, source);
+    if !identity_diagnostics.is_empty() {
+        return Err(identity_diagnostics);
+    }
+
     // The same module-level type namespace typeck itself builds
     // (`typeck::check_module`): primitives plus every declared
     // `record`/`variant` name. Without this, a legitimately-declared
@@ -71,11 +94,53 @@ pub fn lower_module(
     // "unknown type becomes Error with no diagnostic" bug this whole
     // pass exists to close.
     let type_names: HashMap<Symbol, ItemId> = hir
-        .other_items
+        .records
         .iter()
-        .filter(|item| matches!(item.kind, OtherItemKind::Record | OtherItemKind::Variant))
-        .map(|item| (item.name, item.id))
+        .map(|r| (r.name, r.id))
+        .chain(hir.variants.iter().map(|v| (v.name, v.id)))
         .collect();
+
+    let mut record_layouts: HashMap<ItemId, RecordLayout> = HashMap::new();
+    let mut record_order: Vec<ItemId> = Vec::new();
+    for r in &hir.records {
+        let fields = r
+            .fields
+            .iter()
+            .map(|f| (f.name, resolve_named_type(interner, &type_names, &f.ty)))
+            .collect();
+        record_order.push(r.id);
+        record_layouts.insert(
+            r.id,
+            RecordLayout {
+                name: r.name,
+                fields,
+            },
+        );
+    }
+    let mut variant_layouts: HashMap<ItemId, VariantLayout> = HashMap::new();
+    let mut variant_order: Vec<ItemId> = Vec::new();
+    for v in &hir.variants {
+        let cases = v
+            .cases
+            .iter()
+            .map(|c| CaseLayout {
+                name: c.name,
+                payload: c
+                    .payload
+                    .iter()
+                    .map(|t| resolve_named_type(interner, &type_names, t))
+                    .collect(),
+            })
+            .collect();
+        variant_order.push(v.id);
+        variant_layouts.insert(
+            v.id,
+            VariantLayout {
+                name: v.name,
+                cases,
+            },
+        );
+    }
 
     let mut function_sigs = HashMap::new();
     for f in &hir.functions {
@@ -95,9 +160,12 @@ pub fn lower_module(
     let mut lowering = Lowering {
         local_types,
         expr_types,
+        pattern_case,
         interner,
         source,
         type_names,
+        records: record_layouts,
+        variants: variant_layouts,
         function_sigs,
     };
     let mut functions = Vec::new();
@@ -109,11 +177,119 @@ pub fn lower_module(
         }
     }
 
-    if diagnostics.is_empty() {
-        Ok(Module { functions })
-    } else {
-        Err(diagnostics)
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
     }
+
+    // `record_order`/`variant_order` were built by pushing each item's
+    // id exactly once per item in `hir.records`/`hir.variants`, and the
+    // identity validation above already rejected any duplicate id
+    // within either kind -- so every id removed here is guaranteed to
+    // still be present, exactly once. Returned as a diagnostic instead
+    // of an `.expect()` panic anyway: this function's own atomicity
+    // guarantee should never depend on a caller trusting that an
+    // earlier check in this same function was never changed to miss a
+    // case, the same defense-in-depth posture the rest of this module
+    // already takes toward every other stage's guarantees.
+    let mut records = Vec::with_capacity(record_order.len());
+    for id in record_order {
+        let Some(layout) = lowering.records.remove(&id) else {
+            return Err(vec![*lowering.internal_error(&format!(
+                "record layout for {id:?} was not built during lowering"
+            ))]);
+        };
+        records.push((id, layout));
+    }
+    let mut variants = Vec::with_capacity(variant_order.len());
+    for id in variant_order {
+        let Some(layout) = lowering.variants.remove(&id) else {
+            return Err(vec![*lowering.internal_error(&format!(
+                "variant layout for {id:?} was not built during lowering"
+            ))]);
+        };
+        variants.push((id, layout));
+    }
+
+    Ok(Module {
+        functions,
+        records,
+        variants,
+    })
+}
+
+/// Which kind of module-level item an `ItemId` names, for a collision
+/// diagnostic to describe accurately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Record,
+    Variant,
+    Function,
+}
+
+impl ItemKind {
+    fn describe(self) -> &'static str {
+        match self {
+            ItemKind::Record => "record",
+            ItemKind::Variant => "variant",
+            ItemKind::Function => "function",
+        }
+    }
+}
+
+/// Checks that every record/variant/function's `ItemId` is unique
+/// across the whole module -- not merely unique within its own kind.
+/// Visits records, then variants, then functions, each in their own
+/// declaration order (never a `HashMap`'s iteration order), so the
+/// diagnostics this produces are identical across repeated runs.
+fn validate_item_identities(
+    hir: &HirModule,
+    interner: &Interner,
+    source: SourceId,
+) -> Vec<Diagnostic> {
+    let mut seen: HashMap<ItemId, ItemKind> = HashMap::new();
+    let mut diagnostics = Vec::new();
+    let mut check = |id: ItemId, kind: ItemKind, name: Symbol, span: Span| {
+        let text = interner.resolve(name);
+        match seen.get(&id) {
+            Some(&existing) if existing == kind => {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    span,
+                    format!(
+                        "{} `{text}` reuses an id already used by another {} in this module",
+                        kind.describe(),
+                        kind.describe()
+                    ),
+                ));
+            }
+            Some(&existing) => {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    span,
+                    format!(
+                        "{} `{text}` reuses an id already used by a {} in this module",
+                        kind.describe(),
+                        existing.describe()
+                    ),
+                ));
+            }
+            None => {
+                seen.insert(id, kind);
+            }
+        }
+    };
+    for r in &hir.records {
+        check(r.id, ItemKind::Record, r.name, r.span);
+    }
+    for v in &hir.variants {
+        check(v.id, ItemKind::Variant, v.name, v.span);
+    }
+    for f in &hir.functions {
+        check(f.id, ItemKind::Function, f.name, f.name_span);
+    }
+    diagnostics
 }
 
 /// Resolves a written type name the same way `typeck::resolve_named_type`
@@ -142,9 +318,12 @@ fn resolve_named_type(
 struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
+    pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
     interner: &'a Interner,
     source: SourceId,
     type_names: HashMap<Symbol, ItemId>,
+    records: HashMap<ItemId, RecordLayout>,
+    variants: HashMap<ItemId, VariantLayout>,
     function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
 }
 
@@ -321,21 +500,10 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|t| self.resolve_named_type(t))
             .unwrap_or(Ty::Unit);
-        // A declared `record`/`variant` name resolves and nominally
-        // compares fine in typeck (`spec/0003`), but Alpha 0.1 NIR has
-        // no aggregate runtime representation at all -- no instruction
-        // constructs one, no `Value` variant holds one. Silently
-        // treating it as `Ty::Error` here (the previous behavior) would
-        // reach the verifier as an unexplained error type; explicitly
-        // rejecting it here, with a diagnostic naming the actual type
-        // and where it appears, is what keeps that failure at the right
-        // layer instead.
-        self.reject_named_type(&return_type, f.name_span, "a function's return type")?;
         let mut fb = FnBuilder::new(return_type.clone());
         let mut params = Vec::new();
         for p in &f.params {
             let ty = self.local_types.get(&p.local).cloned().unwrap_or(Ty::Error);
-            self.reject_named_type(&ty, p.span, "a function parameter's type")?;
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
@@ -383,22 +551,6 @@ impl<'a> Lowering<'a> {
 
     fn resolve_named_type(&self, ty: &ast::Type) -> Ty {
         resolve_named_type(self.interner, &self.type_names, ty)
-    }
-
-    fn reject_named_type(&self, ty: &Ty, span: Span, position: &str) -> LowerResult<()> {
-        if let Ty::Named(_, name) = ty {
-            return Err(Box::new(Diagnostic::error(
-                codes::UNSUPPORTED_IN_NIR,
-                self.source,
-                span,
-                format!(
-                    "{position} uses the named type `{}`, which has no aggregate runtime \
-                     representation in Alpha 0.1 NIR",
-                    self.interner.resolve(*name)
-                ),
-            )));
-        }
-        Ok(())
     }
 
     // ---- reading typeck's already-resolved types ----
@@ -617,6 +769,19 @@ impl<'a> Lowering<'a> {
                 let text = self.interner.resolve(*name);
                 Err(self.unsupported(*span, &format!("using `{text}` as a first-class value")))
             }
+            // A bare (uncalled) case reference: `typeck` already
+            // confirmed this case carries no payload (else it recorded
+            // `Ty::Error` and this is unreachable for a well-typed
+            // program) -- routed through the same lower_variant_construct
+            // a `Variant.Case(...)` call goes through, with an empty
+            // argument list, so an unknown variant, an invalid case
+            // index, and (via the existing arity check) a bare
+            // reference to a case that actually carries a payload are
+            // all rejected the same one way, not by a second,
+            // independently-drifting implementation here.
+            HirExpr::CaseRef { variant, case, .. } => {
+                self.lower_variant_construct(fb, *variant, *case, &[], expr)
+            }
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
                 op,
@@ -628,8 +793,8 @@ impl<'a> Lowering<'a> {
             HirExpr::Assign {
                 target, op, value, ..
             } => self.lower_assign(fb, target, *op, value),
-            HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args),
-            HirExpr::Field { span, .. } => Err(self.unsupported(*span, "field access")),
+            HirExpr::Call { callee, args, .. } => self.lower_call(fb, callee, args, expr),
+            HirExpr::Field { base, name, .. } => self.lower_field(fb, base, *name, expr),
             // typeck rejects both of these outright (T0007) before
             // lowering ever runs in the normal pipeline. A direct
             // caller bypassing that gate must not get identity lowering
@@ -649,8 +814,16 @@ impl<'a> Lowering<'a> {
                 let result_ty = self.expr_ty(expr);
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
-            HirExpr::Match { span, .. } => Err(self.unsupported(*span, "match")),
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => {
+                let result_ty = self.expr_ty(expr);
+                self.lower_match(fb, scrutinee, arms, result_ty)
+            }
             HirExpr::Block(b) => self.lower_block_value(fb, b),
+            HirExpr::RecordLiteral { record, fields, .. } => {
+                self.lower_record_literal(fb, *record, fields, expr)
+            }
             HirExpr::Return { value, .. } => {
                 let ret_ty = fb.return_ty.clone();
                 let v = match value {
@@ -924,8 +1097,23 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         callee: &HirExpr,
         args: &[HirExpr],
+        call_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
+        if let HirExpr::CaseRef { variant, case, .. } = callee {
+            return self.lower_variant_construct(fb, *variant, *case, args, call_expr);
+        }
+
         let HirExpr::Function { item, .. } = callee else {
+            // typeck already rejects a call whose callee doesn't
+            // resolve to an actual function (Napitia has no first-class
+            // function values); reaching here means a caller lowered
+            // hand-built HIR bypassing that check. The callee and
+            // arguments are still checked for their own divergence (a
+            // diverging callee/argument really would make the whole
+            // call unreachable), but the call itself must never
+            // fabricate a successful `Ty::Error`/`Const::Unit` result --
+            // that would silently invent a value nothing in the source
+            // actually produced.
             if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
                 return Ok(LoweredExpr::Diverged);
             }
@@ -934,9 +1122,7 @@ impl<'a> Lowering<'a> {
                     return Ok(LoweredExpr::Diverged);
                 }
             }
-            return Ok(LoweredExpr::Value(
-                fb.push_value(Ty::Error, ValueKind::Const(Const::Unit)),
-            ));
+            return Err(self.internal_error("call target does not resolve to a function"));
         };
         let (param_tys, ret_ty) = self
             .function_sigs
@@ -954,6 +1140,162 @@ impl<'a> Lowering<'a> {
         Ok(LoweredExpr::Value(
             fb.push_value(ret_ty, ValueKind::Call(*item, arg_values)),
         ))
+    }
+
+    fn lower_variant_construct(
+        &mut self,
+        fb: &mut FnBuilder,
+        variant: ItemId,
+        case: usize,
+        args: &[HirExpr],
+        call_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        // A well-typed program always has a real entry here (typeck
+        // already validated the variant and case); a caller that lowers
+        // hand-built HIR bypassing typeck must get a structured
+        // diagnostic instead of an out-of-bounds panic or a fabricated
+        // payload-type hint for an unknown case.
+        let payload_tys = match self.variants.get(&variant).and_then(|v| v.cases.get(case)) {
+            Some(c) => c.payload.clone(),
+            None => {
+                return Err(self.internal_error(&format!(
+                    "variant construction references unknown variant/case ({variant:?}, {case})"
+                )));
+            }
+        };
+        // The complete shape is validated before a single argument is
+        // evaluated: too few arguments would otherwise leave `payload`
+        // shorter than the case's declared arity, and too many would
+        // leave it longer, either way fabricating a `variant.create`
+        // whose payload count doesn't match its own declared case.
+        if args.len() != payload_tys.len() {
+            return Err(self.internal_error(&format!(
+                "variant construction for case {case} of {variant:?} has {} argument(s), expected {}",
+                args.len(),
+                payload_tys.len()
+            )));
+        }
+        let mut payload = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let hint = payload_tys.get(i).cloned().unwrap_or(Ty::Error);
+            match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => payload.push(v),
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
+        }
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(call_expr),
+            ValueKind::VariantCreate {
+                variant,
+                case,
+                payload,
+            },
+        )))
+    }
+
+    /// `TypeName { field: expr, ... }`. Each field is evaluated exactly
+    /// once, in **source order** (`fields` is already in that order --
+    /// see `HirExpr::RecordLiteral`'s doc comment), then reordered into
+    /// **declaration order** for `record.create` -- runtime layout
+    /// always follows declaration order, independent of how the
+    /// construction site wrote them.
+    fn lower_record_literal(
+        &mut self,
+        fb: &mut FnBuilder,
+        record: ItemId,
+        fields: &[HirFieldInit],
+        literal_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        // typeck/hir::lower already reject a source-level unknown
+        // record, out-of-range/duplicate field index, or missing field;
+        // reaching any of these means a caller lowered a
+        // HirExpr::RecordLiteral built by hand (or otherwise bypassing
+        // those checks). The complete shape is validated up front,
+        // before a single field is evaluated, so lowering never
+        // silently drops an out-of-range field into nowhere or lets a
+        // duplicate index overwrite an earlier field's already-lowered
+        // value in its temporary slot -- either would fabricate a
+        // `record.create` that doesn't reflect what was actually
+        // written.
+        let Some(layout) = self.records.get(&record) else {
+            return Err(self.internal_error(&format!(
+                "record construction references unknown record {record:?}"
+            )));
+        };
+        let field_count = layout.fields.len();
+        let mut seen = vec![false; field_count];
+        for f in fields {
+            let Some(slot_seen) = seen.get_mut(f.field_index) else {
+                return Err(self.internal_error(&format!(
+                    "record construction's field index {} is out of range for {record:?}'s {field_count} declared field(s)",
+                    f.field_index
+                )));
+            };
+            if *slot_seen {
+                return Err(self.internal_error(&format!(
+                    "record construction reuses field index {} more than once",
+                    f.field_index
+                )));
+            }
+            *slot_seen = true;
+        }
+        if let Some(missing) = seen.iter().position(|&s| !s) {
+            return Err(
+                self.internal_error(&format!("record construction is missing field {missing}"))
+            );
+        }
+
+        let mut by_index: Vec<Option<ValueId>> = vec![None; field_count];
+        for f in fields {
+            let hint = self.records[&record].fields[f.field_index].1.clone();
+            match self.lower_expr_hinted(fb, &f.value, &hint)? {
+                LoweredExpr::Value(v) => by_index[f.field_index] = Some(v),
+                // A diverging initializer means the whole construction
+                // never completes; no field written after it in source
+                // order is lowered as reachable work.
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
+        }
+        let ordered: Vec<ValueId> = by_index
+            .into_iter()
+            .map(|v| v.expect("every index was already proven present above"))
+            .collect();
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(literal_expr),
+            ValueKind::RecordCreate(record, ordered),
+        )))
+    }
+
+    fn lower_field(
+        &mut self,
+        fb: &mut FnBuilder,
+        base: &HirExpr,
+        name: Symbol,
+        field_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        let base_value = match self.lower_expr(fb, base)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let base_ty = self.expr_ty(base);
+        let Ty::Named(record, _) = base_ty else {
+            return Err(self.unsupported(field_expr.span(), "field access on a non-record type"));
+        };
+        let field_index = self
+            .records
+            .get(&record)
+            .and_then(|r| r.fields.iter().position(|(n, _)| *n == name))
+            .ok_or_else(|| {
+                self.unsupported(field_expr.span(), "field access on an unknown field")
+            })?;
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(field_expr),
+            ValueKind::RecordField {
+                base: base_value,
+                record,
+                field: field_index,
+            },
+        )))
     }
 
     fn lower_if(
@@ -1073,6 +1415,582 @@ impl<'a> Lowering<'a> {
             fb.push_value(result_ty, ValueKind::Load(result_slot)),
         ))
     }
+
+    // ---- match lowering: a decision tree over a pattern matrix ----
+    //
+    // Mirrors the same recursive specialize/default structure
+    // `typeck::exhaustive` uses for its analysis (see RFC 0005's "Match
+    // lowering"), but building real NIR blocks instead of checking
+    // coverage. A "row" carries one pattern slot per currently pending
+    // occurrence (the original scrutinee, plus one fresh occurrence per
+    // payload position introduced by descending into a `Variant`
+    // pattern) -- `PatternSlot::Wildcard` pads a row that doesn't
+    // itself constrain a newly-introduced occurrence (a wildcard/
+    // binding/unit-case row matches every payload position trivially),
+    // keeping every row in one matrix the same length.
+
+    fn lower_match(
+        &mut self,
+        fb: &mut FnBuilder,
+        scrutinee: &HirExpr,
+        arms: &[HirMatchArm],
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
+        let scrutinee_value = match self.lower_expr(fb, scrutinee)? {
+            LoweredExpr::Value(v) => v,
+            // A diverging scrutinee is evaluated exactly once, before
+            // any pattern could ever be tested -- the whole match is
+            // `never`, and no arm is lowered as reachable work.
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let scrutinee_ty = self.expr_ty(scrutinee);
+
+        let rows: Vec<MatrixRow> = arms
+            .iter()
+            .enumerate()
+            .map(|(i, arm)| MatrixRow {
+                arm_index: i,
+                patterns: vec![PatternSlot::Real(&arm.pattern)],
+                bindings: Vec::new(),
+            })
+            .collect();
+        let occurrences = vec![Occurrence {
+            value: scrutinee_value,
+            ty: scrutinee_ty,
+        }];
+
+        if result_ty == Ty::Never {
+            // Every arm diverges (typeck already proved this); no
+            // result slot or merge block is ever created -- each arm's
+            // own terminator is already a complete CFG on its own.
+            self.lower_decision(fb, rows, occurrences, arms, None, 0)?;
+            return Ok(LoweredExpr::Diverged);
+        }
+
+        // The slot and merge block belong to the block current before
+        // any branching starts, so they dominate every arm -- the same
+        // discipline `lower_if` already uses for its own result slot.
+        let result_slot = fb.alloc_slot(result_ty.clone());
+        let after_block = fb.new_block();
+        self.lower_decision(
+            fb,
+            rows,
+            occurrences,
+            arms,
+            Some((result_slot, after_block)),
+            0,
+        )?;
+
+        fb.switch_to(after_block);
+        Ok(LoweredExpr::Value(
+            fb.push_value(result_ty, ValueKind::Load(result_slot)),
+        ))
+    }
+
+    fn lower_decision<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+        depth: usize,
+    ) -> LowerResult<()> {
+        // Each round trip through lower_decision and one of
+        // lower_bool_switch/lower_variant_switch/lower_literal_chain
+        // consumes exactly one occurrence position -- one nesting
+        // level of the pattern(s) being decided between -- on this
+        // pass's own native call stack. typeck's check_pattern already
+        // keeps every pattern the normal pipeline produces shallow
+        // enough that this can never fire there, but lower_module is a
+        // public entry point a direct caller can invoke with hand-built
+        // HIR bypassing typeck entirely, so this needs its own
+        // independent bound too, matching hir::lower_pattern's and
+        // typeck::is_useful's -- all sharing crate::limits::MAX_PATTERN_DEPTH.
+        if depth > MAX_PATTERN_DEPTH {
+            return Err(self.internal_error("match decision tree is nested too deeply to lower"));
+        }
+        if occurrences.is_empty() {
+            let Some(winner) = rows.first() else {
+                return Err(self.internal_error(
+                    "a match's decision tree ran out of candidate arms with no winner",
+                ));
+            };
+            for (local, value) in &winner.bindings {
+                fb.local_bindings
+                    .insert(*local, LocalBinding::Direct(*value));
+            }
+            let arm = &arms[winner.arm_index];
+            let result = match &arm.body {
+                HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
+                HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+            };
+            if let LoweredExpr::Value(v) = result
+                && let Some((slot, after)) = merge
+            {
+                fb.push_store(slot, v);
+                fb.terminate(Terminator::Branch(after));
+            }
+            return Ok(());
+        }
+
+        if matches!(&occurrences[0].ty, Ty::Named(item, _) if self.variants.contains_key(item)) {
+            self.lower_variant_switch(fb, rows, occurrences, arms, merge, depth)
+        } else if matches!(&occurrences[0].ty, Ty::Bool) {
+            // `bool` is a closed two-constructor domain (like a
+            // variant's finite case set), so it is switched on
+            // directly rather than through the open-domain literal
+            // chain below -- an exhaustive `match true { true => ..,
+            // false => .. }` (no wildcard at all) would otherwise have
+            // no catch-all to terminate that chain's recursion on.
+            self.lower_bool_switch(fb, rows, occurrences, arms, merge, depth)
+        } else {
+            self.lower_literal_chain(fb, rows, occurrences, arms, merge, depth)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_bool_switch<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+        depth: usize,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+
+        let any_real_test = rows.iter().any(|r| {
+            matches!(
+                self.classify(&r.patterns[0]),
+                Classified::Literal(LiteralTest::Bool(_))
+            )
+        });
+        if !any_real_test {
+            let mut new_rows = Vec::with_capacity(rows.len());
+            for r in rows {
+                let mut bindings = r.bindings;
+                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
+                    bindings.push((local, occ.value));
+                }
+                new_rows.push(MatrixRow {
+                    arm_index: r.arm_index,
+                    patterns: r.patterns[1..].to_vec(),
+                    bindings,
+                });
+            }
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+        }
+
+        let then_block = fb.new_block();
+        let else_block = fb.new_block();
+        fb.terminate(Terminator::CondBranch {
+            condition: occ.value,
+            then_block,
+            else_block,
+        });
+
+        for (value, block) in [(true, then_block), (false, else_block)] {
+            fb.switch_to(block);
+            let mut new_rows = Vec::new();
+            for r in &rows {
+                match self.classify(&r.patterns[0]) {
+                    Classified::Literal(LiteralTest::Bool(b)) if b == value => {
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    Classified::Literal(LiteralTest::Bool(_)) => {}
+                    Classified::Bind(local) => {
+                        let mut bindings = r.bindings.clone();
+                        bindings.push((local, occ.value));
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings,
+                        });
+                    }
+                    Classified::Wildcard => {
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns: r.patterns[1..].to_vec(),
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if new_rows.is_empty() {
+                return Err(
+                    self.internal_error("a match's bool switch left a branch with no covering arm")
+                );
+            }
+            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_variant_switch<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+        depth: usize,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+        let Ty::Named(variant_item, _) = occ.ty.clone() else {
+            return Err(self.internal_error("expected a variant-typed occurrence"));
+        };
+
+        let any_real_test = rows
+            .iter()
+            .any(|r| matches!(self.classify(&r.patterns[0]), Classified::Case { .. }));
+        if !any_real_test {
+            let mut new_rows = Vec::with_capacity(rows.len());
+            for r in rows {
+                let mut bindings = r.bindings;
+                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
+                    bindings.push((local, occ.value));
+                }
+                new_rows.push(MatrixRow {
+                    arm_index: r.arm_index,
+                    patterns: r.patterns[1..].to_vec(),
+                    bindings,
+                });
+            }
+            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+        }
+
+        let num_cases = self
+            .variants
+            .get(&variant_item)
+            .map(|v| v.cases.len())
+            .unwrap_or(0);
+        let case_blocks: Vec<BlockId> = (0..num_cases).map(|_| fb.new_block()).collect();
+        fb.terminate(Terminator::Switch {
+            scrutinee: occ.value,
+            variant: variant_item,
+            cases: case_blocks.clone(),
+        });
+
+        for (case_index, case_block) in case_blocks.iter().enumerate() {
+            fb.switch_to(*case_block);
+            let payload_types = self.variants[&variant_item].cases[case_index]
+                .payload
+                .clone();
+            let arity = payload_types.len();
+
+            let mut new_rows: Vec<MatrixRow<'h>> = Vec::new();
+            for r in &rows {
+                let rest: Vec<PatternSlot<'h>> = r.patterns[1..].to_vec();
+                match self.classify(&r.patterns[0]) {
+                    Classified::Case {
+                        variant,
+                        case,
+                        args,
+                    } if variant == variant_item && case == case_index => {
+                        // typeck's check_pattern (fix for malformed
+                        // variant-pattern arity) already rejects an
+                        // args-count/declared-arity mismatch before the
+                        // normal pipeline ever reaches lowering -- but a
+                        // caller that hand-builds HIR and calls this
+                        // module directly could still hand it one.
+                        // `Vec::resize` would otherwise silently
+                        // truncate extra sub-patterns (arity too small)
+                        // or accept too few as if the rest were
+                        // wildcards (arity too large), fabricating a
+                        // decision tree that doesn't match what was
+                        // actually written; a structured diagnostic is
+                        // required instead, matching this function's
+                        // existing unknown-case check just above.
+                        if args.len() != arity {
+                            return Err(self.internal_error(&format!(
+                                "variant pattern for case {case_index} of {variant_item:?} has {} sub-pattern(s), expected {arity}",
+                                args.len()
+                            )));
+                        }
+                        let mut patterns: Vec<PatternSlot<'h>> =
+                            args.iter().map(PatternSlot::Real).collect();
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    Classified::Case { .. } => {}
+                    Classified::Bind(local) => {
+                        let mut bindings = r.bindings.clone();
+                        bindings.push((local, occ.value));
+                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings,
+                        });
+                    }
+                    Classified::Wildcard => {
+                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        patterns.extend(rest);
+                        new_rows.push(MatrixRow {
+                            arm_index: r.arm_index,
+                            patterns,
+                            bindings: r.bindings.clone(),
+                        });
+                    }
+                    // A literal pattern against a variant-typed
+                    // occurrence is rejected by typeck (T0021,
+                    // incompatible pattern) before lowering ever runs
+                    // in the normal pipeline; excluded here rather than
+                    // panicking, matching this module's defense-in-depth
+                    // posture for a direct caller that bypasses typeck.
+                    Classified::Literal(_) => {}
+                }
+            }
+            if new_rows.is_empty() {
+                return Err(self.internal_error(
+                    "a match's decision tree left a variant case with no covering arm",
+                ));
+            }
+
+            let mut payload_occurrences = Vec::with_capacity(arity);
+            for (i, ty) in payload_types.iter().enumerate() {
+                let v = fb.push_value(
+                    ty.clone(),
+                    ValueKind::VariantPayload {
+                        base: occ.value,
+                        variant: variant_item,
+                        case: case_index,
+                        index: i,
+                    },
+                );
+                payload_occurrences.push(Occurrence {
+                    value: v,
+                    ty: ty.clone(),
+                });
+            }
+
+            let mut new_occurrences = payload_occurrences;
+            new_occurrences.extend(rest_occ.clone());
+            self.lower_decision(fb, new_rows, new_occurrences, arms, merge, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_literal_chain<'h>(
+        &mut self,
+        fb: &mut FnBuilder,
+        rows: Vec<MatrixRow<'h>>,
+        occurrences: Vec<Occurrence>,
+        arms: &'h [HirMatchArm],
+        merge: Option<(ValueId, BlockId)>,
+        depth: usize,
+    ) -> LowerResult<()> {
+        let occ = occurrences[0].clone();
+        let rest_occ = occurrences[1..].to_vec();
+
+        let Some(first) = rows.first() else {
+            return Err(self.internal_error("a match's literal chain ran out of candidate arms"));
+        };
+        match self.classify(&first.patterns[0]) {
+            Classified::Wildcard => {
+                let new_rows = vec![MatrixRow {
+                    arm_index: first.arm_index,
+                    patterns: first.patterns[1..].to_vec(),
+                    bindings: first.bindings.clone(),
+                }];
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+            }
+            Classified::Bind(local) => {
+                let mut bindings = first.bindings.clone();
+                bindings.push((local, occ.value));
+                let new_rows = vec![MatrixRow {
+                    arm_index: first.arm_index,
+                    patterns: first.patterns[1..].to_vec(),
+                    bindings,
+                }];
+                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+            }
+            Classified::Literal(lit) => {
+                let const_value = literal_const(fb, &lit, &occ.ty);
+                let eq = fb.push_value(Ty::Bool, ValueKind::Eq(occ.value, const_value));
+                let then_block = fb.new_block();
+                let else_block = fb.new_block();
+                fb.terminate(Terminator::CondBranch {
+                    condition: eq,
+                    then_block,
+                    else_block,
+                });
+
+                let mut then_rows = Vec::new();
+                for r in &rows {
+                    match self.classify(&r.patterns[0]) {
+                        Classified::Literal(l2) if literal_eq(&lit, &l2) => {
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings: r.bindings.clone(),
+                            });
+                        }
+                        Classified::Wildcard => {
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings: r.bindings.clone(),
+                            });
+                        }
+                        Classified::Bind(local) => {
+                            let mut bindings = r.bindings.clone();
+                            bindings.push((local, occ.value));
+                            then_rows.push(MatrixRow {
+                                arm_index: r.arm_index,
+                                patterns: r.patterns[1..].to_vec(),
+                                bindings,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                fb.switch_to(then_block);
+                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+
+                let else_rows: Vec<MatrixRow<'h>> = rows
+                    .into_iter()
+                    .filter(|r| {
+                        !matches!(self.classify(&r.patterns[0]), Classified::Literal(l2) if literal_eq(&lit, &l2))
+                    })
+                    .collect();
+                fb.switch_to(else_block);
+                if else_rows.is_empty() {
+                    return Err(self.internal_error(
+                        "a match's literal chain ran out of rows without a catch-all",
+                    ));
+                }
+                let mut all_occ = vec![occ];
+                all_occ.extend(rest_occ);
+                self.lower_decision(fb, else_rows, all_occ, arms, merge, depth + 1)
+            }
+            Classified::Case { .. } => Err(self
+                .internal_error("a variant pattern was tested against a non-variant occurrence")),
+        }
+    }
+
+    fn classify<'h>(&self, slot: &PatternSlot<'h>) -> Classified<'h> {
+        let pattern = match slot {
+            PatternSlot::Wildcard => return Classified::Wildcard,
+            PatternSlot::Real(p) => *p,
+        };
+        match pattern {
+            HirPattern::Wildcard { .. } => Classified::Wildcard,
+            HirPattern::Bind { id, local, .. } => match self.pattern_case.get(id) {
+                Some(&(variant, case)) => Classified::Case {
+                    variant,
+                    case,
+                    args: &[],
+                },
+                None => Classified::Bind(*local),
+            },
+            HirPattern::Variant { id, args, .. } => match self.pattern_case.get(id) {
+                Some(&(variant, case)) => Classified::Case {
+                    variant,
+                    case,
+                    args,
+                },
+                // Unresolved (typeck-unreachable for a valid program):
+                // treated as matching nothing, defensively.
+                None => Classified::Case {
+                    variant: ItemId(u32::MAX),
+                    case: usize::MAX,
+                    args,
+                },
+            },
+            HirPattern::Int { value, .. } => Classified::Literal(LiteralTest::Int(*value)),
+            HirPattern::Str { value, .. } => Classified::Literal(LiteralTest::Str(value)),
+            HirPattern::Char { value, .. } => Classified::Literal(LiteralTest::Char(*value)),
+            HirPattern::Bool { value, .. } => Classified::Literal(LiteralTest::Bool(*value)),
+        }
+    }
+
+    fn internal_error(&self, message: &str) -> Box<Diagnostic> {
+        Box::new(Diagnostic::error(
+            codes::INTERNAL_INVARIANT_VIOLATED,
+            self.source,
+            Span::dummy(),
+            message.to_string(),
+        ))
+    }
+}
+
+/// One pattern slot in a decision-tree matrix row: either a real
+/// surface pattern, or a synthetic filler for a newly-introduced
+/// occurrence that a wildcard/binding/unit-case row doesn't itself
+/// constrain -- keeps every row in one matrix the same length (see
+/// `Lowering::lower_decision`'s doc comment).
+#[derive(Clone, Copy)]
+enum PatternSlot<'h> {
+    Real(&'h HirPattern),
+    Wildcard,
+}
+
+#[derive(Clone)]
+struct Occurrence {
+    value: ValueId,
+    ty: Ty,
+}
+
+struct MatrixRow<'h> {
+    arm_index: usize,
+    patterns: Vec<PatternSlot<'h>>,
+    bindings: Vec<(LocalId, ValueId)>,
+}
+
+enum Classified<'h> {
+    Wildcard,
+    Bind(LocalId),
+    Case {
+        variant: ItemId,
+        case: usize,
+        args: &'h [HirPattern],
+    },
+    Literal(LiteralTest<'h>),
+}
+
+enum LiteralTest<'h> {
+    Int(u128),
+    Str(&'h str),
+    Char(char),
+    Bool(bool),
+}
+
+fn literal_eq(a: &LiteralTest, b: &LiteralTest) -> bool {
+    match (a, b) {
+        (LiteralTest::Int(x), LiteralTest::Int(y)) => x == y,
+        (LiteralTest::Str(x), LiteralTest::Str(y)) => x == y,
+        (LiteralTest::Char(x), LiteralTest::Char(y)) => x == y,
+        (LiteralTest::Bool(x), LiteralTest::Bool(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn literal_const(fb: &mut FnBuilder, lit: &LiteralTest, ty: &Ty) -> ValueId {
+    match lit {
+        LiteralTest::Int(v) => fb.push_value(ty.clone(), ValueKind::Const(Const::Int(*v))),
+        LiteralTest::Str(s) => {
+            fb.push_value(ty.clone(), ValueKind::Const(Const::Str((*s).to_string())))
+        }
+        LiteralTest::Char(c) => fb.push_value(ty.clone(), ValueKind::Const(Const::Char(*c))),
+        LiteralTest::Bool(b) => fb.push_value(ty.clone(), ValueKind::Const(Const::Bool(*b))),
+    }
 }
 
 #[cfg(test)]
@@ -1104,8 +2022,15 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed")
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed")
     }
 
     /// Like `lower`, but for a program that type-checks cleanly and is
@@ -1131,7 +2056,14 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
     }
 
     /// Like `lower`, but also runs the module through the NIR verifier
@@ -1157,71 +2089,304 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
-        let module = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
-            .expect("expected lowering to succeed");
+        let module = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
         crate::nir::verify_module(&module, id, &interner)
     }
 
     #[test]
-    fn a_named_return_type_fails_lowering_with_i0001_not_v0013() {
-        // `check` accepts this (nominal resolution/comparison of a
-        // declared record name is real, spec/0003), but lowering has no
-        // aggregate runtime representation for it. This must surface as
-        // I0001 at the point lowering actually gives up, not filter
-        // through as a silent Ty::Error caught later by the verifier as
-        // V0013.
+    fn a_named_return_type_lowers_and_verifies_cleanly() {
+        // Alpha 0.1.1: records now have a real aggregate runtime
+        // representation, so a named type in a function signature is
+        // no longer rejected -- it lowers and verifies like any other
+        // type.
         let text = "record Point { x: i64 } func identity(p: Point) -> Point { p } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named aggregate type");
-        };
+        let diagnostics = lower_and_verify(text);
         assert!(
-            diagnostics.iter().any(|d| d.code == "I0001"),
-            "expected an I0001 diagnostic, got {diagnostics:?}"
-        );
-        assert!(
-            !diagnostics.iter().any(|d| d.code == "V0013"),
-            "a named type must never fall through to the verifier as an \
-             unexplained error type: {diagnostics:?}"
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
         );
     }
 
     #[test]
-    fn a_named_parameter_type_fails_lowering_with_i0001() {
+    fn a_named_parameter_type_lowers_successfully() {
         let text = "record Point { x: i64 } func describe(p: Point) -> i64 { 0 } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named parameter type");
-        };
-        assert!(
-            diagnostics.iter().any(|d| d.code == "I0001"),
-            "expected an I0001 diagnostic, got {diagnostics:?}"
-        );
+        assert!(lower_result(text).is_ok());
     }
 
     #[test]
-    fn main_coexisting_with_a_named_type_function_fails_the_whole_module() {
-        // `main` itself never touches the named type, but lowering is
-        // atomic: the module must fail as a whole, not silently produce
-        // a `Module` containing just `main`.
-        let text = "record Point { x: i64 } \
-                    func identity(p: Point) -> Point { p } \
-                    func main() -> i64 { return 42 }";
-        assert!(
-            lower_result(text).is_err(),
-            "expected the whole module to fail lowering"
-        );
-    }
-
-    #[test]
-    fn variant_names_also_resolve_and_are_rejected_in_nir() {
+    fn variant_names_also_resolve_and_lower_successfully() {
         let text = "variant Shape { Circle } \
                     func describe(s: Shape) -> i64 { 0 } \
                     func main() -> i64 { 42 }";
-        let Err(diagnostics) = lower_result(text) else {
-            panic!("expected lowering to fail for a named variant type");
+        assert!(lower_result(text).is_ok());
+    }
+
+    #[test]
+    fn record_create_orders_fields_by_declaration_not_construction_site() {
+        // Written `y` first, `x` second; declaration order is `x, y`.
+        let module = lower(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { value p = Point { y: 2, x: 1 }; return p.x }",
+        );
+        let instructions: Vec<&Instruction> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let (record, args) = instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Value {
+                    kind: ValueKind::RecordCreate(record, args),
+                    ..
+                } => Some((*record, args.clone())),
+                _ => None,
+            })
+            .expect("expected a record.create instruction");
+        // The two const instructions, in source order, produced `2`
+        // then `1`; record.create's args must be reordered so the
+        // first arg is `x`'s value (1) and the second is `y`'s (2).
+        let const_values: HashMap<ValueId, i128> = instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::Const(Const::Int(v)),
+                    ..
+                } => Some((*result, *v as i128)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(const_values[&args[0]], 1, "expected x's value first");
+        assert_eq!(const_values[&args[1]], 2, "expected y's value second");
+        let _ = record;
+    }
+
+    #[test]
+    fn record_field_initializers_evaluate_exactly_once_in_source_order() {
+        let module = lower(
+            "record Pair { a: i64, b: i64 } \
+             func f() -> i64 { value p = Pair { b: 2, a: 1 }; return p.a }",
+        );
+        let const_count = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Const(Const::Int(_)),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            const_count, 2,
+            "each field initializer must be evaluated exactly once"
+        );
+    }
+
+    #[test]
+    fn record_field_access_lowers_to_a_resolved_projection() {
+        let module = lower(
+            "record Point { x: i64, y: i64 } \
+             func f() -> i64 { value p = Point { x: 1, y: 2 }; return p.y }",
+        );
+        let has_field_projection = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::RecordField { field: 1, .. },
+                        ..
+                    }
+                )
+            });
+        assert!(
+            has_field_projection,
+            "expected a record.field projection at declaration index 1 (y)"
+        );
+    }
+
+    #[test]
+    fn variant_construction_lowers_explicitly() {
+        let module = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Circle(7); return 0 }",
+        );
+        let has_variant_create = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::VariantCreate { case: 0, .. },
+                        ..
+                    }
+                )
+            });
+        assert!(has_variant_create, "expected a variant.create for case 0");
+    }
+
+    #[test]
+    fn unit_case_construction_allocates_no_payload() {
+        let module = lower(
+            "variant Shape { Circle(i64), Empty } \
+             func f() -> i64 { value s = Shape.Empty; return 0 }",
+        );
+        let payload_len = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Instruction::Value {
+                    kind:
+                        ValueKind::VariantCreate {
+                            case: 1, payload, ..
+                        },
+                    ..
+                } => Some(payload.len()),
+                _ => None,
+            })
+            .expect("expected a variant.create for the unit case");
+        assert_eq!(payload_len, 0);
+    }
+
+    #[test]
+    fn variant_match_lowers_to_a_deterministic_switch() {
+        let text = "variant Shape { Circle(i64), Square(i64) } \
+                     func f(s: Shape) -> i64 { return match s { Circle(v) => v, Square(v) => v } }";
+        let a = lower(text);
+        let b = lower(text);
+        let switches_of = |m: &Module| -> Vec<(ItemId, usize)> {
+            m.functions[0]
+                .blocks
+                .iter()
+                .filter_map(|blk| match &blk.terminator {
+                    Terminator::Switch { variant, cases, .. } => Some((*variant, cases.len())),
+                    _ => None,
+                })
+                .collect()
         };
-        assert!(diagnostics.iter().any(|d| d.code == "I0001"));
+        assert_eq!(
+            switches_of(&a),
+            switches_of(&b),
+            "switch lowering must be deterministic across runs"
+        );
+        assert_eq!(switches_of(&a).len(), 1);
+        assert_eq!(switches_of(&a)[0].1, 2, "expected one target per case");
+    }
+
+    #[test]
+    fn nested_variant_pattern_lowers_to_nested_switches() {
+        let text = "variant Inner { X, Y } \
+                     variant Outer { A(Inner), B } \
+                     func f(o: Outer) -> i64 { \
+                         return match o { A(X) => 1, A(Y) => 2, B => 3 } \
+                     }";
+        let module = lower(text);
+        let switch_count = module.functions[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .count();
+        assert_eq!(
+            switch_count, 2,
+            "expected one switch for Outer and one for the nested Inner pattern"
+        );
+    }
+
+    #[test]
+    fn fully_diverging_match_allocates_no_result_slot() {
+        let text = "variant Shape { Circle, Empty } \
+                     func f(s: Shape) -> i64 { \
+                         match s { Circle => return 1, Empty => return 2 } \
+                     }";
+        let module = lower(text);
+        let has_alloc = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Alloc,
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !has_alloc,
+            "a fully diverging match must not allocate a result slot"
+        );
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn value_producing_match_allocates_exactly_one_result_slot() {
+        let text = "variant Shape { Circle(i64), Empty } \
+                     func f(s: Shape) -> i64 { return match s { Circle(v) => v, Empty => 0 } }";
+        let module = lower(text);
+        let alloc_count = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Value {
+                        kind: ValueKind::Alloc,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(alloc_count, 1);
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn payload_bindings_dominate_their_arm_body() {
+        // Exercised through the verifier's own dominance analysis: a
+        // payload extracted in a case's block, used in that same arm's
+        // body (however deeply nested), must never be flagged as a
+        // dominance violation.
+        let text = "variant Shape { Circle(i64) } \
+                     func f(s: Shape) -> i64 { \
+                         return match s { Circle(v) => if v > 0 { v } else { 0 - v } } \
+                     }";
+        let diagnostics = lower_and_verify(text);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -1648,7 +2813,14 @@ mod tests {
             "unexpected resolve diagnostics: {diags:?}"
         );
         let result = check_module(&hir, id, &interner);
-        lower_module(&hir, &result.local_types, &result.expr_types, &interner, id)
+        lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        )
     }
 
     fn assert_fails_with_i0001(text: &str, expect_in_message: &str) {
@@ -1668,21 +2840,1042 @@ mod tests {
     }
 
     #[test]
-    fn match_expression_fails_lowering_not_silently_wrong() {
-        // Lowering must refuse to guess at NIR for a construct it
-        // cannot represent, rather than silently emitting something
-        // wrong, if it is ever handed one directly -- and it must fail
-        // atomically (no partial `Module` at all), not return a module
-        // missing just this one function.
-        assert_fails_with_i0001(
-            "func f(x: i64) -> i64 { return match x { _ => 0 } }",
-            "match",
+    fn record_construction_missing_a_field_fails_lowering_with_i0002_not_a_panic() {
+        // hir::lower itself diagnoses a missing field (R0009) but does
+        // not synthesize one, so a caller that lowers past *that*
+        // diagnostic too (not just typeck's, unlike every other test in
+        // this module) reaches NIR lowering with a genuinely incomplete
+        // field list. Must fail atomically with a structured
+        // diagnostic, never panic and never fabricate the missing
+        // field's value.
+        let text = "record Point { x: i64, y: i64 } \
+                    func f() { value p = Point { x: 1 }; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, resolve_diags) = lower_hir(&module, id, &interner);
+        assert!(
+            resolve_diags.iter().any(|d| d.code == "R0009"),
+            "expected a missing-field diagnostic from hir::lower: {resolve_diags:?}"
+        );
+        let result = check_module(&hir, id, &interner);
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail for a record literal missing a field")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic, got {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("missing field")),
+            "expected a diagnostic mentioning the missing field, got {diagnostics:?}"
         );
     }
 
     #[test]
-    fn field_access_fails_lowering_not_silently_wrong() {
-        assert_fails_with_i0001("func f(x: i64) -> i64 { return x.y }", "field access");
+    fn variant_pattern_arity_mismatch_fails_lowering_with_i0002_not_a_silent_truncation() {
+        // typeck reports T0002 for this arity mismatch and the normal
+        // driver never lowers past it, but a caller that lowers anyway
+        // (bypassing that diagnostic gate, like every test in this
+        // module using `lower_bypassing_typeck`) must not have the
+        // extra sub-pattern silently dropped by a bare `Vec::resize` --
+        // it must fail atomically with a structured diagnostic instead.
+        let text = "variant Pair { Two(i64, i64) } \
+                    func f(p: Pair) -> i64 { return match p { Two(a, b, c) => a } }";
+        assert_fails_with_i0002(text, "sub-pattern");
+    }
+
+    fn assert_fails_with_i0002(text: &str, expect_in_message: &str) {
+        let Err(diagnostics) = lower_bypassing_typeck(text) else {
+            panic!("expected lowering to fail for: {text:?}");
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic for {text:?}, got {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains(expect_in_message)),
+            "expected a diagnostic mentioning {expect_in_message:?} for {text:?}, got {diagnostics:?}"
+        );
+    }
+
+    /// A trivial, otherwise-valid `HirFunction` (no params, no return
+    /// type, an empty body) -- only its own `id`/`name` matter for the
+    /// item-identity tests below, which fail before this function's
+    /// body is ever lowered.
+    fn minimal_function(id: ItemId, name: Symbol) -> HirFunction {
+        HirFunction {
+            id,
+            name,
+            name_span: Span::dummy(),
+            params: vec![],
+            return_type: None,
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(0),
+                statements: vec![],
+                tail: None,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        }
+    }
+
+    fn minimal_record(id: ItemId, name: Symbol) -> crate::hir::HirRecord {
+        crate::hir::HirRecord {
+            id,
+            name,
+            span: Span::dummy(),
+            fields: vec![],
+        }
+    }
+
+    fn minimal_variant(id: ItemId, name: Symbol) -> crate::hir::HirVariant {
+        crate::hir::HirVariant {
+            id,
+            name,
+            span: Span::dummy(),
+            cases: vec![],
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn empty_maps() -> (
+        HashMap<LocalId, Ty>,
+        HashMap<ExprId, Ty>,
+        HashMap<PatternId, (ItemId, usize)>,
+    ) {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    /// A trivial function whose body's tail is `tail_expr` -- used by
+    /// the bare-`CaseRef` tests below, which need a real function body
+    /// to place a hand-built `HirExpr::CaseRef` in.
+    fn function_with_tail(id: ItemId, name: Symbol, tail_expr: HirExpr) -> HirFunction {
+        HirFunction {
+            id,
+            name,
+            name_span: Span::dummy(),
+            params: vec![],
+            return_type: None,
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(100),
+                statements: vec![],
+                tail: Some(Box::new(tail_expr)),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        }
+    }
+
+    fn case_ref(variant: ItemId, case: usize, name: Symbol) -> HirExpr {
+        HirExpr::CaseRef {
+            id: ExprId(0),
+            variant,
+            case,
+            name,
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn bare_case_ref_to_an_unknown_variant_fails_lowering_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let case_name = interner.intern("Empty");
+        let unknown_variant = ItemId(0);
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(unknown_variant, 0, case_name),
+            )],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(unknown_variant, case_name));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref to an unknown variant to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn bare_case_ref_with_an_invalid_case_index_fails_lowering_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let variant_sym = interner.intern("Shape");
+        let case_name = interner.intern("Empty");
+        let variant_item = ItemId(0);
+        let variant = minimal_variant(variant_item, variant_sym);
+        // Case index 7 does not exist -- the variant declares no cases
+        // at all.
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(variant_item, 7, case_name),
+            )],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(variant_item, variant_sym));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref with an invalid case index to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn bare_case_ref_to_a_payload_carrying_case_fails_lowering_not_a_panic() {
+        // `Shape.Circle` written bare (no call parens) against a case
+        // that actually carries a payload must be rejected, not
+        // silently construct it with an empty payload.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let variant_sym = interner.intern("Shape");
+        let case_name = interner.intern("Circle");
+        let variant_item = ItemId(0);
+        let variant = crate::hir::HirVariant {
+            id: variant_item,
+            name: variant_sym,
+            span: Span::dummy(),
+            cases: vec![crate::hir::HirCase {
+                name: case_name,
+                span: Span::dummy(),
+                payload: vec![ast::Type {
+                    name: ast::Ident {
+                        symbol: interner.intern("i64"),
+                        span: Span::dummy(),
+                    },
+                }],
+            }],
+        };
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(variant_item, 0, case_name),
+            )],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(variant_item, variant_sym));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref to a payload-carrying case to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn duplicate_record_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate record id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("record"));
+    }
+
+    #[test]
+    fn duplicate_variant_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![],
+            variants: vec![minimal_variant(ItemId(0), a), minimal_variant(ItemId(0), b)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate variant id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("variant"));
+    }
+
+    #[test]
+    fn duplicate_function_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let g = interner.intern("g");
+        let module = HirModule {
+            functions: vec![
+                minimal_function(ItemId(0), f),
+                minimal_function(ItemId(0), g),
+            ],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate function id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("function"));
+    }
+
+    #[test]
+    fn record_variant_id_collision_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a)],
+            variants: vec![minimal_variant(ItemId(0), b)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a record/variant id collision to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(
+            diagnostics[0].message.contains("record") && diagnostics[0].message.contains("variant")
+        );
+    }
+
+    #[test]
+    fn function_aggregate_id_collision_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let f = interner.intern("f");
+        let module = HirModule {
+            functions: vec![minimal_function(ItemId(0), f)],
+            records: vec![minimal_record(ItemId(0), a)],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a function/record id collision to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(
+            diagnostics[0].message.contains("function")
+                && diagnostics[0].message.contains("record")
+        );
+    }
+
+    #[test]
+    fn multiple_id_collisions_produce_deterministic_diagnostics_in_declaration_order() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let c = interner.intern("C");
+        let d = interner.intern("D");
+        // Two independent collisions: records 0/0, then variants 1/1.
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
+            variants: vec![minimal_variant(ItemId(1), c), minimal_variant(ItemId(1), d)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let build = || {
+            lower_module(
+                &module,
+                &local_types,
+                &expr_types,
+                &pattern_case,
+                &interner,
+                source,
+            )
+        };
+        let Err(first) = build() else {
+            panic!("expected multiple id collisions to fail lowering")
+        };
+        assert_eq!(first.len(), 2, "unexpected diagnostics: {first:?}");
+        assert!(first.iter().all(|d| d.code == "I0002"));
+        // Declaration order (records before variants), run twice to
+        // confirm it is the same order every time -- never a HashMap's
+        // iteration order.
+        let Err(second) = build() else {
+            panic!("expected the second run to fail lowering too")
+        };
+        let first_messages: Vec<&str> = first.iter().map(|d| d.message.as_str()).collect();
+        let second_messages: Vec<&str> = second.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(first_messages, second_messages);
+        assert!(first_messages[0].contains("record"));
+        assert!(first_messages[1].contains("variant"));
+    }
+
+    /// Builds a `Lowering` directly (bypassing the whole lex/parse/hir/
+    /// typeck pipeline entirely, not just typeck's diagnostic gate) so a
+    /// single aggregate-lowering method can be exercised with an
+    /// out-of-range index no real frontend ever produces -- the only way
+    /// to reach these defense-in-depth paths at all, since `hir::lower`'s
+    /// own name resolution never emits a case/field index outside its
+    /// declaration's real range.
+    fn direct_lowering<'a>(
+        source: SourceId,
+        interner: &'a Interner,
+        local_types: &'a HashMap<LocalId, Ty>,
+        expr_types: &'a HashMap<ExprId, Ty>,
+        pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
+        records: HashMap<ItemId, RecordLayout>,
+        variants: HashMap<ItemId, VariantLayout>,
+    ) -> Lowering<'a> {
+        Lowering {
+            local_types,
+            expr_types,
+            pattern_case,
+            interner,
+            source,
+            type_names: HashMap::new(),
+            records,
+            variants,
+            function_sigs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn direct_variant_construction_with_an_unknown_case_index_fails_with_i0002_not_a_panic() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        // Case index 7 does not exist on a variant with a single case.
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 7, &[], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an unknown case index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn direct_record_construction_with_an_out_of_range_field_index_fails_with_i0002_not_a_panic() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![(interner.intern("x"), Ty::I64)],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        // Field index 9 does not exist on a record with a single field
+        // -- rejected up front, before its initializer is ever
+        // evaluated, rather than silently dropped into nowhere.
+        let bad_init = HirFieldInit {
+            field_index: 9,
+            value: HirExpr::Bool {
+                id: ExprId(1),
+                value: true,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &[bad_init], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an out-of-range field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+        assert!(
+            diagnostic.message.contains("out of range"),
+            "expected an out-of-range diagnostic, got: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn all_valid_record_fields_plus_one_out_of_range_field_fails_atomically() {
+        // Every genuinely declared field is present and correct; the
+        // one extra field beyond the record's own layout must still
+        // reject the whole construction, not just be ignored while the
+        // rest lowers successfully.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![
+                    (interner.intern("x"), Ty::I64),
+                    (interner.intern("y"), Ty::I64),
+                ],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let init = |field_index: usize, id: u32| HirFieldInit {
+            field_index,
+            value: HirExpr::Int {
+                id: ExprId(id),
+                value: 1,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let fields = vec![init(0, 1), init(1, 2), init(2, 3)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &fields, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an extra out-of-range field")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn duplicate_field_index_with_every_other_field_present_fails_atomically() {
+        // Every field index the record actually declares is covered --
+        // 0 is just covered twice, at the cost of 1 never being
+        // written -- so this can't be caught as "missing" without also
+        // catching the duplicate itself; the second write to index 0
+        // must never silently overwrite the first's already-lowered
+        // value in its temporary slot.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let record_item = ItemId(0);
+        let mut records = HashMap::new();
+        records.insert(
+            record_item,
+            RecordLayout {
+                name: interner.intern("Point"),
+                fields: vec![
+                    (interner.intern("x"), Ty::I64),
+                    (interner.intern("y"), Ty::I64),
+                ],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            records,
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let init = |field_index: usize, id: u32| HirFieldInit {
+            field_index,
+            value: HirExpr::Int {
+                id: ExprId(id),
+                value: 1,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let fields = vec![init(0, 1), init(0, 2)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, record_item, &fields, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a duplicate field index")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+        assert!(
+            diagnostic.message.contains("more than once"),
+            "expected a duplicate-index diagnostic, got: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn unknown_record_id_fails_lowering_instead_of_using_the_provided_field_count() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let interner = Interner::new();
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_record_literal(&mut fb, ItemId(0), &[], &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for an unknown record")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn too_many_variant_payload_arguments_fails_lowering_instead_of_a_longer_payload() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let arg = |id: u32| HirExpr::Int {
+            id: ExprId(id),
+            value: 1,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        };
+        let args = vec![arg(1), arg(2)];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 0, &args, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for too many payload arguments")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn too_few_variant_payload_arguments_fails_lowering_instead_of_a_shorter_payload() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_item = ItemId(0);
+        let mut variants = HashMap::new();
+        variants.insert(
+            variant_item,
+            VariantLayout {
+                name: interner.intern("V"),
+                cases: vec![CaseLayout {
+                    name: interner.intern("A"),
+                    payload: vec![Ty::I64, Ty::I64],
+                }],
+            },
+        );
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let args = vec![HirExpr::Int {
+            id: ExprId(1),
+            value: 1,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        }];
+        let probe = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_variant_construct(&mut fb, variant_item, 0, &args, &probe);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for too few payload arguments")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn deeply_nested_hand_built_match_pattern_fails_lowering_with_i0002_not_a_stack_overflow() {
+        // The parser's own crate::limits::MAX_PATTERN_DEPTH bound keeps
+        // any real parser output shallow enough that lower_decision's
+        // own bound can never fire through the normal pipeline
+        // (typeck's matching bound also stops it before NIR lowering is
+        // ever reached) -- so this exercises it the only way possible:
+        // a hand-built HirModule that bypasses the parser, hir::lower,
+        // and typeck entirely, calling the public nir::lower_module
+        // entry point a direct caller would, and asserting the whole
+        // module fails atomically rather than calling only the private
+        // lower_match helper.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let wrap_name = interner.intern("Wrap");
+        let leaf_name = interner.intern("Leaf");
+        let variant_item = ItemId(0);
+        let variant_sym = interner.intern("Rec");
+        let variant_ty_name = ast::Type {
+            name: ast::Ident {
+                symbol: variant_sym,
+                span: Span::dummy(),
+            },
+        };
+        let i64_name = ast::Type {
+            name: ast::Ident {
+                symbol: interner.intern("i64"),
+                span: Span::dummy(),
+            },
+        };
+        let variant = crate::hir::HirVariant {
+            id: variant_item,
+            name: variant_sym,
+            span: Span::dummy(),
+            cases: vec![
+                crate::hir::HirCase {
+                    name: wrap_name,
+                    span: Span::dummy(),
+                    payload: vec![variant_ty_name.clone()],
+                },
+                crate::hir::HirCase {
+                    name: leaf_name,
+                    span: Span::dummy(),
+                    payload: vec![],
+                },
+            ],
+        };
+
+        let depth = MAX_PATTERN_DEPTH + 50;
+        let mut pattern_case = HashMap::new();
+        let mut pattern = HirPattern::Wildcard {
+            id: PatternId(0),
+            span: Span::dummy(),
+        };
+        for i in 0..depth {
+            let id = PatternId(i as u32 + 1);
+            pattern_case.insert(id, (variant_item, 0usize));
+            pattern = HirPattern::Variant {
+                id,
+                name: wrap_name,
+                args: vec![pattern],
+                span: Span::dummy(),
+            };
+        }
+
+        let param_local = LocalId(0);
+        let scrutinee_id = ExprId(0);
+        let scrutinee = HirExpr::Local {
+            id: scrutinee_id,
+            local: param_local,
+            name: variant_sym,
+            span: Span::dummy(),
+        };
+        let arms = vec![HirMatchArm {
+            pattern,
+            body: HirMatchArmBody::Expr(HirExpr::Int {
+                id: ExprId(1),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            }),
+            span: Span::dummy(),
+        }];
+        let match_expr = HirExpr::Match {
+            id: ExprId(2),
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: Span::dummy(),
+        };
+        let function = HirFunction {
+            id: ItemId(1),
+            name: interner.intern("f"),
+            name_span: Span::dummy(),
+            params: vec![crate::hir::HirParam {
+                local: param_local,
+                name: variant_sym,
+                span: Span::dummy(),
+                ty: variant_ty_name,
+            }],
+            return_type: Some(i64_name),
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(3),
+                statements: vec![],
+                tail: Some(Box::new(match_expr)),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+        let module = HirModule {
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+
+        let mut local_types = HashMap::new();
+        local_types.insert(param_local, Ty::Named(variant_item, variant_sym));
+        let mut expr_types = HashMap::new();
+        expr_types.insert(scrutinee_id, Ty::Named(variant_item, variant_sym));
+
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!(
+                "expected the whole module to fail lowering for a match nested past the depth limit"
+            )
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected an I0002 diagnostic, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn match_expression_now_lowers_successfully() {
+        // Alpha 0.1.1: `match` has real NIR lowering (a decision tree
+        // over `variant.switch`/`condbr`), so it no longer fails with
+        // I0001.
+        let module = lower("func f(x: i64) -> i64 { return match x { _ => 0 } }");
+        assert_eq!(module.functions.len(), 1);
     }
 
     #[test]
@@ -1718,6 +3911,52 @@ mod tests {
     }
 
     #[test]
+    fn calling_a_non_function_value_fails_lowering_instead_of_a_fabricated_error_value() {
+        // typeck already rejects a call whose callee isn't an actual
+        // function reference; reaching lower_call with one anyway (a
+        // hand-built HirExpr::Call over a plain Local, bypassing
+        // typeck) must fail atomically rather than silently return a
+        // fabricated Ty::Error/Const::Unit value as if the call had
+        // "succeeded".
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let x_name = interner.intern("x");
+        let local_types = HashMap::new();
+        let expr_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let mut lowering = direct_lowering(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let placeholder = fb.push_value(Ty::I64, ValueKind::Alloc);
+        fb.local_bindings
+            .insert(LocalId(0), LocalBinding::Direct(placeholder));
+        let callee = HirExpr::Local {
+            id: ExprId(1),
+            local: LocalId(0),
+            name: x_name,
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Bool {
+            id: ExprId(0),
+            value: true,
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a call to a non-function value")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
     fn function_used_as_a_value_fails_lowering_instead_of_a_fabricated_error_value() {
         assert_fails_with_i0001(
             "func add(a: i64, b: i64) -> i64 { return a + b } \
@@ -1745,7 +3984,7 @@ mod tests {
         // containing just `add` -- either everything lowers, or nothing
         // does.
         let text = "func add(left: i64, right: i64) -> i64 { return left + right } \
-                    func bad(x: i64) -> i64 { return match x { _ => 0 } }";
+                    func bad(x: i64) -> i64 { return x? }";
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -1756,7 +3995,14 @@ mod tests {
         let (hir, diags) = lower_hir(&module, id, &interner);
         assert!(diags.is_empty());
         let result = check_module(&hir, id, &interner);
-        let outcome = lower_module(&hir, &result.local_types, &result.expr_types, &interner, id);
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &interner,
+            id,
+        );
         assert!(
             outcome.is_err(),
             "expected the whole module to fail lowering"

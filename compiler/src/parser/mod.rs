@@ -24,6 +24,16 @@ pub struct Parser<'a> {
     source: SourceId,
     interner: &'a mut Interner,
     diagnostics: Vec<Diagnostic>,
+    /// When `true`, a bare identifier directly followed by `{` parses as
+    /// an ordinary identifier expression, not a [`crate::syntax::ast::Expr::RecordLiteral`].
+    /// Set while parsing the condition of `if`/`while` and the scrutinee
+    /// of `match`, so `if user { ... }` can never be misread as
+    /// `if (user { ... }) { ... }` — the same ambiguity every other
+    /// brace-delimited language with struct literals resolves the same
+    /// way. A parenthesized record literal (`if (user { ... }) { }`) is
+    /// unaffected, since `(` starts a nested, independently-scoped
+    /// expression.
+    no_struct_literal: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -38,6 +48,7 @@ impl<'a> Parser<'a> {
             source,
             interner,
             diagnostics: Vec::new(),
+            no_struct_literal: false,
         }
     }
 
@@ -109,6 +120,18 @@ impl<'a> Parser<'a> {
             self.error_expected(what);
             None
         }
+    }
+
+    fn error_pattern_too_deep(&mut self, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                ERROR_CODE,
+                self.source,
+                span,
+                "pattern is nested too deeply to parse",
+            )
+            .with_primary_label("pattern is too complex"),
+        );
     }
 
     fn error_expected(&mut self, what: &str) {

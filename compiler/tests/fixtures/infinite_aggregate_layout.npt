@@ -1,0 +1,7 @@
+record Node {
+    next: Node,
+}
+
+func main() -> i64 {
+    return 0
+}

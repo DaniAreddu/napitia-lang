@@ -190,6 +190,37 @@ fn format_value_kind(
                 .join(", ");
             format!("call @{}({args})", function.0)
         }
+        ValueKind::RecordCreate(record, fields) => {
+            let fields = fields
+                .iter()
+                .map(|v| format!("%{}", v.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("record.create @{}({fields})", record.0)
+        }
+        ValueKind::RecordField {
+            base,
+            record,
+            field,
+        } => format!("record.field @{}.{field} %{}", record.0, base.0),
+        ValueKind::VariantCreate {
+            variant,
+            case,
+            payload,
+        } => {
+            let payload = payload
+                .iter()
+                .map(|v| format!("%{}", v.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("variant.create @{}.{case}({payload})", variant.0)
+        }
+        ValueKind::VariantPayload {
+            base,
+            variant,
+            case,
+            index,
+        } => format!("variant.payload @{}.{case}.{index} %{}", variant.0, base.0),
     }
 }
 
@@ -218,6 +249,18 @@ fn format_terminator(term: &Terminator) -> String {
                 "condbr %{}, bb{}, bb{}",
                 condition.0, then_block.0, else_block.0
             )
+        }
+        Terminator::Switch {
+            scrutinee,
+            variant,
+            cases,
+        } => {
+            let targets = cases
+                .iter()
+                .map(|b| format!("bb{}", b.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("switch %{} : @{} {{{targets}}}", scrutinee.0, variant.0)
         }
     }
 }
@@ -252,6 +295,7 @@ mod tests {
             &hir,
             &typeck_result.local_types,
             &typeck_result.expr_types,
+            &typeck_result.pattern_case,
             &interner,
             id,
         )

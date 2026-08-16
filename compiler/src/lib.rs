@@ -11,6 +11,7 @@ pub mod driver;
 pub mod hir;
 pub mod interpreter;
 pub mod lexer;
+pub(crate) mod limits;
 pub mod nir;
 pub mod resolve;
 pub mod source;

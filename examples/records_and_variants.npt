@@ -1,0 +1,33 @@
+// Records, variants, and exhaustive pattern matching (Alpha 0.1.1).
+record User {
+    id: i64,
+    enabled: bool,
+}
+
+variant LookupResult {
+    Found(User),
+    Missing,
+}
+
+func identifier(result: LookupResult) -> i64 {
+    return match result {
+        Found(user) => {
+            if user.enabled {
+                user.id
+            } else {
+                -1
+            }
+        },
+        Missing => 0,
+    }
+}
+
+func main() -> i64 {
+    value user = User {
+        id: 42,
+        enabled: true,
+    };
+
+    value result = LookupResult.Found(user);
+    return identifier(result)
+}

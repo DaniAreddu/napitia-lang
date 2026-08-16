@@ -1,0 +1,9 @@
+record Point {
+    x: i64,
+    y: i64,
+}
+
+func main() -> i64 {
+    value p = Point { x: 1 };
+    return p.x
+}

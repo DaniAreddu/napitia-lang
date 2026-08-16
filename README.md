@@ -40,11 +40,12 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1
+## Current status: Alpha 0.1.1
 
-This milestone implements a compiler **frontend** and a typed intermediate
-representation, plus a small interpreter to validate semantics before any
-native backend exists.
+This milestone extends Alpha 0.1's compiler **frontend** and typed
+intermediate representation with a real data model: nominal records and
+variants, construction, field access, qualified variant constructors,
+and exhaustive pattern matching, executed end to end by the interpreter.
 
 ### Implemented in this milestone
 
@@ -57,26 +58,36 @@ native backend exists.
   strings (with escapes), raw strings, characters, comments (line and
   nested block), and all initial operators/punctuation.
 - A hand-written recursive-descent parser (`parser/`) with Pratt-style
-  expression parsing and basic error recovery, producing an AST
-  (`syntax::ast`).
+  expression parsing, basic error recovery, and record-construction
+  syntax (`TypeName { field: expr, ... }`, disambiguated from a
+  following block the same way other brace-delimited languages resolve
+  it), producing an AST (`syntax::ast`).
 - Lowering from AST to a High-level IR (`hir/`) with lexical-scope based
-  name resolution (`resolve/`).
+  name resolution (`resolve/`), including nominal record/variant
+  structure, qualified/unambiguous-unqualified variant constructor
+  resolution, and stable pattern identity.
 - A primitive type system (`types/`) and a local type checker (`typeck/`)
   performing constraint-based, monomorphic unification for integer/float
   literal inference, argument/return checking, and assignment
   compatibility — not full Hindley-Milner-style polymorphism; every
-  binding is monomorphic once solved.
+  binding is monomorphic once solved. Now also: nominal record
+  construction/field access, variant constructors, an infinite-
+  aggregate-layout cycle check, and `match` with a pattern-matrix
+  exhaustiveness/unreachable-arm analysis that reports a concrete
+  missing-pattern witness.
 - A typed Napitia IR (`nir/`): explicit control-flow graphs of basic
   blocks, with a textual printer for debugging and a verifier pass that
   re-checks structural and type invariants before a module is ever
-  interpreted. `match`, field access, casts, `defer`, postfix `?`, and
-  non-empty `uses`/`raises` clauses are all parsed, but using any of them
-  is a checked, reported error rather than being lowered or executed —
-  none of them are silently accepted or faked. Lowering the rest of a
-  module is atomic: either every function lowers, or the whole module
-  fails with diagnostics.
+  interpreted. Record/variant construction, field/payload projection,
+  and `match` (lowered to a real decision tree over `switch`/`condbr`)
+  all have full NIR representation now; casts, `defer`, postfix `?`,
+  non-empty `uses`/`raises` clauses, and a value-carrying `break`
+  remain parsed-but-rejected, never silently accepted or faked.
+  Lowering the rest of a module is atomic: either every function
+  lowers, or the whole module fails with diagnostics.
 - A tree-walking interpreter over NIR, used to execute the supported
-  language subset without a native backend.
+  language subset (including records, variants, and `match`) without a
+  native backend.
 - A CLI (`napitia lex|parse|check|ir|run`) exposing every stage.
 
 See `spec/` for the language specifications this milestone implements
@@ -85,9 +96,12 @@ questions that go beyond what is implemented today.
 
 ### Explicitly not yet implemented
 
-Generics, protocols, a `Maybe<T>` absence type, checked `uses`/`raises`
-effects and errors, ownership/region enforcement, structured concurrency,
-modules beyond a single file, an LLVM (or any native) backend, garbage
+Field mutation, record/variant equality, pattern guards, or-patterns,
+record-destructuring/slice/range patterns, generics, protocols, a
+`Maybe<T>` absence type, checked `uses`/`raises` effects and errors,
+ownership/region enforcement (and the indirection that would lift the
+recursive-aggregate restriction), structured concurrency, modules
+beyond a single file, an LLVM (or any native) backend, garbage
 collection, a package manager, and any domain-specific library (REST,
 ORM, tensors, GPU). Design direction for most of these exists in `rfcs/`;
 none of it is faked in the implementation.

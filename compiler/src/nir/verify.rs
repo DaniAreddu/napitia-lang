@@ -19,7 +19,7 @@ use crate::types::{Ty, is_integer, is_numeric};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
-use super::{Function, Module};
+use super::{Function, Module, RecordLayout, VariantLayout};
 
 mod codes {
     pub const DUPLICATE_FUNCTION_ID: &str = "V0001";
@@ -59,6 +59,35 @@ mod codes {
     /// Reading it on that path would read a value that was never
     /// actually produced.
     pub const NON_DOMINATING_DEFINITION: &str = "V0018";
+    pub const UNKNOWN_RECORD: &str = "V0019";
+    pub const RECORD_FIELDS_NOT_INITIALIZED_ONCE_EACH: &str = "V0020";
+    pub const UNKNOWN_FIELD: &str = "V0021";
+    pub const UNKNOWN_VARIANT_OR_CASE: &str = "V0022";
+    pub const SWITCH_CASE_COVERAGE: &str = "V0023";
+    pub const PAYLOAD_OUTSIDE_REFINEMENT: &str = "V0024";
+    pub const SWITCH_SCRUTINEE_TYPE_MISMATCH: &str = "V0025";
+    /// Two records in the same module declare the same `ItemId`. Every
+    /// module-level item's id must be globally unique -- a plain
+    /// `HashMap::insert` would silently let the second layout win,
+    /// hiding a real structural bug in whatever produced this NIR.
+    pub const DUPLICATE_RECORD_ID: &str = "V0026";
+    pub const DUPLICATE_VARIANT_ID: &str = "V0027";
+    /// The same `ItemId` is used by two different *kinds* of
+    /// module-level item (a function and a record, a record and a
+    /// variant, ...). `Ty::Named` compares/hashes by `ItemId` alone, so
+    /// a collision like this would let a value constructed as one kind
+    /// be silently accepted as the other wherever nominal identity is
+    /// the only thing checked.
+    pub const ITEM_ID_KIND_COLLISION: &str = "V0028";
+    /// A `Ty::Named` refers to an `ItemId` that matches no declared
+    /// record or variant in this module.
+    pub const UNKNOWN_NAMED_TYPE: &str = "V0029";
+    /// A `Ty::Named`'s carried display symbol does not match its own
+    /// declaration's name. Nominal identity itself only ever depends on
+    /// the `ItemId`, so this can never change what a program *does* --
+    /// but it means diagnostics and textual NIR referencing this type
+    /// would print the wrong name.
+    pub const NAMED_TYPE_SYMBOL_MISMATCH: &str = "V0030";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -68,26 +97,70 @@ struct KnownFunction {
     return_type: Ty,
 }
 
+/// Every declared record's/variant's layout, by `ItemId`, for validating
+/// aggregate operations against the module's own declared shape rather
+/// than trusting whatever `record.create`/`variant.create` happened to
+/// be built with.
+struct AggregateContext<'a> {
+    records: HashMap<ItemId, &'a RecordLayout>,
+    variants: HashMap<ItemId, &'a VariantLayout>,
+}
+
 /// Verifies every function in `module`, collecting every diagnostic it
 /// can rather than stopping at the first problem (mirroring `typeck`'s
 /// own style) -- an empty result means the module is safe to interpret.
 pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
+    // `ItemId` is required to be globally unique across every
+    // module-level item this NIR represents (functions, records,
+    // variants) -- not just unique within its own kind. Two different
+    // kinds of item sharing an id is exactly the gap that would let a
+    // value constructed as one kind (say, a record) be silently
+    // switched over as another (a variant) sharing that id, since
+    // `Ty::Named` only ever compares by `ItemId`. Tracked independently
+    // of `known_functions`/`agg` below (which use plain `HashMap`s and
+    // would otherwise silently let a duplicate's later entry win).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ItemRole {
+        Function,
+        Record,
+        Variant,
+    }
+    let mut item_roles: HashMap<ItemId, ItemRole> = HashMap::new();
+    let mut check_item_identity =
+        |id: ItemId, role: ItemRole, name: &str, diagnostics: &mut Vec<Diagnostic>| {
+            if let Some(&existing) = item_roles.get(&id) {
+                if existing != role {
+                    diagnostics.push(Diagnostic::error(
+                    codes::ITEM_ID_KIND_COLLISION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "`{name}` reuses an id already used by a different kind of item in this module"
+                    ),
+                ));
+                }
+            } else {
+                item_roles.insert(id, role);
+            }
+        };
+
     let mut known_functions: HashMap<ItemId, KnownFunction> = HashMap::new();
     let mut seen_function_ids = HashSet::new();
     for function in &module.functions {
+        let name = interner.resolve(function.name);
         if !seen_function_ids.insert(function.id) {
             diagnostics.push(Diagnostic::error(
                 codes::DUPLICATE_FUNCTION_ID,
                 source,
                 Span::dummy(),
                 format!(
-                    "function `{}` reuses an id already used by another function in this module",
-                    interner.resolve(function.name)
+                    "function `{name}` reuses an id already used by another function in this module"
                 ),
             ));
         }
+        check_item_identity(function.id, ItemRole::Function, name, &mut diagnostics);
         known_functions.insert(
             function.id,
             KnownFunction {
@@ -97,10 +170,81 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
         );
     }
 
+    let mut seen_record_ids = HashSet::new();
+    for (id, record) in &module.records {
+        let name = interner.resolve(record.name);
+        if !seen_record_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_RECORD_ID,
+                source,
+                Span::dummy(),
+                format!(
+                    "record `{name}` reuses an id already used by another record in this module"
+                ),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Record, name, &mut diagnostics);
+    }
+    let mut seen_variant_ids = HashSet::new();
+    for (id, variant) in &module.variants {
+        let name = interner.resolve(variant.name);
+        if !seen_variant_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_VARIANT_ID,
+                source,
+                Span::dummy(),
+                format!(
+                    "variant `{name}` reuses an id already used by another variant in this module"
+                ),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Variant, name, &mut diagnostics);
+    }
+
+    let agg = AggregateContext {
+        records: module.records.iter().map(|(id, r)| (*id, r)).collect(),
+        variants: module.variants.iter().map(|(id, v)| (*id, v)).collect(),
+    };
+
+    // Every record field's and every variant case payload's own
+    // declared type must be independently valid -- unresolved,
+    // erroneous, or dangling-named types are never allowed to hide
+    // inside an aggregate's layout just because nothing ever
+    // constructs one.
+    for (_, record) in &module.records {
+        let context = format!("record `{}`", interner.resolve(record.name));
+        for (field_name, ty) in &record.fields {
+            let field_context = format!("{context}'s field `{}`", interner.resolve(*field_name));
+            check_no_bad_type(ty, source, &field_context, &mut diagnostics);
+            check_named_type_identity(ty, &agg, source, interner, &field_context, &mut diagnostics);
+        }
+    }
+    for (_, variant) in &module.variants {
+        let context = format!("variant `{}`", interner.resolve(variant.name));
+        for case in &variant.cases {
+            for (i, ty) in case.payload.iter().enumerate() {
+                let payload_context = format!(
+                    "{context}'s case `{}` payload position {i}",
+                    interner.resolve(case.name)
+                );
+                check_no_bad_type(ty, source, &payload_context, &mut diagnostics);
+                check_named_type_identity(
+                    ty,
+                    &agg,
+                    source,
+                    interner,
+                    &payload_context,
+                    &mut diagnostics,
+                );
+            }
+        }
+    }
+
     for function in &module.functions {
         verify_function(
             function,
             &known_functions,
+            &agg,
             source,
             interner,
             &mut diagnostics,
@@ -113,6 +257,7 @@ pub fn verify_module(module: &Module, source: SourceId, interner: &Interner) -> 
 fn verify_function(
     function: &Function,
     known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
     source: SourceId,
     interner: &Interner,
     diagnostics: &mut Vec<Diagnostic>,
@@ -142,9 +287,19 @@ fn verify_function(
         return;
     }
 
-    check_no_bad_type(&function.return_type, source, name, diagnostics);
+    let fn_context = format!("function `{name}`");
+    check_no_bad_type(&function.return_type, source, &fn_context, diagnostics);
+    check_named_type_identity(
+        &function.return_type,
+        agg,
+        source,
+        interner,
+        &fn_context,
+        diagnostics,
+    );
     for param in &function.params {
-        check_no_bad_type(&param.ty, source, name, diagnostics);
+        check_no_bad_type(&param.ty, source, &fn_context, diagnostics);
+        check_named_type_identity(&param.ty, agg, source, interner, &fn_context, diagnostics);
     }
 
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
@@ -232,7 +387,8 @@ fn verify_function(
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Value { result, ty, kind } => {
-                    check_no_bad_type(ty, source, name, diagnostics);
+                    check_no_bad_type(ty, source, &fn_context, diagnostics);
+                    check_named_type_identity(ty, agg, source, interner, &fn_context, diagnostics);
                     verify_value_kind(
                         *result,
                         ty,
@@ -240,6 +396,7 @@ fn verify_function(
                         &value_types,
                         &alloc_slots,
                         known_functions,
+                        agg,
                         source,
                         name,
                         interner,
@@ -356,9 +513,68 @@ fn verify_function(
                     }
                 }
             }
+            Terminator::Switch {
+                scrutinee,
+                variant,
+                cases,
+            } => {
+                require_value(*scrutinee, diagnostics);
+                if let Some(ty) = value_types.get(scrutinee)
+                    && !matches!(ty, Ty::Named(v, _) if v == variant)
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::SWITCH_SCRUTINEE_TYPE_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` switches on a value of type `{}`, which is not the declared variant",
+                            crate::types::display_ty(ty, interner)
+                        ),
+                    ));
+                }
+                let Some(layout) = agg.variants.get(variant) else {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_VARIANT_OR_CASE,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` switches on unknown variant id {}",
+                            variant.0
+                        ),
+                    ));
+                    continue;
+                };
+                if cases.len() != layout.cases.len() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::SWITCH_CASE_COVERAGE,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` switches on `{}` with {} target(s), but it has {} case(s)",
+                            interner.resolve(layout.name),
+                            cases.len(),
+                            layout.cases.len()
+                        ),
+                    ));
+                }
+                for target in cases {
+                    if !known_blocks.contains(target) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_BRANCH_TARGET,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` switches to bb{}, which does not exist",
+                                target.0
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
+    verify_payload_refinement(function, agg, source, name, diagnostics);
     verify_dominance(function, &param_values, source, name, diagnostics);
 }
 
@@ -464,6 +680,9 @@ fn verify_dominance(
             Terminator::CondBranch { condition, .. } => {
                 check_use(*condition, block.id, after_all, diagnostics);
             }
+            Terminator::Switch { scrutinee, .. } => {
+                check_use(*scrutinee, block.id, after_all, diagnostics);
+            }
             Terminator::Return(None) | Terminator::Branch(_) => {}
         }
     }
@@ -493,6 +712,10 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         | ValueKind::Gt(a, b)
         | ValueKind::Ge(a, b) => vec![*a, *b],
         ValueKind::Call(_, args) => args.clone(),
+        ValueKind::RecordCreate(_, fields) => fields.clone(),
+        ValueKind::RecordField { base, .. } => vec![*base],
+        ValueKind::VariantCreate { payload, .. } => payload.clone(),
+        ValueKind::VariantPayload { base, .. } => vec![*base],
     }
 }
 
@@ -530,6 +753,7 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
                 else_block,
                 ..
             } => vec![*then_block, *else_block],
+            Terminator::Switch { cases, .. } => cases.clone(),
         }
     };
 
@@ -597,20 +821,15 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
 /// unresolved type variable (typeck must have already resolved every
 /// one before lowering ever saw this expression) or `Ty::Error` (a
 /// well-typed program that reached lowering should never carry one).
-fn check_no_bad_type(
-    ty: &Ty,
-    source: SourceId,
-    function_name: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut Vec<Diagnostic>) {
     match ty {
         Ty::Var(_) => diagnostics.push(Diagnostic::error(
             codes::UNRESOLVED_TYPE_VARIABLE,
             source,
             Span::dummy(),
             format!(
-                "function `{function_name}` contains an unresolved type variable; typeck must \
-                 fully resolve every type before lowering"
+                "{context} contains an unresolved type variable; typeck must fully resolve \
+                 every type before lowering"
             ),
         )),
         Ty::Error => diagnostics.push(Diagnostic::error(
@@ -618,11 +837,58 @@ fn check_no_bad_type(
             source,
             Span::dummy(),
             format!(
-                "function `{function_name}` contains an error type in executable NIR; an \
-                 ill-typed program should never reach lowering"
+                "{context} contains an error type in executable NIR; an ill-typed program \
+                 should never reach lowering"
             ),
         )),
         _ => {}
+    }
+}
+
+/// Checks that a `Ty::Named` refers to an actually-declared record or
+/// variant in this module, and that its carried display symbol matches
+/// that declaration's own name. Nominal identity itself only ever
+/// depends on the `ItemId` (see `Ty`'s hand-written `PartialEq`/`Hash`),
+/// so neither check can change what a well-formed program does -- but
+/// an unknown id is a dangling reference no valid lowering produces,
+/// and a mismatched symbol means diagnostics/textual NIR referencing
+/// this type would print the wrong name.
+fn check_named_type_identity(
+    ty: &Ty,
+    agg: &AggregateContext,
+    source: SourceId,
+    interner: &Interner,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Ty::Named(item, symbol) = ty else {
+        return;
+    };
+    let declared_name = agg
+        .records
+        .get(item)
+        .map(|r| r.name)
+        .or_else(|| agg.variants.get(item).map(|v| v.name));
+    match declared_name {
+        None => diagnostics.push(Diagnostic::error(
+            codes::UNKNOWN_NAMED_TYPE,
+            source,
+            Span::dummy(),
+            format!(
+                "{context} names a type that matches no declared record or variant in this module"
+            ),
+        )),
+        Some(name) if name != *symbol => diagnostics.push(Diagnostic::error(
+            codes::NAMED_TYPE_SYMBOL_MISMATCH,
+            source,
+            Span::dummy(),
+            format!(
+                "{context} names its type `{}`, but its declaration is actually named `{}`",
+                interner.resolve(*symbol),
+                interner.resolve(name)
+            ),
+        )),
+        Some(_) => {}
     }
 }
 
@@ -634,6 +900,7 @@ fn verify_value_kind(
     value_types: &HashMap<ValueId, Ty>,
     alloc_slots: &HashSet<ValueId>,
     known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
     source: SourceId,
     function_name: &str,
     interner: &Interner,
@@ -867,6 +1134,358 @@ fn verify_value_kind(
                 }
             }
         }
+        ValueKind::RecordCreate(record, fields) => {
+            for f in fields {
+                require_value(*f, diagnostics);
+            }
+            let Some(layout) = agg.records.get(record) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_RECORD,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs unknown record id {}",
+                        result.0, record.0
+                    ),
+                ));
+                return;
+            };
+            if !matches!(result_ty, Ty::Named(r, _) if r == record) {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "constructs record `{}` but is declared `{}`",
+                        interner.resolve(layout.name),
+                        ty_name(result_ty)
+                    ),
+                );
+            }
+            if fields.len() != layout.fields.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::RECORD_FIELDS_NOT_INITIALIZED_ONCE_EACH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs `{}` with {} field value(s), but it has {} field(s)",
+                        result.0,
+                        interner.resolve(layout.name),
+                        fields.len(),
+                        layout.fields.len()
+                    ),
+                ));
+            } else {
+                for (i, (field_value, (_, declared_ty))) in
+                    fields.iter().zip(layout.fields.iter()).enumerate()
+                {
+                    if let Some(ty) = ty_of(*field_value)
+                        && ty != *declared_ty
+                    {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "field {i} has type `{}` but is declared `{}`",
+                                ty_name(&ty),
+                                ty_name(declared_ty)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        ValueKind::RecordField {
+            base,
+            record,
+            field,
+        } => {
+            require_value(*base, diagnostics);
+            let Some(layout) = agg.records.get(record) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_RECORD,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} projects a field of unknown record id {}",
+                        result.0, record.0
+                    ),
+                ));
+                return;
+            };
+            if let Some(base_ty) = ty_of(*base)
+                && !matches!(&base_ty, Ty::Named(r, _) if r == record)
+            {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "projects a field of `{}` from a base of type `{}`",
+                        interner.resolve(layout.name),
+                        ty_name(&base_ty)
+                    ),
+                );
+            }
+            match layout.fields.get(*field) {
+                Some((_, declared_ty)) if declared_ty == result_ty => {}
+                Some((_, declared_ty)) => operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "projects field {field} of type `{}` but is declared `{}`",
+                        ty_name(declared_ty),
+                        ty_name(result_ty)
+                    ),
+                ),
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_FIELD,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} projects field index {field} of `{}`, which has {} field(s)",
+                        result.0,
+                        interner.resolve(layout.name),
+                        layout.fields.len()
+                    ),
+                )),
+            }
+        }
+        ValueKind::VariantCreate {
+            variant,
+            case,
+            payload,
+        } => {
+            for p in payload {
+                require_value(*p, diagnostics);
+            }
+            let Some(layout) = agg.variants.get(variant) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_VARIANT_OR_CASE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs unknown variant id {}",
+                        result.0, variant.0
+                    ),
+                ));
+                return;
+            };
+            if !matches!(result_ty, Ty::Named(v, _) if v == variant) {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "constructs variant `{}` but is declared `{}`",
+                        interner.resolve(layout.name),
+                        ty_name(result_ty)
+                    ),
+                );
+            }
+            let Some(case_layout) = layout.cases.get(*case) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_VARIANT_OR_CASE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs unknown case index {case} of `{}`",
+                        result.0,
+                        interner.resolve(layout.name)
+                    ),
+                ));
+                return;
+            };
+            if payload.len() != case_layout.payload.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs case `{}` with {} payload value(s), but it expects {}",
+                        result.0,
+                        interner.resolve(case_layout.name),
+                        payload.len(),
+                        case_layout.payload.len()
+                    ),
+                ));
+            } else {
+                for (i, (value, declared_ty)) in
+                    payload.iter().zip(case_layout.payload.iter()).enumerate()
+                {
+                    if let Some(ty) = ty_of(*value)
+                        && ty != *declared_ty
+                    {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "payload {i} has type `{}` but is declared `{}`",
+                                ty_name(&ty),
+                                ty_name(declared_ty)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        ValueKind::VariantPayload {
+            base,
+            variant,
+            case,
+            index,
+        } => {
+            require_value(*base, diagnostics);
+            let Some(layout) = agg.variants.get(variant) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_VARIANT_OR_CASE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} projects a payload of unknown variant id {}",
+                        result.0, variant.0
+                    ),
+                ));
+                return;
+            };
+            if let Some(base_ty) = ty_of(*base)
+                && !matches!(&base_ty, Ty::Named(v, _) if v == variant)
+            {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "projects a payload of `{}` from a base of type `{}`",
+                        interner.resolve(layout.name),
+                        ty_name(&base_ty)
+                    ),
+                );
+            }
+            match layout.cases.get(*case).and_then(|c| c.payload.get(*index)) {
+                Some(declared_ty) if declared_ty == result_ty => {}
+                Some(declared_ty) => operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "projects payload {index} of case {case} with type `{}` but is declared `{}`",
+                        ty_name(declared_ty),
+                        ty_name(result_ty)
+                    ),
+                ),
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_VARIANT_OR_CASE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} projects payload index {index} of case {case} of `{}`, which does not have it",
+                        result.0,
+                        interner.resolve(layout.name)
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+/// A `variant.payload` instruction is only legal in a block reached
+/// through the matching case's own `Terminator::Switch` edge -- this
+/// re-derives that from the CFG itself (which block is a direct switch
+/// target for which `(scrutinee, variant, case)`), independent of how
+/// lowering happened to build it.
+/// A single guaranteed fact: the value `.0` is known to be case `.2` of
+/// variant `.1`.
+type RefinementFact = (ValueId, ItemId, usize);
+
+fn verify_payload_refinement(
+    function: &Function,
+    agg: &AggregateContext,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let _ = agg;
+    // Every incoming edge into each block, tracked as its own
+    // independent fact-set: empty for a plain branch/condbr edge
+    // (which guarantees no case refinement at all), or a single
+    // `(scrutinee, variant, case)` fact for a switch-case edge. Two
+    // edges into the same block -- even two cases of the same switch,
+    // or two different switches -- are kept as separate list entries:
+    // a target block reachable through more than one case of the same
+    // switch is genuinely reachable via either case, so nothing about
+    // that specific case can be assumed from having reached the block
+    // at all.
+    let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
+    for block in &function.blocks {
+        match &block.terminator {
+            Terminator::Branch(target) => {
+                incoming.entry(*target).or_default().push(HashSet::new());
+            }
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                incoming
+                    .entry(*then_block)
+                    .or_default()
+                    .push(HashSet::new());
+                incoming
+                    .entry(*else_block)
+                    .or_default()
+                    .push(HashSet::new());
+            }
+            Terminator::Switch {
+                scrutinee,
+                variant,
+                cases,
+            } => {
+                for (case_index, target) in cases.iter().enumerate() {
+                    let mut fact = HashSet::new();
+                    fact.insert((*scrutinee, *variant, case_index));
+                    incoming.entry(*target).or_default().push(fact);
+                }
+            }
+            Terminator::Return(_) => {}
+        }
+    }
+
+    // A payload extraction is only sound when the SAME fact is
+    // guaranteed by EVERY incoming edge -- intersection, never union.
+    // A block with no recorded incoming edges at all (the entry block,
+    // or an otherwise-unreachable block) guarantees nothing, matching
+    // an empty intersection's identity (the universal set) only in the
+    // abstract; concretely there is no edge to ever have proven a case
+    // refinement on, so nothing is ever allowed there.
+    let guaranteed = |block_id: BlockId| -> HashSet<RefinementFact> {
+        let Some(edges) = incoming.get(&block_id) else {
+            return HashSet::new();
+        };
+        let mut edges = edges.iter();
+        let Some(first) = edges.next() else {
+            return HashSet::new();
+        };
+        let mut acc = first.clone();
+        for edge in edges {
+            acc.retain(|fact| edge.contains(fact));
+        }
+        acc
+    };
+
+    for block in &function.blocks {
+        let allowed = guaranteed(block.id);
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                kind:
+                    ValueKind::VariantPayload {
+                        base,
+                        variant,
+                        case,
+                        ..
+                    },
+                ..
+            } = instruction
+                && !allowed.contains(&(*base, *variant, *case))
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::PAYLOAD_OUTSIDE_REFINEMENT,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
+                        block.id.0
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -893,7 +1512,7 @@ fn check_same_as_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nir::BasicBlock;
+    use crate::nir::{BasicBlock, CaseLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -930,6 +1549,8 @@ mod tests {
         let name = interner.intern("f");
         let module = Module {
             functions: vec![valid_function(ItemId(0), name)],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(
@@ -947,6 +1568,8 @@ mod tests {
         let b = interner.intern("b");
         let module = Module {
             functions: vec![valid_function(ItemId(0), a), valid_function(ItemId(0), b)],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_FUNCTION_ID));
@@ -966,6 +1589,8 @@ mod tests {
         });
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_BLOCK_ID));
@@ -981,6 +1606,8 @@ mod tests {
         function.blocks.clear();
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert_eq!(codes_of(&diagnostics), vec![codes::EMPTY_FUNCTION]);
@@ -996,6 +1623,8 @@ mod tests {
         function.blocks[0].terminator = Terminator::Branch(BlockId(99));
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_BRANCH_TARGET));
@@ -1015,6 +1644,8 @@ mod tests {
         });
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_FUNCTION_REF));
@@ -1031,6 +1662,8 @@ mod tests {
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(99)));
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_VALUE));
@@ -1051,6 +1684,8 @@ mod tests {
         });
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_SLOT));
@@ -1082,6 +1717,8 @@ mod tests {
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::STORE_TYPE_MISMATCH));
@@ -1101,6 +1738,8 @@ mod tests {
         };
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::NON_BOOL_CONDITION));
@@ -1116,6 +1755,8 @@ mod tests {
         function.return_type = Ty::Bool; // body still returns an i64
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::RETURN_TYPE_MISMATCH));
@@ -1149,6 +1790,8 @@ mod tests {
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(2)));
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
@@ -1164,6 +1807,8 @@ mod tests {
         function.return_type = Ty::Var(crate::types::TyVar(0));
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE));
@@ -1179,6 +1824,8 @@ mod tests {
         function.return_type = Ty::Error;
         let module = Module {
             functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
@@ -1201,18 +1848,515 @@ mod tests {
         let callee = valid_function(ItemId(0), g_name);
         let module = Module {
             functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
         };
         let diagnostics = verify_module(&module, source, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
     }
 
     fn verify_one(function: Function, interner: &Interner) -> Vec<Diagnostic> {
+        verify_one_with_aggregates(function, Vec::new(), Vec::new(), interner)
+    }
+
+    fn verify_one_with_aggregates(
+        function: Function,
+        records: Vec<(ItemId, RecordLayout)>,
+        variants: Vec<(ItemId, VariantLayout)>,
+        interner: &Interner,
+    ) -> Vec<Diagnostic> {
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let module = Module {
             functions: vec![function],
+            records,
+            variants,
         };
         verify_module(&module, source, interner)
+    }
+
+    /// A `record Point { x: i64 }` layout, and a matching `func f() ->
+    /// i64 { %0 = record.create @Point(%c); %1 = record.field
+    /// @Point.0 %0; ret %1 }`-shaped valid function, for tests that
+    /// mutate exactly one thing about it.
+    fn record_point(interner: &mut Interner) -> (ItemId, RecordLayout, Symbol) {
+        let point = interner.intern("Point");
+        let x = interner.intern("x");
+        (
+            ItemId(100),
+            RecordLayout {
+                name: point,
+                fields: vec![(x, Ty::I64)],
+            },
+            point,
+        )
+    }
+
+    fn valid_record_function(
+        id: ItemId,
+        name: Symbol,
+        record: ItemId,
+        ty_name: Symbol,
+    ) -> Function {
+        Function {
+            id,
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::Named(record, ty_name),
+                        kind: ValueKind::RecordCreate(record, vec![ValueId(0)]),
+                    },
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::RecordField {
+                            base: ValueId(1),
+                            record,
+                            field: 0,
+                        },
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        }
+    }
+
+    #[test]
+    fn valid_record_create_and_field_access_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout, ty_name) = record_point(&mut interner);
+        let function = valid_record_function(ItemId(0), name, record, ty_name);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn record_create_referencing_an_unknown_record_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let unknown_record = ItemId(999);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::Named(unknown_record, interner.intern("Ghost")),
+                        kind: ValueKind::RecordCreate(unknown_record, vec![ValueId(0)]),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_RECORD));
+    }
+
+    #[test]
+    fn record_create_with_the_wrong_field_count_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout, ty_name) = record_point(&mut interner);
+        let mut function = valid_record_function(ItemId(0), name, record, ty_name);
+        // Point has one field, but this supplies two values.
+        function.blocks[0].instructions[1] = Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Named(record, ty_name),
+            kind: ValueKind::RecordCreate(record, vec![ValueId(0), ValueId(0)]),
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::RECORD_FIELDS_NOT_INITIALIZED_ONCE_EACH));
+    }
+
+    #[test]
+    fn record_create_with_a_mismatched_field_type_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout, ty_name) = record_point(&mut interner);
+        let mut function = valid_record_function(ItemId(0), name, record, ty_name);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
+    }
+
+    #[test]
+    fn record_field_with_an_out_of_range_index_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout, ty_name) = record_point(&mut interner);
+        let mut function = valid_record_function(ItemId(0), name, record, ty_name);
+        function.blocks[0].instructions[2] = Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::I64,
+            kind: ValueKind::RecordField {
+                base: ValueId(1),
+                record,
+                field: 5,
+            },
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_FIELD));
+    }
+
+    /// A `variant Shape { Circle(i64), Empty }` layout.
+    fn variant_shape(interner: &mut Interner) -> (ItemId, VariantLayout, Symbol) {
+        let shape = interner.intern("Shape");
+        let circle = interner.intern("Circle");
+        let empty = interner.intern("Empty");
+        (
+            ItemId(200),
+            VariantLayout {
+                name: shape,
+                cases: vec![
+                    CaseLayout {
+                        name: circle,
+                        payload: vec![Ty::I64],
+                    },
+                    CaseLayout {
+                        name: empty,
+                        payload: vec![],
+                    },
+                ],
+            },
+            shape,
+        )
+    }
+
+    fn valid_variant_switch_function(
+        id: ItemId,
+        name: Symbol,
+        variant: ItemId,
+        ty_name: Symbol,
+    ) -> Function {
+        Function {
+            id,
+            name,
+            params: Vec::new(),
+            return_type: Ty::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(1)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Named(variant, ty_name),
+                            kind: ValueKind::VariantCreate {
+                                variant,
+                                case: 0,
+                                payload: vec![ValueId(0)],
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(1),
+                        variant,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(1),
+                            variant,
+                            case: 0,
+                            index: 0,
+                        },
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(0)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn valid_variant_switch_and_payload_extraction_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn variant_create_referencing_an_unknown_variant_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let unknown_variant = ItemId(999);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Named(unknown_variant, interner.intern("Ghost")),
+                    kind: ValueKind::VariantCreate {
+                        variant: unknown_variant,
+                        case: 0,
+                        payload: vec![],
+                    },
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        };
+        let diagnostics = verify_one(function, &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_VARIANT_OR_CASE));
+    }
+
+    #[test]
+    fn variant_create_with_an_out_of_range_case_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::Named(variant, ty_name),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Named(variant, ty_name),
+                    kind: ValueKind::VariantCreate {
+                        variant,
+                        case: 9,
+                        payload: vec![],
+                    },
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_VARIANT_OR_CASE));
+    }
+
+    #[test]
+    fn variant_create_with_the_wrong_payload_count_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            params: Vec::new(),
+            return_type: Ty::Named(variant, ty_name),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Named(variant, ty_name),
+                    kind: ValueKind::VariantCreate {
+                        variant,
+                        case: 0,
+                        payload: vec![],
+                    },
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn switch_with_too_few_case_targets_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[0].terminator = Terminator::Switch {
+            scrutinee: ValueId(1),
+            variant,
+            cases: vec![BlockId(1)],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::SWITCH_CASE_COVERAGE));
+    }
+
+    #[test]
+    fn switch_targeting_a_nonexistent_block_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[0].terminator = Terminator::Switch {
+            scrutinee: ValueId(1),
+            variant,
+            cases: vec![BlockId(1), BlockId(99)],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_BRANCH_TARGET));
+    }
+
+    #[test]
+    fn payload_extraction_outside_its_case_refinement_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        // bb2 (the `Empty` case's own block) illegally extracts the
+        // `Circle` case's payload -- never reached via that case's
+        // switch edge.
+        function.blocks[2].instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: Ty::I64,
+            kind: ValueKind::VariantPayload {
+                base: ValueId(1),
+                variant,
+                case: 0,
+                index: 0,
+            },
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+    }
+
+    #[test]
+    fn two_switch_cases_sharing_one_block_reject_case_specific_payload_extraction() {
+        // Both cases of the switch target bb1 -- reachable via either
+        // case 0 or case 1, so nothing case-specific can be assumed
+        // just from having reached it. A case-0 payload extraction
+        // there must be rejected even though it's the very block the
+        // switch's own case-0 edge points to.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[0].terminator = Terminator::Switch {
+            scrutinee: ValueId(1),
+            variant,
+            cases: vec![BlockId(1), BlockId(1)],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+    }
+
+    #[test]
+    fn a_case_refined_target_with_an_additional_ordinary_predecessor_is_rejected() {
+        // bb1 (the `Circle` case's own block, legally extracting its
+        // own payload under the switch alone) also gets a plain branch
+        // predecessor from a third block -- that edge guarantees
+        // nothing, so the intersection across bb1's predecessors must
+        // now be empty and the extraction must be rejected.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+    }
+
+    #[test]
+    fn two_predecessors_carrying_the_same_refinement_are_accepted() {
+        // bb2 (the `Empty` case's own block, dominated by bb0's
+        // definition of the scrutinee like every block here) also
+        // switches on the same scrutinee value instead of returning
+        // directly -- a second, different edge into bb1, but one that
+        // guarantees the exact same fact as the original switch's
+        // case-0 edge. The intersection across both is still that one
+        // fact, so bb1's existing case-0 payload extraction remains
+        // legal.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[2].terminator = Terminator::Switch {
+            scrutinee: ValueId(1),
+            variant,
+            cases: vec![BlockId(1), BlockId(2)],
+        };
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn variant_payload_used_by_a_sibling_case_block_violates_dominance() {
+        // Even if a payload extraction happened to be legal under its
+        // own case's refinement, using its *result* in an unrelated
+        // sibling block must still be caught by ordinary dominance --
+        // this exercises that the aggregate-instruction additions
+        // didn't bypass the existing dominance analysis.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        // bb2 returns %2, which is only defined in bb1.
+        function.blocks[2].terminator = Terminator::Return(Some(ValueId(2)));
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::NON_DOMINATING_DEFINITION));
     }
 
     #[test]

@@ -109,6 +109,25 @@ fn ir_prints_nir_for_a_valid_file() {
 }
 
 #[test]
+fn textual_nir_names_a_variant_local_by_its_declaration_not_its_case() {
+    // A local's declared type in textual NIR (`alloc.<ty>`) must show the
+    // variant's own name (`LookupResult`), never the case it happened to
+    // be constructed through (`Found`) -- `Ty::Named` must always carry
+    // the declaration's own symbol.
+    let output = napitia(&["ir", &fixture("variant_type_display_name.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("alloc.LookupResult"),
+        "expected the variant's own name in textual NIR: {text}"
+    );
+    assert!(
+        !text.contains("alloc.Found") && !text.contains("alloc.Missing"),
+        "textual NIR leaked a case name as a type: {text}"
+    );
+}
+
+#[test]
 fn ir_reports_diagnostics_instead_of_running_for_an_invalid_file() {
     let output = napitia(&["ir", &fixture("invalid_types.npt")]);
     assert_eq!(output.status.code(), Some(1));
@@ -203,8 +222,22 @@ fn a_value_carrying_break_is_rejected_at_every_stage() {
 }
 
 #[test]
-fn a_named_aggregate_type_is_rejected_by_ir_with_i0001_not_by_check() {
-    let path = fixture("named_aggregate_return_type.npt");
+fn a_named_aggregate_return_type_now_lowers_and_runs_successfully() {
+    // Alpha 0.1.1: records have a real aggregate runtime representation,
+    // so a named type in a function signature is no longer rejected --
+    // it lowers, verifies, and runs cleanly through every stage.
+    assert_pipeline_is_clean_and_returns("named_aggregate_return_type.npt", "42");
+}
+
+/// The example program from RFC 0005 / this milestone's requirements:
+/// records, a variant payload, field access, and an exhaustive match,
+/// all the way through `run`.
+#[test]
+fn records_and_variants_example_runs_end_to_end() {
+    let path = format!(
+        "{}/../examples/records_and_variants.npt",
+        env!("CARGO_MANIFEST_DIR")
+    );
 
     let checked = napitia(&["check", &path]);
     assert!(
@@ -213,14 +246,146 @@ fn a_named_aggregate_type_is_rejected_by_ir_with_i0001_not_by_check() {
         stderr(&checked)
     );
 
-    for command in ["ir", "run"] {
-        let output = napitia(&[command, &path]);
-        assert_eq!(output.status.code(), Some(1), "`{command}` should fail");
+    let ired = napitia(&["ir", &path]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn missing_record_field_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("missing_record_field.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[R0009]"));
+}
+
+#[test]
+fn unknown_record_field_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("unknown_record_field.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[R0008]"));
+}
+
+#[test]
+fn field_mutation_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("field_mutation.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0015]"));
+}
+
+#[test]
+fn non_exhaustive_match_reports_a_concrete_missing_pattern() {
+    let output = napitia(&["check", &fixture("non_exhaustive_match.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0017]"));
+    assert!(stderr(&output).contains("LookupResult.Missing"));
+}
+
+#[test]
+fn unreachable_match_arm_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("unreachable_match_arm.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0018]"));
+}
+
+#[test]
+fn unreachable_arm_with_a_different_result_type_reports_only_the_unreachable_diagnostic() {
+    // The unreachable second arm's body (`false`, a bool) would
+    // mismatch the reachable first arm's body (`1`, an i64) if it were
+    // joined into the match's result type -- it must not be: only the
+    // unreachable-arm diagnostic is expected, never an additional
+    // "match arms must have the same type" diagnostic on top of it.
+    let output = napitia(&[
+        "check",
+        &fixture("unreachable_arm_result_type_mismatch.npt"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("error[T0018]"));
+    assert!(!err.contains("error[T0001]"));
+    assert_eq!(err.matches("error[").count(), 1);
+}
+
+#[test]
+fn infinite_aggregate_layout_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("infinite_aggregate_layout.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0020]"));
+}
+
+/// Every invalid fixture above must fail at `check` already -- `ir`/
+/// `run` must never be reached for a program `check` already rejected,
+/// and neither may ever leak an internal `Ixxxx`/`Vxxxx` diagnostic for
+/// these ordinary, user-triggerable errors.
+#[test]
+fn invalid_aggregate_fixtures_fail_at_check_with_no_leaked_internal_diagnostic() {
+    for name in [
+        "missing_record_field.npt",
+        "unknown_record_field.npt",
+        "field_mutation.npt",
+        "non_exhaustive_match.npt",
+        "unreachable_match_arm.npt",
+        "unreachable_arm_result_type_mismatch.npt",
+        "infinite_aggregate_layout.npt",
+    ] {
+        let path = fixture(name);
+        let output = napitia(&["check", &path]);
+        assert_eq!(output.status.code(), Some(1), "`{name}` should fail check");
+        let err = stderr(&output);
         assert!(
-            stderr(&output).contains("I0001"),
-            "`{command}` should report I0001, got: {}",
-            stderr(&output)
+            !err.contains("I0") && !err.contains("V0"),
+            "`{name}` leaked an internal diagnostic: {err}"
         );
-        assert!(!stderr(&output).contains("V0013"));
     }
+}
+
+/// A pattern nested far past the compiler's structural depth limit,
+/// generated here rather than committed as a giant fixture file. Every
+/// stage that could ever see it (parsing, then -- if it somehow got
+/// past that -- checking, IR lowering, and running) must terminate
+/// with an ordinary diagnostic and a non-zero exit code, never a panic,
+/// a Rust backtrace, or a hang.
+#[test]
+fn deeply_nested_pattern_terminates_diagnostically_at_every_stage() {
+    let depth = 300;
+    let mut pattern = "Leaf".to_string();
+    for _ in 0..depth {
+        pattern = format!("Wrap({pattern})");
+    }
+    let source = format!(
+        "variant Rec {{ Wrap(Rec), Leaf }}\n\
+         func f(x: Rec) -> i64 {{ return match x {{ {pattern} => 1, _ => 0 }} }}\n\
+         func main() -> i64 {{ return 0 }}\n"
+    );
+    let path =
+        std::env::temp_dir().join(format!("napitia_deep_pattern_{}.npt", std::process::id()));
+    std::fs::write(&path, &source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            !output.status.success(),
+            "`{cmd}` unexpectedly succeeded on a pattern nested {depth} levels deep"
+        );
+        assert_ne!(
+            output.status.code(),
+            None,
+            "`{cmd}` was killed by a signal (likely a stack overflow), not a clean exit"
+        );
+        let err = stderr(&output);
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
 }

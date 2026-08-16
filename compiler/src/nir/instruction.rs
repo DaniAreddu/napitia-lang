@@ -50,6 +50,36 @@ pub enum ValueKind {
     Gt(ValueId, ValueId),
     Ge(ValueId, ValueId),
     Call(FunctionRef, Vec<ValueId>),
+    /// Constructs a record value. `fields` is already in **declaration
+    /// order** (never construction-site/source order) -- reordering
+    /// happens once, at the point of construction, so every later
+    /// consumer (the verifier, the interpreter) can index into it
+    /// positionally without re-deriving the order from a name.
+    RecordCreate(ItemId, Vec<ValueId>),
+    /// Projects one field (by declaration index) out of a record value.
+    RecordField {
+        base: ValueId,
+        record: ItemId,
+        field: usize,
+    },
+    /// Constructs a variant value for the given case (by declaration
+    /// index), with its payload values in declaration order. Empty
+    /// `payload` for a unit case allocates no fabricated value.
+    VariantCreate {
+        variant: ItemId,
+        case: usize,
+        payload: Vec<ValueId>,
+    },
+    /// Projects one payload position (by declaration index) out of a
+    /// variant value already known to be the given case -- legal only
+    /// on the control-flow edge reached through that case's
+    /// `Terminator::Switch` target (`nir::verify` checks this).
+    VariantPayload {
+        base: ValueId,
+        variant: ItemId,
+        case: usize,
+        index: usize,
+    },
 }
 
 /// One NIR instruction. `Value` produces a result (`%d = ...`); `Store`

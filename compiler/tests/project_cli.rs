@@ -18,6 +18,14 @@ fn napitia(args: &[&str]) -> Output {
         .expect("failed to run the napitia binary")
 }
 
+fn napitia_in_dir(dir: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_napitia"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run the napitia binary")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -39,6 +47,42 @@ fn a_two_file_project_compiles_and_runs_through_the_directory_path() {
     assert!(stdout(&checked).contains("no errors"));
 
     let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn a_bare_relative_manifest_path_works_from_inside_the_project_directory() {
+    // `Path::parent()` returns `Some("")`, not `None`, for a bare
+    // relative path like `napitia.toml` -- passing that empty path
+    // straight to `canonicalize()` used to fail outright, breaking the
+    // exact invocation style the README documents (`cd` into a project,
+    // then `napitia check napitia.toml`).
+    let dir = project("basic_two_file");
+
+    let checked = napitia_in_dir(&dir, &["check", "napitia.toml"]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ir = napitia_in_dir(&dir, &["ir", "napitia.toml"]);
+    assert!(ir.status.success(), "ir failed: {}", stderr(&ir));
+    let ir_text = stdout(&ir);
+    assert!(ir_text.contains("func @main"));
+    assert!(ir_text.contains("func @add"));
+
+    let ran = napitia_in_dir(&dir, &["run", "napitia.toml"]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn a_dot_slash_prefixed_manifest_path_also_works() {
+    let dir = project("basic_two_file");
+    let ran = napitia_in_dir(&dir, &["run", "./napitia.toml"]);
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "42");
 }

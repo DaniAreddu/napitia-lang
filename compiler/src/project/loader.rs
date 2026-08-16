@@ -79,10 +79,15 @@ pub fn load_project(
     );
     let manifest = manifest::parse_manifest(manifest_source, &manifest_content)?;
 
-    let project_dir = manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // `Path::parent` returns `Some("")`, not `None`, for a bare relative
+    // path like `napitia.toml` -- an empty path is never a valid
+    // `canonicalize` target, so it must be normalized to `.` (the
+    // current directory) the same way a truly parent-less path already
+    // is, rather than being passed through as-is.
+    let project_dir = match manifest_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
     // Canonicalized once, up front, so every later containment check
     // (source-root inside the project directory, the entry file inside
     // source-root, every discovered module inside source-root) compares

@@ -78,6 +78,29 @@ fn unreadable_file_is_a_usage_error() {
 }
 
 #[test]
+fn extra_arguments_are_a_usage_error_not_silently_ignored() {
+    for args in [
+        vec!["lex", &fixture("valid.npt"), "extra"],
+        vec!["parse", &fixture("valid.npt"), "extra"],
+        vec!["check", &fixture("valid.npt"), "extra"],
+        vec!["ir", &fixture("valid.npt"), "extra"],
+        vec!["run", &fixture("valid.npt"), "extra"],
+    ] {
+        let output = napitia(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{args:?}` should reject the unexpected extra argument"
+        );
+        assert!(
+            stderr(&output).contains("unexpected extra argument"),
+            "`{args:?}` produced: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
 fn unknown_command_is_a_usage_error() {
     let output = napitia(&["frobnicate", &fixture("valid.npt")]);
     assert_eq!(output.status.code(), Some(2));

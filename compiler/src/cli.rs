@@ -57,10 +57,16 @@ pub fn run(args: Vec<String>) -> ExitCode {
                         eprint!("{USAGE}");
                         return ExitCode::from(USAGE_ERROR);
                     };
+                    if let Some(extra) = args.next() {
+                        return unexpected_argument_error(&extra);
+                    }
                     dispatch_single_file(&command, &path)
                 }
                 "check" | "ir" | "run" => {
                     let path = args.next().unwrap_or_else(|| ".".to_string());
+                    if let Some(extra) = args.next() {
+                        return unexpected_argument_error(&extra);
+                    }
                     dispatch_check_ir_run(&command, &path)
                 }
                 _ => {
@@ -71,6 +77,16 @@ pub fn run(args: Vec<String>) -> ExitCode {
             }
         }
     }
+}
+
+/// An argument beyond what a command accepts must be reported, not
+/// silently dropped -- a typo'd extra path/flag would otherwise compile
+/// or run something other than what the user actually asked for,
+/// without any indication anything was ignored.
+fn unexpected_argument_error(extra: &str) -> ExitCode {
+    eprintln!("error: unexpected extra argument `{extra}`\n");
+    eprint!("{USAGE}");
+    ExitCode::from(USAGE_ERROR)
 }
 
 fn dispatch_single_file(command: &str, path: &str) -> ExitCode {

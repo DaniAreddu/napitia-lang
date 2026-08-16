@@ -402,6 +402,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pattern(&mut self) -> Option<Pattern> {
+        self.parse_pattern_at_depth(0)
+    }
+
+    /// `depth` counts `Variant(...)` sub-pattern nesting only -- the
+    /// one recursive call this function makes, and so the one thing
+    /// that grows this parser's own native call stack per level of
+    /// source nesting. A malformed-looking but syntactically valid
+    /// chain like `A(A(A(A(...))))` must fail with a diagnostic at
+    /// `MAX_PATTERN_NESTING_DEPTH`, never recurse past it -- typeck's
+    /// own `MAX_PATTERN_NESTING_DEPTH` bound only protects pattern
+    /// *resolution*, which never even runs if parsing itself already
+    /// overflowed the stack first.
+    fn parse_pattern_at_depth(&mut self, depth: usize) -> Option<Pattern> {
+        if depth > super::MAX_PATTERN_NESTING_DEPTH {
+            let span = self.current_span();
+            self.error_pattern_too_deep(span);
+            return None;
+        }
         let span = self.current_span();
         match self.current().clone() {
             TokenKind::Ident(symbol) => {
@@ -414,7 +432,7 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if !self.check(&TokenKind::RParen) {
                         loop {
-                            args.push(self.parse_pattern()?);
+                            args.push(self.parse_pattern_at_depth(depth + 1)?);
                             if self.eat(&TokenKind::Comma) {
                                 if self.check(&TokenKind::RParen) {
                                     break;
@@ -686,6 +704,27 @@ mod tests {
             m.arms[0].pattern,
             crate::syntax::ast::Pattern::Variant { .. }
         ));
+    }
+
+    #[test]
+    fn a_pattern_nested_past_the_depth_limit_fails_parsing_not_the_process() {
+        // Built programmatically, never committed as a giant fixture:
+        // a chain of `Wrap(...)` nested well past
+        // `MAX_PATTERN_NESTING_DEPTH`, which recurses once per level on
+        // the parser's own native call stack. Must fail with a
+        // deterministic diagnostic, never overflow the stack.
+        let depth = super::super::MAX_PATTERN_NESTING_DEPTH + 50;
+        let mut pattern = "Leaf".to_string();
+        for _ in 0..depth {
+            pattern = format!("Wrap({pattern})");
+        }
+        let src = format!("func f() -> i64 {{ return match x {{ {pattern} => 1, _ => 0 }} }}");
+        let (_, diags) = parse(&src);
+        assert!(!diags.is_empty(), "expected a diagnostic, got none");
+        assert!(
+            diags.iter().any(|d| d.code == "P0001"),
+            "expected a P0001 diagnostic, got {diags:?}"
+        );
     }
 
     #[test]

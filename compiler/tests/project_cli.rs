@@ -248,15 +248,24 @@ fn an_npt_path_inside_a_project_directory_still_uses_legacy_single_file_mode() {
 }
 
 #[test]
-fn windows_and_unix_style_path_separators_reach_the_same_project() {
+fn forward_slash_paths_reach_the_project() {
+    // `\` is only a path separator on Windows -- on POSIX it is a valid,
+    // ordinary filename character, so a "does `\` also work" assertion
+    // only makes sense on Windows (see the cfg(windows) test below).
+    // Every platform, however, must accept `/`-separated paths, which is
+    // what this asserts.
+    let unix_style = project("basic_two_file").replace('\\', "/");
+    let via_unix = napitia(&["run", &unix_style]);
+    assert!(via_unix.status.success(), "{}", stderr(&via_unix));
+    assert_eq!(stdout(&via_unix).trim(), "42");
+}
+
+#[cfg(windows)]
+#[test]
+fn backslash_paths_also_reach_the_project_on_windows() {
     let unix_style = project("basic_two_file").replace('\\', "/");
     let windows_style = unix_style.replace('/', "\\");
-
-    let via_unix = napitia(&["run", &unix_style]);
     let via_windows = napitia(&["run", &windows_style]);
-
-    assert!(via_unix.status.success(), "{}", stderr(&via_unix));
     assert!(via_windows.status.success(), "{}", stderr(&via_windows));
-    assert_eq!(stdout(&via_unix).trim(), "42");
     assert_eq!(stdout(&via_windows).trim(), "42");
 }

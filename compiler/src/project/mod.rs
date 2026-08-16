@@ -63,7 +63,7 @@ pub fn compile_project(
     interner: &mut Interner,
 ) -> Result<CompiledProject, Vec<Diagnostic>> {
     let loaded = loader::load_project(manifest_path, map, interner)?;
-    validate_entry_main(&loaded, manifest_path, interner)?;
+    validate_entry_main(&loaded, interner)?;
 
     let module_path_by_dotted: HashMap<String, module::ModuleId> = loaded
         .modules
@@ -248,7 +248,6 @@ pub fn compile_project(
 /// all (`rfcs/0006`).
 fn validate_entry_main(
     loaded: &loader::LoadedProject,
-    manifest_path: &Path,
     interner: &mut Interner,
 ) -> Result<(), Vec<Diagnostic>> {
     let entry_module = loaded
@@ -275,7 +274,7 @@ fn validate_entry_main(
                 crate::source::Span::dummy(),
                 format!(
                     "entry module `{}` has no `main` function",
-                    manifest_path.display()
+                    loaded.manifest.entry
                 ),
             )
             .with_primary_label("configured entry point"),
@@ -435,6 +434,12 @@ mod tests {
         let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0010");
+        // Must name the actual entry file (from the manifest's own
+        // `entry` key), never the manifest path itself.
+        assert_eq!(
+            diags[0].message,
+            "entry module `main.npt` has no `main` function"
+        );
     }
 
     #[test]

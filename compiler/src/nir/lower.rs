@@ -68,6 +68,24 @@ pub fn lower_module(
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
+    // Every module-level item's ItemId must be globally unique across
+    // records, variants, and functions alike -- not just unique within
+    // its own kind. hir::lower's own name resolution already keeps this
+    // true for any HIR it produces, but this is a public entry point a
+    // caller can invoke directly with a hand-built HirModule bypassing
+    // that guarantee. Without this check, a duplicate id would make
+    // record_layouts/variant_layouts silently overwrite the first
+    // entry on insert, then panic on the second of two removals below
+    // ("just inserted" no longer holds); a cross-kind collision would
+    // let records/variants/function_sigs disagree about what the same
+    // id names. Checked here, before any layout is built or any
+    // function is lowered, so a malformed module fails atomically
+    // rather than reaching either failure mode.
+    let identity_diagnostics = validate_item_identities(hir, interner, source);
+    if !identity_diagnostics.is_empty() {
+        return Err(identity_diagnostics);
+    }
+
     // The same module-level type namespace typeck itself builds
     // (`typeck::check_module`): primitives plus every declared
     // `record`/`variant` name. Without this, a legitimately-declared
@@ -163,20 +181,115 @@ pub fn lower_module(
         return Err(diagnostics);
     }
 
-    let records = record_order
-        .into_iter()
-        .map(|id| (id, lowering.records.remove(&id).expect("just inserted")))
-        .collect();
-    let variants = variant_order
-        .into_iter()
-        .map(|id| (id, lowering.variants.remove(&id).expect("just inserted")))
-        .collect();
+    // `record_order`/`variant_order` were built by pushing each item's
+    // id exactly once per item in `hir.records`/`hir.variants`, and the
+    // identity validation above already rejected any duplicate id
+    // within either kind -- so every id removed here is guaranteed to
+    // still be present, exactly once. Returned as a diagnostic instead
+    // of an `.expect()` panic anyway: this function's own atomicity
+    // guarantee should never depend on a caller trusting that an
+    // earlier check in this same function was never changed to miss a
+    // case, the same defense-in-depth posture the rest of this module
+    // already takes toward every other stage's guarantees.
+    let mut records = Vec::with_capacity(record_order.len());
+    for id in record_order {
+        let Some(layout) = lowering.records.remove(&id) else {
+            return Err(vec![*lowering.internal_error(&format!(
+                "record layout for {id:?} was not built during lowering"
+            ))]);
+        };
+        records.push((id, layout));
+    }
+    let mut variants = Vec::with_capacity(variant_order.len());
+    for id in variant_order {
+        let Some(layout) = lowering.variants.remove(&id) else {
+            return Err(vec![*lowering.internal_error(&format!(
+                "variant layout for {id:?} was not built during lowering"
+            ))]);
+        };
+        variants.push((id, layout));
+    }
 
     Ok(Module {
         functions,
         records,
         variants,
     })
+}
+
+/// Which kind of module-level item an `ItemId` names, for a collision
+/// diagnostic to describe accurately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Record,
+    Variant,
+    Function,
+}
+
+impl ItemKind {
+    fn describe(self) -> &'static str {
+        match self {
+            ItemKind::Record => "record",
+            ItemKind::Variant => "variant",
+            ItemKind::Function => "function",
+        }
+    }
+}
+
+/// Checks that every record/variant/function's `ItemId` is unique
+/// across the whole module -- not merely unique within its own kind.
+/// Visits records, then variants, then functions, each in their own
+/// declaration order (never a `HashMap`'s iteration order), so the
+/// diagnostics this produces are identical across repeated runs.
+fn validate_item_identities(
+    hir: &HirModule,
+    interner: &Interner,
+    source: SourceId,
+) -> Vec<Diagnostic> {
+    let mut seen: HashMap<ItemId, ItemKind> = HashMap::new();
+    let mut diagnostics = Vec::new();
+    let mut check = |id: ItemId, kind: ItemKind, name: Symbol, span: Span| {
+        let text = interner.resolve(name);
+        match seen.get(&id) {
+            Some(&existing) if existing == kind => {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    span,
+                    format!(
+                        "{} `{text}` reuses an id already used by another {} in this module",
+                        kind.describe(),
+                        kind.describe()
+                    ),
+                ));
+            }
+            Some(&existing) => {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    span,
+                    format!(
+                        "{} `{text}` reuses an id already used by a {} in this module",
+                        kind.describe(),
+                        existing.describe()
+                    ),
+                ));
+            }
+            None => {
+                seen.insert(id, kind);
+            }
+        }
+    };
+    for r in &hir.records {
+        check(r.id, ItemKind::Record, r.name, r.span);
+    }
+    for v in &hir.variants {
+        check(v.id, ItemKind::Variant, v.name, v.span);
+    }
+    for f in &hir.functions {
+        check(f.id, ItemKind::Function, f.name, f.name_span);
+    }
+    diagnostics
 }
 
 /// Resolves a written type name the same way `typeck::resolve_named_type`
@@ -2800,6 +2913,279 @@ mod tests {
                 .any(|d| d.message.contains(expect_in_message)),
             "expected a diagnostic mentioning {expect_in_message:?} for {text:?}, got {diagnostics:?}"
         );
+    }
+
+    /// A trivial, otherwise-valid `HirFunction` (no params, no return
+    /// type, an empty body) -- only its own `id`/`name` matter for the
+    /// item-identity tests below, which fail before this function's
+    /// body is ever lowered.
+    fn minimal_function(id: ItemId, name: Symbol) -> HirFunction {
+        HirFunction {
+            id,
+            name,
+            name_span: Span::dummy(),
+            params: vec![],
+            return_type: None,
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(0),
+                statements: vec![],
+                tail: None,
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        }
+    }
+
+    fn minimal_record(id: ItemId, name: Symbol) -> crate::hir::HirRecord {
+        crate::hir::HirRecord {
+            id,
+            name,
+            span: Span::dummy(),
+            fields: vec![],
+        }
+    }
+
+    fn minimal_variant(id: ItemId, name: Symbol) -> crate::hir::HirVariant {
+        crate::hir::HirVariant {
+            id,
+            name,
+            span: Span::dummy(),
+            cases: vec![],
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn empty_maps() -> (
+        HashMap<LocalId, Ty>,
+        HashMap<ExprId, Ty>,
+        HashMap<PatternId, (ItemId, usize)>,
+    ) {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn duplicate_record_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate record id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("record"));
+    }
+
+    #[test]
+    fn duplicate_variant_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![],
+            variants: vec![minimal_variant(ItemId(0), a), minimal_variant(ItemId(0), b)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate variant id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("variant"));
+    }
+
+    #[test]
+    fn duplicate_function_id_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let g = interner.intern("g");
+        let module = HirModule {
+            functions: vec![
+                minimal_function(ItemId(0), f),
+                minimal_function(ItemId(0), g),
+            ],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a duplicate function id to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(diagnostics[0].message.contains("function"));
+    }
+
+    #[test]
+    fn record_variant_id_collision_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a)],
+            variants: vec![minimal_variant(ItemId(0), b)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a record/variant id collision to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(
+            diagnostics[0].message.contains("record") && diagnostics[0].message.contains("variant")
+        );
+    }
+
+    #[test]
+    fn function_aggregate_id_collision_fails_lowering_atomically_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let f = interner.intern("f");
+        let module = HirModule {
+            functions: vec![minimal_function(ItemId(0), f)],
+            records: vec![minimal_record(ItemId(0), a)],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a function/record id collision to fail lowering")
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].code, "I0002");
+        assert!(
+            diagnostics[0].message.contains("function")
+                && diagnostics[0].message.contains("record")
+        );
+    }
+
+    #[test]
+    fn multiple_id_collisions_produce_deterministic_diagnostics_in_declaration_order() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let c = interner.intern("C");
+        let d = interner.intern("D");
+        // Two independent collisions: records 0/0, then variants 1/1.
+        let module = HirModule {
+            functions: vec![],
+            records: vec![minimal_record(ItemId(0), a), minimal_record(ItemId(0), b)],
+            variants: vec![minimal_variant(ItemId(1), c), minimal_variant(ItemId(1), d)],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let build = || {
+            lower_module(
+                &module,
+                &local_types,
+                &expr_types,
+                &pattern_case,
+                &interner,
+                source,
+            )
+        };
+        let Err(first) = build() else {
+            panic!("expected multiple id collisions to fail lowering")
+        };
+        assert_eq!(first.len(), 2, "unexpected diagnostics: {first:?}");
+        assert!(first.iter().all(|d| d.code == "I0002"));
+        // Declaration order (records before variants), run twice to
+        // confirm it is the same order every time -- never a HashMap's
+        // iteration order.
+        let Err(second) = build() else {
+            panic!("expected the second run to fail lowering too")
+        };
+        let first_messages: Vec<&str> = first.iter().map(|d| d.message.as_str()).collect();
+        let second_messages: Vec<&str> = second.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(first_messages, second_messages);
+        assert!(first_messages[0].contains("record"));
+        assert!(first_messages[1].contains("variant"));
     }
 
     /// Builds a `Lowering` directly (bypassing the whole lex/parse/hir/

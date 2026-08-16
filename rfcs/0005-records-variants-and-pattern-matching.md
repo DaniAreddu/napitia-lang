@@ -205,33 +205,33 @@ value carries its declaring `ItemId`, never re-derived from shape.
 ## Type checking
 
 - **Record construction**: the type name must resolve to a declared
-  record (else `T0013 unknown record type`). Every declared field must
-  appear exactly once (`T0015 missing field` / `T0016 duplicate field
+  record (else `R0007 unknown record type`). Every declared field must
+  appear exactly once (`R0009 missing field` / `R0010 duplicate field
   initializer`); every named field must exist on the record
-  (`T0014 unknown field`); each field's initializer must unify with its
-  declared type (`T0001`, reused). An unrecognized/malformed literal
-  shape is `T0017`.
+  (`R0008 unknown field`); each field's initializer must unify with its
+  declared type (`T0001`, reused).
 - **Field access**: the base must resolve to a record type
-  (`T0018 field access on a non-record type`); the field must exist on
-  *that* record (`T0014`) — a field declared on a different record with
-  the same name is not found (nominal, nothing structural leaks in).
+  (`T0013 field access on a non-record type`); the field must exist on
+  *that* record (`T0014 unknown field`) — a field declared on a
+  different record with the same name is not found (nominal, nothing
+  structural leaks in).
 - **Field mutation is explicitly rejected, not silently reinterpreted.**
   `user.age = 20;` is not treated as an ordinary assignment target: HIR's
   `Assign` already special-cases `Local`/`Field`/`Error` targets, and
   this RFC keeps `Field` out of the "valid mutable target" set, giving it
-  its own diagnostic (`T0019`, *"field mutation is not implemented in
+  its own diagnostic (`T0015`, *"field mutation is not implemented in
   Alpha 0.1.1"*) instead of `T0008`'s generic "invalid assignment
   target" — the point being made is different (mutation itself is
   unimplemented, not that the target shape is wrong).
 - **Variant construction**: the qualified/unqualified name must resolve
-  to exactly one case (`T0020 unknown variant`, `T0021 unknown case`,
-  `T0022 case belongs to a different variant` when a qualifier and case
-  disagree, `T0023 ambiguous constructor`); payload arity and each
-  payload expression's type against the case's declared payload types
-  reuse `T0002`/`T0001`.
+  to exactly one case (`R0011 unknown variant type`, `R0012 unknown
+  variant case`, `R0013 case belongs to a different variant` when a
+  qualifier and case disagree, `R0006 ambiguous constructor`); payload
+  arity and each payload expression's type against the case's declared
+  payload types reuse `T0002`/`T0001`.
 - **Record/variant equality is not implemented.** `==`/`!=` on two
   aggregate values is rejected the same way arithmetic on a `bool` is —
-  `require_numeric`-style, but for equality specifically: `T0024
+  `require_numeric`-style, but for equality specifically: `T0016
   aggregate equality is not implemented in Alpha 0.1.1`. This is a
   deliberate scope cut (see "Intentionally unsupported"), not an
   oversight — implementing it well means deciding what "equal" means

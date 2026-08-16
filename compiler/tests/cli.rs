@@ -296,6 +296,24 @@ fn unreachable_match_arm_is_a_diagnostic() {
 }
 
 #[test]
+fn unreachable_arm_with_a_different_result_type_reports_only_the_unreachable_diagnostic() {
+    // The unreachable second arm's body (`false`, a bool) would
+    // mismatch the reachable first arm's body (`1`, an i64) if it were
+    // joined into the match's result type -- it must not be: only the
+    // unreachable-arm diagnostic is expected, never an additional
+    // "match arms must have the same type" diagnostic on top of it.
+    let output = napitia(&[
+        "check",
+        &fixture("unreachable_arm_result_type_mismatch.npt"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("error[T0018]"));
+    assert!(!err.contains("error[T0001]"));
+    assert_eq!(err.matches("error[").count(), 1);
+}
+
+#[test]
 fn infinite_aggregate_layout_is_a_diagnostic() {
     let output = napitia(&["check", &fixture("infinite_aggregate_layout.npt")]);
     assert_eq!(output.status.code(), Some(1));
@@ -314,6 +332,7 @@ fn invalid_aggregate_fixtures_fail_at_check_with_no_leaked_internal_diagnostic()
         "field_mutation.npt",
         "non_exhaustive_match.npt",
         "unreachable_match_arm.npt",
+        "unreachable_arm_result_type_mismatch.npt",
         "infinite_aggregate_layout.npt",
     ] {
         let path = fixture(name);

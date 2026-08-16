@@ -1,0 +1,6 @@
+func main() -> i64 {
+    return match true {
+        _ => 1,
+        true => false,
+    }
+}

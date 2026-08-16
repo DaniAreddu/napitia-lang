@@ -772,16 +772,16 @@ impl<'a> Lowering<'a> {
             // A bare (uncalled) case reference: `typeck` already
             // confirmed this case carries no payload (else it recorded
             // `Ty::Error` and this is unreachable for a well-typed
-            // program) -- constructs the unit case directly, with no
-            // fabricated payload.
-            HirExpr::CaseRef { variant, case, .. } => Ok(LoweredExpr::Value(fb.push_value(
-                self.expr_ty(expr),
-                ValueKind::VariantCreate {
-                    variant: *variant,
-                    case: *case,
-                    payload: Vec::new(),
-                },
-            ))),
+            // program) -- routed through the same lower_variant_construct
+            // a `Variant.Case(...)` call goes through, with an empty
+            // argument list, so an unknown variant, an invalid case
+            // index, and (via the existing arity check) a bare
+            // reference to a case that actually carries a payload are
+            // all rejected the same one way, not by a second,
+            // independently-drifting implementation here.
+            HirExpr::CaseRef { variant, case, .. } => {
+                self.lower_variant_construct(fb, *variant, *case, &[], expr)
+            }
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
                 op,
@@ -2963,6 +2963,169 @@ mod tests {
         HashMap<PatternId, (ItemId, usize)>,
     ) {
         (HashMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    /// A trivial function whose body's tail is `tail_expr` -- used by
+    /// the bare-`CaseRef` tests below, which need a real function body
+    /// to place a hand-built `HirExpr::CaseRef` in.
+    fn function_with_tail(id: ItemId, name: Symbol, tail_expr: HirExpr) -> HirFunction {
+        HirFunction {
+            id,
+            name,
+            name_span: Span::dummy(),
+            params: vec![],
+            return_type: None,
+            uses: vec![],
+            raises: vec![],
+            body: HirBlock {
+                id: ExprId(100),
+                statements: vec![],
+                tail: Some(Box::new(tail_expr)),
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        }
+    }
+
+    fn case_ref(variant: ItemId, case: usize, name: Symbol) -> HirExpr {
+        HirExpr::CaseRef {
+            id: ExprId(0),
+            variant,
+            case,
+            name,
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn bare_case_ref_to_an_unknown_variant_fails_lowering_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let case_name = interner.intern("Empty");
+        let unknown_variant = ItemId(0);
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(unknown_variant, 0, case_name),
+            )],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(unknown_variant, case_name));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref to an unknown variant to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn bare_case_ref_with_an_invalid_case_index_fails_lowering_not_a_panic() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let variant_sym = interner.intern("Shape");
+        let case_name = interner.intern("Empty");
+        let variant_item = ItemId(0);
+        let variant = minimal_variant(variant_item, variant_sym);
+        // Case index 7 does not exist -- the variant declares no cases
+        // at all.
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(variant_item, 7, case_name),
+            )],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(variant_item, variant_sym));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref with an invalid case index to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn bare_case_ref_to_a_payload_carrying_case_fails_lowering_not_a_panic() {
+        // `Shape.Circle` written bare (no call parens) against a case
+        // that actually carries a payload must be rejected, not
+        // silently construct it with an empty payload.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let variant_sym = interner.intern("Shape");
+        let case_name = interner.intern("Circle");
+        let variant_item = ItemId(0);
+        let variant = crate::hir::HirVariant {
+            id: variant_item,
+            name: variant_sym,
+            span: Span::dummy(),
+            cases: vec![crate::hir::HirCase {
+                name: case_name,
+                span: Span::dummy(),
+                payload: vec![ast::Type {
+                    name: ast::Ident {
+                        symbol: interner.intern("i64"),
+                        span: Span::dummy(),
+                    },
+                }],
+            }],
+        };
+        let module = HirModule {
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                case_ref(variant_item, 0, case_name),
+            )],
+            records: vec![],
+            variants: vec![variant],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Named(variant_item, variant_sym));
+        let local_types = HashMap::new();
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a bare case ref to a payload-carrying case to fail lowering")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
     }
 
     #[test]

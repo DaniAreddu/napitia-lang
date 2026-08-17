@@ -2505,6 +2505,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -2540,6 +2542,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -2574,6 +2578,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -3299,6 +3305,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -3350,6 +3358,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         );
@@ -3412,6 +3422,7 @@ mod tests {
             params: vec![],
             return_type: None,
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(0),
@@ -3475,6 +3486,7 @@ mod tests {
             params: vec![],
             return_type: None,
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(100),
@@ -3528,6 +3540,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3571,6 +3585,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3632,6 +3648,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3665,6 +3683,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3706,6 +3726,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3746,6 +3768,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3782,6 +3806,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3821,6 +3847,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3872,6 +3900,8 @@ mod tests {
                 &expr_types,
                 &pattern_case,
                 &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
                 &interner,
                 source,
             )
@@ -3920,6 +3950,10 @@ mod tests {
             variants,
             function_sigs: HashMap::new(),
             call_type_args: Box::leak(Box::new(HashMap::new())),
+            call_evidence: Box::leak(Box::new(HashMap::new())),
+            protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
+            function_requirements: HashMap::new(),
+            function_named_type_params: HashMap::new(),
         }
     }
 
@@ -3949,6 +3983,10 @@ mod tests {
             variants,
             function_sigs,
             call_type_args,
+            call_evidence: Box::leak(Box::new(HashMap::new())),
+            protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
+            function_requirements: HashMap::new(),
+            function_named_type_params: HashMap::new(),
         }
     }
 
@@ -4726,6 +4764,7 @@ mod tests {
             }],
             return_type: Some(i64_name),
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(3),
@@ -4756,6 +4795,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -4902,6 +4943,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         );
@@ -4968,7 +5011,7 @@ mod tests {
             .flat_map(|b| &b.instructions)
             .find_map(|i| {
                 if let Instruction::Value {
-                    kind: ValueKind::Call(_, type_args, _),
+                    kind: ValueKind::Call(_, type_args, _, _),
                     ..
                 } = i
                 {

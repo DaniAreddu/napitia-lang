@@ -1,0 +1,8 @@
+record Box[T] {
+    payload: T,
+}
+
+func main() -> i64 {
+    value b = Box[i64, bool] { payload: 42 };
+    return b.payload
+}

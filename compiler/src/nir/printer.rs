@@ -17,8 +17,9 @@ use std::fmt::Write as _;
 use super::block::{BasicBlock, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
 use super::{Function, Module};
-use crate::hir::{ItemId, ItemRegistry};
-use crate::symbol::Interner;
+use crate::hir::{ItemId, ItemRegistry, TypeParamId};
+use crate::limits::MAX_GENERIC_DEPTH;
+use crate::symbol::{Interner, Symbol};
 use crate::types::{Ty, display_ty};
 
 /// Every declaration and reference to `id` renders through this one
@@ -43,10 +44,89 @@ fn qualified_ref(id: ItemId, registry: &ItemRegistry, interner: &Interner) -> St
 /// An import alias never appears: the name always comes from the
 /// registry's own canonical declared name, exactly like `qualified_ref`.
 fn format_ty(ty: &Ty, interner: &Interner, registry: &ItemRegistry) -> String {
+    format_ty_at_depth(ty, interner, registry, 0)
+}
+
+/// `depth`-bounded the same way every other stage that walks a nested
+/// type application is (`crate::limits::MAX_GENERIC_DEPTH`) -- this
+/// printer is a public entry point a direct caller can invoke with
+/// hand-built NIR that bypasses every earlier stage's own depth guard,
+/// so it never trusts them to have already bounded the input
+/// (`rfcs/0008`). Past the bound, an application's remaining arguments
+/// print as `...` rather than recursing further -- this is textual
+/// debug output, not a correctness gate, so a truncated (rather than a
+/// panicking) render is the right degradation.
+fn format_ty_at_depth(
+    ty: &Ty,
+    interner: &Interner,
+    registry: &ItemRegistry,
+    depth: usize,
+) -> String {
+    if depth > MAX_GENERIC_DEPTH {
+        return "...".to_string();
+    }
     match ty {
         Ty::Named(item, _) => qualified_ref(*item, registry, interner),
+        // A generic instantiation prints its declaration's own qualified
+        // reference, then its concrete arguments bracketed the same way
+        // a call/construction site's own applied arguments do
+        // (`@collections.Box#8[str]`, `rfcs/0008`) -- nested applications
+        // (`Box[Maybe[i64]]`) format unambiguously since each argument
+        // recurses through this same function.
+        Ty::Applied(item, args) => format!(
+            "{}{}",
+            qualified_ref(*item, registry, interner),
+            type_args_suffix_at_depth(args, interner, registry, depth + 1)
+        ),
+        // A symbolic reference to the *enclosing declaration's own* type
+        // parameter (inside a parametric body/layout, before any call
+        // site substitutes a concrete argument) prints as its bare
+        // declared name -- `T`, never a registry lookup, since a type
+        // parameter has no module-qualified identity of its own.
+        Ty::Param(_, name) => interner.resolve(*name).to_string(),
         other => display_ty(other, interner),
     }
+}
+
+/// `[i64, str]` (or nested `[Maybe[i64]]`) for a list of concrete type
+/// arguments -- empty for a non-generic call/construction/type, which
+/// prints no brackets at all rather than empty ones.
+fn type_args_suffix(args: &[Ty], interner: &Interner, registry: &ItemRegistry) -> String {
+    type_args_suffix_at_depth(args, interner, registry, 0)
+}
+
+fn type_args_suffix_at_depth(
+    args: &[Ty],
+    interner: &Interner,
+    registry: &ItemRegistry,
+    depth: usize,
+) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = args
+        .iter()
+        .map(|a| format_ty_at_depth(a, interner, registry, depth))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// `[T, U]` for a generic declaration's own parameter list, in stable
+/// declared order -- printed on the declaration itself
+/// (`func @core.identity#12[T](...)`), distinct from
+/// [`type_args_suffix`]'s concrete arguments at a use site.
+fn declared_type_params_suffix(
+    type_params: &[(TypeParamId, Symbol)],
+    interner: &Interner,
+) -> String {
+    if type_params.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = type_params
+        .iter()
+        .map(|(_, name)| interner.resolve(*name))
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistry) -> String {
@@ -74,8 +154,9 @@ fn print_function(
         .join(", ");
     let _ = writeln!(
         out,
-        "func @{}({params}) -> {} {{",
+        "func @{}{}({params}) -> {} {{",
         qualified_ref(function.id, registry, interner),
+        declared_type_params_suffix(&function.type_params, interner),
         format_ty(&function.return_type, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
@@ -223,26 +304,28 @@ fn format_value_kind(
                 b.0
             )
         }
-        ValueKind::Call(function, args) => {
+        ValueKind::Call(function, type_args, args) => {
             let args = args
                 .iter()
                 .map(|v: &ValueId| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "call @{}({args})",
-                qualified_ref(*function, registry, interner)
+                "call @{}{}({args})",
+                qualified_ref(*function, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
-        ValueKind::RecordCreate(record, fields) => {
+        ValueKind::RecordCreate(record, type_args, fields) => {
             let fields = fields
                 .iter()
                 .map(|v| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "record.create @{}({fields})",
-                qualified_ref(*record, registry, interner)
+                "record.create @{}{}({fields})",
+                qualified_ref(*record, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
         ValueKind::RecordField {
@@ -257,6 +340,7 @@ fn format_value_kind(
         ValueKind::VariantCreate {
             variant,
             case,
+            type_args,
             payload,
         } => {
             let payload = payload
@@ -265,8 +349,9 @@ fn format_value_kind(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "variant.create @{}.{case}({payload})",
-                qualified_ref(*variant, registry, interner)
+                "variant.create @{}{}.{case}({payload})",
+                qualified_ref(*variant, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
         ValueKind::VariantPayload {
@@ -358,6 +443,7 @@ mod tests {
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &typeck_result.pattern_case,
+            &typeck_result.call_type_args,
             &interner,
             id,
         )
@@ -423,5 +509,63 @@ mod tests {
         );
         assert!(text.contains(") -> User#0 {"), "{text}");
         assert!(text.contains("alloc.User#0"), "{text}");
+    }
+
+    // -- Generic textual NIR (`rfcs/0008`) -------------------------------
+
+    #[test]
+    fn a_generic_functions_declaration_prints_its_own_type_parameters() {
+        let text = print(
+            "func identity[T](x: T) -> T { return x } func main() -> i64 { return identity[i64](1) }",
+        );
+        assert!(
+            text.contains("func @identity#") && text.contains("[T](%0: T) -> T {"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_generic_call_prints_its_own_concrete_type_arguments() {
+        let text = print(
+            "func identity[T](x: T) -> T { return x } func main() -> i64 { return identity[i64](1) }",
+        );
+        assert!(
+            text.contains("identity#") && text.contains("[i64](%"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_generic_record_type_prints_bracketed_concrete_arguments() {
+        let text = print(
+            "record Box[T] { payload: T } \
+             func main() -> i64 { value b = Box[i64] { payload: 1 }; return b.payload }",
+        );
+        assert!(text.contains("Box#") && text.contains("[i64]("), "{text}");
+    }
+
+    #[test]
+    fn nested_generic_applications_print_unambiguously() {
+        let text = print(
+            "record Box[T] { payload: T } \
+             variant Maybe[T] { Some(T), None } \
+             func f(b: Box[Maybe[i64]]) -> i64 { return 0 }",
+        );
+        assert!(text.contains("Box#") && text.contains("Maybe#"), "{text}");
+        assert!(
+            text.contains("[Maybe#"),
+            "expected a nested bracket, got: {text}"
+        );
+    }
+
+    #[test]
+    fn generic_textual_nir_output_is_deterministic() {
+        let source = "func identity[T](x: T) -> T { return x } \
+                      record Box[T] { payload: T } \
+                      func main() -> i64 { \
+                          value b = Box[i64] { payload: identity[i64](1) }; \
+                          return b.payload \
+                      }";
+        assert_eq!(print(source), print(source));
     }
 }

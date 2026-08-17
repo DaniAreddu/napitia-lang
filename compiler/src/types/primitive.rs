@@ -1,6 +1,6 @@
 //! Primitive types and the checker's internal type representation.
 
-use crate::hir::ItemId;
+use crate::hir::{ItemId, TypeParamId};
 use crate::symbol::{Interner, Symbol};
 
 /// A type variable, solved during unification (`typeck::unify`). Only
@@ -51,6 +51,34 @@ pub enum Ty {
     /// carry the declaration's own symbol, never one of its field/case
     /// names.
     Named(ItemId, Symbol),
+    /// A reference to one of the *enclosing generic declaration's own*
+    /// type parameters (the `T` in `func identity[T](value: T) -> T`),
+    /// while that declaration's body is being checked symbolically
+    /// (`rfcs/0008`) -- rigid and opaque, never itself resolved further:
+    /// it unifies only with another occurrence of the exact same
+    /// `TypeParamId`, which is exactly what makes an unconstrained `T`
+    /// support passing/returning/storing but reject e.g. `T + T`
+    /// (nothing proves every possible `T` supports `+`). Two `Param`s
+    /// are the same type iff they carry the same `TypeParamId` --
+    /// nominal, matching `Named`'s own identity contract. The `Symbol`
+    /// is display-only (the parameter's own declared name), exactly like
+    /// `Named`'s, and is likewise excluded from comparison/hashing.
+    Param(TypeParamId, Symbol),
+    /// A concrete instantiation of a generic record/variant declaration
+    /// (`Box[i64]`, `Pair[i64, str]`, `rfcs/0008`): `declaration` is the
+    /// exact `ItemId` `Named` would otherwise carry, `arguments` is the
+    /// declaration's own type parameters substituted in the same
+    /// positional order it declares them. Two `Applied` types are the
+    /// same type iff they carry the same `declaration` *and* the same
+    /// `arguments`, compared structurally (`Box[i64] != Box[str]`,
+    /// `sales.Box[i64] != admin.Box[i64]`, and an alias never affects
+    /// this since `declaration` is always the canonical `ItemId`,
+    /// exactly like `Named`). A generic declaration is never referenced
+    /// without arguments (`value x: Box;` is rejected, `rfcs/0008`) --
+    /// there is no zero-argument `Applied`, and a non-generic
+    /// declaration is always `Named`, never `Applied` with an empty
+    /// argument list.
+    Applied(ItemId, Vec<Ty>),
     /// An unknown named type, or the result of an earlier error, is not
     /// allowed to *silently* become `Error`: every `Error` a program can
     /// observe must trace back to a diagnostic already recorded at the
@@ -89,6 +117,18 @@ impl PartialEq for Ty {
             // (see the variant's own doc comment) and deliberately
             // excluded here.
             (Named(a, _), Named(b, _)) => a == b,
+            // Nominal in the parameter's identity, matching `Var`; the
+            // carried `Symbol` is display-only, excluded here the same
+            // way `Named`'s is.
+            (Param(a, _), Param(b, _)) => a == b,
+            // Nominal head, structural arguments: same declaration *and*
+            // the same arguments, compared positionally and recursively
+            // (so `Box[Maybe[i64]] == Box[Maybe[i64]]`, but
+            // `Box[i64] != Box[str]` and `Box[i64] != sales.Box[i64]`
+            // when `sales.Box` is a different declaration).
+            (Applied(a_item, a_args), Applied(b_item, b_args)) => {
+                a_item == b_item && a_args == b_args
+            }
             _ => false,
         }
     }
@@ -107,6 +147,11 @@ impl std::hash::Hash for Ty {
             // hashing unequally, which silently breaks any
             // `HashMap`/`HashSet` keyed on `Ty`.
             Ty::Named(item, _) => item.hash(state),
+            Ty::Param(p, _) => p.hash(state),
+            Ty::Applied(item, args) => {
+                item.hash(state);
+                args.hash(state);
+            }
             _ => {}
         }
     }
@@ -157,6 +202,19 @@ pub fn is_numeric(ty: &Ty) -> bool {
 
 /// The name this type is written as in Napitia source, for diagnostics.
 pub fn display_ty(ty: &Ty, interner: &Interner) -> String {
+    display_ty_at_depth(ty, interner, 0)
+}
+
+/// `depth`-bounded the same way every other stage that walks a nested
+/// type application is (`crate::limits::MAX_GENERIC_DEPTH`): this is a
+/// shared, low-level formatter every stage's own diagnostics/printing
+/// falls back to, so it never assumes an already-validated, shallow
+/// `Ty::Applied` -- a hand-built one reaching here still degrades to a
+/// truncated `...` render rather than recursing without bound.
+fn display_ty_at_depth(ty: &Ty, interner: &Interner, depth: usize) -> String {
+    if depth > crate::limits::MAX_GENERIC_DEPTH {
+        return "...".to_string();
+    }
     match ty {
         Ty::I8 => "i8".to_string(),
         Ty::I16 => "i16".to_string(),
@@ -177,6 +235,20 @@ pub fn display_ty(ty: &Ty, interner: &Interner) -> String {
         Ty::Never => "never".to_string(),
         Ty::Var(_) => "_".to_string(),
         Ty::Named(_, name) => interner.resolve(*name).to_string(),
+        Ty::Param(_, name) => interner.resolve(*name).to_string(),
+        Ty::Applied(_, args) => {
+            // No registry available at this layer -- callers that have
+            // one (`typeck::display_for_diagnostic`, `nir`'s printer)
+            // qualify the head themselves and never fall through to
+            // this bare form; this is only the base-case fallback each
+            // of them still uses for the argument list itself.
+            let args_text = args
+                .iter()
+                .map(|a| display_ty_at_depth(a, interner, depth + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("<applied>[{args_text}]")
+        }
         Ty::Error => "<unknown>".to_string(),
     }
 }

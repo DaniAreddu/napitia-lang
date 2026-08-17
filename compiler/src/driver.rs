@@ -54,6 +54,8 @@ pub struct CheckOutput {
     pub local_types: HashMap<LocalId, Ty>,
     pub expr_types: HashMap<hir::ExprId, Ty>,
     pub pattern_case: HashMap<hir::PatternId, (hir::ItemId, usize)>,
+    /// See [`typeck::TypeckResult::call_type_args`].
+    pub call_type_args: HashMap<hir::ExprId, Vec<Ty>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -69,6 +71,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         local_types: typeck_result.local_types,
         expr_types: typeck_result.expr_types,
         pattern_case: typeck_result.pattern_case,
+        call_type_args: typeck_result.call_type_args,
         diagnostics,
     }
 }
@@ -102,6 +105,7 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.local_types,
         &checked.expr_types,
         &checked.pattern_case,
+        &checked.call_type_args,
         interner,
         source,
     ) {

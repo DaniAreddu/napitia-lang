@@ -1,0 +1,10 @@
+// INVALID: Box declares exactly one type parameter; this construction
+// supplies two. Rejected as T0024 (Alpha 0.1.4, rfcs/0008).
+record Box[T] {
+    payload: T,
+}
+
+func main() -> i64 {
+    value b = Box[i64, bool] { payload: 42 };
+    return b.payload
+}

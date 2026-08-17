@@ -40,24 +40,24 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.3
+## Current status: Alpha 0.1.4
 
-This milestone rounds out Alpha 0.1.2's multi-file projects with import
-ergonomics and precise cross-module identity: `import a.b.c as d;` lets
-one item be given a local alias, so two same-named declarations from
-different modules (two unrelated `User` records, say) can be used
-together in one scope without colliding — the alias is purely a local
-spelling and never changes an item's own identity, declared name, or
-the type it names. Textual NIR (`napitia ir`) is now module-qualified
-(`sales.user.User#2`, not just `User`), so two same-named items from
-different modules always print distinguishably, and two different
-module paths that resolve to the same physical file (a symlink or
-junction) are now rejected outright. It builds on Alpha 0.1.2's
-multi-file projects (a `napitia.toml` manifest, one file per module,
-cross-module `import`, `public`/`private` enforced across module
-boundaries) and Alpha 0.1.1's data model (nominal records and variants,
-construction, field access, qualified variant constructors, and
-exhaustive pattern matching, executed end to end by the interpreter).
+This milestone adds square-bracket generics to `func`/`record`/`variant`
+declarations: `func identity[T](value: T) -> T`, `record Box[T] { value: T
+}`, `variant Maybe[T] { Some(T), None }`, with explicit (`Box[i64]`,
+`identity[i64](42)`) or inferred (`identity(42)`) type application at every
+reference. A generic declaration's own body is checked exactly once,
+symbolically, against its own opaque type parameter — never re-checked per
+instantiation, and never permitting an operation (equality, ordering,
+arithmetic, bitwise, logical, field access, calling) nothing proves safe
+for an unconstrained `T`. Every instantiation is identified by one
+canonical key (declaration + concrete type arguments), reused across
+inference, NIR lowering, and verification; NIR itself stays fully
+parametric (a generic function lowers once, a call site records only its
+own concrete type arguments), and the interpreter erases those arguments
+at runtime the same way it always erased nominal identity to a bare item
+id. It builds on Alpha 0.1.3's module-qualified identity and import
+aliases (`rfcs/0007`) and Alpha 0.1.2's multi-file projects.
 
 ### Implemented in this milestone
 
@@ -108,7 +108,16 @@ exhaustive pattern matching, executed end to end by the interpreter).
 - Import aliases (`import a.b.c as d;`), a canonical per-item identity
   registry (`hir::registry`) used by both NIR printing and verification,
   module-qualified textual NIR, and rejection of two module paths that
-  resolve to the same physical file (`M0013`) — see below.
+  resolve to the same physical file (`M0013`).
+- Generics (`func`/`record`/`variant[T, ...]`): per-declaration type
+  parameter identity, explicit and inferred type application, symbolic
+  one-time body checking, `Ty::Applied`/`Ty::Param` with nominal identity
+  and structural unification, a canonical generic-instance key reused by
+  typeck/NIR/the verifier, parametric NIR (one lowering per declaration,
+  concrete type arguments recorded per call/construction site), exhaustive
+  `match` over an instantiated payload type, substitution-aware infinite-
+  layout detection, and depth/instance-count budgets shared across every
+  stage that walks a type application — see below.
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -222,18 +231,54 @@ that alias is exactly what the diagnostic is about. See
 `rfcs/0007-module-identity-and-import-aliases.md` for the full design,
 the collision rules, and the current honest limitations.
 
+### Generics
+
+`func`/`record`/`variant` may each declare their own square-bracket type
+parameters, applied explicitly or inferred at every reference:
+
+```napitia
+record Box[T] {
+    value: T,
+}
+
+func unwrap[T](box: Box[T]) -> T {
+    box.value
+}
+
+func main() -> i64 {
+    unwrap(Box[i64] { value: 42 })   // 42, T inferred as i64
+}
+```
+
+A generic declaration's own body is checked exactly once, symbolically,
+against its own opaque `T` — never re-checked per instantiation, and never
+permitting an operation nothing proves safe for an unconstrained type
+parameter (equality, ordering, arithmetic, bitwise operators, logical use,
+field access, and calling all require a concrete type; plain
+passing/returning/binding/construction do not). Two same-named generic
+declarations from different modules remain nominally distinct, and an
+import alias never bridges them, exactly like every other declaration
+(`rfcs/0007`). `match` exhaustiveness uses the *instantiated* payload type
+(`Maybe[bool]`'s `Some` payload is checked as `bool`, a closed two-value
+space, not the declaration's own unresolved `T`). NIR stays fully
+parametric — a generic function lowers once, and a call site records only
+its own concrete type arguments — and there is no native-code
+monomorphization yet. See `rfcs/0008-canonical-generics.md` for the full
+design, the diagnostic codes, and the current honest limitations.
+
 ### Explicitly not yet implemented
 
 Field mutation, record/variant equality, pattern guards, or-patterns,
-record-destructuring/slice/range patterns, generics, protocols, a
-`Maybe<T>` absence type, checked `uses`/`raises` effects and errors,
-ownership/region enforcement (and the indirection that would lift the
-recursive-aggregate restriction), structured concurrency, remote
+record-destructuring/slice/range patterns, protocols/trait-style
+constraints on a type parameter, checked `uses`/`raises` effects and
+errors, ownership/region enforcement (and the indirection that would lift
+the recursive-aggregate restriction), structured concurrency, remote
 packages/dependency declarations, wildcard/grouped imports, re-exports,
 package/module aliases (as opposed to the per-item import aliases that do
 exist — see above), incremental/cached compilation, an LLVM (or any
-native) backend, garbage collection, and any domain-specific library
-(REST, ORM, tensors, GPU).
+native) backend, native-code generic specialization/monomorphization,
+garbage collection, and any domain-specific library (REST, ORM, tensors,
+GPU).
 Design direction for most of these exists in `rfcs/`;
 none of it is faked in the implementation.
 

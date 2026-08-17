@@ -12,10 +12,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{ItemId, ItemRegistry};
+use crate::hir::{ItemId, ItemRegistry, TypeParamId};
+use crate::limits::MAX_GENERIC_DEPTH;
 use crate::source::{SourceId, Span};
-use crate::symbol::Interner;
-use crate::types::{Ty, is_integer, is_numeric};
+use crate::symbol::{Interner, Symbol};
+use crate::types::{Ty, is_integer, is_numeric, substitute};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
@@ -88,11 +89,51 @@ mod codes {
     /// but it means diagnostics and textual NIR referencing this type
     /// would print the wrong name.
     pub const NAMED_TYPE_SYMBOL_MISMATCH: &str = "V0030";
+    /// A `Call`/`RecordCreate`/`VariantCreate`/type application supplies a
+    /// number of type arguments that does not match the number of type
+    /// parameters its callee/record/variant declares (`rfcs/0008`).
+    pub const GENERIC_ARITY_MISMATCH: &str = "V0031";
+    /// A `Ty::Param` appears somewhere outside the body/layout of the
+    /// generic declaration that actually declares it -- e.g. a function
+    /// with no type parameters of its own using another declaration's
+    /// symbolic parameter as if it were a concrete type. Symbolic
+    /// parameters are only ever meaningful within the one declaration
+    /// that binds them; anywhere else, lowering has a bug and one must
+    /// never reach the interpreter.
+    pub const ESCAPING_TYPE_PARAMETER: &str = "V0032";
+    /// A `Ty::Named` refers to a record/variant that declares one or
+    /// more type parameters, used without any applied type arguments
+    /// (`rfcs/0008` requires every reference to a generic declaration to
+    /// be a `Ty::Applied`; there is no raw/default/partially-applied
+    /// generic type).
+    pub const UNAPPLIED_GENERIC_TYPE: &str = "V0033";
+    /// A function/record/variant declares the same `TypeParamId` more
+    /// than once in its own type parameter list. Every declaration's own
+    /// parameters must be pairwise distinct -- a duplicate would make a
+    /// call/construction site's positional type-argument list ambiguous
+    /// about which argument substitutes which occurrence.
+    pub const DUPLICATE_TYPE_PARAMETER: &str = "V0034";
+    /// A type nested deeper than `crate::limits::MAX_GENERIC_DEPTH`,
+    /// found at *any* type root this verifier checks: a record field, a
+    /// variant case payload, a function parameter or return type, an
+    /// instruction's result type, or a `Call`/`RecordCreate`/
+    /// `VariantCreate` type argument. Reported once per root, never once
+    /// per nested level -- a real, structured diagnostic in place of the
+    /// silent early return every other depth-bounded check in this
+    /// module still falls back to past this same bound (defense in
+    /// depth for those, since this check runs first and rejects the
+    /// type outright before they would ever need to).
+    pub const GENERIC_DEPTH_EXCEEDED: &str = "V0035";
 }
 
 /// Every function this module's `Call` instructions might reference,
 /// along with the signature the verifier checks calls against.
 struct KnownFunction {
+    /// This function's own declared type parameters, in declaration
+    /// order -- a `Call`'s type arguments are substituted into `params`/
+    /// `return_type` positionally against this same order before being
+    /// checked against the call's actual argument/result types.
+    type_params: Vec<TypeParamId>,
     params: Vec<Ty>,
     return_type: Ty,
 }
@@ -169,6 +210,7 @@ pub fn verify_module(
         known_functions.insert(
             function.id,
             KnownFunction {
+                type_params: function.type_params.iter().map(|(id, _)| *id).collect(),
                 params: function.params.iter().map(|p| p.ty.clone()).collect(),
                 return_type: function.return_type.clone(),
             },
@@ -218,12 +260,15 @@ pub fn verify_module(
     // constructs one.
     for (id, record) in &module.records {
         let context = format!("record `{}`", registry.qualified_name(*id, interner));
+        check_no_duplicate_type_params(&record.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            record.type_params.iter().map(|(id, _)| *id).collect();
         for (field_name, ty) in &record.fields {
             let field_context = format!("{context}'s field `{}`", interner.resolve(*field_name));
-            check_no_bad_type(ty, source, &field_context, &mut diagnostics);
-            check_named_type_identity(
+            check_type_root(
                 ty,
                 &agg,
+                &own_params,
                 source,
                 interner,
                 registry,
@@ -234,16 +279,19 @@ pub fn verify_module(
     }
     for (id, variant) in &module.variants {
         let context = format!("variant `{}`", registry.qualified_name(*id, interner));
+        check_no_duplicate_type_params(&variant.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            variant.type_params.iter().map(|(id, _)| *id).collect();
         for case in &variant.cases {
             for (i, ty) in case.payload.iter().enumerate() {
                 let payload_context = format!(
                     "{context}'s case `{}` payload position {i}",
                     interner.resolve(case.name)
                 );
-                check_no_bad_type(ty, source, &payload_context, &mut diagnostics);
-                check_named_type_identity(
+                check_type_root(
                     ty,
                     &agg,
+                    &own_params,
                     source,
                     interner,
                     registry,
@@ -310,10 +358,12 @@ fn verify_function(
     }
 
     let fn_context = format!("function `{name}`");
-    check_no_bad_type(&function.return_type, source, &fn_context, diagnostics);
-    check_named_type_identity(
+    check_no_duplicate_type_params(&function.type_params, source, &fn_context, diagnostics);
+    let own_params: HashSet<TypeParamId> = function.type_params.iter().map(|(id, _)| *id).collect();
+    check_type_root(
         &function.return_type,
         agg,
+        &own_params,
         source,
         interner,
         registry,
@@ -321,10 +371,10 @@ fn verify_function(
         diagnostics,
     );
     for param in &function.params {
-        check_no_bad_type(&param.ty, source, &fn_context, diagnostics);
-        check_named_type_identity(
+        check_type_root(
             &param.ty,
             agg,
+            &own_params,
             source,
             interner,
             registry,
@@ -418,10 +468,10 @@ fn verify_function(
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Value { result, ty, kind } => {
-                    check_no_bad_type(ty, source, &fn_context, diagnostics);
-                    check_named_type_identity(
+                    check_type_root(
                         ty,
                         agg,
+                        &own_params,
                         source,
                         interner,
                         registry,
@@ -436,6 +486,7 @@ fn verify_function(
                         &alloc_slots,
                         known_functions,
                         agg,
+                        &own_params,
                         source,
                         &name,
                         interner,
@@ -560,7 +611,7 @@ fn verify_function(
             } => {
                 require_value(*scrutinee, diagnostics);
                 if let Some(ty) = value_types.get(scrutinee)
-                    && !matches!(ty, Ty::Named(v, _) if v == variant)
+                    && !matches!(ty, Ty::Named(v, _) | Ty::Applied(v, _) if v == variant)
                 {
                     diagnostics.push(Diagnostic::error(
                         codes::SWITCH_SCRUTINEE_TYPE_MISMATCH,
@@ -751,8 +802,8 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         | ValueKind::Le(a, b)
         | ValueKind::Gt(a, b)
         | ValueKind::Ge(a, b) => vec![*a, *b],
-        ValueKind::Call(_, args) => args.clone(),
-        ValueKind::RecordCreate(_, fields) => fields.clone(),
+        ValueKind::Call(_, _, args) => args.clone(),
+        ValueKind::RecordCreate(_, _, fields) => fields.clone(),
         ValueKind::RecordField { base, .. } => vec![*base],
         ValueKind::VariantCreate { payload, .. } => payload.clone(),
         ValueKind::VariantPayload { base, .. } => vec![*base],
@@ -861,7 +912,52 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
 /// unresolved type variable (typeck must have already resolved every
 /// one before lowering ever saw this expression) or `Ty::Error` (a
 /// well-typed program that reached lowering should never carry one).
+/// A declaration's own `type_params` list must never repeat the same
+/// `TypeParamId` -- a duplicate would make positional substitution
+/// ambiguous about which call-site argument binds which occurrence, and
+/// silently collapsing it into a `HashMap`/`HashSet` (as every
+/// substitution site here does) would otherwise just drop one binding
+/// with no diagnostic at all.
+fn check_no_duplicate_type_params(
+    type_params: &[(TypeParamId, Symbol)],
+    source: SourceId,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen: HashSet<TypeParamId> = HashSet::new();
+    for (id, _) in type_params {
+        if !seen.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_TYPE_PARAMETER,
+                source,
+                Span::dummy(),
+                format!("{context} declares the same type parameter more than once"),
+            ));
+        }
+    }
+}
+
 fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut Vec<Diagnostic>) {
+    check_no_bad_type_at_depth(ty, source, context, diagnostics, 0);
+}
+
+/// `depth`-bounded the same way every other stage that walks a nested
+/// type application is (`crate::limits::MAX_GENERIC_DEPTH`). Recurses
+/// into `Ty::Applied`'s own argument list -- an unresolved `Ty::Var` or
+/// `Ty::Error` buried *inside* a generic argument (`Box[Ty::Error]`)
+/// must be rejected exactly as surely as one at the top level, never
+/// silently passed through because only the outer `Ty::Applied` was
+/// ever inspected (`rfcs/0008`).
+fn check_no_bad_type_at_depth(
+    ty: &Ty,
+    source: SourceId,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    depth: usize,
+) {
+    if depth > MAX_GENERIC_DEPTH {
+        return;
+    }
     match ty {
         Ty::Var(_) => diagnostics.push(Diagnostic::error(
             codes::UNRESOLVED_TYPE_VARIABLE,
@@ -881,6 +977,11 @@ fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut
                  should never reach lowering"
             ),
         )),
+        Ty::Applied(_, args) => {
+            for arg in args {
+                check_no_bad_type_at_depth(arg, source, context, diagnostics, depth + 1);
+            }
+        }
         _ => {}
     }
 }
@@ -902,35 +1003,267 @@ fn check_named_type_identity(
     context: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let Ty::Named(item, symbol) = ty else {
+    check_named_type_identity_at_depth(
+        ty,
+        agg,
+        source,
+        interner,
+        registry,
+        context,
+        diagnostics,
+        0,
+    );
+}
+
+/// `depth` bounds recursion into nested `Ty::Applied` arguments the same
+/// way every other stage that walks a type application does
+/// (`crate::limits::MAX_GENERIC_DEPTH`) -- this verifier is a public
+/// entry point a direct caller can invoke with hand-built NIR that
+/// bypasses every earlier stage's own depth guard entirely, so it never
+/// trusts them to have already bounded the input (`rfcs/0008`). Past the
+/// bound, recursion simply stops rather than checking (or rejecting)
+/// anything deeper -- a type that deep is already malformed by
+/// construction and would have been rejected with its own diagnostic far
+/// earlier in any lowering that did not itself bypass every guard.
+#[allow(clippy::too_many_arguments)]
+fn check_named_type_identity_at_depth(
+    ty: &Ty,
+    agg: &AggregateContext,
+    source: SourceId,
+    interner: &Interner,
+    registry: &ItemRegistry,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    depth: usize,
+) {
+    if depth > MAX_GENERIC_DEPTH {
         return;
-    };
-    let declared_name = agg
-        .records
-        .get(item)
-        .map(|r| r.name)
-        .or_else(|| agg.variants.get(item).map(|v| v.name));
-    match declared_name {
-        None => diagnostics.push(Diagnostic::error(
-            codes::UNKNOWN_NAMED_TYPE,
-            source,
-            Span::dummy(),
-            format!(
-                "{context} names a type that matches no declared record or variant in this module"
-            ),
-        )),
-        Some(name) if name != *symbol => diagnostics.push(Diagnostic::error(
-            codes::NAMED_TYPE_SYMBOL_MISMATCH,
-            source,
-            Span::dummy(),
-            format!(
-                "{context} names its type `{}`, but its declaration is actually named `{}`",
-                interner.resolve(*symbol),
-                registry.qualified_name(*item, interner)
-            ),
-        )),
-        Some(_) => {}
     }
+    match ty {
+        Ty::Named(item, symbol) => {
+            let declared = agg
+                .records
+                .get(item)
+                .map(|r| (r.name, r.type_params.len()))
+                .or_else(|| {
+                    agg.variants
+                        .get(item)
+                        .map(|v| (v.name, v.type_params.len()))
+                });
+            match declared {
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_NAMED_TYPE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} names a type that matches no declared record or variant in this module"
+                    ),
+                )),
+                Some((name, _)) if name != *symbol => diagnostics.push(Diagnostic::error(
+                    codes::NAMED_TYPE_SYMBOL_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} names its type `{}`, but its declaration is actually named `{}`",
+                        interner.resolve(*symbol),
+                        registry.qualified_name(*item, interner)
+                    ),
+                )),
+                Some((_, type_param_count)) if type_param_count > 0 => {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNAPPLIED_GENERIC_TYPE,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "{context} names `{}` without type arguments, but it declares {type_param_count} type parameter(s)",
+                            registry.qualified_name(*item, interner)
+                        ),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        Ty::Applied(item, args) => {
+            let declared_param_count = agg
+                .records
+                .get(item)
+                .map(|r| r.type_params.len())
+                .or_else(|| agg.variants.get(item).map(|v| v.type_params.len()));
+            match declared_param_count {
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_NAMED_TYPE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} names a type that matches no declared record or variant in this module"
+                    ),
+                )),
+                Some(count) if count != args.len() => diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} applies {} type argument(s) to `{}`, which declares {count}",
+                        args.len(),
+                        registry.qualified_name(*item, interner)
+                    ),
+                )),
+                Some(0) => diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} applies type arguments to `{}`, which is not generic",
+                        registry.qualified_name(*item, interner)
+                    ),
+                )),
+                Some(_) => {}
+            }
+            for arg in args {
+                check_named_type_identity_at_depth(
+                    arg,
+                    agg,
+                    source,
+                    interner,
+                    registry,
+                    context,
+                    diagnostics,
+                    depth + 1,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A `Ty::Param` is only ever meaningful within the one generic
+/// declaration that binds it (`rfcs/0008`) -- it must never appear as a
+/// concrete type anywhere else (a non-generic function's own signature,
+/// another declaration's field/payload types, a call's type arguments in
+/// a context that doesn't itself declare that parameter). `own_params` is
+/// the set of `TypeParamId`s the *current* declaration (function, record,
+/// or variant) itself declares; any `Ty::Param` found outside that set has
+/// escaped its owning declaration, which no valid lowering ever produces.
+fn check_type_param_scope(
+    ty: &Ty,
+    own_params: &HashSet<TypeParamId>,
+    source: SourceId,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    check_type_param_scope_at_depth(ty, own_params, source, context, diagnostics, 0);
+}
+
+/// `depth`-bounded the same way [`check_named_type_identity_at_depth`]
+/// is, and for the same reason: this verifier must never trust a
+/// hand-built `Ty::Applied` to already be shallow.
+fn check_type_param_scope_at_depth(
+    ty: &Ty,
+    own_params: &HashSet<TypeParamId>,
+    source: SourceId,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    depth: usize,
+) {
+    if depth > MAX_GENERIC_DEPTH {
+        return;
+    }
+    match ty {
+        Ty::Param(id, _) => {
+            if !own_params.contains(id) {
+                diagnostics.push(Diagnostic::error(
+                    codes::ESCAPING_TYPE_PARAMETER,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} uses a symbolic type parameter that does not belong to this declaration"
+                    ),
+                ));
+            }
+        }
+        Ty::Applied(_, args) => {
+            for arg in args {
+                check_type_param_scope_at_depth(
+                    arg,
+                    own_params,
+                    source,
+                    context,
+                    diagnostics,
+                    depth + 1,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `ty`'s own nested `Ty::Applied` structure goes deeper than
+/// `MAX_GENERIC_DEPTH` -- stops descending the instant the bound is
+/// exceeded rather than computing the type's true depth beyond that
+/// point, so *measuring* a pathologically deep hand-built type can never
+/// itself overflow the native stack.
+fn exceeds_generic_depth(ty: &Ty, depth: usize) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Applied(_, args) => args.iter().any(|a| exceeds_generic_depth(a, depth + 1)),
+        _ => false,
+    }
+}
+
+/// The single, shared check every type root `verify_module` inspects
+/// goes through -- a record field, a variant case payload, a function
+/// parameter or return type, an instruction's result type, or a
+/// `Call`/`RecordCreate`/`VariantCreate` type argument. One place
+/// validating everything any of these must satisfy, so no call site can
+/// ever drift into checking a different subset of these, and no root is
+/// ever checked by only some of them:
+///
+/// - not nested deeper than `MAX_GENERIC_DEPTH` (checked first, and
+///   reported as its own dedicated diagnostic rather than the silent
+///   early return every check below still falls back to past this same
+///   bound as defense in depth -- a controlled single diagnostic for the
+///   whole root, never one per nested level, and no further checks run
+///   on a root already rejected this way);
+/// - no `Ty::Error` or unresolved `Ty::Var`, however deeply nested
+///   (`check_no_bad_type`);
+/// - valid named/applied aggregate identity and correct nested generic
+///   arity, including rejecting an unapplied reference to a generic
+///   declaration (`check_named_type_identity`);
+/// - no symbolic type parameter escaping the declaration that binds it
+///   (`check_type_param_scope`).
+///
+/// This is the module's one authoritative type-integrity path: it never
+/// trusts the parser, HIR, type checker, or lowering to have already
+/// rejected an over-deep or otherwise malformed type, since every caller
+/// here is a `verify_module` entry point that hand-built NIR can reach
+/// directly, bypassing every earlier stage entirely (`rfcs/0008`).
+#[allow(clippy::too_many_arguments)]
+fn check_type_root(
+    ty: &Ty,
+    agg: &AggregateContext,
+    own_params: &HashSet<TypeParamId>,
+    source: SourceId,
+    interner: &Interner,
+    registry: &ItemRegistry,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if exceeds_generic_depth(ty, 0) {
+        diagnostics.push(Diagnostic::error(
+            codes::GENERIC_DEPTH_EXCEEDED,
+            source,
+            Span::dummy(),
+            format!(
+                "{context} is nested deeper than the maximum generic depth of {MAX_GENERIC_DEPTH}"
+            ),
+        ));
+        return;
+    }
+    check_no_bad_type(ty, source, context, diagnostics);
+    check_named_type_identity(ty, agg, source, interner, registry, context, diagnostics);
+    check_type_param_scope(ty, own_params, source, context, diagnostics);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,6 +1275,7 @@ fn verify_value_kind(
     alloc_slots: &HashSet<ValueId>,
     known_functions: &HashMap<ItemId, KnownFunction>,
     agg: &AggregateContext,
+    own_params: &HashSet<TypeParamId>,
     source: SourceId,
     function_name: &str,
     interner: &Interner,
@@ -1122,7 +1456,7 @@ fn verify_value_kind(
                 );
             }
         }
-        ValueKind::Call(callee, args) => {
+        ValueKind::Call(callee, type_args, args) => {
             for arg in args {
                 require_value(*arg, diagnostics);
             }
@@ -1138,29 +1472,71 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            if sig.return_type != *result_ty {
+            let call_context = format!(
+                "function `{function_name}`: %{}'s call type argument",
+                result.0
+            );
+            for t in type_args {
+                check_type_root(
+                    t,
+                    agg,
+                    own_params,
+                    source,
+                    interner,
+                    registry,
+                    &call_context,
+                    diagnostics,
+                );
+            }
+            let (return_ty, param_tys): (Ty, Vec<Ty>) = if type_args.len() == sig.type_params.len()
+            {
+                let subst: HashMap<TypeParamId, Ty> = sig
+                    .type_params
+                    .iter()
+                    .copied()
+                    .zip(type_args.iter().cloned())
+                    .collect();
+                (
+                    substitute(&sig.return_type, &subst),
+                    sig.params.iter().map(|p| substitute(p, &subst)).collect(),
+                )
+            } else {
+                diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls a function declaring {} type parameter(s) with {} type argument(s)",
+                        result.0,
+                        sig.type_params.len(),
+                        type_args.len()
+                    ),
+                ));
+                (sig.return_type.clone(), sig.params.clone())
+            };
+            if return_ty != *result_ty {
                 operand_mismatch(
                     diagnostics,
                     format!(
                         "calls a function returning `{}` but is itself declared `{}`",
-                        ty_name(&sig.return_type),
+                        ty_name(&return_ty),
                         ty_name(result_ty)
                     ),
                 );
             }
-            if sig.params.len() != args.len() {
+            if param_tys.len() != args.len() {
                 diagnostics.push(Diagnostic::error(
                     codes::ARITY_MISMATCH,
                     source,
                     Span::dummy(),
                     format!(
                         "function `{function_name}` calls a function expecting {} argument(s) with {}",
-                        sig.params.len(),
+                        param_tys.len(),
                         args.len()
                     ),
                 ));
             } else {
-                for (param_ty, arg) in sig.params.iter().zip(args.iter()) {
+                for (param_ty, arg) in param_tys.iter().zip(args.iter()) {
                     if let Some(arg_ty) = ty_of(*arg)
                         && arg_ty != *param_ty
                     {
@@ -1176,7 +1552,7 @@ fn verify_value_kind(
                 }
             }
         }
-        ValueKind::RecordCreate(record, fields) => {
+        ValueKind::RecordCreate(record, type_args, fields) => {
             for f in fields {
                 require_value(*f, diagnostics);
             }
@@ -1192,16 +1568,63 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            if !matches!(result_ty, Ty::Named(r, _) if r == record) {
-                operand_mismatch(
+            let construct_context = format!(
+                "function `{function_name}`: %{}'s record construction type argument",
+                result.0
+            );
+            for t in type_args {
+                check_type_root(
+                    t,
+                    agg,
+                    own_params,
+                    source,
+                    interner,
+                    registry,
+                    &construct_context,
                     diagnostics,
-                    format!(
-                        "constructs record `{}` but is declared `{}`",
-                        registry.qualified_name(*record, interner),
-                        ty_name(result_ty)
-                    ),
                 );
             }
+            let arity_ok = type_args.len() == layout.type_params.len();
+            if !arity_ok {
+                diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs `{}` (declaring {} type parameter(s)) with {} type argument(s)",
+                        result.0,
+                        registry.qualified_name(*record, interner),
+                        layout.type_params.len(),
+                        type_args.len()
+                    ),
+                ));
+            } else {
+                let expected_ty = if type_args.is_empty() {
+                    Ty::Named(*record, layout.name)
+                } else {
+                    Ty::Applied(*record, type_args.clone())
+                };
+                if *result_ty != expected_ty {
+                    operand_mismatch(
+                        diagnostics,
+                        format!(
+                            "constructs record `{}` but is declared `{}`",
+                            registry.qualified_name(*record, interner),
+                            ty_name(result_ty)
+                        ),
+                    );
+                }
+            }
+            let subst: HashMap<TypeParamId, Ty> = if arity_ok {
+                layout
+                    .type_params
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(type_args.iter().cloned())
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             if fields.len() != layout.fields.len() {
                 diagnostics.push(Diagnostic::error(
                     codes::RECORD_FIELDS_NOT_INITIALIZED_ONCE_EACH,
@@ -1219,15 +1642,16 @@ fn verify_value_kind(
                 for (i, (field_value, (_, declared_ty))) in
                     fields.iter().zip(layout.fields.iter()).enumerate()
                 {
+                    let expected = substitute(declared_ty, &subst);
                     if let Some(ty) = ty_of(*field_value)
-                        && ty != *declared_ty
+                        && ty != expected
                     {
                         operand_mismatch(
                             diagnostics,
                             format!(
                                 "field {i} has type `{}` but is declared `{}`",
                                 ty_name(&ty),
-                                ty_name(declared_ty)
+                                ty_name(&expected)
                             ),
                         );
                     }
@@ -1252,28 +1676,46 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            if let Some(base_ty) = ty_of(*base)
-                && !matches!(&base_ty, Ty::Named(r, _) if r == record)
-            {
-                operand_mismatch(
-                    diagnostics,
-                    format!(
-                        "projects a field of `{}` from a base of type `{}`",
-                        registry.qualified_name(*record, interner),
-                        ty_name(&base_ty)
-                    ),
-                );
-            }
+            let base_ty = ty_of(*base);
+            let base_args: Option<&[Ty]> = match &base_ty {
+                Some(Ty::Named(r, _)) if r == record => Some(&[]),
+                Some(Ty::Applied(r, args)) if r == record => Some(args.as_slice()),
+                Some(other) => {
+                    operand_mismatch(
+                        diagnostics,
+                        format!(
+                            "projects a field of `{}` from a base of type `{}`",
+                            registry.qualified_name(*record, interner),
+                            ty_name(other)
+                        ),
+                    );
+                    None
+                }
+                None => None,
+            };
+            let subst: HashMap<TypeParamId, Ty> = match base_args {
+                Some(args) if args.len() == layout.type_params.len() => layout
+                    .type_params
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(args.iter().cloned())
+                    .collect(),
+                _ => HashMap::new(),
+            };
             match layout.fields.get(*field) {
-                Some((_, declared_ty)) if declared_ty == result_ty => {}
-                Some((_, declared_ty)) => operand_mismatch(
-                    diagnostics,
-                    format!(
-                        "projects field {field} of type `{}` but is declared `{}`",
-                        ty_name(declared_ty),
-                        ty_name(result_ty)
-                    ),
-                ),
+                Some((_, declared_ty)) => {
+                    let expected = substitute(declared_ty, &subst);
+                    if expected != *result_ty {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "projects field {field} of type `{}` but is declared `{}`",
+                                ty_name(&expected),
+                                ty_name(result_ty)
+                            ),
+                        );
+                    }
+                }
                 None => diagnostics.push(Diagnostic::error(
                     codes::UNKNOWN_FIELD,
                     source,
@@ -1290,6 +1732,7 @@ fn verify_value_kind(
         ValueKind::VariantCreate {
             variant,
             case,
+            type_args,
             payload,
         } => {
             for p in payload {
@@ -1307,16 +1750,63 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            if !matches!(result_ty, Ty::Named(v, _) if v == variant) {
-                operand_mismatch(
+            let construct_context = format!(
+                "function `{function_name}`: %{}'s variant construction type argument",
+                result.0
+            );
+            for t in type_args {
+                check_type_root(
+                    t,
+                    agg,
+                    own_params,
+                    source,
+                    interner,
+                    registry,
+                    &construct_context,
                     diagnostics,
-                    format!(
-                        "constructs variant `{}` but is declared `{}`",
-                        registry.qualified_name(*variant, interner),
-                        ty_name(result_ty)
-                    ),
                 );
             }
+            let arity_ok = type_args.len() == layout.type_params.len();
+            if !arity_ok {
+                diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} constructs `{}` (declaring {} type parameter(s)) with {} type argument(s)",
+                        result.0,
+                        registry.qualified_name(*variant, interner),
+                        layout.type_params.len(),
+                        type_args.len()
+                    ),
+                ));
+            } else {
+                let expected_ty = if type_args.is_empty() {
+                    Ty::Named(*variant, layout.name)
+                } else {
+                    Ty::Applied(*variant, type_args.clone())
+                };
+                if *result_ty != expected_ty {
+                    operand_mismatch(
+                        diagnostics,
+                        format!(
+                            "constructs variant `{}` but is declared `{}`",
+                            registry.qualified_name(*variant, interner),
+                            ty_name(result_ty)
+                        ),
+                    );
+                }
+            }
+            let subst: HashMap<TypeParamId, Ty> = if arity_ok {
+                layout
+                    .type_params
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(type_args.iter().cloned())
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             let Some(case_layout) = layout.cases.get(*case) else {
                 diagnostics.push(Diagnostic::error(
                     codes::UNKNOWN_VARIANT_OR_CASE,
@@ -1347,15 +1837,16 @@ fn verify_value_kind(
                 for (i, (value, declared_ty)) in
                     payload.iter().zip(case_layout.payload.iter()).enumerate()
                 {
+                    let expected = substitute(declared_ty, &subst);
                     if let Some(ty) = ty_of(*value)
-                        && ty != *declared_ty
+                        && ty != expected
                     {
                         operand_mismatch(
                             diagnostics,
                             format!(
                                 "payload {i} has type `{}` but is declared `{}`",
                                 ty_name(&ty),
-                                ty_name(declared_ty)
+                                ty_name(&expected)
                             ),
                         );
                     }
@@ -1381,28 +1872,46 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            if let Some(base_ty) = ty_of(*base)
-                && !matches!(&base_ty, Ty::Named(v, _) if v == variant)
-            {
-                operand_mismatch(
-                    diagnostics,
-                    format!(
-                        "projects a payload of `{}` from a base of type `{}`",
-                        registry.qualified_name(*variant, interner),
-                        ty_name(&base_ty)
-                    ),
-                );
-            }
+            let base_ty = ty_of(*base);
+            let base_args: Option<&[Ty]> = match &base_ty {
+                Some(Ty::Named(v, _)) if v == variant => Some(&[]),
+                Some(Ty::Applied(v, args)) if v == variant => Some(args.as_slice()),
+                Some(other) => {
+                    operand_mismatch(
+                        diagnostics,
+                        format!(
+                            "projects a payload of `{}` from a base of type `{}`",
+                            registry.qualified_name(*variant, interner),
+                            ty_name(other)
+                        ),
+                    );
+                    None
+                }
+                None => None,
+            };
+            let subst: HashMap<TypeParamId, Ty> = match base_args {
+                Some(args) if args.len() == layout.type_params.len() => layout
+                    .type_params
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(args.iter().cloned())
+                    .collect(),
+                _ => HashMap::new(),
+            };
             match layout.cases.get(*case).and_then(|c| c.payload.get(*index)) {
-                Some(declared_ty) if declared_ty == result_ty => {}
-                Some(declared_ty) => operand_mismatch(
-                    diagnostics,
-                    format!(
-                        "projects payload {index} of case {case} with type `{}` but is declared `{}`",
-                        ty_name(declared_ty),
-                        ty_name(result_ty)
-                    ),
-                ),
+                Some(declared_ty) => {
+                    let expected = substitute(declared_ty, &subst);
+                    if expected != *result_ty {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "projects payload {index} of case {case} with type `{}` but is declared `{}`",
+                                ty_name(&expected),
+                                ty_name(result_ty)
+                            ),
+                        );
+                    }
+                }
                 None => diagnostics.push(Diagnostic::error(
                     codes::UNKNOWN_VARIANT_OR_CASE,
                     source,
@@ -1565,6 +2074,7 @@ mod tests {
         Function {
             id,
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -1682,7 +2192,7 @@ mod tests {
         function.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(42), Vec::new()),
+            kind: ValueKind::Call(ItemId(42), Vec::new(), Vec::new()),
         });
         let module = Module {
             functions: vec![function],
@@ -1885,7 +2395,7 @@ mod tests {
             result: ValueId(1),
             ty: Ty::I64,
             // `g` takes zero parameters; this call passes one.
-            kind: ValueKind::Call(ItemId(0), vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
         });
         let callee = valid_function(ItemId(0), g_name);
         let module = Module {
@@ -1928,6 +2438,7 @@ mod tests {
             ItemId(100),
             RecordLayout {
                 name: point,
+                type_params: Vec::new(),
                 fields: vec![(x, Ty::I64)],
             },
             point,
@@ -1943,6 +2454,7 @@ mod tests {
         Function {
             id,
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -1956,7 +2468,7 @@ mod tests {
                     Instruction::Value {
                         result: ValueId(1),
                         ty: Ty::Named(record, ty_name),
-                        kind: ValueKind::RecordCreate(record, vec![ValueId(0)]),
+                        kind: ValueKind::RecordCreate(record, Vec::new(), vec![ValueId(0)]),
                     },
                     Instruction::Value {
                         result: ValueId(2),
@@ -1995,6 +2507,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2008,7 +2521,7 @@ mod tests {
                     Instruction::Value {
                         result: ValueId(1),
                         ty: Ty::Named(unknown_record, interner.intern("Ghost")),
-                        kind: ValueKind::RecordCreate(unknown_record, vec![ValueId(0)]),
+                        kind: ValueKind::RecordCreate(unknown_record, Vec::new(), vec![ValueId(0)]),
                     },
                 ],
                 terminator: Terminator::Return(Some(ValueId(1))),
@@ -2028,7 +2541,7 @@ mod tests {
         function.blocks[0].instructions[1] = Instruction::Value {
             result: ValueId(1),
             ty: Ty::Named(record, ty_name),
-            kind: ValueKind::RecordCreate(record, vec![ValueId(0), ValueId(0)]),
+            kind: ValueKind::RecordCreate(record, Vec::new(), vec![ValueId(0), ValueId(0)]),
         };
         let diagnostics =
             verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
@@ -2080,6 +2593,7 @@ mod tests {
             ItemId(200),
             VariantLayout {
                 name: shape,
+                type_params: Vec::new(),
                 cases: vec![
                     CaseLayout {
                         name: circle,
@@ -2104,6 +2618,7 @@ mod tests {
         Function {
             id,
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2121,6 +2636,7 @@ mod tests {
                             kind: ValueKind::VariantCreate {
                                 variant,
                                 case: 0,
+                                type_args: Vec::new(),
                                 payload: vec![ValueId(0)],
                             },
                         },
@@ -2180,6 +2696,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2190,6 +2707,7 @@ mod tests {
                     kind: ValueKind::VariantCreate {
                         variant: unknown_variant,
                         case: 0,
+                        type_args: Vec::new(),
                         payload: vec![],
                     },
                 }],
@@ -2208,6 +2726,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -2218,6 +2737,7 @@ mod tests {
                     kind: ValueKind::VariantCreate {
                         variant,
                         case: 9,
+                        type_args: Vec::new(),
                         payload: vec![],
                     },
                 }],
@@ -2237,6 +2757,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -2247,6 +2768,7 @@ mod tests {
                     kind: ValueKind::VariantCreate {
                         variant,
                         case: 0,
+                        type_args: Vec::new(),
                         payload: vec![],
                     },
                 }],
@@ -2423,6 +2945,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2534,6 +3057,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2580,6 +3104,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2648,6 +3173,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2751,6 +3277,7 @@ mod tests {
         let function = Function {
             id: ItemId(0),
             name,
+            type_params: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2816,6 +3343,838 @@ mod tests {
             ],
         };
         let diagnostics = verify_one(function, &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Generic type-argument validation (`rfcs/0008`) -----------------
+
+    #[test]
+    fn a_type_parameter_escaping_a_non_generic_function_is_rejected() {
+        // A `Ty::Param` belonging to *no* declaration this function
+        // itself declares -- no valid lowering ever produces this; only
+        // a hand-built (malformed) NIR module can.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let foreign_t = interner.intern("T");
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = Ty::Param(TypeParamId(999), foreign_t);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Param(TypeParamId(999), foreign_t),
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        function.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_parameter_matching_the_functions_own_declaration_is_accepted() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let t = interner.intern("T");
+        let mut function = valid_function(ItemId(0), name);
+        function.type_params = vec![(TypeParamId(0), t)];
+        function.return_type = Ty::Param(TypeParamId(0), t);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Param(TypeParamId(0), t),
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        // A `Ty::Param`-typed constant is itself a defense-in-depth
+        // impossibility (no valid lowering emits one), but this test
+        // only cares about the parameter-scope check specifically; the
+        // const/type mismatch it also happens to trip is not what is
+        // being asserted here.
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_type_parameter_in_a_function_declaration_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let t = interner.intern("T");
+        let mut function = valid_function(ItemId(0), name);
+        function.type_params = vec![(TypeParamId(0), t), (TypeParamId(0), t)];
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::DUPLICATE_TYPE_PARAMETER),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_type_parameter_in_a_record_declaration_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let point = interner.intern("Point");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: point,
+            type_params: vec![(TypeParamId(0), t), (TypeParamId(0), t)],
+            fields: vec![],
+        };
+        let function = valid_function(ItemId(0), name);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::DUPLICATE_TYPE_PARAMETER),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_type_parameter_in_a_variant_declaration_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let shape = interner.intern("Shape");
+        let t = interner.intern("T");
+        let variant = ItemId(200);
+        let layout = VariantLayout {
+            name: shape,
+            type_params: vec![(TypeParamId(0), t), (TypeParamId(0), t)],
+            cases: vec![],
+        };
+        let function = valid_function(ItemId(0), name);
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::DUPLICATE_TYPE_PARAMETER),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_type_variable_nested_inside_an_applied_type_is_rejected() {
+        // `Ty::Var` buried *inside* a `Ty::Applied`'s own argument list
+        // (`Box[Var(0)]`), not just at the top level -- a hand-built NIR
+        // module bypassing typeck's own resolution is the only way this
+        // is ever reachable.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: boxed,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = Ty::Applied(record, vec![Ty::Var(crate::types::TyVar(0))]);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_error_type_nested_inside_an_applied_type_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: boxed,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = Ty::Applied(record, vec![Ty::Error]);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn generic_arity_mismatch_nested_inside_an_applied_types_own_argument_is_rejected() {
+        // `Outer[Pair[i64]]`, where `Pair` itself declares two type
+        // parameters -- the arity problem is one level *inside* the
+        // outer application's own argument, not at `Outer` itself, so
+        // recursive validation (not just a top-level check) is required
+        // to catch it.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let outer_name = interner.intern("Outer");
+        let pair_name = interner.intern("Pair");
+        let t = interner.intern("T");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let outer = ItemId(100);
+        let pair = ItemId(101);
+        let outer_layout = RecordLayout {
+            name: outer_name,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![],
+        };
+        let pair_layout = RecordLayout {
+            name: pair_name,
+            type_params: vec![(TypeParamId(1), a), (TypeParamId(2), b)],
+            fields: vec![],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = Ty::Applied(outer, vec![Ty::Applied(pair, vec![Ty::I64])]);
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            vec![(outer, outer_layout), (pair, pair_layout)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_ARITY_MISMATCH),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_supplying_the_wrong_number_of_type_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.type_params = vec![(TypeParamId(0), t)];
+        callee.return_type = Ty::Param(TypeParamId(0), t);
+        callee.params = vec![crate::nir::Param {
+            value: ValueId(0),
+            ty: Ty::Param(TypeParamId(0), t),
+        }];
+        callee.blocks[0].instructions.clear();
+        callee.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            // `g` declares one type parameter; this call supplies none.
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
+        });
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_ARITY_MISMATCH),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_generic_call_with_matching_type_argument_count_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.type_params = vec![(TypeParamId(0), t)];
+        callee.return_type = Ty::Param(TypeParamId(0), t);
+        callee.params = vec![crate::nir::Param {
+            value: ValueId(0),
+            ty: Ty::Param(TypeParamId(0), t),
+        }];
+        callee.blocks[0].instructions.clear();
+        callee.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Call(ItemId(0), vec![Ty::I64], vec![ValueId(0)]),
+        });
+        caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_phantom_type_parameter_never_occurring_in_params_or_return_is_accepted() {
+        // `T` appears in the function's own declared type parameters but
+        // nowhere in its params or return type -- a legitimate
+        // compile-time-only marker, not a malformed declaration; the
+        // verifier must not require every declared parameter to actually
+        // occur anywhere.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let t = interner.intern("T");
+        let mut function = valid_function(ItemId(0), name);
+        function.type_params = vec![(TypeParamId(0), t)];
+        let diagnostics = verify_one(function, &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_phantom_type_parameter_on_a_record_never_occurring_in_any_field_is_accepted() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let marker = interner.intern("Marker");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: marker,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![(interner.intern("tag"), Ty::I64)],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Applied(record, vec![Ty::Bool]),
+            kind: ValueKind::RecordCreate(record, vec![Ty::Bool], vec![ValueId(0)]),
+        });
+        function.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Built programmatically: a `Ty::Applied` nested well past
+    /// `crate::limits::MAX_GENERIC_DEPTH`, used as a function's own
+    /// return type. `check_type_root`'s depth check runs before every
+    /// recursive check this verifier would otherwise run over a type
+    /// (`check_no_bad_type`, `check_named_type_identity`,
+    /// `check_type_param_scope`), each of which would otherwise descend
+    /// into it once per level. Must terminate (this test finishing at
+    /// all is the no-hang assertion), never overflow the native call
+    /// stack, and must produce exactly the dedicated `V0035` diagnostic
+    /// -- not silently pass, and not one diagnostic per nested level.
+    #[test]
+    fn a_pathologically_deep_applied_type_does_not_overflow_the_verifier() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: boxed,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![],
+        };
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 200;
+        let mut ty = Ty::I64;
+        for _ in 0..depth {
+            ty = Ty::Applied(record, vec![ty]);
+        }
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = ty;
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    // -- `check_type_root` over every type root `verify_module` inspects --
+
+    /// A `record Box[T] { payload: i64 }`-shaped layout (`payload` is
+    /// deliberately non-generic; only its *use* as a type root under
+    /// test needs to be generic-shaped) reused by every over-depth test
+    /// below to build a `Ty::Applied` nested `depth` levels deep.
+    fn deeply_applied_type(record: ItemId, depth: usize) -> Ty {
+        let mut ty = Ty::I64;
+        for _ in 0..depth {
+            ty = Ty::Applied(record, vec![ty]);
+        }
+        ty
+    }
+
+    fn box_layout(interner: &mut Interner) -> (ItemId, RecordLayout) {
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        (
+            ItemId(100),
+            RecordLayout {
+                name: boxed,
+                type_params: vec![(TypeParamId(0), t)],
+                fields: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn an_over_depth_function_parameter_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.params.push(crate::nir::Param {
+            value: ValueId(1),
+            ty: deeply_applied_type(record, depth),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_function_return_type_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = deeply_applied_type(record, depth);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_record_field_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, mut layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let deep = interner.intern("deep");
+        layout
+            .fields
+            .push((deep, deeply_applied_type(record, depth)));
+        let function = valid_function(ItemId(0), name);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_variant_payload_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, record_layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let maybe = interner.intern("Maybe");
+        let some = interner.intern("Some");
+        let variant = ItemId(101);
+        let variant_layout = VariantLayout {
+            name: maybe,
+            type_params: Vec::new(),
+            cases: vec![CaseLayout {
+                name: some,
+                payload: vec![deeply_applied_type(record, depth)],
+            }],
+        };
+        let function = valid_function(ItemId(0), name);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let module = Module {
+            functions: vec![function],
+            records: vec![(record, record_layout)],
+            variants: vec![(variant, variant_layout)],
+        };
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_instruction_result_type_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: deeply_applied_type(record, depth),
+            kind: ValueKind::Const(Const::Int(1)),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    /// A type nested *exactly* `MAX_GENERIC_DEPTH` levels deep is still
+    /// within bounds -- `exceeds_generic_depth` must reject strictly
+    /// past the limit, not at it, so this must produce no `V0035`.
+    #[test]
+    fn a_type_nested_exactly_at_the_generic_depth_limit_is_accepted() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = deeply_applied_type(record, crate::limits::MAX_GENERIC_DEPTH);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Shared type-root validation (`check_type_root`) at use-site generic arguments --
+
+    /// `func g[T](x: i64) -> i64 { return x }` -- `T` occurs in neither
+    /// its parameter nor its return type, so the declaration itself is
+    /// legitimate (a compile-time-only marker); every *call* to it must
+    /// still supply a valid type argument for its own sake.
+    fn phantom_generic_callee(id: ItemId, name: Symbol, t: Symbol) -> Function {
+        Function {
+            id,
+            name,
+            type_params: vec![(TypeParamId(0), t)],
+            params: vec![crate::nir::Param {
+                value: ValueId(0),
+                ty: Ty::I64,
+            }],
+            return_type: Ty::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    /// `func f() -> i64 { ...; return %1 }` calling `g` (id 0) with
+    /// `type_arg` as its sole type argument and a single `const.i64 1`
+    /// as its sole value argument.
+    fn caller_calling_g_with_type_arg(f_name: Symbol, type_arg: Ty) -> Function {
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Call(ItemId(0), vec![type_arg], vec![ValueId(0)]),
+        });
+        caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
+        caller
+    }
+
+    #[test]
+    fn a_call_with_ty_error_as_a_phantom_type_argument_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let caller = caller_calling_g_with_type_arg(f_name, Ty::Error);
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_an_unresolved_type_variable_as_a_phantom_type_argument_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let caller = caller_calling_g_with_type_arg(f_name, Ty::Var(crate::types::TyVar(0)));
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_an_applied_type_naming_an_unknown_declaration_as_a_type_argument_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let unknown = ItemId(9999);
+        let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(unknown, vec![Ty::I64]));
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNKNOWN_NAMED_TYPE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_nested_wrong_arity_application_as_a_type_argument_is_rejected() {
+        // The call's own type argument is `Pair[i64]` -- valid on its
+        // own shape, but `Pair` actually declares *two* type parameters,
+        // so this arity problem is one level inside the call's own type
+        // argument, not at the call itself.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let pair_name = interner.intern("Pair");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let pair = ItemId(100);
+        let pair_layout = RecordLayout {
+            name: pair_name,
+            type_params: vec![(TypeParamId(1), a), (TypeParamId(2), b)],
+            fields: vec![],
+        };
+        let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(pair, vec![Ty::I64]));
+        let module = Module {
+            functions: vec![callee, caller],
+            records: vec![(pair, pair_layout)],
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_ARITY_MISMATCH),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_type_argument_deeper_than_the_generic_depth_limit_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let boxed = interner.intern("Box");
+        let box_t = interner.intern("T");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let box_item = ItemId(100);
+        let box_layout = RecordLayout {
+            name: boxed,
+            type_params: vec![(TypeParamId(1), box_t)],
+            fields: vec![],
+        };
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut deep_ty = Ty::I64;
+        for _ in 0..depth {
+            deep_ty = Ty::Applied(box_item, vec![deep_ty]);
+        }
+        let caller = caller_calling_g_with_type_arg(f_name, deep_ty);
+        let module = Module {
+            functions: vec![callee, caller],
+            records: vec![(box_item, box_layout)],
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        // A controlled number of diagnostics, not one per nested level.
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn a_valid_phantom_generic_call_still_verifies() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let t = interner.intern("T");
+        let callee = phantom_generic_callee(ItemId(0), g_name, t);
+        let caller = caller_calling_g_with_type_arg(f_name, Ty::Bool);
+        let module = Module {
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_generic_record_construction_with_a_real_field_still_verifies() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let record = ItemId(100);
+        let layout = RecordLayout {
+            name: boxed,
+            type_params: vec![(TypeParamId(0), t)],
+            fields: vec![(interner.intern("value"), Ty::Param(TypeParamId(0), t))],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Applied(record, vec![Ty::I64]),
+            kind: ValueKind::RecordCreate(record, vec![Ty::I64], vec![ValueId(0)]),
+        });
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::I64,
+            kind: ValueKind::RecordField {
+                base: ValueId(1),
+                record,
+                field: 0,
+            },
+        });
+        function.blocks[0].terminator = Terminator::Return(Some(ValueId(2)));
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_generic_variant_construction_still_verifies() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let maybe = interner.intern("Maybe");
+        let some_case = interner.intern("Some");
+        let t = interner.intern("T");
+        let variant = ItemId(200);
+        let layout = VariantLayout {
+            name: maybe,
+            type_params: vec![(TypeParamId(0), t)],
+            cases: vec![CaseLayout {
+                name: some_case,
+                payload: vec![Ty::Param(TypeParamId(0), t)],
+            }],
+        };
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(1)),
+        };
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Applied(variant, vec![Ty::I64]),
+            kind: ValueKind::VariantCreate {
+                variant,
+                case: 0,
+                type_args: vec![Ty::I64],
+                payload: vec![ValueId(0)],
+            },
+        });
+        // Not projecting the payload back out here: doing so validly
+        // requires a case-refinement edge (a `switch`), which is its own
+        // separate, already-covered concern
+        // (`valid_variant_switch_and_payload_extraction_has_no_diagnostics`)
+        // -- this test is only about construction itself verifying.
+        function.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
         assert!(
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"

@@ -1,0 +1,4 @@
+public variant Maybe[T] {
+    Some(T),
+    None,
+}

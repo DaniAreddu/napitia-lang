@@ -1,0 +1,13 @@
+// Generic record with inferred type arguments at the call site
+// (Alpha 0.1.4, rfcs/0008).
+record Box[T] {
+    payload: T,
+}
+
+func unwrap[T](box: Box[T]) -> T {
+    return box.payload
+}
+
+func main() -> i64 {
+    return unwrap(Box[i64] { payload: 42 })
+}

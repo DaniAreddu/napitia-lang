@@ -134,6 +134,24 @@ impl<'a> Parser<'a> {
         );
     }
 
+    /// A type application (`Box[Box[Box[...]]]`) nested past
+    /// `crate::limits::MAX_GENERIC_DEPTH` -- the same shared bound
+    /// `hir::lower`'s own type-application depth guard (R0019) and every
+    /// other stage that walks a nested `Ty::Applied` enforces, so a
+    /// pathological chain fails here, at the very first stage able to
+    /// see it, rather than recursing further on the native call stack.
+    fn error_type_too_deep(&mut self, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                ERROR_CODE,
+                self.source,
+                span,
+                "type application is nested too deeply to parse",
+            )
+            .with_primary_label("type is too complex"),
+        );
+    }
+
     fn error_expected(&mut self, what: &str) {
         // The lexer already reported a diagnostic for an Error token;
         // adding "expected X, found an invalid token" on top of it would

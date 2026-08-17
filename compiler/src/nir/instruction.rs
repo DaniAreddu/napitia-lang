@@ -49,14 +49,26 @@ pub enum ValueKind {
     Le(ValueId, ValueId),
     Gt(ValueId, ValueId),
     Ge(ValueId, ValueId),
-    Call(FunctionRef, Vec<ValueId>),
+    /// `type_args` is this call's own concrete type arguments for the
+    /// callee's generic parameters, in the callee's own declared order
+    /// (`rfcs/0008`) -- empty for a non-generic call. The callee itself
+    /// is looked up once by `FunctionRef` regardless: one parametric NIR
+    /// function body is shared by every call, never cloned per
+    /// instantiation.
+    Call(FunctionRef, Vec<Ty>, Vec<ValueId>),
     /// Constructs a record value. `fields` is already in **declaration
     /// order** (never construction-site/source order) -- reordering
     /// happens once, at the point of construction, so every later
     /// consumer (the verifier, the interpreter) can index into it
     /// positionally without re-deriving the order from a name.
-    RecordCreate(ItemId, Vec<ValueId>),
+    /// `type_args` is this construction's own concrete type arguments
+    /// (`rfcs/0008`), empty for a non-generic record.
+    RecordCreate(ItemId, Vec<Ty>, Vec<ValueId>),
     /// Projects one field (by declaration index) out of a record value.
+    /// No separate `type_args` here: the verifier/interpreter recover
+    /// the exact instantiation from `base`'s own already-recorded type
+    /// (`Ty::Applied`, if generic) rather than duplicating it on this
+    /// instruction too.
     RecordField {
         base: ValueId,
         record: ItemId,
@@ -65,9 +77,12 @@ pub enum ValueKind {
     /// Constructs a variant value for the given case (by declaration
     /// index), with its payload values in declaration order. Empty
     /// `payload` for a unit case allocates no fabricated value.
+    /// `type_args` is this construction's own concrete type arguments
+    /// (`rfcs/0008`), empty for a non-generic variant.
     VariantCreate {
         variant: ItemId,
         case: usize,
+        type_args: Vec<Ty>,
         payload: Vec<ValueId>,
     },
     /// Projects one payload position (by declaration index) out of a

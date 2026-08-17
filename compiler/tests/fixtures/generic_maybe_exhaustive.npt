@@ -1,0 +1,16 @@
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+func inspect(v: Maybe[bool]) -> i64 {
+    return match v {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    }
+}
+
+func main() -> i64 {
+    return inspect(Maybe[bool].Some(true))
+}

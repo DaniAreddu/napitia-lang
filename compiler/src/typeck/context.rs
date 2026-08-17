@@ -74,6 +74,40 @@ impl TypeContext {
         }
         current
     }
+
+    /// A snapshot of every variable's substitution and kind, taken
+    /// before a top-level [`super::unify::unify`] call attempts any
+    /// binds -- restoring it undoes every bind that call made, so a
+    /// unification that partially succeeds before ultimately failing
+    /// (e.g. `Pair[V, V]` against `Pair[i64, bool]`, which would
+    /// otherwise bind `V = i64` from the first argument pair before
+    /// failing on the second) never leaves `V` bound at all once
+    /// `unify` itself reports `Err`. Cloning both tables is correct and
+    /// cheap here: `unify` never allocates a fresh variable partway
+    /// through its own recursion (every variable it ever binds already
+    /// existed when the checkpoint was taken), so a checkpoint is never
+    /// invalidated by the vectors changing length underneath it.
+    pub(super) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            substitutions: self.substitutions.clone(),
+            kinds: self.kinds.clone(),
+        }
+    }
+
+    /// Undoes every bind/kind-change made since `checkpoint` was taken.
+    pub(super) fn restore(&mut self, checkpoint: Checkpoint) {
+        self.substitutions = checkpoint.substitutions;
+        self.kinds = checkpoint.kinds;
+    }
+}
+
+/// Opaque snapshot produced by [`TypeContext::checkpoint`]; see its own
+/// doc comment. Deliberately exposes no fields or way to inspect its
+/// contents -- the only operation is handing it back to
+/// [`TypeContext::restore`].
+pub(super) struct Checkpoint {
+    substitutions: Vec<Option<Ty>>,
+    kinds: Vec<Option<VarKind>>,
 }
 
 #[cfg(test)]

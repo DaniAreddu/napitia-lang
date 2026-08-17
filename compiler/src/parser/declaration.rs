@@ -2,6 +2,7 @@
 
 use super::{Parser, recovery};
 use crate::lexer::TokenKind;
+use crate::source::Span;
 use crate::syntax::ast::{
     Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
     Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, VariantDecl, WhileStmt,
@@ -49,6 +50,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'func'
         let name = self.expect_ident("a function name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LParen, "`(`")?;
         let params = self.parse_param_list()?;
         self.expect(&TokenKind::RParen, "`)`")?;
@@ -72,6 +78,7 @@ impl<'a> Parser<'a> {
         Some(FunctionDecl {
             public,
             name,
+            type_params,
             params,
             return_type,
             uses,
@@ -79,6 +86,97 @@ impl<'a> Parser<'a> {
             body,
             span,
         })
+    }
+
+    /// `[T, U]` after a `func`/`record`/`variant` name -- the
+    /// declaration's own generic parameters (`rfcs/0008`). Every entry is
+    /// a plain identifier; an empty `[]` is itself malformed (if a
+    /// declaration isn't generic, the brackets are simply omitted) but
+    /// still recovers rather than aborting the whole declaration. A
+    /// trailing comma (`[T,]`) is accepted, matching every other
+    /// comma-separated list in this grammar.
+    fn parse_type_param_list(&mut self) -> Option<Vec<Ident>> {
+        self.expect(&TokenKind::LBracket, "`[`")?;
+        let mut params = Vec::new();
+        if self.check(&TokenKind::RBracket) {
+            self.error_expected("a type parameter");
+        } else {
+            loop {
+                let name = self.expect_ident("a type parameter name")?;
+                params.push(name);
+                if self.eat(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]`");
+        Some(params)
+    }
+
+    /// `[i64, str]`, in either type position (`Box[i64]`) or expression
+    /// position (`identity[i64]`, `Maybe[i64]`) -- `rfcs/0008`. Same
+    /// empty-list-is-malformed, trailing-comma-is-fine rules as
+    /// [`Self::parse_type_param_list`]. Returns the parsed arguments
+    /// alongside the whole `[...]`'s own span (from `[` through `]`),
+    /// distinct from any one argument's span, so an arity diagnostic can
+    /// underline the complete application.
+    pub(super) fn parse_type_arg_list(&mut self) -> Option<(Vec<Type>, Span)> {
+        self.parse_type_arg_list_at_depth(0)
+    }
+
+    /// `depth` counts how many `[...]` applications deep parsing has
+    /// already descended -- the one thing that grows this parser's own
+    /// native call stack per level of nested generic syntax
+    /// (`Box[Box[Box[...]]]`). Enforced *before* descending into another
+    /// type argument, using the same `crate::limits::MAX_GENERIC_DEPTH`
+    /// every other stage that walks a nested type application is bounded
+    /// by (`hir::lower`'s own R0019, the verifier, the printer), so a
+    /// malformed-looking but syntactically valid chain fails here with a
+    /// structured diagnostic, never by exhausting the stack.
+    fn parse_type_arg_list_at_depth(&mut self, depth: usize) -> Option<(Vec<Type>, Span)> {
+        let lbracket_span = self.expect(&TokenKind::LBracket, "`[`")?.span;
+        if depth > crate::limits::MAX_GENERIC_DEPTH {
+            self.error_type_too_deep(lbracket_span);
+            recovery::synchronize_to_bracket_list_item(self);
+            let end = self
+                .expect(&TokenKind::RBracket, "`]`")
+                .map(|t| t.span)
+                .unwrap_or(self.current_span());
+            return Some((Vec::new(), lbracket_span.join(end)));
+        }
+        let mut args = Vec::new();
+        if self.check(&TokenKind::RBracket) {
+            self.error_expected("a type argument");
+        } else {
+            loop {
+                match self.parse_type_at_depth(depth) {
+                    Some(ty) => args.push(ty),
+                    None => {
+                        recovery::synchronize_to_bracket_list_item(self);
+                        if self.check(&TokenKind::RBracket) || self.at_eof() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if self.eat(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RBracket, "`]`")
+            .map(|t| t.span)
+            .unwrap_or(self.current_span());
+        Some((args, lbracket_span.join(end)))
     }
 
     /// A `func` signature with no body, used inside `protocol` blocks.
@@ -129,8 +227,24 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_type(&mut self) -> Option<Type> {
+        self.parse_type_at_depth(0)
+    }
+
+    /// `depth` counts type-application nesting only (see
+    /// [`Self::parse_type_arg_list_at_depth`]'s own doc comment) --
+    /// incremented exactly once per `[...]` this type reference itself
+    /// opens, before parsing what is inside it.
+    fn parse_type_at_depth(&mut self, depth: usize) -> Option<Type> {
         let name = self.expect_ident("a type name")?;
-        Some(Type { name })
+        let mut span = name.span;
+        let args = if self.check(&TokenKind::LBracket) {
+            let (args, bracket_span) = self.parse_type_arg_list_at_depth(depth + 1)?;
+            span = span.join(bracket_span);
+            args
+        } else {
+            Vec::new()
+        };
+        Some(Type { name, args, span })
     }
 
     fn parse_path(&mut self) -> Option<Path> {
@@ -166,6 +280,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'record'
         let name = self.expect_ident("a record name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -197,6 +316,7 @@ impl<'a> Parser<'a> {
         Some(RecordDecl {
             public,
             name,
+            type_params,
             fields,
             span: start.join(end),
         })
@@ -206,6 +326,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'variant'
         let name = self.expect_ident("a variant name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -251,6 +376,7 @@ impl<'a> Parser<'a> {
         Some(VariantDecl {
             public,
             name,
+            type_params,
             cases,
             span: start.join(end),
         })
@@ -748,5 +874,213 @@ mod tests {
         };
         // Despite the missing `;`, both bindings should still be recovered.
         assert_eq!(f.body.statements.len(), 2);
+    }
+
+    // -- Generic syntax (`rfcs/0008`) -----------------------------------
+
+    #[test]
+    fn parses_generic_function_type_parameters() {
+        let (module, diags) = parse("func identity[T](x: T) -> T { return x }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.type_params.len(), 1);
+        assert_eq!(f.params.len(), 1);
+    }
+
+    #[test]
+    fn parses_generic_function_with_multiple_type_parameters() {
+        let (module, diags) = parse("func pair[A, B](left: A, right: B) -> A { return left }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.type_params.len(), 2);
+    }
+
+    #[test]
+    fn parses_generic_record_declaration() {
+        let (module, diags) = parse("record Box[T] { payload: T }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Record(r) = &module.items[0] else {
+            panic!("expected record")
+        };
+        assert_eq!(r.type_params.len(), 1);
+        assert_eq!(r.fields.len(), 1);
+    }
+
+    #[test]
+    fn parses_generic_variant_declaration() {
+        let (module, diags) = parse("variant Maybe[T] { Some(T), None }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Variant(v) = &module.items[0] else {
+            panic!("expected variant")
+        };
+        assert_eq!(v.type_params.len(), 1);
+        assert_eq!(v.cases.len(), 2);
+    }
+
+    #[test]
+    fn parses_applied_type_in_type_position() {
+        let (module, diags) = parse("func f(b: Box[i64]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.params[0].ty.args.len(), 1);
+    }
+
+    #[test]
+    fn parses_applied_type_with_multiple_arguments() {
+        let (module, diags) = parse("func f(p: Pair[i64, str]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.params[0].ty.args.len(), 2);
+    }
+
+    #[test]
+    fn parses_nested_applied_type() {
+        let (module, diags) = parse("func f(b: Box[Maybe[i64]]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.params[0].ty.args.len(), 1);
+        assert_eq!(f.params[0].ty.args[0].args.len(), 1);
+    }
+
+    #[test]
+    fn a_trailing_comma_in_a_type_parameter_list_is_accepted() {
+        let (module, diags) = parse("func pair[A, B,](left: A, right: B) -> A { return left }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.type_params.len(), 2);
+    }
+
+    #[test]
+    fn a_trailing_comma_in_a_type_argument_list_is_accepted() {
+        let (module, diags) = parse("func f(p: Pair[i64, str,]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(f.params[0].ty.args.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_type_parameter_list_is_a_diagnostic_not_a_panic() {
+        let (_, diags) =
+            parse("func broken[]() -> i64 { return 0 } func main() -> i64 { return 0 }");
+        assert!(
+            !diags.is_empty(),
+            "expected a diagnostic for `func broken[]`"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_trailing_comma_type_parameter_list_still_recovers() {
+        // `[T,]` (single trailing comma) is fine; `func broken[T,](...)`
+        // rejecting outright would be *too* strict, but this still
+        // exercises the same recovery path with a genuinely malformed
+        // list (two consecutive commas) to prove it never panics.
+        let (_, diags) = parse("func broken[T,,](x: T) -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic for `[T,,]`");
+    }
+
+    #[test]
+    fn an_empty_type_argument_list_is_a_diagnostic_not_a_panic() {
+        let (_, diags) = parse("func f(b: Box[]) -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic for `Box[]`");
+    }
+
+    #[test]
+    fn an_unclosed_type_parameter_list_recovers_without_panicking() {
+        let (_, diags) = parse("record Box[T { value: T }");
+        assert!(
+            !diags.is_empty(),
+            "expected a diagnostic for `record Box[T`"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_type_argument_list_recovers_without_panicking() {
+        let (_, diags) = parse("func f(b: Box[i64) -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic for `Box[i64`");
+    }
+
+    #[test]
+    fn a_type_argument_list_never_reinterprets_as_indexing_or_comparison() {
+        // `Box[i64,]` (trailing comma) and a bare `identity[i64(42)`
+        // (missing `]`) must never be silently reparsed as an indexing
+        // expression or a `<`/`>` comparison chain -- both fail with a
+        // structured diagnostic instead.
+        let (_, diags) = parse("func f() -> i64 { return identity[i64(42) }");
+        assert!(
+            !diags.is_empty(),
+            "expected a diagnostic for an unclosed type application"
+        );
+    }
+
+    /// Built programmatically, never committed as a giant fixture: a
+    /// chain of `Box[...]` applications nested exactly at
+    /// `crate::limits::MAX_GENERIC_DEPTH`, which must still parse
+    /// successfully -- the bound must reject strictly *more* than this,
+    /// never this exact depth itself.
+    #[test]
+    fn a_type_application_exactly_at_the_depth_limit_still_parses() {
+        let depth = crate::limits::MAX_GENERIC_DEPTH;
+        let mut ty = "i64".to_string();
+        for _ in 0..depth {
+            ty = format!("Box[{ty}]");
+        }
+        let src = format!("func f(x: {ty}) -> i64 {{ return 0 }}");
+        let (_, diags) = parse(&src);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics at exactly the depth limit, got {diags:?}"
+        );
+    }
+
+    /// The same chain, one level past the limit: must fail with a
+    /// structured diagnostic, never overflow the native call stack.
+    #[test]
+    fn a_type_application_past_the_depth_limit_is_a_diagnostic_not_a_panic() {
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut ty = "i64".to_string();
+        for _ in 0..depth {
+            ty = format!("Box[{ty}]");
+        }
+        let src = format!("func f(x: {ty}) -> i64 {{ return 0 }}");
+        let (_, diags) = parse(&src);
+        assert!(!diags.is_empty(), "expected a diagnostic, got none");
+        assert!(
+            diags.iter().any(|d| d.code == "P0001"),
+            "expected a P0001 diagnostic, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_deeply_nested_type_application_in_expression_position_does_not_panic() {
+        // The expression-position entry point (`identity[...]`) is a
+        // separate call site into the same depth-guarded parsing --
+        // must be independently protected, not just the type-position
+        // one exercised above.
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut ty = "i64".to_string();
+        for _ in 0..depth {
+            ty = format!("Box[{ty}]");
+        }
+        let src = format!("func f() -> i64 {{ return identity[{ty}](0) }}");
+        let (_, diags) = parse(&src);
+        assert!(!diags.is_empty(), "expected a diagnostic, got none");
+        assert!(
+            diags.iter().any(|d| d.code == "P0001"),
+            "expected a P0001 diagnostic, got {diags:?}"
+        );
     }
 }

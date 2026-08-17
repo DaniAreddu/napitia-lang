@@ -502,3 +502,29 @@ fn two_same_named_functions_are_callable_together_through_aliases() {
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "31");
 }
+
+#[test]
+fn a_generic_variant_matched_exhaustively_through_an_import_alias_runs_end_to_end() {
+    // `Optional` is a local alias for `shapes.Maybe`; exhaustiveness
+    // keys off the canonical declaration, not the alias a particular
+    // file happens to construct/match it through, so a fully-covered
+    // match on `Optional[bool]` must not be reported as incomplete
+    // (rfcs/0007, rfcs/0008).
+    let dir = project("generic_variant_alias_exhaustive");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "3");
+}
+
+#[test]
+fn two_same_named_generic_records_from_different_modules_remain_distinct() {
+    // `sales.Box[T]` and `admin.Box[T]` are two distinct declarations
+    // that happen to share a name and shape -- each is only usable
+    // through its own module's own function, and instantiating both
+    // with the same type argument never makes them the same type
+    // (rfcs/0007, rfcs/0008).
+    let dir = project("generic_same_named_records_across_modules");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}

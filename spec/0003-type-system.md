@@ -1,8 +1,9 @@
 # Spec 0003: Type System
 
-- Status: Partially implemented (Alpha 0.1.1) — primitive types, local
-  inference, and nominal record/variant aggregates with pattern
-  matching.
+- Status: Partially implemented (Alpha 0.1.4) — primitive types, local
+  inference, nominal record/variant aggregates with pattern matching
+  (Alpha 0.1.1), and unconstrained generic type parameters on
+  functions/records/variants (Alpha 0.1.4, `rfcs/0008`).
 
 ## Implemented features
 
@@ -114,13 +115,68 @@ inference, without introducing a separate compile-time-only numeric type.
   checked, via a deterministic (declaration-order, not hash-order)
   dependency-graph cycle check.
 
+### Generics (Alpha 0.1.4)
+
+- **Symbolic type parameters**: `func`/`record`/`variant` may declare
+  their own `[T, ...]`; each parameter gets a stable, per-declaration
+  identity (`TypeParamId`) — two declarations spelling their own
+  parameter the same way (`first[T]`/`second[T]`) never share identity,
+  and a name from one declaration has no meaning inside another that did
+  not itself declare it.
+- **Nominal applied types**: `Box[i64]` is a distinct type from `Box[str]`
+  and from `sales.Box[i64]` when `sales.Box` is a different declaration —
+  comparison is nominal on the declaration plus structural on the
+  argument list, matching `record`/`variant`'s own identity contract
+  above. There is no raw (zero-argument) reference to a generic
+  declaration: `value x: Box;` is a checked error, and so is applying
+  type arguments to a declaration that is not generic.
+- **Checked once, symbolically**: a generic declaration's own body is
+  type-checked exactly once, treating its own parameters as opaque and
+  rigid — never re-checked per instantiation. Only the operations
+  provably safe for *any* type are permitted on an unconstrained
+  parameter: passing, returning, binding, assignment, construction, and
+  extraction. Equality/inequality, ordering, arithmetic, bitwise
+  operators, logical use (including as an `if`/`while` condition), field
+  access, and calling are all rejected symbolically, before any
+  instantiation exists, with a dedicated diagnostic distinct from an
+  ordinary "wrong concrete type" mismatch.
+- **Inference**: a call/constructor's type arguments may be given
+  explicitly (`identity[i64](42)`) or inferred from argument types
+  (`identity(42)`) via the same unification the rest of this spec
+  describes, extended to unify two applied types when they name the same
+  declaration and have matching arity (recursing into corresponding
+  arguments). Record/variant *construction* and a bare unit-case
+  reference always require explicit type arguments (there is nothing to
+  infer construction arguments from); a function call and a variant
+  constructor call both support inference. Conflicting inferred
+  arguments and an argument that cannot be inferred at all are each their
+  own diagnostic.
+- **Instantiated field/payload types**: field access, constructor payload
+  types, and match-arm binding types all use the type *after*
+  substituting a value's own concrete type arguments — never the
+  declaration's raw symbolic shape.
+- **Infinite generic layouts**: the existing infinite-aggregate-layout
+  check (below) is extended to detect a cycle mediated through a generic
+  parameter (`record Box[T] { value: T } record Node { next: Box[Node] }`
+  is rejected, even though `Box[T]` alone is not cyclic), and an
+  ever-growing (never-repeating) instantiation chain is rejected once it
+  exceeds a shared depth budget.
+
+See `rfcs/0008-canonical-generics.md` for the complete design, the
+diagnostic codes, and the current honest limitations (no protocol/trait
+bounds yet, so every type parameter is unconstrained; no native-code
+specialization).
+
 ### `match` and pattern matching (Alpha 0.1.1)
 
 `match` is a real expression: the scrutinee is checked exactly once,
 each pattern is checked against the scrutinee's type (a pattern whose
 shape is incompatible with that type — e.g. a variant pattern against
 a `bool` scrutinee — is a checked error), and pattern-bound locals
-receive their *exact* resolved payload type, never an approximation.
+receive their *exact* resolved payload type, never an approximation —
+for a generic variant, this is the type *after* substituting the
+scrutinee's own concrete type arguments (`Maybe[bool]`'s `Some` payload
+is `bool`), not the declaration's raw `T` (Alpha 0.1.4, `rfcs/0008`).
 Supported pattern forms: wildcard (`_`), an immutable binding, a
 boolean/integer/string/char literal, a variant case without payload, a
 variant case with positional sub-patterns, and nested variant patterns
@@ -207,10 +263,11 @@ signature being called against.
   checker.
 - **No `null`.** There is no type-system-level "nullable" flag on any
   type; absence is represented by a Napitia-native `variant` type
-  (provisionally `Maybe<T>`, see `spec/0005`) once generics exist (see
-  "Accepted design direction" below) — it is not part of the primitive
-  type system itself, and deliberately not a copy of another language's
-  type of that name (`rfcs/0004`).
+  (provisionally `Maybe[T]`, see `spec/0005`) — now expressible directly
+  as an ordinary generic `variant` (Alpha 0.1.4, `rfcs/0008`), though no
+  standard-library `Maybe[T]` is bundled yet — it is not part of the
+  primitive type system itself, and deliberately not a copy of another
+  language's type of that name (`rfcs/0004`).
 
 ## Accepted design direction
 
@@ -218,20 +275,24 @@ The internal type representation is deliberately structured so the
 following can be added without a redesign of the checker's core
 unification algorithm:
 
-- **Generic types**: type parameters with protocol bounds
-  (`func max<T: Comparable>(a: T, b: T) -> T`). The type representation
-  already distinguishes a concrete `Type` from a `TypeVar`; a generic
-  parameter is a `TypeVar` that is universally quantified at a
-  function/record boundary instead of being solved away by the end of
-  checking that item.
+- **Protocol/trait bounds on a generic type parameter**
+  (`func max[T: Comparable](a: T, b: T) -> T`). Alpha 0.1.4 implements
+  unconstrained generics only (`rfcs/0008`) — a type parameter is opaque
+  and rigid, with no operation beyond passing/returning/binding/
+  construction proven safe for it; bounds are what would let a
+  constrained `T` prove it supports a specific operation (equality,
+  ordering, ...) without the whole-program symbolic body check needing
+  to reject it outright.
 - **Protocols**: as constraints on type variables during unification, not
   as a runtime vtable mechanism at this layer.
-- **A `Maybe<T>` absence type**: as an ordinary generic `variant` defined
-  in a future standard library, once generic `variant`s are checkable
-  (`spec/0005`). Failure, by contrast, is intended to be modeled primarily
-  through `raises` clauses rather than a generic wrapper type; the `never`
-  type and the existing `variant`-lowering path in HIR/NIR are meant to
-  make early-return-on-error patterns implementable without new compiler
+- **A standard-library `Maybe[T]` absence type**: the language itself
+  can express `variant Maybe[T] { Some(T), None }` directly as of
+  Alpha 0.1.4 (`rfcs/0008`); what remains future work is bundling one in
+  an actual standard library rather than every program declaring its
+  own. Failure, by contrast, is intended to be modeled primarily through
+  `raises` clauses rather than a generic wrapper type; the `never` type
+  and the existing `variant`-lowering path in HIR/NIR are meant to make
+  early-return-on-error patterns implementable without new compiler
   primitives regardless of which representation `raises` ultimately
   compiles to.
 - **Effects** (`spec/0005`): tracked as an additional annotation on

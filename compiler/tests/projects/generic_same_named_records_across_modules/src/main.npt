@@ -1,0 +1,15 @@
+// `sales.Box` and `admin.Box` are two distinct generic declarations that
+// happen to share a name and shape -- nominal identity means they remain
+// two different types even instantiated with the same type argument
+// (`sales.Box[i64] != admin.Box[i64]`), and each is only usable through
+// its own module's own function (rfcs/0007, rfcs/0008).
+import sales.Box as SalesBox;
+import sales.sales_unwrap;
+import admin.Box as AdminBox;
+import admin.admin_unwrap;
+
+func main() -> i64 {
+    value s = SalesBox[i64] { payload: 40 };
+    value a = AdminBox[i64] { payload: 2 };
+    return sales_unwrap(s) + admin_unwrap(a)
+}

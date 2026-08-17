@@ -1,0 +1,7 @@
+[package]
+name = "generic_variant_alias_exhaustive"
+version = "0.1.0"
+
+[project]
+source-root = "src"
+entry = "main.npt"

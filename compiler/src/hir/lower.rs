@@ -12,9 +12,11 @@ use std::collections::HashMap;
 use super::{
     AggregateKind, ExprId, HirBinding, HirBlock, HirCase, HirElse, HirExpr, HirField, HirFieldInit,
     HirFunction, HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirRecord, HirStmt,
-    HirType, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
+    HirType, HirTypeParam, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
+    TypeParamId,
 };
 use crate::diagnostics::Diagnostic;
+use crate::limits::MAX_GENERIC_DEPTH;
 use crate::resolve::Scopes;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -37,6 +39,11 @@ mod codes {
     pub const WRONG_VARIANT: &str = "R0013";
     pub const DUPLICATE_PATTERN_BINDING: &str = "R0014";
     pub const PATTERN_TOO_DEEP: &str = "R0015";
+    pub const DUPLICATE_TYPE_PARAMETER: &str = "R0016";
+    pub const PRIMITIVE_TYPE_PARAMETER_NAME: &str = "R0017";
+    pub const TYPE_PARAMETER_APPLIED: &str = "R0018";
+    pub const GENERIC_DEPTH_EXCEEDED: &str = "R0019";
+    pub const INVALID_TYPE_APPLICATION: &str = "R0020";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -60,6 +67,7 @@ pub struct IdCursor {
     pub next_local_id: u32,
     pub next_expr_id: u32,
     pub next_pattern_id: u32,
+    pub next_type_param_id: u32,
 }
 
 /// One item made visible to a module via `import`, already resolved to
@@ -166,10 +174,12 @@ pub fn lower_module_with_imports(
         variant_cases: HashMap::new(),
         case_lookup: HashMap::new(),
         imported_record_field_public: HashMap::new(),
+        type_param_scope: HashMap::new(),
         next_item_id: ids.next_item_id,
         next_local_id: ids.next_local_id,
         next_expr_id: ids.next_expr_id,
         next_pattern_id: ids.next_pattern_id,
+        next_type_param_id: ids.next_type_param_id,
     };
     let hir = lowering.run_with_imports(module, imports);
     let cursor = IdCursor {
@@ -177,6 +187,7 @@ pub fn lower_module_with_imports(
         next_local_id: lowering.next_local_id,
         next_expr_id: lowering.next_expr_id,
         next_pattern_id: lowering.next_pattern_id,
+        next_type_param_id: lowering.next_type_param_id,
     };
     (hir, cursor, lowering.diagnostics)
 }
@@ -211,10 +222,19 @@ struct Lowering<'a> {
     /// module), so this map staying empty for a purely single-file
     /// compilation costs nothing.
     imported_record_field_public: HashMap<ItemId, HashMap<Symbol, bool>>,
+    /// The *currently-being-lowered* declaration's own generic
+    /// parameters, name -> (identity, declaration span) -- populated by
+    /// [`Self::lower_type_params`] right before that declaration's own
+    /// field/param/return/payload types are resolved, and cleared
+    /// immediately after, so a type parameter is visible only while its
+    /// own declaration is being lowered and never leaks into an
+    /// unrelated one (`rfcs/0008`).
+    type_param_scope: HashMap<Symbol, (TypeParamId, Span)>,
     next_item_id: u32,
     next_local_id: u32,
     next_expr_id: u32,
     next_pattern_id: u32,
+    next_type_param_id: u32,
 }
 
 impl<'a> Lowering<'a> {
@@ -429,9 +449,18 @@ impl<'a> Lowering<'a> {
                 .with_primary_label("private type used in a public signature"),
             );
         }
+        // A public generic type's own type *arguments* can leak a
+        // private type just as easily as the head can (`public func f()
+        // -> Box[Secret]` leaks `Secret` even though `Box` itself is
+        // public) -- checked recursively, the same way argument
+        // resolution itself is (`rfcs/0008`).
+        for arg in &ty.args {
+            self.check_public_api_leak(arg, local_public);
+        }
     }
 
     fn lower_record(&mut self, id: ItemId, r: &ast::RecordDecl) -> HirRecord {
+        let type_params = self.lower_type_params(&r.type_params);
         let mut seen: HashMap<Symbol, usize> = HashMap::new();
         let mut fields = Vec::new();
         for field in &r.fields {
@@ -459,9 +488,11 @@ impl<'a> Lowering<'a> {
             });
         }
         self.record_fields.insert(id, seen);
+        self.clear_type_param_scope();
         HirRecord {
             id,
             name: r.name.symbol,
+            type_params,
             span: r.span,
             source: self.source,
             public: r.public,
@@ -470,6 +501,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower_variant(&mut self, id: ItemId, v: &ast::VariantDecl) -> HirVariant {
+        let type_params = self.lower_type_params(&v.type_params);
         let mut seen: HashMap<Symbol, usize> = HashMap::new();
         let mut cases = Vec::new();
         for case in &v.cases {
@@ -502,9 +534,11 @@ impl<'a> Lowering<'a> {
             });
         }
         self.variant_cases.insert(id, seen);
+        self.clear_type_param_scope();
         HirVariant {
             id,
             name: v.name.symbol,
+            type_params,
             span: v.span,
             source: self.source,
             public: v.public,
@@ -591,7 +625,60 @@ impl<'a> Lowering<'a> {
     /// never imported (`rfcs/0006`). A name that isn't a locally-known
     /// aggregate is left `Unresolved` -- it may still be a primitive, or
     /// genuinely unknown, neither of which HIR lowering itself decides.
-    fn resolve_type_ref(&self, ty: &ast::Type) -> HirType {
+    fn resolve_type_ref(&mut self, ty: &ast::Type) -> HirType {
+        self.resolve_type_ref_at_depth(ty, 0)
+    }
+
+    /// `depth` counts one level per bracketed nesting level
+    /// (`Box[Maybe[i64]]` resolves `Maybe[i64]` at `depth + 1`), bounded
+    /// by [`MAX_GENERIC_DEPTH`] so a pathologically (or adversarially)
+    /// deep annotation fails with a diagnostic instead of exhausting the
+    /// native call stack (`rfcs/0008`).
+    fn resolve_type_ref_at_depth(&mut self, ty: &ast::Type, depth: usize) -> HirType {
+        if depth > MAX_GENERIC_DEPTH {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::GENERIC_DEPTH_EXCEEDED,
+                    self.source,
+                    ty.span,
+                    "generic type application is nested too deeply to resolve",
+                )
+                .with_primary_label("type application is too deeply nested"),
+            );
+            return HirType::Unresolved {
+                name: ty.name.symbol,
+                span: ty.span,
+            };
+        }
+        // A declaration's own type parameter takes precedence over
+        // everything else: inside `func identity[T](value: T) -> T`,
+        // `T` always means that parameter, never a same-named primitive
+        // or aggregate (which, since primitive names are already
+        // rejected as parameter names, could only be a hypothetical
+        // module-level `record T { .. }` -- still shadowed, matching how
+        // a parameter shadows an outer name everywhere else in this
+        // grammar).
+        if let Some(&(id, _)) = self.type_param_scope.get(&ty.name.symbol) {
+            if !ty.args.is_empty() {
+                let text = self.interner.resolve(ty.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::TYPE_PARAMETER_APPLIED,
+                        self.source,
+                        ty.span,
+                        format!(
+                            "`{text}` is a type parameter and cannot itself be applied to type arguments"
+                        ),
+                    )
+                    .with_primary_label("type parameter applied to arguments"),
+                );
+            }
+            return HirType::Param {
+                id,
+                name: ty.name.symbol,
+                span: ty.span,
+            };
+        }
         // Primitive names take precedence over an aggregate of the same
         // name, matching the pre-project-era rule (typeck always checked
         // its primitive namespace first): a local or imported `record`/
@@ -601,25 +688,47 @@ impl<'a> Lowering<'a> {
         // `resolve_named_type` -- which already checks primitives first
         // -- resolves it the same way it always has.
         if primitive_from_name(self.interner.resolve(ty.name.symbol)).is_some() {
+            if !ty.args.is_empty() {
+                let text = self.interner.resolve(ty.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::TYPE_PARAMETER_APPLIED,
+                        self.source,
+                        ty.span,
+                        format!(
+                            "`{text}` is a primitive type and cannot be applied to type arguments"
+                        ),
+                    )
+                    .with_primary_label("primitive type applied to arguments"),
+                );
+            }
             return HirType::Unresolved {
                 name: ty.name.symbol,
                 span: ty.name.span,
             };
         }
         match self.type_names.get(&ty.name.symbol) {
-            Some(&(item, kind, declared_name)) => HirType::Aggregate {
-                item,
-                kind: match kind {
-                    TypeNameKind::Record => AggregateKind::Record,
-                    TypeNameKind::Variant => AggregateKind::Variant,
-                },
-                // The item's own canonical name, never the local
-                // (possibly aliased) spelling this annotation happened
-                // to use -- `Ty::Named`'s display symbol must be
-                // alias-independent (`rfcs/0007`).
-                name: declared_name,
-                span: ty.name.span,
-            },
+            Some(&(item, kind, declared_name)) => {
+                let args = ty
+                    .args
+                    .iter()
+                    .map(|a| self.resolve_type_ref_at_depth(a, depth + 1))
+                    .collect();
+                HirType::Aggregate {
+                    item,
+                    kind: match kind {
+                        TypeNameKind::Record => AggregateKind::Record,
+                        TypeNameKind::Variant => AggregateKind::Variant,
+                    },
+                    // The item's own canonical name, never the local
+                    // (possibly aliased) spelling this annotation
+                    // happened to use -- `Ty::Named`'s display symbol
+                    // must be alias-independent (`rfcs/0007`).
+                    name: declared_name,
+                    args,
+                    span: ty.span,
+                }
+            }
             None => HirType::Unresolved {
                 name: ty.name.symbol,
                 span: ty.name.span,
@@ -651,7 +760,72 @@ impl<'a> Lowering<'a> {
         id
     }
 
+    fn fresh_type_param(&mut self) -> TypeParamId {
+        let id = TypeParamId(self.next_type_param_id);
+        self.next_type_param_id += 1;
+        id
+    }
+
+    /// Resolves a `func`/`record`/`variant`'s own `[T, U]` parameter
+    /// list into stable identities, populating `self.type_param_scope`
+    /// for the caller to resolve that same declaration's own field/
+    /// param/return/payload types against (`rfcs/0008`). The caller is
+    /// responsible for clearing the scope again once done (see
+    /// [`Self::clear_type_param_scope`]) -- a type parameter's own
+    /// identity must never be visible while lowering a different
+    /// declaration.
+    fn lower_type_params(&mut self, params: &[ast::Ident]) -> Vec<HirTypeParam> {
+        self.type_param_scope.clear();
+        let mut result = Vec::with_capacity(params.len());
+        for p in params {
+            if let Some(&(_, first_span)) = self.type_param_scope.get(&p.symbol) {
+                let text = self.interner.resolve(p.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_TYPE_PARAMETER,
+                        self.source,
+                        p.span,
+                        format!("type parameter `{text}` is declared more than once"),
+                    )
+                    .with_primary_label("duplicate type parameter")
+                    .with_label(first_span, "first declared here"),
+                );
+                continue;
+            }
+            if primitive_from_name(self.interner.resolve(p.symbol)).is_some() {
+                let text = self.interner.resolve(p.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::PRIMITIVE_TYPE_PARAMETER_NAME,
+                        self.source,
+                        p.span,
+                        format!("`{text}` is a primitive type name and cannot be used as a type parameter"),
+                    )
+                    .with_primary_label("primitive type name"),
+                );
+                continue;
+            }
+            let id = self.fresh_type_param();
+            self.type_param_scope.insert(p.symbol, (id, p.span));
+            result.push(HirTypeParam {
+                id,
+                name: p.symbol,
+                span: p.span,
+            });
+        }
+        result
+    }
+
+    /// Ends the currently-lowered declaration's type-parameter scope --
+    /// called once its own signature/fields/body are fully lowered, so
+    /// its parameters never remain visible while lowering the next
+    /// declaration (`rfcs/0008`).
+    fn clear_type_param_scope(&mut self) {
+        self.type_param_scope.clear();
+    }
+
     fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
+        let type_params = self.lower_type_params(&f.type_params);
         let mut scopes = Scopes::new();
         let mut seen_params: HashMap<Symbol, Span> = HashMap::new();
         let params = f
@@ -686,10 +860,12 @@ impl<'a> Lowering<'a> {
             .collect();
         let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
         let body = self.lower_block(&f.body, &mut scopes);
+        self.clear_type_param_scope();
         HirFunction {
             id,
             name: f.name.symbol,
             name_span: f.name.span,
+            type_params,
             source: self.source,
             public: f.public,
             params,
@@ -855,13 +1031,112 @@ impl<'a> Lowering<'a> {
             },
             ast::Expr::RecordLiteral {
                 type_name,
+                type_args,
                 fields,
                 span,
-            } => self.lower_record_literal(*type_name, fields, *span, scopes),
+            } => self.lower_record_literal(*type_name, type_args, fields, *span, scopes),
+            ast::Expr::TypeApply { base, args, span } => {
+                self.lower_type_apply(base, args, *span, scopes)
+            }
             ast::Expr::Error { span } => HirExpr::Error {
                 id: self.fresh_expr_id(),
                 span: *span,
             },
+        }
+    }
+
+    /// Lowers `Base[Args]` in a non-record-literal position
+    /// (`identity[i64]`, or the base of `Maybe[i64].Some(...)` once
+    /// `lower_field` has already handled and returned early for that
+    /// shape) -- `rfcs/0008`. Only ever legal directly on a plain,
+    /// unshadowed function name in this milestone: a local variable, an
+    /// unresolved name, or anything else `base` might structurally be is
+    /// rejected here, never silently reinterpreted.
+    fn lower_type_apply(
+        &mut self,
+        base: &ast::Expr,
+        args: &[ast::Type],
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> HirExpr {
+        let ast::Expr::Ident(ident) = base else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::INVALID_TYPE_APPLICATION,
+                    self.source,
+                    span,
+                    "type arguments may only follow a plain function or type name",
+                )
+                .with_primary_label("invalid type application"),
+            );
+            return HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span,
+            };
+        };
+        if scopes.lookup(ident.symbol).is_some() {
+            let text = self.interner.resolve(ident.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::INVALID_TYPE_APPLICATION,
+                    self.source,
+                    span,
+                    format!("`{text}` is a local binding and cannot take type arguments"),
+                )
+                .with_primary_label("invalid type application"),
+            );
+            return HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span,
+            };
+        }
+        if let Some(&item) = self.functions_by_name.get(&ident.symbol) {
+            let type_args = args.iter().map(|a| self.resolve_type_ref(a)).collect();
+            return HirExpr::Function {
+                id: self.fresh_expr_id(),
+                item,
+                name: ident.symbol,
+                type_args,
+                span,
+            };
+        }
+        if self.type_names.contains_key(&ident.symbol) {
+            // A generic type name standing alone (no `.Case` qualifier,
+            // no record-literal `{ .. }`) is never itself a value --
+            // `lower_field`'s own `TypeApply`-aware handling intercepts
+            // the `Maybe[i64].Some` shape before `lower_expr` (and so
+            // this function) ever sees it, and `parse_record_literal`
+            // intercepts the `Box[i64] { .. }` shape at parse time, so
+            // reaching here with a known type name means neither
+            // followed.
+            let text = self.interner.resolve(ident.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::INVALID_TYPE_APPLICATION,
+                    self.source,
+                    span,
+                    format!("`{text}` is a type, not a value"),
+                )
+                .with_primary_label("type used as a value"),
+            );
+            return HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span,
+            };
+        }
+        let text = self.interner.resolve(ident.symbol);
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNRESOLVED_NAME,
+                self.source,
+                ident.span,
+                format!("cannot find `{text}` in this scope"),
+            )
+            .with_primary_label("not found"),
+        );
+        HirExpr::Error {
+            id: self.fresh_expr_id(),
+            span,
         }
     }
 
@@ -879,6 +1154,7 @@ impl<'a> Lowering<'a> {
                 id: self.fresh_expr_id(),
                 item,
                 name: ident.symbol,
+                type_args: Vec::new(),
                 span: ident.span,
             };
         }
@@ -946,6 +1222,7 @@ impl<'a> Lowering<'a> {
             variant,
             case,
             name: ident.symbol,
+            type_args: Vec::new(),
             span: ident.span,
         }
     }
@@ -1000,13 +1277,29 @@ impl<'a> Lowering<'a> {
         span: Span,
         scopes: &mut Scopes,
     ) -> HirExpr {
-        if let ast::Expr::Ident(base_ident) = base
+        // `Variant.Case` and `Variant[Args].Case` are both qualified
+        // case references -- `[Args]` (if any) binds to the base name
+        // before this field access, exactly like a record literal's own
+        // `[Args] { .. }` (`rfcs/0008`).
+        let (base_ident, type_args_ast): (Option<&ast::Ident>, &[ast::Type]) = match base {
+            ast::Expr::Ident(ident) => (Some(ident), &[]),
+            ast::Expr::TypeApply {
+                base: inner, args, ..
+            } => match inner.as_ref() {
+                ast::Expr::Ident(ident) => (Some(ident), args.as_slice()),
+                _ => (None, &[]),
+            },
+            _ => (None, &[]),
+        };
+        if let Some(base_ident) = base_ident
             && scopes.lookup(base_ident.symbol).is_none()
             && !self.functions_by_name.contains_key(&base_ident.symbol)
             && let Some(&(item, kind, _)) = self.type_names.get(&base_ident.symbol)
         {
             return match kind {
-                TypeNameKind::Variant => self.resolve_qualified_case(item, *base_ident, name),
+                TypeNameKind::Variant => {
+                    self.resolve_qualified_case(item, *base_ident, type_args_ast, name)
+                }
                 TypeNameKind::Record => {
                     let base_text = self.interner.resolve(base_ident.symbol);
                     self.diagnostics.push(
@@ -1037,6 +1330,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         variant: ItemId,
         base_ident: ast::Ident,
+        type_args_ast: &[ast::Type],
         case_name: ast::Ident,
     ) -> HirExpr {
         let span = base_ident.span.join(case_name.span);
@@ -1045,11 +1339,16 @@ impl<'a> Lowering<'a> {
             .get(&variant)
             .and_then(|cases| cases.get(&case_name.symbol))
         {
+            let type_args = type_args_ast
+                .iter()
+                .map(|a| self.resolve_type_ref(a))
+                .collect();
             return HirExpr::CaseRef {
                 id: self.fresh_expr_id(),
                 variant,
                 case: index,
                 name: case_name.symbol,
+                type_args,
                 span,
             };
         }
@@ -1111,6 +1410,7 @@ impl<'a> Lowering<'a> {
     fn lower_record_literal(
         &mut self,
         type_name: ast::Ident,
+        type_args_ast: &[ast::Type],
         fields: &[ast::FieldInit],
         span: Span,
         scopes: &mut Scopes,
@@ -1251,9 +1551,14 @@ impl<'a> Lowering<'a> {
             );
         }
 
+        let type_args = type_args_ast
+            .iter()
+            .map(|a| self.resolve_type_ref(a))
+            .collect();
         HirExpr::RecordLiteral {
             id: self.fresh_expr_id(),
             record,
+            type_args,
             fields: resolved,
             span,
         }
@@ -1855,6 +2160,8 @@ mod tests {
             next_local_id: 0,
             next_expr_id: 0,
             next_pattern_id: 0,
+            type_param_scope: HashMap::new(),
+            next_type_param_id: 0,
         };
         let depth = crate::limits::MAX_PATTERN_DEPTH + 50;
         let mut pattern = ast::Pattern::Wildcard {
@@ -2093,5 +2400,100 @@ mod tests {
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0011");
+    }
+
+    // -- Generic parameter lowering (`rfcs/0008`) -----------------------
+
+    #[test]
+    fn same_spelled_type_parameters_in_different_declarations_get_distinct_ids() {
+        // `first[T]` and `second[T]` are unrelated declarations that
+        // just happen to spell their own parameter the same way --
+        // `TypeParamId` identity must come from *which declaration*
+        // introduced it, never from the spelling alone.
+        let (hir, diags) = lower(
+            "func first[T](x: T) -> T { return x } \
+             func second[T](x: T) -> T { return x }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let ids: Vec<TypeParamId> = hir.functions.iter().map(|f| f.type_params[0].id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "each declaration's own T must get its own TypeParamId"
+        );
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_function_is_rejected() {
+        let (_, diags) = lower("func f[T, T](x: T) -> T { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_record_is_rejected() {
+        let (_, diags) = lower("record Box[T, T] { payload: T }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_variant_is_rejected() {
+        let (_, diags) = lower("variant Maybe[T, T] { Some(T), None }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn a_primitive_name_as_a_type_parameter_is_rejected() {
+        let (_, diags) = lower("func f[i64](x: i64) -> i64 { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0017");
+    }
+
+    #[test]
+    fn a_type_parameter_used_outside_its_own_declaration_does_not_leak_across_declarations() {
+        // `T` from `first`'s own declaration has no meaning in `second`,
+        // which declares no type parameter of its own at all -- `T`
+        // there must resolve as an ordinary unresolved name (deferred to
+        // typeck's own T0006), never silently reuse `first`'s parameter
+        // as if `second` had declared it too.
+        let (hir, diags) = lower(
+            "func first[T](x: T) -> T { return x } \
+             func second(x: T) -> T { return x }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let second = &hir.functions[1];
+        assert!(
+            matches!(second.params[0].ty, HirType::Unresolved { .. }),
+            "expected `T` in `second` to be unresolved, not reuse `first`'s parameter: {:?}",
+            second.params[0].ty
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_type_parameters_has_an_empty_type_params_list() {
+        let (hir, diags) = lower("record Point { x: i64 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert!(hir.records[0].type_params.is_empty());
+    }
+
+    #[test]
+    fn a_generic_record_lowers_its_own_type_parameters() {
+        let (hir, diags) = lower("record Box[T] { payload: T }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.records[0].type_params.len(), 1);
+    }
+
+    #[test]
+    fn an_applied_type_reference_resolves_to_an_aggregate_type_with_args() {
+        let (hir, diags) =
+            lower("record Box[T] { payload: T } func f(b: Box[i64]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let f = &hir.functions[0];
+        match &f.params[0].ty {
+            HirType::Aggregate { args, .. } => assert_eq!(args.len(), 1),
+            other => panic!("expected an applied aggregate type, got {other:?}"),
+        }
     }
 }

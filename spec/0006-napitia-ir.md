@@ -72,10 +72,10 @@ value is a real, typed value, not an absence of one.
 %d = le.<ty>  %a, %b   -> bool
 %d = gt.<ty>  %a, %b   -> bool
 %d = ge.<ty>  %a, %b   -> bool
-%d = call @<function>(%a, %b, ...)
-%d = record.create @<record>(%a, %b, ...)      ; fields in declaration order
+%d = call @<function>[<type-args>](%a, %b, ...)
+%d = record.create @<record>[<type-args>](%a, %b, ...)      ; fields in declaration order
 %d = record.field @<record>.<index> %base
-%d = variant.create @<variant>.<case>(%a, ...) ; payload in declaration order
+%d = variant.create @<variant>[<type-args>].<case>(%a, ...) ; payload in declaration order
 %d = variant.payload @<variant>.<case>.<index> %base
 ```
 
@@ -86,6 +86,15 @@ carry the record/variant identity alongside the index so the verifier
 can check the base's actual type, not just index-bounds. A unit case's
 `variant.create` supplies no payload values at all -- no fabricated
 placeholder is ever allocated for it.
+
+`[<type-args>]` (Alpha 0.1.4, `rfcs/0008`) is present only when the
+callee/record/variant is generic — a call/construction against a
+non-generic declaration prints and carries no bracket at all, not an
+empty one. These are the *concrete* type arguments this one call site or
+construction resolved to (already validated by typeck, never re-inferred
+here); a generic declaration's own body/layout still lowers exactly once,
+keeping its own parameter types symbolic (`Ty::Param`) — a call site
+never causes it to be cloned or re-checked.
 
 ### Terminators implemented
 
@@ -135,6 +144,39 @@ own canonical declared name.
 Printer output is stable across runs for the same input (no
 pointer-derived or nondeterministic identifiers), which is what makes it
 usable in tests as a golden-output comparison.
+
+### Generics (Alpha 0.1.4)
+
+A generic declaration prints its own type parameters on the declaration
+itself, in declared order; a call/construction site prints its own
+concrete type arguments the same bracketed way:
+
+```text
+func @identity#12[T](%0: T) -> T {
+bb0:
+    ret %0
+}
+
+func @main#13() -> i64 {
+bb0:
+    %0 = const.i64 42
+    %1 = call @identity#12[i64](%0)
+    ret %1
+}
+```
+
+`identity#12` lowers exactly once regardless of how many call sites
+instantiate it — there is no per-instantiation clone, and a symbolic
+parameter type (`T` above) never leaks outside the one declaration that
+binds it. `record.create`/`variant.create` print and carry their own
+concrete arguments identically (`record.create @Box#8[i64](%0)`), and a
+nested application formats unambiguously the same way a type in any other
+position does (`Box[Maybe[i64]]`). This output is byte-identical across
+repeated compiles, exactly like every other property in "Textual printer"
+above, and an import alias never appears here either. See
+`rfcs/0008-canonical-generics.md` for the complete semantics, the
+canonical generic-instance-key design, and the verifier rules described
+below.
 
 ### Lowering from HIR
 
@@ -243,8 +285,21 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   instructions must also name an `ItemId` that actually resolves to a
   declared record/variant in this module, and its carried display
   symbol must match that declaration's own name.
+- **Generics** (Alpha 0.1.4, `rfcs/0008`): a `Call`/`RecordCreate`/
+  `VariantCreate`'s type argument count is validated against its
+  callee's/record's/variant's own declared parameter count, and those
+  arguments are substituted into the declared signature/field/payload
+  types before comparing against actual operand/result types — the same
+  type-checking discipline above, generic-aware. A `Ty::Named` for a
+  declaration that is actually generic, a `Ty::Applied` with mismatched
+  arity or naming a non-generic declaration, a `Ty::Param` appearing
+  outside the one declaration that binds it, and a declaration whose own
+  type parameter list contains a duplicate are all rejected. Every one of
+  these checks recurses through nested `Ty::Applied` arguments and is
+  bounded by the same generic-depth limit every other stage that walks a
+  type application shares.
 
-It reports structured diagnostics (`V0001`–`V0030` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0034` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

@@ -33,9 +33,16 @@ use crate::types::{Ty, TyVar, is_integer};
 /// failure, not a silent pick of one side.
 ///
 /// On failure, returns both sides fully resolved, for the caller to
-/// report. Resolution always terminates: a variable is only ever bound
-/// to the *other* side's already-fully-resolved form, so the
-/// substitution graph is always a forest (no cycles can form).
+/// report. A variable is never bound to a type that (transitively,
+/// through the current substitution state) already contains that same
+/// variable -- see [`occurs`] -- so the substitution graph the *bound*
+/// side of a successful unification produces is always a forest, never
+/// a cycle. And because this top-level entry point checkpoints
+/// `ctx` first and restores it on any `Err`, a *failed* call to `unify`
+/// is transactional: it can never leave a partial bind behind, even one
+/// made by a nested `Ty::Applied` argument that unified successfully
+/// before a later sibling argument failed (e.g. `Pair[V, V]` against
+/// `Pair[i64, bool]`, which must never leave `V` bound to `i64`).
 ///
 /// A `Ty::Applied` unifies structurally with another one iff they name
 /// the exact same declaration (nominal, matching `Ty::Applied`'s own
@@ -49,7 +56,14 @@ use crate::types::{Ty, TyVar, is_integer};
 /// not just at the top level. A mismatched declaration or arity is a
 /// deterministic, immediate failure, never a partial/best-effort bind.
 pub fn unify(ctx: &mut TypeContext, a: &Ty, b: &Ty) -> Result<(), (Ty, Ty)> {
-    unify_at_depth(ctx, a, b, 0)
+    let checkpoint = ctx.checkpoint();
+    match unify_at_depth(ctx, a, b, 0) {
+        Ok(()) => Ok(()),
+        Err(mismatch) => {
+            ctx.restore(checkpoint);
+            Err(mismatch)
+        }
+    }
 }
 
 fn unify_at_depth(ctx: &mut TypeContext, a: &Ty, b: &Ty, depth: usize) -> Result<(), (Ty, Ty)> {
@@ -65,6 +79,9 @@ fn unify_at_depth(ctx: &mut TypeContext, a: &Ty, b: &Ty, depth: usize) -> Result
         (Ty::Never, _) | (_, Ty::Never) => Ok(()),
         (Ty::Var(va), Ty::Var(vb)) => merge_vars(ctx, *va, *vb, &a, &b),
         (Ty::Var(v), _) => {
+            if occurs(ctx, *v, &b, 0) {
+                return Err((a, b));
+            }
             if kind_allows(ctx, *v, &b) {
                 ctx.bind(*v, b);
                 Ok(())
@@ -73,6 +90,9 @@ fn unify_at_depth(ctx: &mut TypeContext, a: &Ty, b: &Ty, depth: usize) -> Result
             }
         }
         (_, Ty::Var(v)) => {
+            if occurs(ctx, *v, &a, 0) {
+                return Err((a, b));
+            }
             if kind_allows(ctx, *v, &a) {
                 ctx.bind(*v, a);
                 Ok(())
@@ -100,6 +120,36 @@ fn unify_at_depth(ctx: &mut TypeContext, a: &Ty, b: &Ty, depth: usize) -> Result
             Ok(())
         }
         _ => Err((a, b)),
+    }
+}
+
+/// Whether `var` occurs anywhere inside `ty`'s structure -- checked
+/// before ever binding `var` to `ty`, so a bind can never introduce a
+/// cycle into the substitution graph (`unify(Var(v), Box[Var(v)])` must
+/// fail, not hang whatever later resolves `v`). `ctx.resolve` alone only
+/// ever follows a `Var -> Var -> concrete` chain at the *top* level, so
+/// this resolves at every level of the recursion instead, which is what
+/// catches an *indirect* cycle too: `v` unified with `w` (binding one to
+/// the other), followed by `w` unified with `Box[v]`, must also fail --
+/// by the time this checks whether `w` occurs in `Box[v]`, resolving the
+/// argument `v` chases back through `w`'s own (still-unbound) slot and
+/// finds `w` again.
+///
+/// Depth-bounded the same way every other stage that walks a nested type
+/// application is; past the bound this conservatively reports an
+/// occurrence (refusing the bind) rather than risking a false "safe to
+/// bind" verdict on a type already too pathological to prove either way
+/// -- a well-typed program's own `Ty::Applied` nesting is already far
+/// shallower than this (`hir::lower`'s own R0019), so this only ever
+/// matters for a hand-built, malformed `Ty`.
+fn occurs(ctx: &TypeContext, var: TyVar, ty: &Ty, depth: usize) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match ctx.resolve(ty) {
+        Ty::Var(v) => v == var,
+        Ty::Applied(_, args) => args.iter().any(|a| occurs(ctx, var, a, depth + 1)),
+        _ => false,
     }
 }
 
@@ -337,5 +387,85 @@ mod tests {
         let a = Ty::Applied(item, vec![Ty::I64]);
         let b = Ty::Applied(item, vec![Ty::I64]);
         assert!(unify(&mut ctx, &a, &b).is_ok());
+    }
+
+    // -- Occurs-check and transactional rollback ------------------------
+
+    #[test]
+    fn a_variable_unified_with_an_application_containing_itself_fails_not_hangs() {
+        let mut ctx = TypeContext::new();
+        let box_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let cyclic = Ty::Applied(box_item, vec![Ty::Var(v)]);
+        assert!(unify(&mut ctx, &Ty::Var(v), &cyclic).is_err());
+        // A failed unification must not have bound the variable.
+        assert_eq!(ctx.resolve(&Ty::Var(v)), Ty::Var(v));
+    }
+
+    #[test]
+    fn an_indirect_cycle_through_a_merged_variable_fails_not_hangs() {
+        // v -> w (merged), then w unified against Box[v] -- v is not
+        // literally w, but by the time the occurs-check resolves the
+        // argument it chases back through w's own slot and finds w
+        // again, so this must fail exactly like the direct case above.
+        let mut ctx = TypeContext::new();
+        let box_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let w = ctx.fresh_var();
+        assert!(unify(&mut ctx, &Ty::Var(v), &Ty::Var(w)).is_ok());
+        let cyclic = Ty::Applied(box_item, vec![Ty::Var(v)]);
+        assert!(unify(&mut ctx, &Ty::Var(w), &cyclic).is_err());
+    }
+
+    #[test]
+    fn resolving_after_a_failed_occurs_check_is_safe_and_non_cyclic() {
+        // After either failure above, resolving every variable involved
+        // must terminate immediately and never loop -- the occurs-check
+        // failing must not itself have left a half-made cyclic bind.
+        let mut ctx = TypeContext::new();
+        let box_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let w = ctx.fresh_var();
+        assert!(unify(&mut ctx, &Ty::Var(v), &Ty::Var(w)).is_ok());
+        let cyclic = Ty::Applied(box_item, vec![Ty::Var(v)]);
+        assert!(unify(&mut ctx, &Ty::Var(w), &cyclic).is_err());
+        // Both directions of the merge must still resolve to a plain,
+        // unbound variable -- never recurse, never panic.
+        assert_eq!(ctx.resolve(&Ty::Var(v)), Ty::Var(w));
+        assert_eq!(ctx.resolve(&Ty::Var(w)), Ty::Var(w));
+    }
+
+    #[test]
+    fn a_failed_nested_applied_unification_leaves_no_partial_bind() {
+        // Pair[V, V] against Pair[i64, bool]: the first argument pair
+        // (V vs i64) would succeed and bind V, but the second (V vs
+        // bool, since V is now i64) fails -- the whole `unify` call must
+        // roll back that first bind, not leave V bound to i64 despite
+        // reporting Err.
+        let mut ctx = TypeContext::new();
+        let pair_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let expected = Ty::Applied(pair_item, vec![Ty::Var(v), Ty::Var(v)]);
+        let actual = Ty::Applied(pair_item, vec![Ty::I64, Ty::Bool]);
+        assert!(unify(&mut ctx, &expected, &actual).is_err());
+        assert_eq!(
+            ctx.resolve(&Ty::Var(v)),
+            Ty::Var(v),
+            "a failed unify() must never leave a partial bind behind"
+        );
+    }
+
+    #[test]
+    fn a_successful_nested_applied_inference_is_unaffected_by_the_rollback_machinery() {
+        // The rollback/occurs-check machinery must not interfere with an
+        // ordinary successful inference: Pair[V, V] against
+        // Pair[i64, i64] must still bind V = i64.
+        let mut ctx = TypeContext::new();
+        let pair_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let expected = Ty::Applied(pair_item, vec![Ty::Var(v), Ty::Var(v)]);
+        let actual = Ty::Applied(pair_item, vec![Ty::I64, Ty::I64]);
+        assert!(unify(&mut ctx, &expected, &actual).is_ok());
+        assert_eq!(ctx.resolve(&Ty::Var(v)), Ty::I64);
     }
 }

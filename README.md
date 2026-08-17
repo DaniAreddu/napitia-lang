@@ -40,15 +40,24 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.2
+## Current status: Alpha 0.1.3
 
-This milestone makes Napitia a real multi-file project language: a
-`napitia.toml` manifest names a source root and an entry file, every
-`.npt` file under the source root is its own module, and `import` brings
-a single public item from another module into scope. It builds on Alpha
-0.1.1's data model (nominal records and variants, construction, field
-access, qualified variant constructors, and exhaustive pattern matching,
-executed end to end by the interpreter).
+This milestone rounds out Alpha 0.1.2's multi-file projects with import
+ergonomics and precise cross-module identity: `import a.b.c as d;` lets
+one item be given a local alias, so two same-named declarations from
+different modules (two unrelated `User` records, say) can be used
+together in one scope without colliding — the alias is purely a local
+spelling and never changes an item's own identity, declared name, or
+the type it names. Textual NIR (`napitia ir`) is now module-qualified
+(`sales.user.User#2`, not just `User`), so two same-named items from
+different modules always print distinguishably, and two different
+module paths that resolve to the same physical file (a symlink or
+junction) are now rejected outright. It builds on Alpha 0.1.2's
+multi-file projects (a `napitia.toml` manifest, one file per module,
+cross-module `import`, `public`/`private` enforced across module
+boundaries) and Alpha 0.1.1's data model (nominal records and variants,
+construction, field access, qualified variant constructors, and
+exhaustive pattern matching, executed end to end by the interpreter).
 
 ### Implemented in this milestone
 
@@ -96,6 +105,10 @@ executed end to end by the interpreter).
 - Multi-file projects (`project/`): a `napitia.toml` manifest, one file
   per module, cross-module `import`, and `public`/`private` enforced for
   real across module boundaries — see below.
+- Import aliases (`import a.b.c as d;`), a canonical per-item identity
+  registry (`hir::registry`) used by both NIR printing and verification,
+  module-qualified textual NIR, and rejection of two module paths that
+  resolve to the same physical file (`M0013`) — see below.
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -174,6 +187,41 @@ happens to sit next to it.
 See `rfcs/0006-multi-file-projects-and-modules.md` for the full
 architecture and the complete list of project-level diagnostic codes.
 
+### Import aliases and module identity
+
+`import <path> as <alias>;` gives one imported item a local name distinct
+from its own declared name — the only way to bring two same-named
+declarations from different modules into one scope at once:
+
+```napitia
+import sales.user.User as SalesUser;
+import admin.user.User as AdminUser;
+
+func main() -> i64 {
+    value s = SalesUser { id: 40 };
+    value a = AdminUser { id: 2 };
+    return s.id + a.id                 // 42
+}
+```
+
+`SalesUser` and `AdminUser` remain exactly the two distinct types they
+already were — an alias is a local spelling only, never a merge: passing
+a `SalesUser` value anywhere `admin.user`'s own declaration is expected is
+still an ordinary type error, and the message names both sides
+unambiguously, showing `admin.user.User` and `sales.user.User` rather
+than the same bare `User` twice. `napitia ir`'s textual output qualifies
+every item, and every type in a parameter/return/allocation position, by
+its declaring module (`sales.user.User#2`, not just `User`), so two
+same-named items from different modules always print distinguishably
+there too. Nominal types in both typechecker diagnostics and textual NIR
+always use an item's canonical, module-qualified declaration name, never
+an import alias substituted in its place; an alias-related resolution
+diagnostic (an import colliding with something else, say) is a different
+case and may naturally display the local alias that caused it, since
+that alias is exactly what the diagnostic is about. See
+`rfcs/0007-module-identity-and-import-aliases.md` for the full design,
+the collision rules, and the current honest limitations.
+
 ### Explicitly not yet implemented
 
 Field mutation, record/variant equality, pattern guards, or-patterns,
@@ -181,9 +229,11 @@ record-destructuring/slice/range patterns, generics, protocols, a
 `Maybe<T>` absence type, checked `uses`/`raises` effects and errors,
 ownership/region enforcement (and the indirection that would lift the
 recursive-aggregate restriction), structured concurrency, remote
-packages/dependency declarations, import aliases/wildcards/re-exports,
-incremental/cached compilation, an LLVM (or any native) backend, garbage
-collection, and any domain-specific library (REST, ORM, tensors, GPU).
+packages/dependency declarations, wildcard/grouped imports, re-exports,
+package/module aliases (as opposed to the per-item import aliases that do
+exist — see above), incremental/cached compilation, an LLVM (or any
+native) backend, garbage collection, and any domain-specific library
+(REST, ORM, tensors, GPU).
 Design direction for most of these exists in `rfcs/`;
 none of it is faked in the implementation.
 

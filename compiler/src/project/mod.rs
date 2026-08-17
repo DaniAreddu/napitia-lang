@@ -31,6 +31,7 @@ pub(crate) mod codes {
     pub const INVALID_ENTRY: &str = "M0010";
     pub const INACCESSIBLE_FIELD: &str = "M0011";
     pub const PRIVATE_TYPE_LEAKED: &str = "M0012";
+    pub const DUPLICATE_PHYSICAL_MODULE: &str = "M0013";
 }
 
 /// A fully compiled, verified project, ready to print or execute.
@@ -41,6 +42,11 @@ pub struct CompiledProject {
     /// name lookup over the merged module, which a project with more
     /// than one module could make ambiguous.
     pub entry_item: ItemId,
+    /// Canonical module-qualified identity for every item in `nir`
+    /// (`rfcs/0007`) -- what `nir::print_module`/`nir::verify_module`
+    /// and any future qualified diagnostic read from, rather than each
+    /// keeping its own name lookup that could drift from this one.
+    pub registry: hir::ItemRegistry,
 }
 
 /// Loads, resolves, and compiles the project rooted at `manifest_path`
@@ -183,6 +189,18 @@ pub fn compile_project(
     }
     let entry_source = entry_source.expect("the entry module is always among loaded.modules");
 
+    // Canonical module-qualified identity for every item, built once
+    // from the already-merged HIR (`rfcs/0007`) -- the single source of
+    // truth `nir::print_module`/`nir::verify_module` and any future
+    // qualified diagnostic read from, never a second name map that
+    // could disagree with it.
+    let module_path_of: HashMap<SourceId, String> = loaded
+        .modules
+        .iter()
+        .map(|m| (m.source, m.path.dotted()))
+        .collect();
+    let registry = hir::registry::build(&merged, &module_path_of);
+
     // Identified by `ItemId` *before* typeck ever runs, so typeck's own
     // entry-signature check (`EntryMain::ByIdentity`) can be scoped to
     // this exact declaration -- never a global "any function named
@@ -204,11 +222,12 @@ pub fn compile_project(
         .expect("validate_entry_main already guaranteed exactly one entry `main`")
         .id;
 
-    let typeck_result = typeck::check_module(
+    let typeck_result = typeck::check_module_with_registry(
         &merged,
         loaded.manifest_source,
         interner,
         typeck::EntryMain::ByIdentity(Some(entry_item)),
+        &registry,
     );
     if !typeck_result.diagnostics.is_empty() {
         return Err(typeck_result.diagnostics);
@@ -223,7 +242,8 @@ pub fn compile_project(
         loaded.manifest_source,
     )?;
 
-    let verify_diagnostics = nir::verify_module(&nir_module, loaded.manifest_source, interner);
+    let verify_diagnostics =
+        nir::verify_module(&nir_module, loaded.manifest_source, interner, &registry);
     if !verify_diagnostics.is_empty() {
         return Err(verify_diagnostics);
     }
@@ -231,6 +251,7 @@ pub fn compile_project(
     Ok(CompiledProject {
         nir: nir_module,
         entry_item,
+        registry,
     })
 }
 
@@ -542,8 +563,900 @@ mod tests {
             let mut interner = Interner::new();
             let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
                 .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
-            crate::nir::print_module(&compiled.nir, &interner)
+            crate::nir::print_module(&compiled.nir, &interner, &compiled.registry)
         };
         assert_eq!(render(), render());
+    }
+
+    #[test]
+    fn a_function_alias_resolves_to_the_exact_original_item_id() {
+        let project = TempProject::new("alias_function");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add as plus;\nfunc main() -> i64 { return plus(1, 2) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(3)));
+    }
+
+    #[test]
+    fn a_record_alias_resolves_in_annotations_and_construction() {
+        let project = TempProject::new("alias_record");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             func id_of(a: Account) -> i64 { return a.id }\n\
+             func main() -> i64 { value a = Account { id: 9 }; return id_of(a) }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(9)));
+    }
+
+    #[test]
+    fn a_variant_alias_resolves_in_annotations_construction_and_patterns() {
+        let project = TempProject::new("alias_variant");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             func area(s: Figure) -> i64 { return match s { Circle(r) => r * r, Square(x) => x * x } }\n\
+             func main() -> i64 { value c = Figure.Circle(3); return area(c) }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(9)));
+    }
+
+    #[test]
+    fn the_original_name_is_unavailable_once_aliased() {
+        let project = TempProject::new("alias_hides_original");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             func main() -> i64 { value u = User { id: 1 }; return u.id }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0007");
+    }
+
+    #[test]
+    fn two_same_named_cross_module_records_coexist_through_aliases() {
+        let project = TempProject::new("alias_coexist");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func main() -> i64 {\n\
+             \x20   value s = SalesUser { id: 20 };\n\
+             \x20   value a = AdminUser { id: 22 };\n\
+             \x20   return sales_id(s) + admin_id(a)\n\
+             }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(42)));
+    }
+
+    #[test]
+    fn an_alias_does_not_create_a_new_nominal_type() {
+        // `SalesUser` and `AdminUser` are just local spellings for two
+        // still-genuinely-distinct declarations -- passing one where
+        // the other is expected must still be rejected.
+        let project = TempProject::new("alias_nominal_incompatible");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func main() -> i64 { value a = AdminUser { id: 22 }; return sales_id(a) }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        // Both same-named `User` records must read as genuinely
+        // different in the message text, not the same ambiguous `User`
+        // on both sides (`rfcs/0007`); no raw ItemId anywhere in it,
+        // since typeck diagnostics -- unlike textual NIR -- never
+        // attach a bare `#id`.
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `sales.User`, found `admin.User`"
+        );
+        assert!(!diags[0].message.contains('#'));
+    }
+
+    #[test]
+    fn cross_module_same_named_record_mismatch_names_both_nested_module_paths() {
+        // Nested module paths (`sales.user`/`admin.user`, not flat
+        // `sales`/`admin`) -- the exact worked example rfcs/0007 itself
+        // documents.
+        let project = TempProject::new("typeck_qualify_nested_records");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.user.User as SalesUser;\n\
+             import admin.user.User;\n\
+             import admin.user.user_id;\n\
+             func main() -> i64 { value s = SalesUser { id: 1 }; return user_id(s) }\n",
+        );
+        project.write(
+            "src/admin/user.npt",
+            "public record User { public id: i64 }\n\
+             public func user_id(u: User) -> i64 { return u.id }\n",
+        );
+        project.write(
+            "src/sales/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `admin.user.User`, found `sales.user.User`"
+        );
+    }
+
+    #[test]
+    fn cross_module_same_named_variants_show_both_qualified_names() {
+        let project = TempProject::new("typeck_qualify_variants");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.Status as SalesStatus;\n\
+             import admin.accept;\n\
+             func main() -> i64 { value s = SalesStatus.Open; return accept(s) }\n",
+        );
+        project.write(
+            "src/admin.npt",
+            "public variant Status { Open, Closed }\n\
+             public func accept(s: Status) -> i64 { return 0 }\n",
+        );
+        project.write("src/sales.npt", "public variant Status { Open, Closed }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `admin.Status`, found `sales.Status`"
+        );
+    }
+
+    #[test]
+    fn aliases_of_the_same_declaration_remain_type_compatible() {
+        // Unlike the mismatch tests above: `models.User` imported twice,
+        // under two different local aliases, is still exactly one
+        // declaration -- passing a value built through one alias where
+        // the other is expected must compile cleanly, never T0001.
+        let project = TempProject::new("typeck_alias_same_decl_compatible");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             import models.User as Profile;\n\
+             import models.user_id;\n\
+             func main() -> i64 { value p = Profile { id: 7 }; return user_id(p) }\n",
+        );
+        project.write(
+            "src/models.npt",
+            "public record User { public id: i64 }\n\
+             public func user_id(u: User) -> i64 { return u.id }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(7)));
+    }
+
+    #[test]
+    fn an_alias_named_after_a_primitive_never_shadows_it() {
+        let project = TempProject::new("alias_primitive_precedence");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as i64;\n\
+             func main() -> i64 { return 1 }\n",
+        );
+        project.write("src/models.npt", "public record User { public id: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(1)));
+    }
+
+    #[test]
+    fn a_failed_import_leaves_no_partial_alias_in_the_namespace() {
+        // `helper.secret` is private, so this whole module's imports
+        // must fail atomically -- the earlier, individually-valid
+        // `helper.thing as greet` alias must never partially register
+        // before the later failure is discovered.
+        let project = TempProject::new("alias_partial_failure");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import helper.thing as greet;\n\
+             import helper.secret as whisper;\n\
+             func main() -> i64 { return greet() }\n",
+        );
+        project.write(
+            "src/helper.npt",
+            "public func thing() -> i64 { return 1 }\nfunc secret() -> i64 { return 2 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0006");
+    }
+
+    #[test]
+    fn the_same_variant_imported_under_two_aliases_is_not_falsely_ambiguous() {
+        // `Shape` is imported twice, as `Figure` and as `Form` -- both
+        // resolve to the exact same `ItemId`, so an *unqualified* case
+        // constructor and a `match` over it must both still work: the
+        // variant having two local names must never make its own cases
+        // look like they belong to two different variants.
+        let project = TempProject::new("alias_same_variant_two_aliases");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             func main() -> i64 {\n\
+             \x20   value first = Circle(4);\n\
+             \x20   value second = Form.Square(2);\n\
+             \x20   return match first {\n\
+             \x20       Circle(n) => n,\n\
+             \x20       Square(n) => n,\n\
+             \x20   } + match second {\n\
+             \x20       Circle(n) => n,\n\
+             \x20       Square(n) => n,\n\
+             \x20   }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(6)));
+    }
+
+    #[test]
+    fn qualified_construction_works_through_every_alias_of_the_same_variant() {
+        let project = TempProject::new("alias_same_variant_qualified");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             func main() -> i64 {\n\
+             \x20   value a = Figure.Circle(3);\n\
+             \x20   value b = Form.Circle(9);\n\
+             \x20   return match a { Circle(n) => n, Square(n) => n }\n\
+             \x20       + match b { Circle(n) => n, Square(n) => n }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(12)));
+    }
+
+    #[test]
+    fn two_genuinely_distinct_variants_sharing_a_case_name_remain_ambiguous() {
+        // Unlike the two-aliases-of-one-variant case above, `shapes.Shape`
+        // and `vehicles.Vehicle` are two real, different declarations that
+        // both happen to declare a case named `Circle` -- this must still
+        // be rejected, and the message must name both (sorted, deduplicated)
+        // local names.
+        let project = TempProject::new("alias_two_distinct_variants_ambiguous");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import vehicles.Vehicle as Ride;\n\
+             func main() -> i64 { value x = Circle(4); return 0 }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+        project.write(
+            "src/vehicles.npt",
+            "public variant Vehicle { Circle(i64), Truck(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0006");
+        assert_eq!(
+            diags[0].message,
+            "`Circle` is ambiguous: it names a case in more than one variant (Figure, Ride); \
+             use a qualified path (`Variant.Circle`)"
+        );
+    }
+
+    #[test]
+    fn the_ambiguous_constructor_diagnostic_is_identical_regardless_of_import_order() {
+        let render = |first: &str, second: &str| {
+            let project = TempProject::new("alias_ambiguity_order");
+            project.write("napitia.toml", MANIFEST);
+            project.write(
+                "src/main.npt",
+                &format!(
+                    "import {first};\n\
+                     import {second};\n\
+                     func main() -> i64 {{ value x = Circle(4); return 0 }}\n"
+                ),
+            );
+            project.write(
+                "src/shapes.npt",
+                "public variant Shape { Circle(i64), Square(i64) }\n",
+            );
+            project.write(
+                "src/vehicles.npt",
+                "public variant Vehicle { Circle(i64), Truck(i64) }\n",
+            );
+
+            let mut map = SourceMap::new();
+            let mut interner = Interner::new();
+            let diags =
+                compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            diags[0].message.clone()
+        };
+
+        let forward = render("shapes.Shape as Figure", "vehicles.Vehicle as Ride");
+        let reversed = render("vehicles.Vehicle as Ride", "shapes.Shape as Figure");
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn three_aliases_of_the_same_variant_do_not_panic_or_duplicate_candidates() {
+        // Guards `add_case_candidate`'s dedup directly against more than
+        // two aliases of the same declaration, and against
+        // `variant_name`'s internal lookup ever panicking when a variant
+        // has several local names in scope at once.
+        let project = TempProject::new("alias_same_variant_three_aliases");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             import shapes.Shape as Outline;\n\
+             func main() -> i64 {\n\
+             \x20   value x = Circle(5);\n\
+             \x20   return match x { Circle(n) => n, Square(n) => n }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(5)));
+    }
+
+    /// A project with two same-named, same-shaped `User` records, each
+    /// used (via an alias) as a parameter type, a return type, and a
+    /// `mutable`-bound (alloc/store/load) local -- the fixture shared by
+    /// every qualified-NIR test below (`rfcs/0007`).
+    fn write_same_named_record_project(project: &TempProject) {
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func make_sales() -> SalesUser { mutable s = SalesUser { id: 1 }; return s }\n\
+             func make_admin() -> AdminUser { mutable a = AdminUser { id: 2 }; return a }\n\
+             func main() -> i64 {\n\
+             \x20   return sales_id(make_sales()) + admin_id(make_admin())\n\
+             }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+    }
+
+    fn compile_and_print(project: &TempProject) -> String {
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        crate::nir::print_module(&compiled.nir, &interner, &compiled.registry)
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_parameter_position() {
+        let project = TempProject::new("nir_qualify_params");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(text.contains("(%0: sales.User#"), "{text}");
+        assert!(text.contains("(%0: admin.User#"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_return_position() {
+        let project = TempProject::new("nir_qualify_returns");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(
+            text.contains("make_sales") && text.contains(") -> sales.User#"),
+            "{text}"
+        );
+        assert!(
+            text.contains("make_admin") && text.contains(") -> admin.User#"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_allocations() {
+        let project = TempProject::new("nir_qualify_alloc");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(text.contains("alloc.sales.User#"), "{text}");
+        assert!(text.contains("alloc.admin.User#"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_never_prints_an_import_alias() {
+        let project = TempProject::new("nir_qualify_no_alias");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(!text.contains("SalesUser"), "{text}");
+        assert!(!text.contains("AdminUser"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_declaration_and_reference_formatting_agree() {
+        // Whatever `sales.User`'s declaration-site id is (from its
+        // `record.create`), every reference to it -- its qualified
+        // parameter type, its qualified return type, its `alloc` -- must
+        // repeat that exact same qualified name, never a different
+        // spelling or a different id for the same item.
+        let project = TempProject::new("nir_qualify_agree");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        let start = text.find("record.create @sales.User#").expect(&text);
+        let rest = &text[start + "record.create @".len()..];
+        let end = rest.find('(').expect(&text);
+        let sales_ref = &rest[..end];
+        assert!(text.contains(&format!("(%0: {sales_ref})")), "{text}");
+        assert!(text.contains(&format!("-> {sales_ref}")), "{text}");
+        assert!(text.contains(&format!("alloc.{sales_ref}")), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_is_byte_identical_across_repeated_compiles() {
+        let project = TempProject::new("nir_qualify_repeatable");
+        write_same_named_record_project(&project);
+        assert_eq!(compile_and_print(&project), compile_and_print(&project));
+    }
+
+    #[test]
+    fn qualified_nir_is_identical_regardless_of_import_order() {
+        let forward = TempProject::new("nir_qualify_order_forward");
+        write_same_named_record_project(&forward);
+
+        let reversed = TempProject::new("nir_qualify_order_reversed");
+        reversed.write("napitia.toml", MANIFEST);
+        reversed.write(
+            "src/main.npt",
+            "import admin.User as AdminUser;\n\
+             import sales.User as SalesUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func make_sales() -> SalesUser { mutable s = SalesUser { id: 1 }; return s }\n\
+             func make_admin() -> AdminUser { mutable a = AdminUser { id: 2 }; return a }\n\
+             func main() -> i64 {\n\
+             \x20   return sales_id(make_sales()) + admin_id(make_admin())\n\
+             }\n",
+        );
+        reversed.write("src/sales.npt", "public record User { public id: i64 }\n");
+        reversed.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        assert_eq!(compile_and_print(&forward), compile_and_print(&reversed));
+    }
+
+    /// The exact source text a diagnostic's label span covers, sliced
+    /// out of `text` -- used to assert *which token* a label points at
+    /// without hand-computing byte offsets (`rfcs/0007`).
+    fn label_text(text: &str, span_start: u32, span_end: u32) -> &str {
+        &text[span_start as usize..span_end as usize]
+    }
+
+    #[test]
+    fn alias_collision_labels_precisely_the_alias_token_not_the_whole_import() {
+        let project = TempProject::new("alias_span_alias_vs_alias");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.f as shared;\n\
+                          import b.g as shared;\n\
+                          func main() -> i64 { return shared() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func f() -> i64 { return 1 }\n");
+        project.write("src/b.npt", "public func g() -> i64 { return 2 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        // The new (conflicting) import's own primary span is just its
+        // alias token, `shared` on line 2 -- not the whole `import b.g
+        // as shared;` statement.
+        assert_eq!(
+            label_text(
+                main_text,
+                diags[0].primary_span.start,
+                diags[0].primary_span.end
+            ),
+            "shared"
+        );
+        // The "already imported here" label is the *first* import's own
+        // alias token -- also just `shared`, not its whole statement.
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "shared"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_an_unaliased_import_labels_each_side_precisely() {
+        let project = TempProject::new("alias_span_alias_vs_unaliased");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.thing;\n\
+                          import b.other as thing;\n\
+                          func main() -> i64 { return thing() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func thing() -> i64 { return 1 }\n");
+        project.write("src/b.npt", "public func other() -> i64 { return 2 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        // The new aliased import's primary span is its alias token.
+        assert_eq!(
+            label_text(
+                main_text,
+                diags[0].primary_span.start,
+                diags[0].primary_span.end
+            ),
+            "thing"
+        );
+        // The earlier, unaliased import has no alias to point at -- its
+        // label is the imported item's own written name (also `thing`,
+        // the last path segment of `import a.thing;`), never the whole
+        // statement.
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "thing"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_function_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_function");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.thing as helper;\n\
+                          func helper() -> i64 { return 0 }\n\
+                          func main() -> i64 { return helper() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func thing() -> i64 { return 1 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "helper"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_record_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_record");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.Thing as Helper;\n\
+                          record Helper { x: i64 }\n\
+                          func main() -> i64 { return 0 }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public record Thing { public y: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "Helper"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_variant_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_variant");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.Thing as Helper;\n\
+                          variant Helper { A, B }\n\
+                          func main() -> i64 { return 0 }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public variant Thing { X, Y }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "Helper"
+        );
+    }
+
+    #[test]
+    fn wrong_variant_with_a_single_alternative_owner_keeps_its_wording() {
+        let project = TempProject::new("wrong_variant_single_owner");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import first.First;\n\
+             import target.Target;\n\
+             func main() -> i64 { value x = Target.Shared; return 0 }\n",
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variant `First`, not `Target`"
+        );
+    }
+
+    /// Shared fixture for the multi-owner `WRONG_VARIANT` tests below:
+    /// `First` and `Second` both declare `Shared`; `Target` does not.
+    fn write_wrong_variant_multi_owner_project(project: &TempProject, first_import_first: bool) {
+        project.write("napitia.toml", MANIFEST);
+        let imports = if first_import_first {
+            "import first.First;\nimport second.Second;\n"
+        } else {
+            "import second.Second;\nimport first.First;\n"
+        };
+        project.write(
+            "src/main.npt",
+            &format!(
+                "{imports}import target.Target;\n\
+                 func main() -> i64 {{ value x = Target.Shared; return 0 }}\n"
+            ),
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write(
+            "src/second.npt",
+            "public variant Second { Shared(i64), Alt }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+    }
+
+    #[test]
+    fn wrong_variant_with_two_alternative_owners_lists_them_deterministically() {
+        let project = TempProject::new("wrong_variant_two_owners");
+        write_wrong_variant_multi_owner_project(&project, true);
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variants `First`, `Second`, not `Target`"
+        );
+    }
+
+    #[test]
+    fn wrong_variant_message_is_identical_regardless_of_import_order() {
+        let forward = TempProject::new("wrong_variant_order_forward");
+        write_wrong_variant_multi_owner_project(&forward, true);
+        let reversed = TempProject::new("wrong_variant_order_reversed");
+        write_wrong_variant_multi_owner_project(&reversed, false);
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let forward_diags =
+            compile_project(&forward.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let reversed_diags =
+            compile_project(&reversed.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(forward_diags.len(), 1, "unexpected: {forward_diags:?}");
+        assert_eq!(reversed_diags.len(), 1, "unexpected: {reversed_diags:?}");
+        assert_eq!(forward_diags[0].message, reversed_diags[0].message);
+        assert_eq!(
+            forward_diags[0].message,
+            "`Shared` is a case of variants `First`, `Second`, not `Target`"
+        );
+    }
+
+    #[test]
+    fn wrong_variant_never_duplicates_an_owner_reached_through_two_aliases() {
+        // `First` is imported twice, under two different aliases -- it
+        // must still be named exactly once in the owner list, alongside
+        // `Second` (a genuinely distinct variant), never twice.
+        let project = TempProject::new("wrong_variant_duplicate_alias");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import first.First as Figure;\n\
+             import first.First as Form;\n\
+             import second.Second;\n\
+             import target.Target;\n\
+             func main() -> i64 { value x = Target.Shared; return 0 }\n",
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write(
+            "src/second.npt",
+            "public variant Second { Shared(i64), Alt }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        // `First` has no unaliased import in scope here -- only its two
+        // aliases, `Figure` and `Form` -- so the owner list names it by
+        // whichever local spelling `variant_name` deterministically picks
+        // (`Figure`, lexicographically smallest), exactly once, never
+        // both `Figure` and `Form` for the same underlying ItemId.
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variants `Figure`, `Second`, not `Target`"
+        );
     }
 }

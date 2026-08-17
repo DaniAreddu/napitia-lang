@@ -151,8 +151,8 @@ fn dispatch_project(command: &str, manifest_path: &Path) -> ExitCode {
                 print_diagnostics(&diagnostics, &map);
                 exit_for(&diagnostics)
             }
-            ProjectIrOutput::Ready { nir } => {
-                print!("{}", crate::nir::print_module(&nir, &interner));
+            ProjectIrOutput::Ready { nir, registry } => {
+                print!("{}", crate::nir::print_module(&nir, &interner, &registry));
                 ExitCode::SUCCESS
             }
         },
@@ -207,8 +207,8 @@ fn ir_command(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Exi
             print_diagnostics(&diagnostics, map);
             exit_for(&diagnostics)
         }
-        IrOutput::Ready { nir } => {
-            print!("{}", crate::nir::print_module(&nir, interner));
+        IrOutput::Ready { nir, registry } => {
+            print!("{}", crate::nir::print_module(&nir, interner, &registry));
             ExitCode::SUCCESS
         }
     }

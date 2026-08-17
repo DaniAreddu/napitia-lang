@@ -1,6 +1,6 @@
 # Spec 0006: Napitia IR (NIR)
 
-- Status: Partially implemented (Alpha 0.1.1)
+- Status: Partially implemented (Alpha 0.1.3)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -108,12 +108,29 @@ The implementation includes a deterministic textual printer, used for
 debugging and for the `napitia ir` CLI subcommand:
 
 ```text
-func @add(%0: i64, %1: i64) -> i64 {
+func @add#0(%0: i64, %1: i64) -> i64 {
 bb0:
     %2 = add.i64 %0, %1
     ret %2
 }
 ```
+
+Every function, record, variant, call, construction, field/payload
+access, and pattern switch is named by its full identity,
+`module.path.name#id` (`add#0` above has an empty module path — legacy
+single-file compilation has no project-level module path at all) — and so
+is every *type* a nominal record/variant appears as: a parameter, a
+return type, an `alloc`, and any other typed instruction print a
+`Ty::Named` the same qualified way (`%0: sales.user.User#2`), not just
+item declarations and references. In project (multi-file) compilation
+this qualification is what lets two same-named items or types declared in
+different modules (`sales.user.User` and `admin.user.User`, say) always
+print distinguishably (`sales.user.User#2` vs. `admin.user.User#0`)
+rather than as the same ambiguous bare name; `#id` additionally guarantees
+two references can never be confused even in the degenerate case of two
+qualified names somehow colliding (Alpha 0.1.3, `rfcs/0007`). An import
+alias never appears in this output: the printed name is always an item's
+own canonical declared name.
 
 Printer output is stable across runs for the same input (no
 pointer-derived or nondeterministic identifiers), which is what makes it

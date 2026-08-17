@@ -71,8 +71,8 @@ fn a_bare_relative_manifest_path_works_from_inside_the_project_directory() {
     let ir = napitia_in_dir(&dir, &["ir", "napitia.toml"]);
     assert!(ir.status.success(), "ir failed: {}", stderr(&ir));
     let ir_text = stdout(&ir);
-    assert!(ir_text.contains("func @main"));
-    assert!(ir_text.contains("func @add"));
+    assert!(ir_text.contains("func @main.main#"));
+    assert!(ir_text.contains("func @math.add#"));
 
     let ran = napitia_in_dir(&dir, &["run", "napitia.toml"]);
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
@@ -102,8 +102,10 @@ fn ir_prints_nir_for_a_project_naming_both_modules() {
     let output = napitia(&["ir", &dir]);
     assert!(output.status.success(), "ir failed: {}", stderr(&output));
     let text = stdout(&output);
-    assert!(text.contains("func @main"));
-    assert!(text.contains("func @add"));
+    // Module-qualified (rfcs/0007): `main.npt`'s own `main` is module
+    // `main`, `math.npt`'s `add` is module `math`.
+    assert!(text.contains("func @main.main#"));
+    assert!(text.contains("func @math.add#"));
 }
 
 #[test]
@@ -466,4 +468,37 @@ fn backslash_paths_also_reach_the_project_on_windows() {
     let via_windows = napitia(&["run", &windows_style]);
     assert!(via_windows.status.success(), "{}", stderr(&via_windows));
     assert_eq!(stdout(&via_windows).trim(), "42");
+}
+
+#[test]
+fn two_same_named_record_types_are_usable_together_through_aliases() {
+    // `sales.user.User` and `admin.user.User` share both a name and a
+    // field shape; only aliasing lets both be named in `main`'s scope
+    // at once. 40 (from the aliased `SalesUser`) + 2 (from the aliased
+    // `AdminUser`) is the exact worked example from `rfcs/0007`.
+    let dir = project("alias_same_named_records");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn an_alias_never_makes_two_same_named_types_nominally_compatible() {
+    // Same two same-named, same-shaped `User` types as above, but this
+    // time a value of the aliased `SalesUser` is passed where
+    // `admin.user`'s own `user_id` expects its own `User` -- aliasing is
+    // only a local spelling, never a bridge between distinct types, so
+    // this must still be rejected as an ordinary type mismatch.
+    assert_project_check_fails_with("alias_nominal_mismatch", "T0001");
+}
+
+#[test]
+fn two_same_named_functions_are_callable_together_through_aliases() {
+    // `ops_a.calculate` and `ops_b.calculate` share a name; aliasing
+    // brings both into scope under distinct local names and each still
+    // calls its own, exact declaration (11 + 20).
+    let dir = project("alias_same_named_functions");
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "31");
 }

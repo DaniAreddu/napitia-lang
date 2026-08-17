@@ -2078,7 +2078,7 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        crate::nir::verify_module(&module, id, &interner)
+        crate::nir::verify_module(&module, id, &interner, &crate::hir::ItemRegistry::default())
     }
 
     #[test]

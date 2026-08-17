@@ -319,12 +319,19 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'import'
         let path = self.parse_path()?;
+        let alias = if self.eat(&TokenKind::As) {
+            Some(self.expect_ident("an alias name")?)
+        } else {
+            None
+        };
+        let last_span = alias.map_or(path.span, |a| a.span);
         let end = self
             .expect(&TokenKind::Semi, "`;`")
             .map(|t| t.span)
-            .unwrap_or(path.span);
+            .unwrap_or(last_span);
         Some(ImportDecl {
             path,
+            alias,
             span: start.join(end),
         })
     }
@@ -629,6 +636,70 @@ mod tests {
             panic!("expected import")
         };
         assert_eq!(i.path.segments.len(), 2);
+        assert!(i.alias.is_none());
+    }
+
+    #[test]
+    fn parses_aliased_import_declaration() {
+        let (module, diags) = parse("import sales.user.User as SalesUser;");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Import(i) = &module.items[0] else {
+            panic!("expected import")
+        };
+        assert_eq!(i.path.segments.len(), 3);
+        let alias = i.alias.expect("expected an alias");
+        // The alias's own span must be distinct from the imported name's
+        // (the path's last segment) -- they're two different tokens.
+        let imported_name = i.path.segments.last().unwrap();
+        assert_ne!(alias.span, imported_name.span);
+    }
+
+    #[test]
+    fn missing_alias_identifier_is_a_diagnostic_not_a_panic() {
+        let (module, diags) = parse("import sales.user.User as; func f() -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic");
+        assert_eq!(diags[0].code, "P0001");
+        // Recovery must still reach the function after the malformed
+        // import, not abandon the rest of the file.
+        assert!(
+            module
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(_))),
+            "expected recovery to still parse the function: {module:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_alias_token_recovers() {
+        let (module, diags) = parse("import sales.user.User as 42; func f() -> i64 { return 0 }");
+        assert!(!diags.is_empty(), "expected a diagnostic");
+        assert_eq!(diags[0].code, "P0001");
+        assert!(
+            module
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(_))),
+            "expected recovery to still parse the function: {module:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_tokens_after_an_alias_are_rejected_not_silently_accepted() {
+        let (module, diags) =
+            parse("import sales.user.User as SalesUser extra; func f() -> i64 { return 0 }");
+        assert!(
+            !diags.is_empty(),
+            "a trailing token after the alias must be diagnosed"
+        );
+        assert!(diags.iter().all(|d| d.code == "P0001"));
+        // The import itself, alias included, must still have parsed --
+        // only the unexpected trailing token (and whatever follows it
+        // until recovery resynchronizes) is rejected.
+        let Item::Import(i) = &module.items[0] else {
+            panic!("expected import")
+        };
+        assert!(i.alias.is_some(), "expected the alias to still parse");
     }
 
     #[test]

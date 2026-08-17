@@ -8,21 +8,26 @@
 //! sized type, so it is rejected here, once, before any function body
 //! is checked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{HirModule, ItemId};
+use crate::hir::{HirModule, ItemId, TypeParamId};
+use crate::limits::MAX_GENERIC_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::types::Ty;
+use crate::types::generics::{GenericInstanceKey, substitute};
 
 const INFINITE_AGGREGATE_LAYOUT: &str = "T0020";
 
-/// One declaration's outgoing edges: every other record/variant its
-/// fields/payloads directly reference, in declaration order, alongside
-/// the field/case name that introduced the edge (for the diagnostic's
-/// containment path) and the span to point at.
-struct Node {
+/// One declaration's own (unsubstituted) shape: its declared type
+/// parameters (in declaration order, with their display names) and the
+/// declared type of every field/payload position, alongside the
+/// field/case label and span to use if that edge ever turns out to
+/// close a cycle. Never itself concrete for a generic declaration --
+/// `substitute_edges` is what turns this into one instantiation's
+/// actual outgoing edges.
+struct Decl {
     name: Symbol,
     span: Span,
     /// The declaring module -- a cycle spanning more than one module is
@@ -33,23 +38,89 @@ struct Node {
     /// external parameter, so that guarantee is never load-bearing for
     /// correctness.
     source: SourceId,
-    edges: Vec<Edge>,
+    type_params: Vec<(TypeParamId, Symbol)>,
+    fields: Vec<(Ty, String, Span)>,
 }
 
-struct Edge {
-    to: ItemId,
-    /// e.g. `next` (a field name) or `Cons.0` (a payload position).
-    label: String,
-    span: Span,
+/// This declaration's own type parameters, applied to themselves
+/// (`Ty::Param(id, name)` for each) -- the "generic self" instance every
+/// declaration's own traversal starts from, so a self-referential
+/// generic layout (`Node[T] { next: Node[T] }`) closes back to its own
+/// starting instance exactly like a non-generic self-cycle does, and a
+/// declaration whose *own* body is not recursive (`Box[T] { value: T }`)
+/// correctly contributes no edges of its own until some other, concrete
+/// instantiation substitutes a real cycle into it.
+fn symbolic_self(decl_id: ItemId, decl: &Decl) -> GenericInstanceKey {
+    GenericInstanceKey::new(
+        decl_id,
+        decl.type_params
+            .iter()
+            .map(|(id, name)| Ty::Param(*id, *name))
+            .collect(),
+    )
+}
+
+/// The outgoing edges of one concrete instance: each of `decl`'s own
+/// field/payload types, with `instance`'s own arguments substituted for
+/// `decl`'s type parameters, then reduced to the target instance the
+/// substituted type refers to (a bare declaration for a `Ty::Named`
+/// target, or another applied instance for a `Ty::Applied` one). A
+/// substituted type that resolves to neither (a primitive, a still-bare
+/// `Ty::Param` because `instance`'s own arguments didn't cover it, ...)
+/// introduces no edge, matching how such a field can never itself be the
+/// source of an infinite layout.
+fn substitute_edges(
+    instance: &GenericInstanceKey,
+    decls: &HashMap<ItemId, Decl>,
+) -> Vec<(GenericInstanceKey, String, Span)> {
+    let Some(decl) = decls.get(&instance.declaration) else {
+        return Vec::new();
+    };
+    let subst: HashMap<TypeParamId, Ty> = decl
+        .type_params
+        .iter()
+        .map(|(id, _)| *id)
+        .zip(instance.arguments.iter().cloned())
+        .collect();
+    let mut edges = Vec::new();
+    for (ty, label, span) in &decl.fields {
+        let substituted = substitute(ty, &subst);
+        let target = match substituted {
+            Ty::Named(target, _) => Some(GenericInstanceKey::new(target, Vec::new())),
+            Ty::Applied(target, args) => Some(GenericInstanceKey::new(target, args)),
+            _ => None,
+        };
+        if let Some(target) = target {
+            edges.push((target, label.clone(), *span));
+        }
+    }
+    edges
 }
 
 /// Checks every declared record/variant for a direct or indirect cycle
 /// through its fields/payloads. `field_types`/`payload_types` are the
 /// already-resolved `Ty` for each record's fields (in declaration
-/// order) and each variant's case payloads (in declaration order) --
-/// this pass only follows `Ty::Named` edges, so it does not need (and
-/// must not need) the aggregate types to already be acyclic to resolve
-/// them.
+/// order) and each variant's case payloads (in declaration order).
+///
+/// A cycle is detected *after* substituting the concrete type arguments
+/// flowing through each edge, not just by following an applied type's
+/// bare declaration -- `record Box[T] { value: T }` alone is not
+/// infinite, but `record Node { next: Box[Node] }` is (`Node` ->
+/// `Box[Node]`'s own `value` field, substituted, is `Node` again),
+/// which a declaration-only graph can never see since `Box`'s own field
+/// is just `T` until something concrete flows through it (`rfcs/0008`).
+/// Traversal is over these substituted *instances*
+/// (`GenericInstanceKey`s), not bare declarations, so the same
+/// declaration instantiated two different ways is correctly treated as
+/// two different graph nodes.
+///
+/// A layout that never repeats an exact instance but keeps growing
+/// instead (`record Wrap[T] { inner: Wrap[Box[T]] }`) is exactly as
+/// unlayoutable as a literal cycle, so a traversal path deeper than
+/// [`MAX_GENERIC_DEPTH`] is reported the same way -- the same shared
+/// budget every other stage that walks a nested type application is
+/// bounded by, so no single check can recurse further than the rest of
+/// the compiler already agrees is meaningful.
 pub fn check_cycles(
     hir: &HirModule,
     field_types: &HashMap<ItemId, Vec<Ty>>,
@@ -61,71 +132,55 @@ pub fn check_cycles(
     // `HashMap`'s iteration order -- so the reported cycle is identical
     // across runs regardless of hashing.
     let mut order: Vec<ItemId> = Vec::new();
-    let mut nodes: HashMap<ItemId, Node> = HashMap::new();
+    let mut decls: HashMap<ItemId, Decl> = HashMap::new();
 
     for record in &hir.records {
         order.push(record.id);
         let types = field_types.get(&record.id).cloned().unwrap_or_default();
-        let mut edges = Vec::new();
-        for (field, ty) in record.fields.iter().zip(types.iter()) {
-            // A cycle through the *head* declaration of an applied
-            // generic type (`Node[T] { next: Node[T] }`) is exactly as
-            // infinite as a non-generic one -- Napitia still has no
-            // indirection to break it with regardless of what the type
-            // arguments are, so `Ty::Applied`'s own arguments are
-            // deliberately not walked into here (`rfcs/0008`): only
-            // whether the *declaration itself* recurs matters for this
-            // check.
-            let target = match ty {
-                Ty::Named(target, _) => Some(*target),
-                Ty::Applied(target, _) => Some(*target),
-                _ => None,
-            };
-            if let Some(target) = target {
-                edges.push(Edge {
-                    to: target,
-                    label: interner.resolve(field.name).to_string(),
-                    span: field.span,
-                });
-            }
-        }
-        nodes.insert(
+        let fields = record
+            .fields
+            .iter()
+            .zip(types.iter())
+            .map(|(field, ty)| {
+                (
+                    ty.clone(),
+                    interner.resolve(field.name).to_string(),
+                    field.span,
+                )
+            })
+            .collect();
+        decls.insert(
             record.id,
-            Node {
+            Decl {
                 name: record.name,
                 span: record.span,
                 source: record.source,
-                edges,
+                type_params: record.type_params.iter().map(|p| (p.id, p.name)).collect(),
+                fields,
             },
         );
     }
     for variant in &hir.variants {
         order.push(variant.id);
         let case_types = payload_types.get(&variant.id).cloned().unwrap_or_default();
-        let mut edges = Vec::new();
+        let mut fields = Vec::new();
         for (case, payload) in variant.cases.iter().zip(case_types.iter()) {
             for (i, ty) in payload.iter().enumerate() {
-                let target = match ty {
-                    Ty::Named(target, _) => Some(*target),
-                    Ty::Applied(target, _) => Some(*target),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    edges.push(Edge {
-                        to: target,
-                        label: format!("{}.{}", interner.resolve(case.name), i),
-                        span: case.span,
-                    });
-                }
+                fields.push((
+                    ty.clone(),
+                    format!("{}.{}", interner.resolve(case.name), i),
+                    case.span,
+                ));
             }
         }
-        nodes.insert(
+        decls.insert(
             variant.id,
-            Node {
+            Decl {
                 name: variant.name,
                 span: variant.span,
                 source: variant.source,
-                edges,
+                type_params: variant.type_params.iter().map(|p| (p.id, p.name)).collect(),
+                fields,
             },
         );
     }
@@ -137,55 +192,75 @@ pub fn check_cycles(
         Black,
     }
 
-    let mut color: HashMap<ItemId, Color> = order.iter().map(|id| (*id, Color::White)).collect();
+    let mut color: HashMap<GenericInstanceKey, Color> = HashMap::new();
     let mut diagnostics = Vec::new();
-    let mut reported: std::collections::HashSet<ItemId> = std::collections::HashSet::new();
+    // Dedup key: the declaration whose own traversal is responsible for
+    // the report (the cycle's closing target for a genuine repeat, or
+    // the declaration whose subtree hit the depth budget) -- so the same
+    // underlying problem reached from more than one starting point is
+    // reported once, not once per entry point.
+    let mut reported: HashSet<ItemId> = HashSet::new();
 
     // Iterative DFS (an explicit stack, never native recursion) so a
-    // pathologically long dependency chain cannot exhaust the Rust
-    // call stack -- work is bounded by the number of edges actually
-    // declared in the source.
+    // pathologically long dependency chain cannot exhaust the Rust call
+    // stack -- work is bounded by `MAX_GENERIC_DEPTH` on any one path,
+    // and by the number of distinct instances actually reachable
+    // (finite for every non-infinite layout) overall.
     for &start in &order {
-        if color[&start] != Color::White {
+        let start_key = symbolic_self(start, &decls[&start]);
+        if color.get(&start_key).copied().unwrap_or(Color::White) != Color::White {
             continue;
         }
-        // Each stack frame: the node being visited, and an index into
-        // its edge list of which edge to try next.
-        let mut stack: Vec<(ItemId, usize)> = vec![(start, 0)];
-        color.insert(start, Color::Gray);
-        let mut path: Vec<ItemId> = vec![start];
+        color.insert(start_key.clone(), Color::Gray);
+        let mut path: Vec<GenericInstanceKey> = vec![start_key.clone()];
+        let mut edges_stack: Vec<Vec<(GenericInstanceKey, String, Span)>> =
+            vec![substitute_edges(&start_key, &decls)];
+        let mut idx_stack: Vec<usize> = vec![0];
 
-        while let Some((current, edge_idx)) = stack.pop() {
-            let edges_len = nodes[&current].edges.len();
-            if edge_idx >= edges_len {
+        while let Some(current) = path.last().cloned() {
+            let idx = *idx_stack
+                .last()
+                .expect("path and idx_stack stay in lockstep");
+            let edges = edges_stack
+                .last()
+                .expect("path and edges_stack stay in lockstep");
+            if idx >= edges.len() {
                 color.insert(current, Color::Black);
                 path.pop();
+                edges_stack.pop();
+                idx_stack.pop();
                 continue;
             }
-            // Re-push the current frame with the next edge index before
-            // descending, so control returns here after the child
-            // finishes.
-            stack.push((current, edge_idx + 1));
-            let edge = &nodes[&current].edges[edge_idx];
-            let target = edge.to;
-            match color.get(&target).copied().unwrap_or(Color::Black) {
+            let (target, label, span) = edges[idx].clone();
+            *idx_stack.last_mut().unwrap() += 1;
+
+            match color.get(&target).copied().unwrap_or(Color::White) {
                 Color::White => {
-                    color.insert(target, Color::Gray);
+                    if path.len() >= MAX_GENERIC_DEPTH {
+                        if reported.insert(start) {
+                            diagnostics
+                                .push(budget_diagnostic(start, &decls, &label, span, interner));
+                        }
+                        continue;
+                    }
+                    color.insert(target.clone(), Color::Gray);
+                    edges_stack.push(substitute_edges(&target, &decls));
+                    idx_stack.push(0);
                     path.push(target);
-                    stack.push((target, 0));
                 }
                 Color::Gray => {
                     // Found a cycle: `target` is still on the current
                     // path. Report it once per distinct cycle entry
                     // point, using the path from `target`'s first
                     // occurrence back to itself.
-                    if let Some(start_idx) = path.iter().position(|id| *id == target)
-                        && reported.insert(target)
+                    if let Some(start_idx) = path.iter().position(|k| *k == target)
+                        && reported.insert(target.declaration)
                     {
                         diagnostics.push(cycle_diagnostic(
                             &path[start_idx..],
-                            &nodes,
-                            edge,
+                            &decls,
+                            &label,
+                            span,
                             interner,
                         ));
                     }
@@ -198,46 +273,125 @@ pub fn check_cycles(
     diagnostics
 }
 
+/// Renders one instance (a declaration plus its own concrete arguments,
+/// if any) the way a cycle's path text names each of its steps --
+/// `Node`, or `Box[Node]`, or a nested `Wrap[Box[Node]]`.
+fn instance_display(
+    key: &GenericInstanceKey,
+    decls: &HashMap<ItemId, Decl>,
+    interner: &Interner,
+) -> String {
+    let name = decls
+        .get(&key.declaration)
+        .map(|d| interner.resolve(d.name))
+        .unwrap_or("?");
+    if key.arguments.is_empty() {
+        return name.to_string();
+    }
+    let parts: Vec<String> = key
+        .arguments
+        .iter()
+        .map(|a| arg_display(a, decls, interner))
+        .collect();
+    format!("{name}[{}]", parts.join(", "))
+}
+
+/// Like [`instance_display`], but for one type argument found *inside*
+/// an instance's own argument list (which is a plain `Ty`, not
+/// necessarily a `GenericInstanceKey` -- it may be a primitive, a bare
+/// named type, or another nested application).
+fn arg_display(ty: &Ty, decls: &HashMap<ItemId, Decl>, interner: &Interner) -> String {
+    match ty {
+        Ty::Named(item, sym) => decls
+            .get(item)
+            .map(|d| interner.resolve(d.name).to_string())
+            .unwrap_or_else(|| interner.resolve(*sym).to_string()),
+        Ty::Applied(item, args) => instance_display(
+            &GenericInstanceKey::new(*item, args.clone()),
+            decls,
+            interner,
+        ),
+        Ty::Param(_, name) => interner.resolve(*name).to_string(),
+        other => crate::types::display_ty(other, interner),
+    }
+}
+
 fn cycle_diagnostic(
-    cycle: &[ItemId],
-    nodes: &HashMap<ItemId, Node>,
-    closing_edge: &Edge,
+    cycle: &[GenericInstanceKey],
+    decls: &HashMap<ItemId, Decl>,
+    closing_label: &str,
+    closing_span: Span,
     interner: &Interner,
 ) -> Diagnostic {
-    let source = nodes[&cycle[0]].source;
+    let source = decls[&cycle[0].declaration].source;
     let mut path_text = String::new();
-    for id in cycle {
+    for key in cycle {
         if !path_text.is_empty() {
             path_text.push_str(" -> ");
         }
-        path_text.push_str(interner.resolve(nodes[id].name));
+        path_text.push_str(&instance_display(key, decls, interner));
     }
     // The cycle always closes back to its own entry point (`cycle[0]`,
-    // the same node `closing_edge` targets) -- never to whichever node
-    // happened to be current when the closing edge was found, which for
-    // an indirect cycle is a different, *later* node on the path (e.g.
-    // `A -> B -> A` must render as exactly that, not `A -> B -> B`).
+    // the same instance the closing edge targets) -- never to whichever
+    // instance happened to be current when the closing edge was found,
+    // which for an indirect cycle is a different, *later* step on the
+    // path (e.g. `A -> B -> A` must render as exactly that, not
+    // `A -> B -> B`).
     path_text.push_str(" -> ");
-    path_text.push_str(interner.resolve(nodes[&cycle[0]].name));
+    path_text.push_str(&instance_display(&cycle[0], decls, interner));
 
-    let head_name = interner.resolve(nodes[&cycle[0]].name);
+    let head_name = interner.resolve(decls[&cycle[0].declaration].name);
     let mut diag = Diagnostic::error(
         INFINITE_AGGREGATE_LAYOUT,
         source,
-        closing_edge.span,
+        closing_span,
         format!(
-            "`{head_name}` has an infinite layout: {path_text} (via `.{}`), and Napitia has no \
-             indirection feature yet to break the cycle with",
-            closing_edge.label
+            "`{head_name}` has an infinite layout: {path_text} (via `.{closing_label}`), and \
+             Napitia has no indirection feature yet to break the cycle with"
         ),
     )
     .with_primary_label("this field/payload closes the cycle");
-    for id in cycle {
-        let node = &nodes[id];
-        let name = interner.resolve(node.name);
-        diag = diag.with_label(node.span, format!("part of the cycle: `{name}`"));
+    for key in cycle {
+        let decl = &decls[&key.declaration];
+        diag = diag.with_label(
+            decl.span,
+            format!(
+                "part of the cycle: `{}`",
+                instance_display(key, decls, interner)
+            ),
+        );
     }
     diag
+}
+
+/// A traversal path deeper than `MAX_GENERIC_DEPTH` without ever
+/// repeating an exact instance -- an expanding substitution
+/// (`Wrap[T] { inner: Wrap[Box[T]] }`) that would keep growing forever
+/// rather than closing a literal cycle. Reported the same way an actual
+/// cycle is (this is exactly as unlayoutable), naming the declaration
+/// whose own traversal hit the bound rather than any one particular
+/// instance along the way, since there is no single instance that
+/// "closes" an expansion that never repeats.
+fn budget_diagnostic(
+    start: ItemId,
+    decls: &HashMap<ItemId, Decl>,
+    closing_label: &str,
+    closing_span: Span,
+    interner: &Interner,
+) -> Diagnostic {
+    let decl = &decls[&start];
+    let head_name = interner.resolve(decl.name);
+    Diagnostic::error(
+        INFINITE_AGGREGATE_LAYOUT,
+        decl.source,
+        closing_span,
+        format!(
+            "`{head_name}` has an infinite layout: substituting concrete type arguments through \
+             `.{closing_label}` never stops growing within {MAX_GENERIC_DEPTH} levels, and \
+             Napitia has no indirection feature yet to break the cycle with"
+        ),
+    )
+    .with_primary_label("this field/payload never stops expanding")
 }
 
 #[cfg(test)]
@@ -399,6 +553,376 @@ mod tests {
         );
         assert!(
             diagnostics[0].message.contains("A -> B -> A"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    /// A generic record with `type_params` (a single `T`) and one field
+    /// of `field_ty` -- unlike `record`, this lets a test build a
+    /// `Box[T] { payload: T }`-shaped declaration directly.
+    fn generic_record(
+        id: u32,
+        name: Symbol,
+        type_param: TypeParamId,
+        type_param_name: Symbol,
+        field_name: Symbol,
+        field_ty: Ty,
+        source: SourceId,
+    ) -> (HirRecord, Ty) {
+        (
+            HirRecord {
+                id: ItemId(id),
+                name,
+                span: Span::dummy(),
+                source,
+                public: true,
+                type_params: vec![crate::hir::HirTypeParam {
+                    id: type_param,
+                    name: type_param_name,
+                    span: Span::dummy(),
+                }],
+                fields: vec![HirField {
+                    name: field_name,
+                    span: Span::dummy(),
+                    public: true,
+                    ty: crate::hir::HirType::Unresolved {
+                        name,
+                        span: Span::dummy(),
+                    },
+                }],
+            },
+            field_ty,
+        )
+    }
+
+    /// Like `generic_record`, but a variant with a single `T`-headed
+    /// case (`List[T] { Cons(T, List[T]) }`-shaped), with a caller-
+    /// supplied list of payload types for that one case.
+    fn generic_variant(
+        id: u32,
+        name: Symbol,
+        type_param: TypeParamId,
+        type_param_name: Symbol,
+        case_name: Symbol,
+        payload: Vec<Ty>,
+        source: SourceId,
+    ) -> (HirVariant, Vec<Ty>) {
+        let payload_len = payload.len();
+        (
+            HirVariant {
+                id: ItemId(id),
+                name,
+                span: Span::dummy(),
+                source,
+                public: true,
+                type_params: vec![crate::hir::HirTypeParam {
+                    id: type_param,
+                    name: type_param_name,
+                    span: Span::dummy(),
+                }],
+                cases: vec![HirCase {
+                    name: case_name,
+                    span: Span::dummy(),
+                    payload: (0..payload_len)
+                        .map(|_| crate::hir::HirType::Unresolved {
+                            name,
+                            span: Span::dummy(),
+                        })
+                        .collect(),
+                }],
+            },
+            payload,
+        )
+    }
+
+    /// `record Box[T] { payload: T } record Node { next: Box[Node] }` --
+    /// the parameter-mediated case a declaration-only (head-only) cycle
+    /// graph cannot see: `Box`'s own field is just `T`, and only becomes
+    /// `Node` again once `Node`'s own concrete field substitutes it in.
+    #[test]
+    fn parameter_mediated_cycle_through_a_generic_record_is_detected() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let node = interner.intern("Node");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let next = interner.intern("next");
+        let payload = interner.intern("payload");
+        let box_id = ItemId(1);
+        let node_id = ItemId(0);
+
+        let (node_record, node_field_ty) = record(
+            0,
+            node,
+            next,
+            Ty::Applied(box_id, vec![Ty::Named(node_id, node)]),
+            source,
+        );
+        let (box_record, box_field_ty) = generic_record(
+            1,
+            boxed,
+            TypeParamId(0),
+            t,
+            payload,
+            Ty::Param(TypeParamId(0), t),
+            source,
+        );
+
+        let mut field_types = HashMap::new();
+        field_types.insert(node_record.id, vec![node_field_ty]);
+        field_types.insert(box_record.id, vec![box_field_ty]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![node_record, box_record],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("Node -> Box[Node] -> Node"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `record Box[T] { payload: T }` alone: `T` is never itself an
+    /// applied/named type, so this declaration contributes no edges of
+    /// its own and must not be flagged -- only instantiating it with
+    /// something that recurs back (covered above) is infinite.
+    #[test]
+    fn a_generic_record_with_no_self_reference_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        let payload = interner.intern("payload");
+        let (box_record, box_field_ty) = generic_record(
+            0,
+            boxed,
+            TypeParamId(0),
+            t,
+            payload,
+            Ty::Param(TypeParamId(0), t),
+            source,
+        );
+        let mut field_types = HashMap::new();
+        field_types.insert(box_record.id, vec![box_field_ty]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![box_record],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// `record Outer[T] { inner: Box[T] } record Box[T] { payload: T }`
+    /// -- a nested application through two distinct generic declarations
+    /// with no recursion at all, which must remain accepted.
+    #[test]
+    fn nested_generic_application_with_no_cycle_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let outer = interner.intern("Outer");
+        let boxed = interner.intern("Box");
+        let t_outer = interner.intern("T");
+        let t_box = interner.intern("T");
+        let inner = interner.intern("inner");
+        let payload = interner.intern("payload");
+        let box_id = ItemId(1);
+
+        let (outer_record, outer_field_ty) = generic_record(
+            0,
+            outer,
+            TypeParamId(0),
+            t_outer,
+            inner,
+            Ty::Applied(box_id, vec![Ty::Param(TypeParamId(0), t_outer)]),
+            source,
+        );
+        let (box_record, box_field_ty) = generic_record(
+            1,
+            boxed,
+            TypeParamId(1),
+            t_box,
+            payload,
+            Ty::Param(TypeParamId(1), t_box),
+            source,
+        );
+        let mut field_types = HashMap::new();
+        field_types.insert(outer_record.id, vec![outer_field_ty]);
+        field_types.insert(box_record.id, vec![box_field_ty]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![outer_record, box_record],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// `record Node[T] { next: Node[T] }` -- the head-only case the
+    /// original, declaration-only graph already caught; still must be
+    /// caught by the substitution-aware traversal that replaced it.
+    #[test]
+    fn self_referential_generic_record_is_still_detected() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let node = interner.intern("Node");
+        let t = interner.intern("T");
+        let next = interner.intern("next");
+        let node_id = ItemId(0);
+        let (node_record, field_ty) = generic_record(
+            0,
+            node,
+            TypeParamId(0),
+            t,
+            next,
+            Ty::Applied(node_id, vec![Ty::Param(TypeParamId(0), t)]),
+            source,
+        );
+        let mut field_types = HashMap::new();
+        field_types.insert(node_record.id, vec![field_ty]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![node_record],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("Node[T] -> Node[T]"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `variant List[T] { Cons(T, List[T]) }` -- the generic-variant
+    /// analog of the record self-cycle above.
+    #[test]
+    fn self_referential_generic_variant_is_detected() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let list = interner.intern("List");
+        let t = interner.intern("T");
+        let cons = interner.intern("Cons");
+        let list_id = ItemId(0);
+        let (list_variant, payload) = generic_variant(
+            0,
+            list,
+            TypeParamId(0),
+            t,
+            cons,
+            vec![
+                Ty::Param(TypeParamId(0), t),
+                Ty::Applied(list_id, vec![Ty::Param(TypeParamId(0), t)]),
+            ],
+            source,
+        );
+        let mut payload_types = HashMap::new();
+        payload_types.insert(list_variant.id, vec![payload]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: Vec::new(),
+            variants: vec![list_variant],
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &HashMap::new(), &payload_types, &interner);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("List[T] -> List[T]"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `record Wrap[T] { inner: Wrap[Box[T]] } record Box[T] { payload: T }`
+    /// -- every instance along this path is distinct (`Wrap[T]`,
+    /// `Wrap[Box[T]]`, `Wrap[Box[Box[T]]]`, ...), so a literal-repeat
+    /// check alone would recurse forever; this must instead terminate
+    /// (the test finishing at all is the no-hang assertion) by hitting
+    /// the shared generic-depth budget.
+    #[test]
+    fn expanding_generic_substitution_hits_the_depth_budget_not_a_hang() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let wrap = interner.intern("Wrap");
+        let boxed = interner.intern("Box");
+        let t_wrap = interner.intern("T");
+        let t_box = interner.intern("T");
+        let inner = interner.intern("inner");
+        let payload = interner.intern("payload");
+        let wrap_id = ItemId(0);
+        let box_id = ItemId(1);
+
+        let (wrap_record, wrap_field_ty) = generic_record(
+            0,
+            wrap,
+            TypeParamId(0),
+            t_wrap,
+            inner,
+            Ty::Applied(
+                wrap_id,
+                vec![Ty::Applied(box_id, vec![Ty::Param(TypeParamId(0), t_wrap)])],
+            ),
+            source,
+        );
+        let (box_record, box_field_ty) = generic_record(
+            1,
+            boxed,
+            TypeParamId(1),
+            t_box,
+            payload,
+            Ty::Param(TypeParamId(1), t_box),
+            source,
+        );
+        let mut field_types = HashMap::new();
+        field_types.insert(wrap_record.id, vec![wrap_field_ty]);
+        field_types.insert(box_record.id, vec![box_field_ty]);
+        let hir = HirModule {
+            functions: Vec::new(),
+            records: vec![wrap_record, box_record],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("Wrap")
+                && diagnostics[0].message.contains("never stops growing"),
             "{}",
             diagnostics[0].message
         );

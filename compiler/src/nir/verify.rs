@@ -2130,6 +2130,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -2155,6 +2156,8 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![valid_function(ItemId(0), name)],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2174,6 +2177,8 @@ mod tests {
         let a = interner.intern("a");
         let b = interner.intern("b");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![valid_function(ItemId(0), a), valid_function(ItemId(0), b)],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2195,6 +2200,8 @@ mod tests {
             terminator: Terminator::Return(None),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2212,6 +2219,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.blocks.clear();
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2229,6 +2238,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.blocks[0].terminator = Terminator::Branch(BlockId(99));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2247,9 +2258,11 @@ mod tests {
         function.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(42), Vec::new(), Vec::new()),
+            kind: ValueKind::Call(ItemId(42), Vec::new(), Vec::new(), Vec::new()),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2268,6 +2281,8 @@ mod tests {
         // %99 is never defined anywhere in this function.
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(99)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2290,6 +2305,8 @@ mod tests {
             kind: ValueKind::Load(ValueId(0)),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2323,6 +2340,8 @@ mod tests {
         ];
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2344,6 +2363,8 @@ mod tests {
             else_block: BlockId(0),
         };
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2361,6 +2382,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Bool; // body still returns an i64
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2396,6 +2419,8 @@ mod tests {
         ];
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(2)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2413,6 +2438,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Var(crate::types::TyVar(0));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2430,6 +2457,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Error;
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2450,10 +2479,12 @@ mod tests {
             result: ValueId(1),
             ty: Ty::I64,
             // `g` takes zero parameters; this call passes one.
-            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)], Vec::new()),
         });
         let callee = valid_function(ItemId(0), g_name);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2475,6 +2506,8 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records,
             variants,
@@ -2510,6 +2543,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -2563,6 +2597,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2674,6 +2709,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2752,6 +2788,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2782,6 +2819,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -2813,6 +2851,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -3001,6 +3040,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3113,6 +3153,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3160,6 +3201,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3229,6 +3271,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3333,6 +3376,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3619,9 +3663,11 @@ mod tests {
             result: ValueId(1),
             ty: Ty::I64,
             // `g` declares one type parameter; this call supplies none.
-            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)], Vec::new()),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3660,10 +3706,12 @@ mod tests {
         caller.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(0), vec![Ty::I64], vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), vec![Ty::I64], vec![ValueId(0)], Vec::new()),
         });
         caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3887,6 +3935,8 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: vec![(record, record_layout)],
             variants: vec![(variant, variant_layout)],
@@ -3957,6 +4007,7 @@ mod tests {
             id,
             name,
             type_params: vec![(TypeParamId(0), t)],
+            requirements: Vec::new(),
             params: vec![crate::nir::Param {
                 value: ValueId(0),
                 ty: Ty::I64,
@@ -3978,7 +4029,7 @@ mod tests {
         caller.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(0), vec![type_arg], vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), vec![type_arg], vec![ValueId(0)], Vec::new()),
         });
         caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         caller
@@ -3993,6 +4044,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Error);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -4015,6 +4068,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Var(crate::types::TyVar(0)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -4038,6 +4093,8 @@ mod tests {
         let unknown = ItemId(9999);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(unknown, vec![Ty::I64]));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -4073,6 +4130,8 @@ mod tests {
         };
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(pair, vec![Ty::I64]));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: vec![(pair, pair_layout)],
             variants: Vec::new(),
@@ -4108,6 +4167,8 @@ mod tests {
         }
         let caller = caller_calling_g_with_type_arg(f_name, deep_ty);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: vec![(box_item, box_layout)],
             variants: Vec::new(),
@@ -4136,6 +4197,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Bool);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),

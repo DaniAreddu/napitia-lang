@@ -289,8 +289,10 @@ which by construction can only ever produce an item's true declared
 identity. Single-file compilation still prints valid, readable NIR: with
 an empty module path, `@add#0` is what a bare `func add` becomes, and a
 bare `record User`'s own parameter/return/alloc positions print `User#0`
-(the `#id` suffix is not new to single-file mode's *format*, just newly
-documented here — 0.1.2's printer already suffixed ids the same way).
+(the `#id` suffix itself is new in this milestone — 0.1.2's printer
+emitted a bare `func @add`, with no id at all; single-file mode simply
+goes through the same now-qualified printer every other compilation does,
+so it gains the same `#id` suffix rather than being a special case).
 
 `nir::printer` and `nir::verify` both gained an `&ItemRegistry` parameter
 threaded alongside their existing `&Interner` one; every prior call to

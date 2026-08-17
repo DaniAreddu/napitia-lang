@@ -208,14 +208,19 @@ func main() -> i64 {
 already were — an alias is a local spelling only, never a merge: passing
 a `SalesUser` value anywhere `admin.user`'s own declaration is expected is
 still an ordinary type error, and the message names both sides
-unambiguously: `expected `admin.user.User`, found `sales.user.User``.
-`napitia ir`'s textual output qualifies every item, and every type in a
-parameter/return/allocation position, by its declaring module
-(`sales.user.User#2`, not just `User`), so two same-named items from
-different modules always print distinguishably there too; aliases never
-appear in either diagnostics or NIR output, only each item's own true
-declared name. See `rfcs/0007-module-identity-and-import-aliases.md` for
-the full design, the collision rules, and the current honest limitations.
+unambiguously, showing `admin.user.User` and `sales.user.User` rather
+than the same bare `User` twice. `napitia ir`'s textual output qualifies
+every item, and every type in a parameter/return/allocation position, by
+its declaring module (`sales.user.User#2`, not just `User`), so two
+same-named items from different modules always print distinguishably
+there too. Nominal types in both typechecker diagnostics and textual NIR
+always use an item's canonical, module-qualified declaration name, never
+an import alias substituted in its place; an alias-related resolution
+diagnostic (an import colliding with something else, say) is a different
+case and may naturally display the local alias that caused it, since
+that alias is exactly what the diagnostic is about. See
+`rfcs/0007-module-identity-and-import-aliases.md` for the full design,
+the collision rules, and the current honest limitations.
 
 ### Explicitly not yet implemented
 

@@ -414,7 +414,7 @@ impl<'a> Parser<'a> {
                 members.push(member);
             }
             if self.pos == before {
-                recovery::synchronize_to_stmt(self);
+                recovery::synchronize_to_member_start(self);
             }
         }
         let end = self
@@ -458,7 +458,7 @@ impl<'a> Parser<'a> {
                 functions.push(func);
             }
             if self.pos == before {
-                recovery::synchronize_to_stmt(self);
+                recovery::synchronize_to_member_start(self);
             }
         }
         let end = self
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn parses_protocol_declaration() {
-        let (module, diags) = parse("protocol Encodable[T] { func encode(value: T) -> str; }");
+        let (module, diags) = parse("protocol Encodable[T] { func encode(target: T) -> str; }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let Item::Protocol(p) = &module.items[0] else {
             panic!("expected protocol")

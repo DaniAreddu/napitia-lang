@@ -1,0 +1,10 @@
+// INVALID: both arguments must share one inferred T; i64 and bool
+// conflict. Rejected (T0025/T0026), never silently picking one side
+// (Alpha 0.1.4, rfcs/0008).
+func choose[T](left: T, right: T) -> T {
+    return left
+}
+
+func main() -> i64 {
+    return choose(1, true)
+}

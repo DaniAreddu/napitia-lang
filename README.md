@@ -207,13 +207,15 @@ func main() -> i64 {
 `SalesUser` and `AdminUser` remain exactly the two distinct types they
 already were — an alias is a local spelling only, never a merge: passing
 a `SalesUser` value anywhere `admin.user`'s own declaration is expected is
-still an ordinary type error, alias or not. `napitia ir`'s textual output
-qualifies every item by its declaring module (`sales.user.User#2`, not
-just `User`), so two same-named items from different modules always print
-distinguishably; aliases never appear in that output, only each item's own
-true declared name. See `rfcs/0007-module-identity-and-import-aliases.md`
-for the full design, the collision rules, and the current honest
-limitations (typeck's own diagnostics are not yet module-qualified).
+still an ordinary type error, and the message names both sides
+unambiguously: `expected `admin.user.User`, found `sales.user.User``.
+`napitia ir`'s textual output qualifies every item, and every type in a
+parameter/return/allocation position, by its declaring module
+(`sales.user.User#2`, not just `User`), so two same-named items from
+different modules always print distinguishably there too; aliases never
+appear in either diagnostics or NIR output, only each item's own true
+declared name. See `rfcs/0007-module-identity-and-import-aliases.md` for
+the full design, the collision rules, and the current honest limitations.
 
 ### Explicitly not yet implemented
 

@@ -50,6 +50,32 @@ pub struct ExprId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PatternId(pub(crate) u32);
 
+/// Identifies one declaration-local generic type parameter (the `T` in
+/// `func identity[T](value: T) -> T`) for the lifetime of one
+/// compilation session -- distinct from every other identity newtype
+/// here, and in particular never equal across two declarations that
+/// happen to spell their parameter the same way (`rfcs/0008`):
+///
+/// ```text
+/// func first[T](value: T) -> T { value }
+/// func second[T](value: T) -> T { value }
+/// ```
+///
+/// `first`'s `T` and `second`'s `T` are unrelated parameters with
+/// unrelated `TypeParamId`s, even though both are spelled `T` and both
+/// resolve (via `Symbol`) to the same interned string.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeParamId(pub(crate) u32);
+
+/// One declaration's own generic parameter: a stable identity plus the
+/// name it was declared under, for display.
+#[derive(Debug, Clone, Copy)]
+pub struct HirTypeParam {
+    pub id: TypeParamId,
+    pub name: Symbol,
+    pub span: Span,
+}
+
 /// Which kind of declaration an [`HirType::Aggregate`] reference
 /// resolved to -- carried so a diagnostic can say "record" or "variant"
 /// without a second identity lookup.
@@ -75,6 +101,24 @@ pub enum HirType {
         item: ItemId,
         kind: AggregateKind,
         name: Symbol,
+        /// Resolved type arguments from a bracketed application
+        /// (`Box[i64]`, `Pair[i64, str]`), recursively resolved the same
+        /// way -- empty for a reference to a non-generic aggregate.
+        /// Arity (does this match the declaration's own parameter count)
+        /// is validated later, by `typeck`, against the merged
+        /// declaration it resolves to; HIR only records what was
+        /// structurally written (`rfcs/0008`).
+        args: Vec<HirType>,
+        span: Span,
+    },
+    /// A reference to one of the *enclosing declaration's own* generic
+    /// parameters (`T` inside `func identity[T](value: T) -> T`),
+    /// resolved to that parameter's exact identity -- never re-derived
+    /// from a bare name later, the same way [`HirType::Aggregate`]'s
+    /// `item` never is.
+    Param {
+        id: TypeParamId,
+        name: Symbol,
         span: Span,
     },
     Unresolved {
@@ -86,7 +130,9 @@ pub enum HirType {
 impl HirType {
     pub fn span(&self) -> Span {
         match self {
-            HirType::Aggregate { span, .. } | HirType::Unresolved { span, .. } => *span,
+            HirType::Aggregate { span, .. }
+            | HirType::Param { span, .. }
+            | HirType::Unresolved { span, .. } => *span,
         }
     }
 }
@@ -125,6 +171,10 @@ pub struct OtherItem {
 pub struct HirRecord {
     pub id: ItemId,
     pub name: Symbol,
+    /// This record's own generic parameters (`rfcs/0008`), empty for a
+    /// non-generic record. Field types may reference these by
+    /// [`HirType::Param`].
+    pub type_params: Vec<HirTypeParam>,
     pub span: Span,
     /// The module this record was declared in, always the source
     /// `hir::lower_module` (or `lower_module_with_imports`) actually ran
@@ -159,6 +209,8 @@ pub struct HirField {
 pub struct HirVariant {
     pub id: ItemId,
     pub name: Symbol,
+    /// See [`HirRecord::type_params`].
+    pub type_params: Vec<HirTypeParam>,
     pub span: Span,
     /// See [`HirRecord::source`].
     pub source: SourceId,
@@ -181,6 +233,8 @@ pub struct HirFunction {
     pub id: ItemId,
     pub name: Symbol,
     pub name_span: Span,
+    /// See [`HirRecord::type_params`].
+    pub type_params: Vec<HirTypeParam>,
     /// See [`HirRecord::source`].
     pub source: SourceId,
     /// See [`HirRecord::public`].
@@ -280,11 +334,15 @@ pub enum HirExpr {
         name: Symbol,
         span: Span,
     },
-    /// A resolved reference to a module-level function.
+    /// A resolved reference to a module-level function. `type_args` is
+    /// non-empty only for an explicit application (`identity[i64]`,
+    /// `rfcs/0008`); an inferred generic call leaves it empty and
+    /// `typeck` fills in the instantiation it infers.
     Function {
         id: ExprId,
         item: ItemId,
         name: Symbol,
+        type_args: Vec<HirType>,
         span: Span,
     },
     /// A resolved reference to a variant case constructor (`Variant.Case`
@@ -299,6 +357,10 @@ pub enum HirExpr {
         variant: ItemId,
         case: usize,
         name: Symbol,
+        /// Non-empty only for an explicit qualified application
+        /// (`Maybe[i64].Some`/`Maybe[i64].None`, `rfcs/0008`); otherwise
+        /// `typeck` infers the instantiation from context.
+        type_args: Vec<HirType>,
         span: Span,
     },
     Unary {
@@ -384,6 +446,11 @@ pub enum HirExpr {
     RecordLiteral {
         id: ExprId,
         record: ItemId,
+        /// `[i64]` written directly after the type name (`rfcs/0008`) --
+        /// generic record construction always requires this explicitly
+        /// (there is no inferred-from-fields form), so this is empty
+        /// only for a non-generic record.
+        type_args: Vec<HirType>,
         fields: Vec<HirFieldInit>,
         span: Span,
     },

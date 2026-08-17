@@ -33,6 +33,22 @@ fn qualified_ref(id: ItemId, registry: &ItemRegistry, interner: &Interner) -> St
     format!("{}#{}", registry.qualified_name(id, interner), id.0)
 }
 
+/// Formats a type for textual NIR. Primitives keep their existing
+/// spelling; a nominal `Ty::Named` renders through the same
+/// `qualified_ref` every declaration and reference already uses, so two
+/// same-named types declared in different modules (`sales.user.User` vs
+/// `admin.user.User`) always print distinguishably here too -- in
+/// parameter/return positions, allocations, loads, and every other typed
+/// instruction -- never as the same ambiguous bare name (`rfcs/0007`).
+/// An import alias never appears: the name always comes from the
+/// registry's own canonical declared name, exactly like `qualified_ref`.
+fn format_ty(ty: &Ty, interner: &Interner, registry: &ItemRegistry) -> String {
+    match ty {
+        Ty::Named(item, _) => qualified_ref(*item, registry, interner),
+        other => display_ty(other, interner),
+    }
+}
+
 pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistry) -> String {
     let mut out = String::new();
     for (i, function) in module.functions.iter().enumerate() {
@@ -53,14 +69,14 @@ fn print_function(
     let params = function
         .params
         .iter()
-        .map(|p| format!("%{}: {}", p.value.0, display_ty(&p.ty, interner)))
+        .map(|p| format!("%{}: {}", p.value.0, format_ty(&p.ty, interner, registry)))
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(
         out,
         "func @{}({params}) -> {} {{",
         qualified_ref(function.id, registry, interner),
-        display_ty(&function.return_type, interner)
+        format_ty(&function.return_type, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
     // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
@@ -142,7 +158,7 @@ fn format_value_kind(
     interner: &Interner,
     registry: &ItemRegistry,
 ) -> String {
-    let ty_name = display_ty(ty, interner);
+    let ty_name = format_ty(ty, interner, registry);
     match kind {
         ValueKind::Alloc => format!("alloc.{ty_name}"),
         ValueKind::Const(c) => format!("const.{ty_name} {}", format_const(c)),
@@ -162,7 +178,7 @@ fn format_value_kind(
         ValueKind::Eq(a, b) => {
             format!(
                 "eq.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -170,7 +186,7 @@ fn format_value_kind(
         ValueKind::Ne(a, b) => {
             format!(
                 "ne.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -178,7 +194,7 @@ fn format_value_kind(
         ValueKind::Lt(a, b) => {
             format!(
                 "lt.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -186,7 +202,7 @@ fn format_value_kind(
         ValueKind::Le(a, b) => {
             format!(
                 "le.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -194,7 +210,7 @@ fn format_value_kind(
         ValueKind::Gt(a, b) => {
             format!(
                 "gt.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -202,7 +218,7 @@ fn format_value_kind(
         ValueKind::Ge(a, b) => {
             format!(
                 "ge.{} %{}, %{}",
-                display_ty(operand_ty(*a, ty, value_types), interner),
+                format_ty(operand_ty(*a, ty, value_types), interner, registry),
                 a.0,
                 b.0
             )
@@ -382,5 +398,30 @@ mod tests {
     fn prints_conditional_branches_for_if() {
         let text = print("func f(x: bool) -> i64 { if x { return 1 } return 0 }");
         assert!(text.contains("condbr"));
+    }
+
+    #[test]
+    fn single_file_nir_qualifies_a_nominal_parameter_type_with_just_its_own_id() {
+        // Single-file compilation has no project-level module path
+        // (`rfcs/0007`) -- a nominal type in a parameter position must
+        // still print readably as its bare declared name plus its own
+        // `ItemId`, the same `#id` suffix every other item reference
+        // gets, never a raw `ItemId` alone and never a module-path
+        // prefix that doesn't exist here.
+        let text = print(
+            "record User { id: i64 }\n\
+             func user_id(u: User) -> i64 { return u.id }\n",
+        );
+        assert!(text.contains("(%0: User#0)"), "{text}");
+    }
+
+    #[test]
+    fn single_file_nir_qualifies_a_nominal_return_type_and_allocation() {
+        let text = print(
+            "record User { id: i64 }\n\
+             func make() -> User { mutable u = User { id: 1 }; return u }\n",
+        );
+        assert!(text.contains(") -> User#0 {"), "{text}");
+        assert!(text.contains("alloc.User#0"), "{text}");
     }
 }

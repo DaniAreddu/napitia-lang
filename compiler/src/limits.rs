@@ -18,3 +18,28 @@
 /// in type checking and exhaustiveness analysis, `I0002` in NIR
 /// lowering) instead of recursing further.
 pub(crate) const MAX_PATTERN_DEPTH: usize = 200;
+
+/// Maximum nesting depth of a bracketed generic type application
+/// (`Box[Maybe[Box[...]]]`, `rfcs/0008`) any stage will descend into --
+/// resolving a written type reference (`hir::lower`), substituting type
+/// arguments (`typeck`, `nir::verify`), and printing a type (`nir`'s
+/// printer) all recurse once per nesting level, so this one shared bound
+/// keeps all of them from exhausting the native call stack on a
+/// pathologically (or adversarially) deep annotation, each failing with
+/// its own stage-appropriate diagnostic rather than trusting an earlier
+/// stage to have already caught it.
+pub(crate) const MAX_GENERIC_DEPTH: usize = 64;
+
+/// Maximum number of distinct generic instances (one canonical
+/// declaration `ItemId` plus its concrete type arguments,
+/// `hir::registry`-adjacent `rfcs/0008`) one compilation will
+/// instantiate before failing with a structured diagnostic instead of
+/// continuing to expand. Checking generic bodies once, symbolically
+/// (never eagerly monomorphizing at compile time), already rules out the
+/// classic exponential-specialization blowup; this budget exists for the
+/// residual case of a program that is itself well-typed but simply
+/// instantiates an unreasonable number of genuinely distinct
+/// declaration/argument combinations (e.g. a self-recursive generic call
+/// that nests its own type argument one level deeper on every call,
+/// `f[T] -> f[Box[T]] -> f[Box[Box[T]]] -> ...`).
+pub(crate) const MAX_GENERIC_INSTANCES: usize = 4096;

@@ -239,6 +239,8 @@ pub fn compile_project(
         &typeck_result.expr_types,
         &typeck_result.pattern_case,
         &typeck_result.call_type_args,
+        &typeck_result.call_evidence,
+        &typeck_result.protocol_call_evidence,
         interner,
         loaded.manifest_source,
     )?;

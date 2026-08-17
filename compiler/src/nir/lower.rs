@@ -150,7 +150,10 @@ pub fn lower_module(
         function_sigs.insert(f.id, (type_params, params, ret));
         function_requirements.insert(
             f.id,
-            f.requirements.iter().map(|r| resolve_requirement(interner, r)).collect(),
+            f.requirements
+                .iter()
+                .map(|r| resolve_requirement(interner, r))
+                .collect(),
         );
     }
 
@@ -164,7 +167,11 @@ pub fn lower_module(
             .iter()
             .map(|m| ProtocolMethodLayout {
                 name: m.name,
-                params: m.params.iter().map(|t| resolve_named_type(interner, t)).collect(),
+                params: m
+                    .params
+                    .iter()
+                    .map(|t| resolve_named_type(interner, t))
+                    .collect(),
                 return_type: m
                     .return_type
                     .as_ref()
@@ -206,8 +213,11 @@ pub fn lower_module(
             .iter()
             .map(|t| resolve_named_type(interner, t))
             .collect();
-        let requirements: Vec<CapabilityRequirement> =
-            e.requirements.iter().map(|r| resolve_requirement(interner, r)).collect();
+        let requirements: Vec<CapabilityRequirement> = e
+            .requirements
+            .iter()
+            .map(|r| resolve_requirement(interner, r))
+            .collect();
         let proto_method_names: Vec<Symbol> = protocols
             .iter()
             .find(|(id, _)| *id == e.protocol)
@@ -219,7 +229,10 @@ pub fn lower_module(
                 m.id,
                 (
                     extend_type_params.clone(),
-                    m.params.iter().map(|p| resolve_named_type(interner, &p.ty)).collect(),
+                    m.params
+                        .iter()
+                        .map(|p| resolve_named_type(interner, &p.ty))
+                        .collect(),
                     m.return_type
                         .as_ref()
                         .map(|t| resolve_named_type(interner, t))
@@ -419,7 +432,12 @@ fn validate_item_identities(
         // resolved (`hir::lower` already reported that separately) has
         // no name to borrow here, so its own id-collision check is
         // skipped rather than fabricating one.
-        if let Some(protocol_name) = hir.protocols.iter().find(|p| p.id == e.protocol).map(|p| p.name) {
+        if let Some(protocol_name) = hir
+            .protocols
+            .iter()
+            .find(|p| p.id == e.protocol)
+            .map(|p| p.name)
+        {
             check(e.id, ItemKind::Extend, protocol_name, e.span);
         }
         for m in &e.methods {
@@ -764,7 +782,11 @@ impl<'a> Lowering<'a> {
             .get(&f.id)
             .cloned()
             .unwrap_or_else(|| f.type_params.iter().map(|p| (p.id, p.name)).collect());
-        let requirements = self.function_requirements.get(&f.id).cloned().unwrap_or_default();
+        let requirements = self
+            .function_requirements
+            .get(&f.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(Function {
             id: f.id,
             name: f.name,
@@ -1396,9 +1418,12 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        let requirements = self.function_requirements.get(item).cloned().unwrap_or_default();
-        let evidence =
-            self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
+        let requirements = self
+            .function_requirements
+            .get(item)
+            .cloned()
+            .unwrap_or_default();
+        let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(call_expr),
             ValueKind::Call(*item, type_args, arg_values, evidence),
@@ -1419,8 +1444,10 @@ impl<'a> Lowering<'a> {
         args: &[HirExpr],
         call_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
-        let resolved_arguments: Vec<Ty> =
-            arguments.iter().map(|a| self.resolve_named_type(a)).collect();
+        let resolved_arguments: Vec<Ty> = arguments
+            .iter()
+            .map(|a| self.resolve_named_type(a))
+            .collect();
         let mut arg_values = Vec::with_capacity(args.len());
         for arg in args {
             match self.lower_expr(fb, arg)? {

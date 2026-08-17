@@ -292,6 +292,20 @@ fn validate_item_identities(
 /// only ever exercised by a direct caller that bypasses that gate -- the
 /// same defense-in-depth posture as the rest of this module.
 fn resolve_named_type(interner: &Interner, ty: &crate::hir::HirType) -> Ty {
+    resolve_named_type_at_depth(interner, ty, 0)
+}
+
+/// `depth` bounds recursion into nested `Ty::Applied` arguments the same
+/// way every other stage that walks a type application does
+/// (`crate::limits::MAX_GENERIC_DEPTH`) -- `nir::lower_module` is a
+/// public entry point a direct caller can invoke with hand-built HIR
+/// that bypasses `hir::lower`'s own depth guard (R0019) entirely, so
+/// this cannot simply trust that earlier stage to have already bounded
+/// the input.
+fn resolve_named_type_at_depth(interner: &Interner, ty: &crate::hir::HirType, depth: usize) -> Ty {
+    if depth > crate::limits::MAX_GENERIC_DEPTH {
+        return Ty::Error;
+    }
     match ty {
         crate::hir::HirType::Aggregate {
             item, name, args, ..
@@ -309,7 +323,7 @@ fn resolve_named_type(interner: &Interner, ty: &crate::hir::HirType) -> Ty {
                 Ty::Applied(
                     *item,
                     args.iter()
-                        .map(|a| resolve_named_type(interner, a))
+                        .map(|a| resolve_named_type_at_depth(interner, a, depth + 1))
                         .collect(),
                 )
             }
@@ -1351,8 +1365,22 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
         let base_ty = self.expr_ty(base);
-        let Ty::Named(record, _) = base_ty else {
-            return Err(self.unsupported(field_expr.span(), "field access on a non-record type"));
+        // A generic record's own body (e.g. `unwrap[T](box: Box[T]) ->
+        // T { box.value }`) accesses a field whose base is symbolically
+        // typed `Box[T]` (`Ty::Applied`), never `Ty::Named` -- checked
+        // once, symbolically, the same way every other operation on an
+        // unconstrained type parameter is (`rfcs/0008`). Field lookup
+        // itself only ever needs the declaration's own (unsubstituted)
+        // field list, never the concrete/symbolic arguments, so both
+        // forms resolve identically here.
+        let record = match base_ty {
+            Ty::Named(record, _) => record,
+            Ty::Applied(record, _) => record,
+            _ => {
+                return Err(
+                    self.unsupported(field_expr.span(), "field access on a non-record type")
+                );
+            }
         };
         let field_index = self
             .records
@@ -1607,7 +1635,17 @@ impl<'a> Lowering<'a> {
             return Ok(());
         }
 
-        if matches!(&occurrences[0].ty, Ty::Named(item, _) if self.variants.contains_key(item)) {
+        // A generic variant's scrutinee/occurrence is `Ty::Applied`, not
+        // `Ty::Named` -- `Maybe[bool]` must still dispatch to the same
+        // variant-switch lowering a non-generic variant's `Ty::Named`
+        // does, or it falls through to the literal chain below and
+        // fails the instant it meets its first `Some`/`None` pattern
+        // (`rfcs/0008`).
+        let scrutinee_variant = match &occurrences[0].ty {
+            Ty::Named(item, _) | Ty::Applied(item, _) => Some(*item),
+            _ => None,
+        };
+        if scrutinee_variant.is_some_and(|item| self.variants.contains_key(&item)) {
             self.lower_variant_switch(fb, rows, occurrences, arms, merge, depth)
         } else if matches!(&occurrences[0].ty, Ty::Bool) {
             // `bool` is a closed two-constructor domain (like a
@@ -1719,9 +1757,19 @@ impl<'a> Lowering<'a> {
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
         let rest_occ = occurrences[1..].to_vec();
-        let Ty::Named(variant_item, _) = occ.ty.clone() else {
-            return Err(self.internal_error("expected a variant-typed occurrence"));
+        let (variant_item, concrete_args): (ItemId, Vec<Ty>) = match occ.ty.clone() {
+            Ty::Named(item, _) => (item, Vec::new()),
+            Ty::Applied(item, args) => (item, args),
+            _ => return Err(self.internal_error("expected a variant-typed occurrence")),
         };
+        let payload_subst: HashMap<crate::hir::TypeParamId, Ty> = self
+            .variants
+            .get(&variant_item)
+            .map(|v| v.type_params.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+            .into_iter()
+            .flatten()
+            .zip(concrete_args.iter().cloned())
+            .collect();
 
         let any_real_test = rows
             .iter()
@@ -1756,9 +1804,19 @@ impl<'a> Lowering<'a> {
 
         for (case_index, case_block) in case_blocks.iter().enumerate() {
             fb.switch_to(*case_block);
-            let payload_types = self.variants[&variant_item].cases[case_index]
+            // The declaration's own *symbolic* payload shape (may
+            // contain `Ty::Param`), substituted with this occurrence's
+            // own concrete type arguments before use -- otherwise a
+            // `Some[T]` payload's sub-occurrence would keep the
+            // unconstrained `Ty::Param(T)` as its own type, and the next
+            // `lower_decision` call would fail to recognize it as e.g.
+            // `bool` and route it to the wrong lowering strategy
+            // (`rfcs/0008`).
+            let payload_types: Vec<Ty> = self.variants[&variant_item].cases[case_index]
                 .payload
-                .clone();
+                .iter()
+                .map(|t| crate::types::substitute(t, &payload_subst))
+                .collect();
             let arity = payload_types.len();
 
             let mut new_rows: Vec<MatrixRow<'h>> = Vec::new();
@@ -4154,5 +4212,166 @@ mod tests {
             .iter()
             .any(|b| matches!(b.terminator, Terminator::CondBranch { .. }));
         assert!(has_condbr);
+    }
+
+    // -- Generic lowering (`rfcs/0008`) ---------------------------------
+
+    #[test]
+    fn a_generic_function_lowers_exactly_once_with_symbolic_param_types() {
+        // `identity[T]` must lower to one `Function` whose own parameter
+        // is typed by its own `Ty::Param`, never a per-call-site clone.
+        let module = lower(
+            "func identity[T](x: T) -> T { return x } \
+             func main() -> i64 { return identity[i64](1) + identity[i64](2) }",
+        );
+        assert_eq!(
+            module
+                .functions
+                .iter()
+                .filter(|f| f.params.len() == 1)
+                .count(),
+            1,
+            "identity must lower exactly once regardless of how many call sites instantiate it"
+        );
+        let identity = module
+            .functions
+            .iter()
+            .find(|f| f.params.len() == 1)
+            .unwrap();
+        assert!(matches!(identity.params[0].ty, Ty::Param(..)));
+        assert!(matches!(identity.return_type, Ty::Param(..)));
+        assert_eq!(identity.type_params.len(), 1);
+    }
+
+    #[test]
+    fn a_call_to_a_generic_function_records_its_own_concrete_type_arguments() {
+        let module = lower(
+            "func identity[T](x: T) -> T { return x } func main() -> i64 { return identity[i64](42) }",
+        );
+        let main = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        let call_type_args = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                if let Instruction::Value {
+                    kind: ValueKind::Call(_, type_args, _),
+                    ..
+                } = i
+                {
+                    Some(type_args.clone())
+                } else {
+                    None
+                }
+            });
+        assert_eq!(call_type_args, Some(vec![Ty::I64]));
+    }
+
+    #[test]
+    fn a_generic_record_construction_records_its_own_concrete_type_arguments() {
+        let module = lower(
+            "record Box[T] { payload: T } \
+             func main() -> i64 { value b = Box[i64] { payload: 42 }; return b.payload }",
+        );
+        let main = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        let create_type_args = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                if let Instruction::Value {
+                    kind: ValueKind::RecordCreate(_, type_args, _),
+                    ..
+                } = i
+                {
+                    Some(type_args.clone())
+                } else {
+                    None
+                }
+            });
+        assert_eq!(create_type_args, Some(vec![Ty::I64]));
+    }
+
+    #[test]
+    fn a_generic_variant_construction_records_its_own_concrete_type_arguments() {
+        let module = lower(
+            "variant Maybe[T] { Some(T), None } \
+             func main() -> i64 { \
+                 return match Maybe[i64].Some(42) { \
+                     Some(n) => n, \
+                     None => 0, \
+                 } \
+             }",
+        );
+        let main = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        let create_type_args = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                if let Instruction::Value {
+                    kind: ValueKind::VariantCreate { type_args, .. },
+                    ..
+                } = i
+                {
+                    Some(type_args.clone())
+                } else {
+                    None
+                }
+            });
+        assert_eq!(create_type_args, Some(vec![Ty::I64]));
+    }
+
+    #[test]
+    fn a_bare_generic_unit_case_records_its_own_concrete_type_arguments() {
+        // Regression: `Maybe[i64].None` (no call syntax at all) must
+        // still record its type argument -- `check_case_ref` threading
+        // its own `ExprId` into `call_type_args` is what this exercises.
+        let module = lower(
+            "variant Maybe[T] { Some(T), None } \
+             func main() -> i64 { \
+                 return match Maybe[i64].None { \
+                     Some(n) => n, \
+                     None => 0, \
+                 } \
+             }",
+        );
+        let main = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        let create_type_args = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                if let Instruction::Value {
+                    kind: ValueKind::VariantCreate { type_args, .. },
+                    ..
+                } = i
+                {
+                    Some(type_args.clone())
+                } else {
+                    None
+                }
+            });
+        assert_eq!(
+            create_type_args,
+            Some(vec![Ty::I64]),
+            "a bare generic unit case must not silently default to an empty type argument list"
+        );
     }
 }

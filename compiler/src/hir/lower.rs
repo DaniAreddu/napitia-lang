@@ -379,7 +379,8 @@ impl<'a> Lowering<'a> {
                 ast::Item::Protocol(p) => {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, p.name, id);
-                    self.protocol_names.insert(p.name.symbol, (id, p.name.symbol));
+                    self.protocol_names
+                        .insert(p.name.symbol, (id, p.name.symbol));
                     protocol_decls.push((id, p));
                 }
                 ast::Item::Extend(e) => {
@@ -966,7 +967,11 @@ impl<'a> Lowering<'a> {
                 );
                 continue;
             };
-            let arguments = clause.args.iter().map(|a| self.resolve_type_ref(a)).collect();
+            let arguments = clause
+                .args
+                .iter()
+                .map(|a| self.resolve_type_ref(a))
+                .collect();
             requirements.push(HirCapabilityRequirement {
                 protocol,
                 arguments,
@@ -1032,7 +1037,10 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .map(|prm| self.resolve_type_ref(&prm.ty))
                 .collect();
-            let return_type = member.return_type.as_ref().map(|t| self.resolve_type_ref(t));
+            let return_type = member
+                .return_type
+                .as_ref()
+                .map(|t| self.resolve_type_ref(t));
             methods.push(HirProtocolMethod {
                 index,
                 name: member.name.symbol,

@@ -280,6 +280,7 @@ mod tests {
             importing_module: ModuleId(1),
             segments: segments.iter().map(|s| s.to_string()).collect(),
             span,
+            item_span: span,
             alias: None,
         }
     }

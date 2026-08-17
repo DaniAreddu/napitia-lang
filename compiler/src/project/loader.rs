@@ -31,6 +31,13 @@ pub struct ImportRef {
     pub importing_module: ModuleId,
     pub segments: Vec<String>,
     pub span: Span,
+    /// The imported item's own written name's span -- `segments`'s last
+    /// element's span, kept alongside the resolved text the same way
+    /// `alias` is, so `project::resolve` can build a precise
+    /// "conflicting name" / "already imported here" collision label
+    /// (`rfcs/0007`) even for an unaliased import, without re-deriving
+    /// it from `segments` (which has lost per-segment spans).
+    pub item_span: Span,
     /// The `as <alias>` clause's own name and span, if the import wrote
     /// one (`rfcs/0007`) -- `project::resolve` uses this text as the
     /// item's local name instead of its last path segment. Kept as
@@ -343,6 +350,12 @@ pub fn load_project(
                     .iter()
                     .map(|seg| interner.resolve(seg.symbol).to_string())
                     .collect();
+                let item_span = import
+                    .path
+                    .segments
+                    .last()
+                    .expect("a path has at least one segment")
+                    .span;
                 if let Some((target_module, _)) = ModulePath::split_import_path(&segments) {
                     let target_dotted = target_module.dotted();
                     if !queued.contains(&target_dotted) {
@@ -357,6 +370,7 @@ pub fn load_project(
                     importing_module: id,
                     segments,
                     span: import.span,
+                    item_span,
                     alias,
                 });
             }

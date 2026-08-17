@@ -20,7 +20,9 @@ use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::generics::GenericInstanceKey;
-use crate::types::{Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name, substitute};
+use crate::types::{
+    Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name, substitute,
+};
 
 mod codes {
     pub const TYPE_MISMATCH: &str = "T0001";
@@ -1167,7 +1169,10 @@ impl<'a> Checker<'a> {
         what: &str,
     ) -> Option<(HashMap<TypeParamId, Ty>, bool)> {
         if !explicit.is_empty() {
-            let resolved: Vec<Ty> = explicit.iter().map(|t| self.resolve_named_type(t)).collect();
+            let resolved: Vec<Ty> = explicit
+                .iter()
+                .map(|t| self.resolve_named_type(t))
+                .collect();
             if resolved.len() != type_params.len() {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1284,7 +1289,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_call(&mut self, call_id: ExprId, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
+    fn check_call(
+        &mut self,
+        call_id: ExprId,
+        callee: &HirExpr,
+        args: &[HirExpr],
+        span: Span,
+    ) -> Ty {
         if let HirExpr::CaseRef {
             variant,
             case,
@@ -1370,12 +1381,20 @@ impl<'a> Checker<'a> {
             }
         }
 
-        let mut ok = !inferred || self.check_inferred_args_resolved(&sig.type_params, &subst, span, &quoted);
+        let mut ok =
+            !inferred || self.check_inferred_args_resolved(&sig.type_params, &subst, span, &quoted);
         if ok && !sig.type_params.is_empty() {
             let resolved_args: Vec<Ty> = sig
                 .type_params
                 .iter()
-                .map(|p| deep_resolve(&self.ctx, subst.get(p).expect("every declared parameter has a substitution entry")))
+                .map(|p| {
+                    deep_resolve(
+                        &self.ctx,
+                        subst
+                            .get(p)
+                            .expect("every declared parameter has a substitution entry"),
+                    )
+                })
                 .collect();
             let key = GenericInstanceKey::new(*item, resolved_args.clone());
             if self.record_generic_instance(key, span) {
@@ -1442,7 +1461,12 @@ impl<'a> Checker<'a> {
         let resolved_args: Vec<Ty> = info
             .type_params
             .iter()
-            .map(|p| subst.get(p).expect("explicit substitution covers every parameter").clone())
+            .map(|p| {
+                subst
+                    .get(p)
+                    .expect("explicit substitution covers every parameter")
+                    .clone()
+            })
             .collect();
         let key = GenericInstanceKey::new(variant, resolved_args.clone());
         if !self.record_generic_instance(key, span) {
@@ -1519,7 +1543,14 @@ impl<'a> Checker<'a> {
             let resolved_args: Vec<Ty> = info
                 .type_params
                 .iter()
-                .map(|p| deep_resolve(&self.ctx, subst.get(p).expect("every declared parameter has a substitution entry")))
+                .map(|p| {
+                    deep_resolve(
+                        &self.ctx,
+                        subst
+                            .get(p)
+                            .expect("every declared parameter has a substitution entry"),
+                    )
+                })
                 .collect();
             let key = GenericInstanceKey::new(variant, resolved_args.clone());
             if self.record_generic_instance(key, span) {
@@ -1585,12 +1616,21 @@ impl<'a> Checker<'a> {
         }
         let _ = span;
         if info.type_params.is_empty() {
-            return if diverged { Ty::Never } else { self.named_record_ty(record) };
+            return if diverged {
+                Ty::Never
+            } else {
+                self.named_record_ty(record)
+            };
         }
         let resolved_args: Vec<Ty> = info
             .type_params
             .iter()
-            .map(|p| subst.get(p).expect("explicit substitution covers every parameter").clone())
+            .map(|p| {
+                subst
+                    .get(p)
+                    .expect("explicit substitution covers every parameter")
+                    .clone()
+            })
             .collect();
         let key = GenericInstanceKey::new(record, resolved_args.clone());
         if !self.record_generic_instance(key, span) {
@@ -1631,7 +1671,10 @@ impl<'a> Checker<'a> {
                     .get(item)
                     .map(|r| r.type_params.clone())
                     .unwrap_or_default();
-                (*item, type_params.into_iter().zip(args.iter().cloned()).collect())
+                (
+                    *item,
+                    type_params.into_iter().zip(args.iter().cloned()).collect(),
+                )
             }
             _ => {
                 self.diagnostics.push(
@@ -1706,7 +1749,9 @@ impl<'a> Checker<'a> {
     fn is_aggregate(&self, ty: &Ty) -> bool {
         let resolved = self.ctx.resolve(ty);
         match resolved {
-            Ty::Named(item, _) => self.records.contains_key(&item) || self.variants.contains_key(&item),
+            Ty::Named(item, _) => {
+                self.records.contains_key(&item) || self.variants.contains_key(&item)
+            }
             Ty::Applied(..) => true,
             _ => false,
         }

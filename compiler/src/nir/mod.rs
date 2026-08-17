@@ -18,7 +18,7 @@ pub use lower::lower_module;
 pub use printer::print_module;
 pub use verify::verify_module;
 
-use crate::hir::ItemId;
+use crate::hir::{ItemId, TypeParamId};
 use crate::symbol::Symbol;
 use crate::types::Ty;
 
@@ -36,6 +36,12 @@ pub struct Module {
 #[derive(Debug, Clone)]
 pub struct RecordLayout {
     pub name: Symbol,
+    /// This record's own generic parameters, in declaration order
+    /// (`rfcs/0008`) -- empty for a non-generic record. `fields`' types
+    /// may reference these via `Ty::Param`; one canonical layout schema
+    /// is shared by every concrete use, never duplicated per
+    /// instantiation.
+    pub type_params: Vec<(TypeParamId, Symbol)>,
     /// `(field name, declared type)`, in declaration order -- the order
     /// `record.create`'s arguments are always given in.
     pub fields: Vec<(Symbol, Ty)>,
@@ -44,6 +50,8 @@ pub struct RecordLayout {
 #[derive(Debug, Clone)]
 pub struct VariantLayout {
     pub name: Symbol,
+    /// See [`RecordLayout::type_params`].
+    pub type_params: Vec<(TypeParamId, Symbol)>,
     /// One entry per case, in declaration order -- the order
     /// `Terminator::Switch`'s targets are always given in.
     pub cases: Vec<CaseLayout>,
@@ -59,6 +67,13 @@ pub struct CaseLayout {
 pub struct Function {
     pub id: ItemId,
     pub name: Symbol,
+    /// This function's own generic parameters, in declaration order
+    /// (`rfcs/0008`) -- empty for a non-generic function. `params`/
+    /// `return_type` may reference these via `Ty::Param`; one parametric
+    /// body is lowered per declaration, shared across every call
+    /// (`ValueKind::Call` carries each call site's own concrete
+    /// arguments instead of a cloned body).
+    pub type_params: Vec<(TypeParamId, Symbol)>,
     pub params: Vec<Param>,
     pub return_type: Ty,
     pub blocks: Vec<BasicBlock>,

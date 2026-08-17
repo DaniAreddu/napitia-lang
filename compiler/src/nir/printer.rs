@@ -20,7 +20,7 @@ use super::{Function, Module};
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
 use crate::limits::MAX_GENERIC_DEPTH;
 use crate::symbol::{Interner, Symbol};
-use crate::types::{Ty, display_ty};
+use crate::types::{CapabilityRequirement, Evidence, Ty, display_ty};
 
 /// Every declaration and reference to `id` renders through this one
 /// helper, so the two can never drift into different formats
@@ -131,6 +131,14 @@ fn declared_type_params_suffix(
 
 pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistry) -> String {
     let mut out = String::new();
+    for (protocol, layout) in &module.protocols {
+        print_protocol(&mut out, *protocol, layout, interner, registry);
+        out.push('\n');
+    }
+    for (extend, layout) in &module.extends {
+        print_extend(&mut out, *extend, layout, interner, registry);
+        out.push('\n');
+    }
     for (i, function) in module.functions.iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -138,6 +146,125 @@ pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistr
         print_function(&mut out, function, interner, registry);
     }
     out
+}
+
+/// `protocol @Equal#4[T] { func equal(left: T, right: T) -> bool; ... }`
+/// (`rfcs/0009`) -- each method printed with its own declaration-order
+/// index, since that index (never its name) is what a `protocol.call`
+/// instruction actually references.
+fn print_protocol(
+    out: &mut String,
+    protocol: ItemId,
+    layout: &super::ProtocolLayout,
+    interner: &Interner,
+    registry: &ItemRegistry,
+) {
+    let _ = writeln!(
+        out,
+        "protocol @{}{} {{",
+        qualified_ref(protocol, registry, interner),
+        declared_type_params_suffix(&layout.type_params, interner)
+    );
+    for (index, method) in layout.methods.iter().enumerate() {
+        let params = method
+            .params
+            .iter()
+            .map(|t| format_ty(t, interner, registry))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "    method[{index}] {}({params}) -> {};",
+            interner.resolve(method.name),
+            format_ty(&method.return_type, interner, registry)
+        );
+    }
+    out.push_str("}\n");
+}
+
+/// `extend @Equal#4[i64] { method[0] = @equal_i64#28; }` (`rfcs/0009`)
+/// -- an extend's own method table, mapping each protocol method's own
+/// index to the concrete NIR function implementing it. A conditional
+/// extend's own `uses` requirements print the same way a function's own
+/// do (see `requirements_suffix`).
+fn print_extend(
+    out: &mut String,
+    extend: ItemId,
+    layout: &super::ExtendLayout,
+    interner: &Interner,
+    registry: &ItemRegistry,
+) {
+    let args = type_args_suffix(&layout.protocol_arguments, interner, registry);
+    let _ = writeln!(
+        out,
+        "extend @{}{} for @{}{}{} {{",
+        qualified_ref(extend, registry, interner),
+        declared_type_params_suffix(&layout.type_params, interner),
+        qualified_ref(layout.protocol, registry, interner),
+        args,
+        requirements_suffix(&layout.requirements, interner, registry),
+    );
+    for (index, method) in layout.methods.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "    method[{index}] = @{};",
+            qualified_ref(*method, registry, interner)
+        );
+    }
+    out.push_str("}\n");
+}
+
+/// `uses @Equal#4[T], @Ord#5[T]` printed on its own line between a
+/// signature and `{` (`rfcs/0009`) -- empty for a declaration with no
+/// capability requirements, matching how `type_args_suffix` renders
+/// nothing for a non-generic reference.
+fn requirements_suffix(
+    requirements: &[CapabilityRequirement],
+    interner: &Interner,
+    registry: &ItemRegistry,
+) -> String {
+    if requirements.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = requirements
+        .iter()
+        .map(|r| {
+            format!(
+                "@{}{}",
+                qualified_ref(r.protocol, registry, interner),
+                type_args_suffix(&r.arguments, interner, registry)
+            )
+        })
+        .collect();
+    format!("\nuses {}", parts.join(", "))
+}
+
+fn format_evidence(evidence: &Evidence, interner: &Interner, registry: &ItemRegistry) -> String {
+    match evidence {
+        Evidence::Forwarded(index) => format!("forwarded[{index}]"),
+        Evidence::Extension { extend, nested } => {
+            if nested.is_empty() {
+                format!("@{}", qualified_ref(*extend, registry, interner))
+            } else {
+                let parts: Vec<String> = nested
+                    .iter()
+                    .map(|n| format_evidence(n, interner, registry))
+                    .collect();
+                format!("@{}[{}]", qualified_ref(*extend, registry, interner), parts.join(", "))
+            }
+        }
+    }
+}
+
+fn evidence_list_suffix(evidence: &[Evidence], interner: &Interner, registry: &ItemRegistry) -> String {
+    if evidence.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = evidence
+        .iter()
+        .map(|e| format_evidence(e, interner, registry))
+        .collect();
+    format!(" evidence [{}]", parts.join(", "))
 }
 
 fn print_function(
@@ -154,10 +281,11 @@ fn print_function(
         .join(", ");
     let _ = writeln!(
         out,
-        "func @{}{}({params}) -> {} {{",
+        "func @{}{}({params}) -> {}{} {{",
         qualified_ref(function.id, registry, interner),
         declared_type_params_suffix(&function.type_params, interner),
-        format_ty(&function.return_type, interner, registry)
+        format_ty(&function.return_type, interner, registry),
+        requirements_suffix(&function.requirements, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
     // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
@@ -304,16 +432,36 @@ fn format_value_kind(
                 b.0
             )
         }
-        ValueKind::Call(function, type_args, args) => {
+        ValueKind::Call(function, type_args, args, evidence) => {
             let args = args
                 .iter()
                 .map(|v: &ValueId| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "call @{}{}({args})",
+                "call @{}{}({args}){}",
                 qualified_ref(*function, registry, interner),
-                type_args_suffix(type_args, interner, registry)
+                type_args_suffix(type_args, interner, registry),
+                evidence_list_suffix(evidence, interner, registry)
+            )
+        }
+        ValueKind::ProtocolCall {
+            protocol,
+            arguments,
+            method,
+            evidence,
+            args,
+        } => {
+            let args = args
+                .iter()
+                .map(|v: &ValueId| format!("%{}", v.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "protocol.call @{}{}.method[{method}]({args}){}",
+                qualified_ref(*protocol, registry, interner),
+                type_args_suffix(arguments, interner, registry),
+                evidence_list_suffix(std::slice::from_ref(evidence), interner, registry)
             )
         }
         ValueKind::RecordCreate(record, type_args, fields) => {

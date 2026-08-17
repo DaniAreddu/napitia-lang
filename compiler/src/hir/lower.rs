@@ -268,10 +268,7 @@ impl<'a> Lowering<'a> {
                     let mut case_indices = HashMap::new();
                     for (name, index) in cases {
                         case_indices.insert(name, index);
-                        self.case_lookup
-                            .entry(name)
-                            .or_default()
-                            .push((item, index));
+                        self.add_case_candidate(name, item, index);
                     }
                     self.variant_cases.insert(item, case_indices);
                 }
@@ -485,10 +482,7 @@ impl<'a> Lowering<'a> {
             }
             let index = cases.len();
             seen.insert(case.name.symbol, index);
-            self.case_lookup
-                .entry(case.name.symbol)
-                .or_default()
-                .push((id, index));
+            self.add_case_candidate(case.name.symbol, id, index);
             let payload = case
                 .payload
                 .iter()
@@ -911,10 +905,16 @@ impl<'a> Lowering<'a> {
     ) -> HirExpr {
         if candidates.len() > 1 {
             let text = self.interner.resolve(ident.symbol);
-            let variant_names: Vec<&str> = candidates
+            // Sorted and deduplicated so the message text is independent
+            // of both `case_lookup`'s insertion order (itself a function
+            // of import declaration order) and `variant_name`'s own
+            // internal `HashMap` traversal.
+            let mut variant_names: Vec<&str> = candidates
                 .iter()
                 .map(|(variant, _)| self.variant_name(*variant))
                 .collect();
+            variant_names.sort_unstable();
+            variant_names.dedup();
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::AMBIGUOUS_CONSTRUCTOR,
@@ -943,23 +943,43 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Records that `item`'s case `index`, named `name`, is reachable
+    /// under an unqualified reference in this module -- deduplicated by
+    /// `(item, index)` so importing the very same variant under two (or
+    /// more) different aliases pushes only one candidate, not one per
+    /// alias. Without this, an unqualified constructor could become
+    /// falsely "ambiguous" against itself merely because it was reachable
+    /// under more than one local spelling (`rfcs/0007`).
+    fn add_case_candidate(&mut self, name: Symbol, item: ItemId, index: usize) {
+        let candidates = self.case_lookup.entry(name).or_default();
+        if !candidates.contains(&(item, index)) {
+            candidates.push((item, index));
+        }
+    }
+
     /// Looks up a declared item's name for use inside another
     /// diagnostic's message; every `ItemId` reaching this function came
     /// from this module's own `type_names`/`case_lookup` tables, so the
     /// name is always present.
     fn variant_name(&self, item: ItemId) -> &'a str {
-        // The *local* name (the map's own key -- an alias if this
-        // variant was imported under one), not the canonical declared
-        // name: this is used to tell the user what to write in a
-        // qualified path (`Variant.Case`) right here in this module, and
-        // the original name may not even be in scope if it was aliased.
-        let symbol = self
+        // A variant reachable under more than one local alias has more
+        // than one matching key in `type_names` -- iterating a `HashMap`
+        // would make the choice depend on that map's (unspecified, and
+        // in practice randomized per process) iteration order, so every
+        // matching name is collected and the lexicographically smallest
+        // one is used instead: deterministic regardless of which alias
+        // was inserted first, and independent of import order.
+        let mut names: Vec<&str> = self
             .type_names
             .iter()
-            .find(|(_, (id, kind, _))| *id == item && *kind == TypeNameKind::Variant)
-            .map(|(name, _)| *name)
-            .expect("internal invariant: every case_lookup entry names a known variant");
-        self.interner.resolve(symbol)
+            .filter(|(_, (id, kind, _))| *id == item && *kind == TypeNameKind::Variant)
+            .map(|(name, _)| self.interner.resolve(*name))
+            .collect();
+        names.sort_unstable();
+        names
+            .into_iter()
+            .next()
+            .expect("internal invariant: every case_lookup entry names a known variant")
     }
 
     /// Lowers `base.name`, distinguishing three shapes: ordinary field

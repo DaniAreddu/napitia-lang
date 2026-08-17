@@ -1,0 +1,7 @@
+func choose[T](left: T, right: T) -> T {
+    return left
+}
+
+func main() -> i64 {
+    return choose(1, true)
+}

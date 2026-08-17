@@ -1,0 +1,11 @@
+record Box[T] {
+    payload: T,
+}
+
+record Node {
+    next: Box[Node],
+}
+
+func main() -> i64 {
+    return 0
+}

@@ -10,6 +10,7 @@
 //! known concretely.
 
 use super::context::{TypeContext, VarKind};
+use crate::limits::MAX_GENERIC_DEPTH;
 use crate::types::{Ty, TyVar, is_integer};
 
 /// Unifies `a` and `b`, binding type variables in `ctx` as needed.
@@ -35,7 +36,23 @@ use crate::types::{Ty, TyVar, is_integer};
 /// report. Resolution always terminates: a variable is only ever bound
 /// to the *other* side's already-fully-resolved form, so the
 /// substitution graph is always a forest (no cycles can form).
+///
+/// A `Ty::Applied` unifies structurally with another one iff they name
+/// the exact same declaration (nominal, matching `Ty::Applied`'s own
+/// identity contract -- `sales.Box[i64]` never unifies with
+/// `admin.Box[i64]` even if both spell `Box`, and an alias never affects
+/// this since the declaration is always the canonical `ItemId`) and have
+/// the same arity, in which case corresponding type arguments unify
+/// pairwise, recursively (`rfcs/0008`) -- this is what lets a generic
+/// parameter's fresh inference variable be discovered *inside* an
+/// applied argument (`unify(Box[Var(T)], Box[i64])` binds `T` to `i64`),
+/// not just at the top level. A mismatched declaration or arity is a
+/// deterministic, immediate failure, never a partial/best-effort bind.
 pub fn unify(ctx: &mut TypeContext, a: &Ty, b: &Ty) -> Result<(), (Ty, Ty)> {
+    unify_at_depth(ctx, a, b, 0)
+}
+
+fn unify_at_depth(ctx: &mut TypeContext, a: &Ty, b: &Ty, depth: usize) -> Result<(), (Ty, Ty)> {
     let a = ctx.resolve(a);
     let b = ctx.resolve(b);
 
@@ -62,6 +79,25 @@ pub fn unify(ctx: &mut TypeContext, a: &Ty, b: &Ty) -> Result<(), (Ty, Ty)> {
             } else {
                 Err((a, b))
             }
+        }
+        (Ty::Applied(a_item, a_args), Ty::Applied(b_item, b_args)) => {
+            if a_item != b_item || a_args.len() != b_args.len() {
+                return Err((a.clone(), b.clone()));
+            }
+            // Defense in depth, mirroring `types::generics::substitute`'s
+            // own bound: a well-typed program's own `Ty::Applied`
+            // nesting is already far shallower than this by the time it
+            // reaches unification (`hir::lower` rejects deeper type
+            // applications at the syntax level, R0019), so this only
+            // ever stops a malformed/hand-built `Ty` from recursing
+            // unboundedly, never a real program's inference.
+            if depth >= MAX_GENERIC_DEPTH {
+                return Err((a.clone(), b.clone()));
+            }
+            for (x, y) in a_args.iter().zip(b_args.iter()) {
+                unify_at_depth(ctx, x, y, depth + 1)?;
+            }
+            Ok(())
         }
         _ => Err((a, b)),
     }
@@ -232,5 +268,74 @@ mod tests {
         assert!(unify(&mut ctx, &Ty::Var(c), &Ty::Bool).is_err());
         assert!(unify(&mut ctx, &Ty::Var(c), &Ty::I64).is_ok());
         assert_eq!(ctx.resolve(&Ty::Var(a)), Ty::I64);
+    }
+
+    #[test]
+    fn applied_types_with_a_variable_argument_infer_it_from_a_concrete_one() {
+        // `unify(Box[Var(T)], Box[i64])` is exactly what a generic
+        // call's own argument-vs-parameter check does once `T` is a
+        // fresh inference variable substituted into `Box[T]` --
+        // unification must reach inside the applied argument list to
+        // bind it, not just fail at the top level.
+        let mut ctx = TypeContext::new();
+        let box_item = crate::hir::ItemId(0);
+        let v = ctx.fresh_var();
+        let expected = Ty::Applied(box_item, vec![Ty::Var(v)]);
+        let actual = Ty::Applied(box_item, vec![Ty::I64]);
+        assert!(unify(&mut ctx, &expected, &actual).is_ok());
+        assert_eq!(ctx.resolve(&Ty::Var(v)), Ty::I64);
+    }
+
+    #[test]
+    fn applied_types_unify_recursively_through_nested_arguments() {
+        // `Box[Maybe[Var(T)]]` vs `Box[Maybe[i64]]` -- the variable is
+        // two applications deep, not just one.
+        let mut ctx = TypeContext::new();
+        let box_item = crate::hir::ItemId(0);
+        let maybe_item = crate::hir::ItemId(1);
+        let v = ctx.fresh_var();
+        let expected = Ty::Applied(box_item, vec![Ty::Applied(maybe_item, vec![Ty::Var(v)])]);
+        let actual = Ty::Applied(box_item, vec![Ty::Applied(maybe_item, vec![Ty::I64])]);
+        assert!(unify(&mut ctx, &expected, &actual).is_ok());
+        assert_eq!(ctx.resolve(&Ty::Var(v)), Ty::I64);
+    }
+
+    #[test]
+    fn applied_types_with_different_declarations_never_unify() {
+        // Same arity and argument, different declaration -- e.g.
+        // `sales.Box[i64]` vs `admin.Box[i64]`: nominal identity means
+        // these must never unify even though they'd look identical
+        // structurally.
+        let mut ctx = TypeContext::new();
+        let a = Ty::Applied(crate::hir::ItemId(0), vec![Ty::I64]);
+        let b = Ty::Applied(crate::hir::ItemId(1), vec![Ty::I64]);
+        assert_eq!(unify(&mut ctx, &a, &b), Err((a, b)));
+    }
+
+    #[test]
+    fn applied_types_with_different_arity_never_unify() {
+        let mut ctx = TypeContext::new();
+        let item = crate::hir::ItemId(0);
+        let a = Ty::Applied(item, vec![Ty::I64]);
+        let b = Ty::Applied(item, vec![Ty::I64, Ty::Bool]);
+        assert_eq!(unify(&mut ctx, &a, &b), Err((a, b)));
+    }
+
+    #[test]
+    fn applied_types_with_conflicting_arguments_never_unify() {
+        let mut ctx = TypeContext::new();
+        let item = crate::hir::ItemId(0);
+        let a = Ty::Applied(item, vec![Ty::I64]);
+        let b = Ty::Applied(item, vec![Ty::Bool]);
+        assert!(unify(&mut ctx, &a, &b).is_err());
+    }
+
+    #[test]
+    fn applied_types_with_identical_arguments_unify_with_no_bindings_needed() {
+        let mut ctx = TypeContext::new();
+        let item = crate::hir::ItemId(0);
+        let a = Ty::Applied(item, vec![Ty::I64]);
+        let b = Ty::Applied(item, vec![Ty::I64]);
+        assert!(unify(&mut ctx, &a, &b).is_ok());
     }
 }

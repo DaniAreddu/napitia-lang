@@ -14,12 +14,13 @@ use unify::unify;
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirPattern, HirStmt, HirType, ItemId, ItemRegistry, LocalId,
+    HirPattern, HirStmt, HirType, ItemId, ItemRegistry, LocalId, TypeParamId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
-use crate::types::{Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name};
+use crate::types::generics::GenericInstanceKey;
+use crate::types::{Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name, substitute};
 
 mod codes {
     pub const TYPE_MISMATCH: &str = "T0001";
@@ -42,6 +43,13 @@ mod codes {
     pub const UNREACHABLE_ARM: &str = "T0018";
     pub const PATTERN_BUDGET_EXCEEDED: &str = "T0019";
     pub const INCOMPATIBLE_PATTERN: &str = "T0021";
+    pub const TYPE_ARGUMENTS_TO_NON_GENERIC: &str = "T0022";
+    pub const MISSING_TYPE_ARGUMENTS: &str = "T0023";
+    pub const GENERIC_ARITY_MISMATCH: &str = "T0024";
+    pub const CONFLICTING_INFERRED_ARGUMENTS: &str = "T0025";
+    pub const CANNOT_INFER_TYPE_ARGUMENT: &str = "T0026";
+    pub const UNSUPPORTED_ON_TYPE_PARAMETER: &str = "T0027";
+    pub const GENERIC_INSTANCE_BUDGET_EXCEEDED: &str = "T0028";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -80,6 +88,11 @@ enum MatchCoverage {
 struct FunctionSig {
     params: Vec<Ty>,
     ret: Ty,
+    /// This function's own generic parameters, in declaration order
+    /// (`rfcs/0008`) -- empty for a non-generic function. `params`/`ret`
+    /// may reference these via `Ty::Param`; a call site substitutes a
+    /// concrete argument for each before unifying.
+    type_params: Vec<TypeParamId>,
     span: Span,
     /// Where this function was declared -- a different file than the
     /// call site's, in every cross-module call. A diagnostic pointing at
@@ -117,6 +130,15 @@ pub struct TypeckResult {
     /// that fills this in, lands in a later commit); NIR lowering will
     /// consult it, keyed by the pattern's own stable `PatternId`.
     pub pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
+    /// For every generic call, variant construction, or record
+    /// construction, the exact concrete type arguments this checker
+    /// resolved for it (inferred or explicit, always fully resolved --
+    /// never a bare `Ty::Var`) -- keyed by that expression's own
+    /// `ExprId` (`rfcs/0008`). `nir::lower` reads this back to attach
+    /// the same instantiation to the corresponding NIR instruction,
+    /// rather than re-inferring or re-resolving it independently. Empty
+    /// for a non-generic call/construction.
+    pub call_type_args: HashMap<ExprId, Vec<Ty>>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`], the same as
@@ -173,9 +195,13 @@ pub fn check_module_with_registry(
         loop_depth: 0,
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
+        call_type_args: HashMap::new(),
         pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
         entry_main,
+        generic_params: HashMap::new(),
+        generic_instances: std::collections::HashSet::new(),
     };
+    checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
     checker.build_signatures(hir);
@@ -188,7 +214,7 @@ pub fn check_module_with_registry(
     let local_types = checker
         .locals
         .iter()
-        .map(|(id, info)| (*id, checker.ctx.resolve(&info.ty)))
+        .map(|(id, info)| (*id, deep_resolve(&checker.ctx, &info.ty)))
         .collect();
     // Resolved the same way as local_types, and for the same reason:
     // an expression's raw recorded type can still be an unresolved
@@ -199,7 +225,17 @@ pub fn check_module_with_registry(
     let expr_types = checker
         .expr_types
         .iter()
-        .map(|(id, ty)| (*id, checker.ctx.resolve(ty)))
+        .map(|(id, ty)| (*id, deep_resolve(&checker.ctx, ty)))
+        .collect();
+    let call_type_args = checker
+        .call_type_args
+        .iter()
+        .map(|(id, args)| {
+            (
+                *id,
+                args.iter().map(|a| deep_resolve(&checker.ctx, a)).collect(),
+            )
+        })
         .collect();
 
     TypeckResult {
@@ -207,6 +243,22 @@ pub fn check_module_with_registry(
         local_types,
         expr_types,
         pattern_case: checker.pattern_case,
+        call_type_args,
+    }
+}
+
+/// Resolves `ty` through `ctx`'s substitution table, then recurses into
+/// a resulting `Ty::Applied`'s own argument list so a still-unresolved
+/// `Ty::Var` nested inside one (`Box[T]` where `T` was itself inferred)
+/// is collapsed too, not just the outermost type -- `TypeContext::resolve`
+/// alone only ever follows a `Var -> Var -> concrete` chain at the top
+/// level (`rfcs/0008`).
+fn deep_resolve(ctx: &TypeContext, ty: &Ty) -> Ty {
+    match ctx.resolve(ty) {
+        Ty::Applied(item, args) => {
+            Ty::Applied(item, args.iter().map(|a| deep_resolve(ctx, a)).collect())
+        }
+        other => other,
     }
 }
 
@@ -247,6 +299,8 @@ struct Checker<'a> {
     expr_types: HashMap<ExprId, Ty>,
     /// See [`TypeckResult::pattern_case`].
     pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
+    /// See [`TypeckResult::call_type_args`].
+    call_type_args: HashMap<ExprId, Vec<Ty>>,
     /// Starting work budget for each match's exhaustiveness analysis.
     /// Always `exhaustive::MAX_USEFULNESS_STEPS` in `check_module`; a
     /// smaller value is a controlled test seam for exercising
@@ -256,6 +310,19 @@ struct Checker<'a> {
     /// Which function(s) must satisfy the executable entry signature --
     /// see [`EntryMain`].
     entry_main: EntryMain,
+    /// Every function/record/variant's own generic parameters, in
+    /// declaration order -- collected once, up front, from the whole
+    /// (already name-resolved) module, so resolving a *reference* to any
+    /// one of them (in a field type possibly declared later, or earlier,
+    /// than the reference) never depends on processing order
+    /// (`rfcs/0008`).
+    generic_params: HashMap<ItemId, Vec<TypeParamId>>,
+    /// Every distinct generic instance (`GenericInstanceKey`) this
+    /// checker has resolved a call/construction against so far --
+    /// central bookkeeping for the compile-wide instance budget
+    /// (`crate::limits::MAX_GENERIC_INSTANCES`), never an independent
+    /// counter duplicated per call site.
+    generic_instances: std::collections::HashSet<GenericInstanceKey>,
 }
 
 #[derive(Clone)]
@@ -265,12 +332,18 @@ struct RecordInfo {
     /// `named_record_ty`), the same reason `VariantInfo` carries one.
     name: Symbol,
     /// `(field name, declared type, is_public)`, in declaration order.
+    /// A field's declared type may reference `type_params` via
+    /// `Ty::Param`, symbolically -- substituted with a specific use's
+    /// own arguments wherever it's read out (`rfcs/0008`).
     fields: Vec<(Symbol, Ty, bool)>,
     /// Where this record was declared -- compared against `self.source`
     /// (the module currently being checked) to tell an in-module field
     /// access/construction (always allowed) apart from a cross-module
     /// one (only ever allowed for a `public` field).
     source: SourceId,
+    /// This record's own generic parameters, in declaration order.
+    /// Empty for a non-generic record.
+    type_params: Vec<TypeParamId>,
 }
 
 #[derive(Clone)]
@@ -279,11 +352,38 @@ struct VariantInfo {
     /// one of its case names -- carried so `Ty::Named` can always be
     /// built with the declaration's own name (see `named_variant_ty`).
     name: Symbol,
-    /// `(case name, declared payload types)`, in declaration order.
+    /// `(case name, declared payload types)`, in declaration order. A
+    /// payload type may reference `type_params` via `Ty::Param`,
+    /// symbolically (`rfcs/0008`).
     cases: Vec<(Symbol, Vec<Ty>)>,
+    /// This variant's own generic parameters, in declaration order.
+    /// Empty for a non-generic variant.
+    type_params: Vec<TypeParamId>,
 }
 
 impl<'a> Checker<'a> {
+    /// Collects every function/record/variant's own generic parameter
+    /// identities, once, before anything resolves a single type
+    /// reference -- so resolving a reference to any one of them (a
+    /// field typed with a record declared elsewhere in the module,
+    /// forward or backward) can validate its arity without depending on
+    /// which order `build_aggregate_info`/`build_signatures` happens to
+    /// process declarations in (`rfcs/0008`).
+    fn collect_generic_params(&mut self, hir: &HirModule) {
+        for r in &hir.records {
+            self.generic_params
+                .insert(r.id, r.type_params.iter().map(|p| p.id).collect());
+        }
+        for v in &hir.variants {
+            self.generic_params
+                .insert(v.id, v.type_params.iter().map(|p| p.id).collect());
+        }
+        for f in &hir.functions {
+            self.generic_params
+                .insert(f.id, f.type_params.iter().map(|p| p.id).collect());
+        }
+    }
+
     /// Resolves every declared record's field types and every declared
     /// variant's case payload types, once, before any function body or
     /// the aggregate-cycle check runs -- both need every item's fields/
@@ -302,6 +402,7 @@ impl<'a> Checker<'a> {
                     name: r.name,
                     fields,
                     source: r.source,
+                    type_params: r.type_params.iter().map(|p| p.id).collect(),
                 },
             );
         }
@@ -324,6 +425,7 @@ impl<'a> Checker<'a> {
                 VariantInfo {
                     name: v.name,
                     cases,
+                    type_params: v.type_params.iter().map(|p| p.id).collect(),
                 },
             );
             self.variant_display.insert(
@@ -385,6 +487,7 @@ impl<'a> Checker<'a> {
                 FunctionSig {
                     params,
                     ret,
+                    type_params: f.type_params.iter().map(|p| p.id).collect(),
                     span: f.span,
                     source: f.source,
                 },
@@ -402,9 +505,72 @@ impl<'a> Checker<'a> {
     /// a diagnostic at the type's own span -- `Ty::Error` is only ever
     /// returned *after* recording why, never as a silent wildcard for
     /// "some type we don't recognize".
+    ///
+    /// A generic aggregate reference validates its arity against
+    /// `self.generic_params` (collected once, up front, for every
+    /// declaration in the whole module -- see [`Self::collect_generic_params`])
+    /// and resolves to `Ty::Applied` when correct; a non-generic
+    /// declaration always resolves to the same `Ty::Named` it always
+    /// has (`rfcs/0008`).
     fn resolve_named_type(&mut self, ty: &HirType) -> Ty {
         match ty {
-            HirType::Aggregate { item, name, .. } => Ty::Named(*item, *name),
+            HirType::Aggregate {
+                item, name, args, ..
+            } => {
+                let resolved_args: Vec<Ty> =
+                    args.iter().map(|a| self.resolve_named_type(a)).collect();
+                let type_params = self.generic_params.get(item).cloned().unwrap_or_default();
+                if type_params.is_empty() {
+                    if !resolved_args.is_empty() {
+                        let text = self.registry.qualified_name(*item, self.interner);
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::TYPE_ARGUMENTS_TO_NON_GENERIC,
+                                self.source,
+                                ty.span(),
+                                format!("`{text}` is not generic and cannot take type arguments"),
+                            )
+                            .with_primary_label("type arguments on a non-generic declaration"),
+                        );
+                        return Ty::Error;
+                    }
+                    Ty::Named(*item, *name)
+                } else if resolved_args.is_empty() {
+                    let text = self.registry.qualified_name(*item, self.interner);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::MISSING_TYPE_ARGUMENTS,
+                            self.source,
+                            ty.span(),
+                            format!(
+                                "`{text}` is generic and requires {} type argument(s)",
+                                type_params.len()
+                            ),
+                        )
+                        .with_primary_label("missing type arguments"),
+                    );
+                    Ty::Error
+                } else if resolved_args.len() != type_params.len() {
+                    let text = self.registry.qualified_name(*item, self.interner);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::GENERIC_ARITY_MISMATCH,
+                            self.source,
+                            ty.span(),
+                            format!(
+                                "`{text}` expects {} type argument(s), found {}",
+                                type_params.len(),
+                                resolved_args.len()
+                            ),
+                        )
+                        .with_primary_label("wrong number of type arguments"),
+                    );
+                    Ty::Error
+                } else {
+                    Ty::Applied(*item, resolved_args)
+                }
+            }
+            HirType::Param { id, name, .. } => Ty::Param(*id, *name),
             HirType::Unresolved { name, span } => {
                 let text = self.interner.resolve(*name);
                 if let Some(prim) = primitive_from_name(text) {
@@ -422,6 +588,37 @@ impl<'a> Checker<'a> {
                 Ty::Error
             }
         }
+    }
+
+    /// Records that `key` is a distinct generic instance this
+    /// compilation has now resolved, enforcing the shared instance
+    /// budget the first time each unique key is seen (never once per
+    /// occurrence -- calling `identity(1)` a thousand times is one
+    /// instance, not a thousand). Returns `false` once the budget is
+    /// exceeded, having already recorded the diagnostic; callers must
+    /// not additionally trust the (still returned, best-effort) type in
+    /// that case.
+    fn record_generic_instance(&mut self, key: GenericInstanceKey, span: Span) -> bool {
+        if self.generic_instances.contains(&key) {
+            return true;
+        }
+        if self.generic_instances.len() >= crate::limits::MAX_GENERIC_INSTANCES {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::GENERIC_INSTANCE_BUDGET_EXCEEDED,
+                    self.source,
+                    span,
+                    format!(
+                        "this compilation has exceeded its budget of {} distinct generic instances",
+                        crate::limits::MAX_GENERIC_INSTANCES
+                    ),
+                )
+                .with_primary_label("generic instance budget exceeded"),
+            );
+            return false;
+        }
+        self.generic_instances.insert(key);
+        true
     }
 
     fn check_function(&mut self, f: &HirFunction) {
@@ -641,9 +838,10 @@ impl<'a> Checker<'a> {
             HirExpr::CaseRef {
                 variant,
                 case,
+                type_args,
                 span,
                 ..
-            } => self.check_case_ref(*variant, *case, *span),
+            } => self.check_case_ref(*variant, *case, type_args, *span),
             HirExpr::Unary {
                 op, operand, span, ..
             } => self.check_unary(*op, operand, *span),
@@ -662,8 +860,11 @@ impl<'a> Checker<'a> {
                 ..
             } => self.check_assign(target, *op, value, *span),
             HirExpr::Call {
-                callee, args, span, ..
-            } => self.check_call(callee, args, *span),
+                id,
+                callee,
+                args,
+                span,
+            } => self.check_call(*id, callee, args, *span),
             HirExpr::Field {
                 base, name, span, ..
             } => self.check_field_access(base, *name, *span),
@@ -696,11 +897,12 @@ impl<'a> Checker<'a> {
             } => self.check_match(scrutinee, arms, *span),
             HirExpr::Block(block) => self.check_block(block),
             HirExpr::RecordLiteral {
+                id,
                 record,
+                type_args,
                 fields,
                 span,
-                ..
-            } => self.check_record_literal(*record, fields, *span),
+            } => self.check_record_literal(*id, *record, type_args, fields, *span),
             HirExpr::Return { value, span, .. } => {
                 let value_ty = value
                     .as_ref()
@@ -943,15 +1145,166 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_call(&mut self, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
-        if let HirExpr::CaseRef { variant, case, .. } = callee {
-            return self.check_variant_construct(*variant, *case, args, span);
+    /// Resolves the type arguments to use for one generic call or
+    /// construction site (`rfcs/0008`): `explicit`'s own resolved types,
+    /// validated for arity, when the syntax supplied any; otherwise, if
+    /// `allow_inference`, one fresh inference variable per parameter (a
+    /// caller then unifies each argument against the substituted
+    /// parameter type to solve them). `what` is a pre-quoted name
+    /// (`` `identity` ``) for diagnostics. Returns `None` after already
+    /// recording the diagnostic on an explicit arity mismatch, or (when
+    /// `!allow_inference`) on an omitted type-argument list for a
+    /// generic declaration -- record/variant *construction* always
+    /// requires explicit arguments (there is no infer-from-fields form),
+    /// while a function call or a payload-carrying variant constructor
+    /// may infer from its arguments the same way.
+    fn resolve_generic_args(
+        &mut self,
+        type_params: &[TypeParamId],
+        explicit: &[HirType],
+        allow_inference: bool,
+        span: Span,
+        what: &str,
+    ) -> Option<(HashMap<TypeParamId, Ty>, bool)> {
+        if !explicit.is_empty() {
+            let resolved: Vec<Ty> = explicit.iter().map(|t| self.resolve_named_type(t)).collect();
+            if resolved.len() != type_params.len() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::GENERIC_ARITY_MISMATCH,
+                        self.source,
+                        span,
+                        format!(
+                            "{what} expects {} type argument(s), found {}",
+                            type_params.len(),
+                            resolved.len()
+                        ),
+                    )
+                    .with_primary_label("wrong number of type arguments"),
+                );
+                return None;
+            }
+            return Some((type_params.iter().copied().zip(resolved).collect(), false));
+        }
+        if type_params.is_empty() {
+            return Some((HashMap::new(), false));
+        }
+        if !allow_inference {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::MISSING_TYPE_ARGUMENTS,
+                    self.source,
+                    span,
+                    format!(
+                        "{what} is generic and requires {} type argument(s)",
+                        type_params.len()
+                    ),
+                )
+                .with_primary_label("missing type arguments"),
+            );
+            return None;
+        }
+        let subst = type_params
+            .iter()
+            .map(|&p| (p, Ty::Var(self.ctx.fresh_var())))
+            .collect();
+        Some((subst, true))
+    }
+
+    /// After every argument has been unified against its (possibly
+    /// substituted) parameter type, checks that every one of an
+    /// *inferred* call's fresh type-argument variables actually got
+    /// resolved -- a parameter appearing only in the return type
+    /// (`func create[T]() -> T;`) is never touched by argument
+    /// unification at all, so it stays an unbound `Ty::Var` unless the
+    /// caller supplied it explicitly (`rfcs/0008`).
+    fn check_inferred_args_resolved(
+        &mut self,
+        type_params: &[TypeParamId],
+        subst: &HashMap<TypeParamId, Ty>,
+        span: Span,
+        what: &str,
+    ) -> bool {
+        let mut ok = true;
+        for p in type_params {
+            if let Some(ty) = subst.get(p)
+                && matches!(self.ctx.resolve(ty), Ty::Var(_))
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::CANNOT_INFER_TYPE_ARGUMENT,
+                        self.source,
+                        span,
+                        format!(
+                            "cannot infer {what}'s type argument from these arguments; provide it explicitly"
+                        ),
+                    )
+                    .with_primary_label("type argument cannot be inferred"),
+                );
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Like [`Self::unify_report`], but used specifically for an
+    /// *inferred* generic call/construction's argument-vs-parameter
+    /// check: a conflict here means two arguments disagreed about what
+    /// the same type parameter should be (`choose(1, "text")` for
+    /// `func choose[T](left: T, right: T) -> T`), which gets its own
+    /// diagnostic distinct from an ordinary type mismatch. An
+    /// *explicit*-type-argument call's argument mismatches are ordinary
+    /// mismatches (the caller already said what the type is), so callers
+    /// pass `inferred: false` to fall back to `unify_report` unchanged.
+    fn unify_arg_report(
+        &mut self,
+        expected: &Ty,
+        actual: &Ty,
+        span: Span,
+        message: &str,
+        inferred: bool,
+    ) -> bool {
+        if !inferred {
+            return self.unify_report(expected, actual, span, message);
+        }
+        if let Err((ra, rb)) = unify(&mut self.ctx, expected, actual) {
+            self.diagnostics.push(Diagnostic::error(
+                codes::CONFLICTING_INFERRED_ARGUMENTS,
+                self.source,
+                span,
+                format!(
+                    "{message}: expected `{}`, found `{}`",
+                    self.display_for_diagnostic(&ra),
+                    self.display_for_diagnostic(&rb)
+                ),
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn check_call(&mut self, call_id: ExprId, callee: &HirExpr, args: &[HirExpr], span: Span) -> Ty {
+        if let HirExpr::CaseRef {
+            variant,
+            case,
+            type_args,
+            ..
+        } = callee
+        {
+            return self.check_variant_construct(call_id, *variant, *case, type_args, args, span);
         }
 
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
         let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
 
-        let HirExpr::Function { item, name, .. } = callee else {
+        let HirExpr::Function {
+            item,
+            name,
+            type_args,
+            ..
+        } = callee
+        else {
             let callee_ty = self.check_expr(callee);
             // Error/Never already trace back to a diagnostic recorded
             // elsewhere (an unresolved name, an unsupported feature, a
@@ -982,15 +1335,21 @@ impl<'a> Checker<'a> {
             return if any_arg_never { Ty::Never } else { Ty::Error };
         };
 
+        let quoted = format!("`{}`", self.interner.resolve(*name));
+        let Some((subst, inferred)) =
+            self.resolve_generic_args(&sig.type_params, type_args, true, span, &quoted)
+        else {
+            return if any_arg_never { Ty::Never } else { Ty::Error };
+        };
+
         if sig.params.len() != args.len() {
-            let text = self.interner.resolve(*name);
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::ARITY_MISMATCH,
                     self.source,
                     span,
                     format!(
-                        "`{text}` expects {} argument(s), found {}",
+                        "{quoted} expects {} argument(s), found {}",
                         sig.params.len(),
                         args.len()
                     ),
@@ -1000,28 +1359,57 @@ impl<'a> Checker<'a> {
             );
         } else {
             for (arg_ty, param_ty) in arg_tys.iter().zip(sig.params.iter()) {
-                self.unify_report(
-                    param_ty,
+                let substituted = substitute(param_ty, &subst);
+                self.unify_arg_report(
+                    &substituted,
                     arg_ty,
                     span,
                     "argument type does not match the parameter's declared type",
+                    inferred,
                 );
             }
         }
 
+        let mut ok = !inferred || self.check_inferred_args_resolved(&sig.type_params, &subst, span, &quoted);
+        if ok && !sig.type_params.is_empty() {
+            let resolved_args: Vec<Ty> = sig
+                .type_params
+                .iter()
+                .map(|p| deep_resolve(&self.ctx, subst.get(p).expect("every declared parameter has a substitution entry")))
+                .collect();
+            let key = GenericInstanceKey::new(*item, resolved_args.clone());
+            if self.record_generic_instance(key, span) {
+                self.call_type_args.insert(call_id, resolved_args);
+            } else {
+                ok = false;
+            }
+        }
+        if !ok {
+            return if any_arg_never { Ty::Never } else { Ty::Error };
+        }
+
+        let ret = substitute(&sig.ret, &subst);
         // A call is strict in its arguments: every one of them is
         // evaluated before the call itself ever happens, so any
         // argument that never produces a value means the call is never
         // actually reached.
-        if any_arg_never { Ty::Never } else { sig.ret }
+        if any_arg_never { Ty::Never } else { ret }
     }
 
     /// A bare (uncalled) variant-case reference: only valid when that
     /// case carries no payload, in which case it is itself a complete
     /// value of the variant's type -- `LookupResult.Missing` needs no
     /// call syntax at all, matching a unit case allocating no
-    /// fabricated payload.
-    fn check_case_ref(&mut self, variant: ItemId, case: usize, span: Span) -> Ty {
+    /// fabricated payload. A generic variant referenced this way has
+    /// nothing to infer its type argument from, so it always requires
+    /// an explicit qualified application (`Maybe[i64].None`).
+    fn check_case_ref(
+        &mut self,
+        variant: ItemId,
+        case: usize,
+        type_args: &[HirType],
+        span: Span,
+    ) -> Ty {
         let Some(info) = self.variants.get(&variant).cloned() else {
             return Ty::Error;
         };
@@ -1042,13 +1430,33 @@ impl<'a> Checker<'a> {
             );
             return Ty::Error;
         }
-        self.named_variant_ty(variant)
+        let quoted = format!("`{}`", self.interner.resolve(info.name));
+        let Some((subst, _)) =
+            self.resolve_generic_args(&info.type_params, type_args, false, span, &quoted)
+        else {
+            return Ty::Error;
+        };
+        if info.type_params.is_empty() {
+            return self.named_variant_ty(variant);
+        }
+        let resolved_args: Vec<Ty> = info
+            .type_params
+            .iter()
+            .map(|p| subst.get(p).expect("explicit substitution covers every parameter").clone())
+            .collect();
+        let key = GenericInstanceKey::new(variant, resolved_args.clone());
+        if !self.record_generic_instance(key, span) {
+            return Ty::Error;
+        }
+        Ty::Applied(variant, resolved_args)
     }
 
     fn check_variant_construct(
         &mut self,
+        call_id: ExprId,
         variant: ItemId,
         case: usize,
+        type_args: &[HirType],
         args: &[HirExpr],
         span: Span,
     ) -> Ty {
@@ -1059,6 +1467,16 @@ impl<'a> Checker<'a> {
             return Ty::Error;
         };
         let (case_name, payload) = info.cases[case].clone();
+        let variant_quoted = format!("`{}`", self.interner.resolve(info.name));
+        let Some((subst, inferred)) =
+            self.resolve_generic_args(&info.type_params, type_args, true, span, &variant_quoted)
+        else {
+            for a in args {
+                self.check_expr(a);
+            }
+            return Ty::Error;
+        };
+
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
         let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
 
@@ -1079,20 +1497,43 @@ impl<'a> Checker<'a> {
             );
         } else {
             for (arg_ty, payload_ty) in arg_tys.iter().zip(payload.iter()) {
-                self.unify_report(
-                    payload_ty,
+                let substituted = substitute(payload_ty, &subst);
+                self.unify_arg_report(
+                    &substituted,
                     arg_ty,
                     span,
                     "payload argument type does not match the case's declared type",
+                    inferred,
                 );
             }
         }
 
-        if any_arg_never {
-            Ty::Never
-        } else {
+        let mut ok = !inferred
+            || self.check_inferred_args_resolved(&info.type_params, &subst, span, &variant_quoted);
+        let mut result_ty = if info.type_params.is_empty() {
             self.named_variant_ty(variant)
+        } else {
+            Ty::Error
+        };
+        if ok && !info.type_params.is_empty() {
+            let resolved_args: Vec<Ty> = info
+                .type_params
+                .iter()
+                .map(|p| deep_resolve(&self.ctx, subst.get(p).expect("every declared parameter has a substitution entry")))
+                .collect();
+            let key = GenericInstanceKey::new(variant, resolved_args.clone());
+            if self.record_generic_instance(key, span) {
+                self.call_type_args.insert(call_id, resolved_args.clone());
+                result_ty = Ty::Applied(variant, resolved_args);
+            } else {
+                ok = false;
+            }
         }
+        if !ok {
+            return Ty::Error;
+        }
+
+        if any_arg_never { Ty::Never } else { result_ty }
     }
 
     /// `TypeName { field: expr, ... }`. `hir::lower` already resolved
@@ -1103,11 +1544,25 @@ impl<'a> Checker<'a> {
     /// evaluated (RFC 0005).
     fn check_record_literal(
         &mut self,
+        call_id: ExprId,
         record: ItemId,
+        type_args: &[HirType],
         fields: &[crate::hir::HirFieldInit],
         span: Span,
     ) -> Ty {
         let Some(info) = self.records.get(&record).cloned() else {
+            for f in fields {
+                self.check_expr(&f.value);
+            }
+            return Ty::Error;
+        };
+        // Generic record construction always requires an explicit
+        // application (`Box[i64] { .. }`) -- there is no infer-from-
+        // field-values form (`rfcs/0008`).
+        let quoted = format!("`{}`", self.interner.resolve(info.name));
+        let Some((subst, _)) =
+            self.resolve_generic_args(&info.type_params, type_args, false, span, &quoted)
+        else {
             for f in fields {
                 self.check_expr(&f.value);
             }
@@ -1120,18 +1575,32 @@ impl<'a> Checker<'a> {
                 diverged = true;
             }
             let (_, declared_ty, _) = &info.fields[f.field_index];
+            let substituted = substitute(declared_ty, &subst);
             self.unify_report(
-                declared_ty,
+                &substituted,
                 &field_ty,
                 f.span,
                 "the field's initializer does not match its declared type",
             );
         }
         let _ = span;
+        if info.type_params.is_empty() {
+            return if diverged { Ty::Never } else { self.named_record_ty(record) };
+        }
+        let resolved_args: Vec<Ty> = info
+            .type_params
+            .iter()
+            .map(|p| subst.get(p).expect("explicit substitution covers every parameter").clone())
+            .collect();
+        let key = GenericInstanceKey::new(record, resolved_args.clone());
+        if !self.record_generic_instance(key, span) {
+            return Ty::Error;
+        }
+        self.call_type_args.insert(call_id, resolved_args.clone());
         if diverged {
             Ty::Never
         } else {
-            self.named_record_ty(record)
+            Ty::Applied(record, resolved_args)
         }
     }
 
@@ -1148,22 +1617,39 @@ impl<'a> Checker<'a> {
         if matches!(base_ty, Ty::Error) {
             return Ty::Error;
         }
-        let Ty::Named(item, _) = &base_ty else {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    codes::FIELD_ACCESS_NON_RECORD,
-                    self.source,
-                    span,
-                    format!(
-                        "field access on a non-record type `{}`",
-                        self.display_for_diagnostic(&base_ty)
-                    ),
-                )
-                .with_primary_label("not a record"),
-            );
-            return Ty::Error;
+        // A generic record's field type may itself reference the
+        // record's own type parameters (`Ty::Param`) -- substituted here
+        // with *this particular value's* own type arguments (from its
+        // `Ty::Applied`) before being handed back as the access's
+        // result type (`rfcs/0008`). A non-generic record's `subst` is
+        // simply empty, so `substitute` below is a no-op for it.
+        let (item, subst): (ItemId, HashMap<TypeParamId, Ty>) = match &base_ty {
+            Ty::Named(item, _) => (*item, HashMap::new()),
+            Ty::Applied(item, args) => {
+                let type_params = self
+                    .records
+                    .get(item)
+                    .map(|r| r.type_params.clone())
+                    .unwrap_or_default();
+                (*item, type_params.into_iter().zip(args.iter().cloned()).collect())
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::FIELD_ACCESS_NON_RECORD,
+                        self.source,
+                        span,
+                        format!(
+                            "field access on a non-record type `{}`",
+                            self.display_for_diagnostic(&base_ty)
+                        ),
+                    )
+                    .with_primary_label("not a record"),
+                );
+                return Ty::Error;
+            }
         };
-        let Some(info) = self.records.get(item).cloned() else {
+        let Some(info) = self.records.get(&item).cloned() else {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::FIELD_ACCESS_NON_RECORD,
@@ -1196,7 +1682,7 @@ impl<'a> Checker<'a> {
                     );
                     return Ty::Error;
                 }
-                ty.clone()
+                substitute(ty, &subst)
             }
             None => {
                 let text = self.interner.resolve(name);
@@ -1219,7 +1705,11 @@ impl<'a> Checker<'a> {
 
     fn is_aggregate(&self, ty: &Ty) -> bool {
         let resolved = self.ctx.resolve(ty);
-        matches!(resolved, Ty::Named(item, _) if self.records.contains_key(&item) || self.variants.contains_key(&item))
+        match resolved {
+            Ty::Named(item, _) => self.records.contains_key(&item) || self.variants.contains_key(&item),
+            Ty::Applied(..) => true,
+            _ => false,
+        }
     }
 
     /// Builds `Ty::Named` for a record item, using the record
@@ -1541,17 +2031,22 @@ impl<'a> Checker<'a> {
             HirPattern::Bind {
                 id, local, name, ..
             } => {
-                if let Ty::Named(item, _) = &resolved_scrutinee
-                    && let Some(info) = self.variants.get(item)
+                let variant_item = match &resolved_scrutinee {
+                    Ty::Named(item, _) => Some(*item),
+                    Ty::Applied(item, _) => Some(*item),
+                    _ => None,
+                };
+                if let Some(item) = variant_item
+                    && let Some(info) = self.variants.get(&item)
                     && let Some(case_index) = info
                         .cases
                         .iter()
                         .position(|(case_name, payload)| case_name == name && payload.is_empty())
                 {
-                    self.pattern_case.insert(*id, (*item, case_index));
+                    self.pattern_case.insert(*id, (item, case_index));
                     return (
                         ResolvedPattern::Variant {
-                            variant: *item,
+                            variant: item,
                             case: case_index,
                             args: Vec::new(),
                         },
@@ -1573,16 +2068,39 @@ impl<'a> Checker<'a> {
                 args,
                 span,
             } => {
-                let Ty::Named(item, _) = &resolved_scrutinee else {
-                    if !matches!(resolved_scrutinee, Ty::Error) {
-                        self.push_incompatible_pattern(*span, &resolved_scrutinee);
+                // A generic variant's scrutinee is `Ty::Applied`, not
+                // `Ty::Named` -- its own type arguments substitute into
+                // each case's symbolic payload types below, so a bound
+                // sub-pattern (`inner` in `Some(inner)`) gets the exact
+                // instantiated type (`T` -> `i64`), never the bare
+                // parameter (`rfcs/0008`).
+                let (item, subst): (ItemId, HashMap<TypeParamId, Ty>) = match &resolved_scrutinee {
+                    Ty::Named(item, _) => (*item, HashMap::new()),
+                    Ty::Applied(item, applied_args) => {
+                        let type_params = self
+                            .variants
+                            .get(item)
+                            .map(|v| v.type_params.clone())
+                            .unwrap_or_default();
+                        (
+                            *item,
+                            type_params
+                                .into_iter()
+                                .zip(applied_args.iter().cloned())
+                                .collect(),
+                        )
                     }
-                    for a in args {
-                        self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
+                    _ => {
+                        if !matches!(resolved_scrutinee, Ty::Error) {
+                            self.push_incompatible_pattern(*span, &resolved_scrutinee);
+                        }
+                        for a in args {
+                            self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
+                        }
+                        return (ResolvedPattern::Wildcard, false);
                     }
-                    return (ResolvedPattern::Wildcard, false);
                 };
-                let Some(info) = self.variants.get(item).cloned() else {
+                let Some(info) = self.variants.get(&item).cloned() else {
                     // `resolved_scrutinee` is `Ty::Named` but names a
                     // *record*, not a variant (e.g. a variant pattern
                     // written against a record-typed scrutinee) -- just
@@ -1617,7 +2135,7 @@ impl<'a> Checker<'a> {
                     }
                     return (ResolvedPattern::Wildcard, false);
                 };
-                self.pattern_case.insert(*id, (*item, case_index));
+                self.pattern_case.insert(*id, (item, case_index));
                 let payload = info.cases[case_index].1.clone();
                 let mut valid = payload.len() == args.len();
                 if !valid {
@@ -1648,10 +2166,11 @@ impl<'a> Checker<'a> {
                 // from the resolved pattern.
                 let mut resolved_args = Vec::with_capacity(payload.len());
                 for (i, payload_ty) in payload.iter().enumerate() {
+                    let payload_ty = substitute(payload_ty, &subst);
                     match args.get(i) {
                         Some(a) => {
                             let (resolved, arg_valid) =
-                                self.check_pattern_at_depth(a, payload_ty, depth + 1);
+                                self.check_pattern_at_depth(a, &payload_ty, depth + 1);
                             valid &= arg_valid;
                             resolved_args.push(resolved);
                         }
@@ -1663,7 +2182,7 @@ impl<'a> Checker<'a> {
                 }
                 (
                     ResolvedPattern::Variant {
-                        variant: *item,
+                        variant: item,
                         case: case_index,
                         args: resolved_args,
                     },
@@ -1810,6 +2329,18 @@ impl<'a> Checker<'a> {
         if let Ty::Named(item, _) = ty {
             return self.registry.qualified_name(*item, self.interner);
         }
+        if let Ty::Param(_, name) = ty {
+            return self.interner.resolve(*name).to_string();
+        }
+        if let Ty::Applied(item, args) = ty {
+            let head = self.registry.qualified_name(*item, self.interner);
+            let args_text = args
+                .iter()
+                .map(|a| self.display_for_diagnostic(a))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("{head}[{args_text}]");
+        }
         display_ty(ty, self.interner)
     }
 
@@ -1817,9 +2348,43 @@ impl<'a> Checker<'a> {
         self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
+    /// `true` for a resolved type this checker can prove *no* operation
+    /// is universally valid for -- specifically, one of the enclosing
+    /// generic declaration's own unconstrained type parameters
+    /// (`rfcs/0008`). Distinguishing this from an ordinary "wrong
+    /// concrete type" is what lets `require_numeric`/`require_integer`
+    /// give `func add[T](left: T, right: T) -> T { left + right }` its
+    /// own dedicated explanation instead of reporting `T` as if it were
+    /// simply some non-numeric type like `bool` -- protocols/
+    /// constraints (Alpha 0.1.5) are what will eventually let a type
+    /// parameter prove it supports a specific operation; nothing does
+    /// yet.
+    fn report_unconstrained_type_parameter(&mut self, ty: &Ty, span: Span) -> bool {
+        let Ty::Param(_, name) = ty else {
+            return false;
+        };
+        let text = self.interner.resolve(*name);
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNSUPPORTED_ON_TYPE_PARAMETER,
+                self.source,
+                span,
+                format!(
+                    "this operation is not available for `{text}`: an unconstrained type \
+                     parameter has no operations guaranteed for every possible type"
+                ),
+            )
+            .with_primary_label("not available for an unconstrained type parameter"),
+        );
+        true
+    }
+
     fn require_numeric(&mut self, ty: &Ty, span: Span) {
         let resolved = self.ctx.resolve(ty);
         if matches!(resolved, Ty::Var(_) | Ty::Error | Ty::Never) || is_numeric(&resolved) {
+            return;
+        }
+        if self.report_unconstrained_type_parameter(&resolved, span) {
             return;
         }
         self.diagnostics.push(Diagnostic::error(
@@ -1844,6 +2409,9 @@ impl<'a> Checker<'a> {
             other => is_integer(other),
         };
         if ok {
+            return;
+        }
+        if self.report_unconstrained_type_parameter(&resolved, span) {
             return;
         }
         self.diagnostics.push(Diagnostic::error(
@@ -2290,6 +2858,9 @@ mod tests {
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
+            call_type_args: HashMap::new(),
+            generic_params: HashMap::new(),
+            generic_instances: std::collections::HashSet::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -2337,6 +2908,9 @@ mod tests {
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
+            call_type_args: HashMap::new(),
+            generic_params: HashMap::new(),
+            generic_instances: std::collections::HashSet::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }
@@ -3125,6 +3699,7 @@ mod tests {
             span: Span::dummy(),
             source: record_source,
             public: true,
+            type_params: Vec::new(),
             fields: vec![
                 crate::hir::HirField {
                     name: field_x,
@@ -3153,6 +3728,7 @@ mod tests {
             name_span: Span::dummy(),
             source: accessing_source,
             public: true,
+            type_params: Vec::new(),
             params: vec![crate::hir::HirParam {
                 local: param_local,
                 name: param_name,
@@ -3161,6 +3737,7 @@ mod tests {
                     item: ItemId(0),
                     kind: crate::hir::AggregateKind::Record,
                     name: record_name,
+                    args: Vec::new(),
                     span: Span::dummy(),
                 },
             }],

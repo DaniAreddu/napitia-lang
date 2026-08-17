@@ -60,6 +60,7 @@ type LowerResult<T> = Result<T, Box<Diagnostic>>;
 /// successfully and the whole `Module` is returned, or one or more
 /// failed and the *only* thing returned is their diagnostics -- there is
 /// no way to get back a `Module` with some functions missing.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,

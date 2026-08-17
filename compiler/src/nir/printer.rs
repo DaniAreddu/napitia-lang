@@ -250,13 +250,21 @@ fn format_evidence(evidence: &Evidence, interner: &Interner, registry: &ItemRegi
                     .iter()
                     .map(|n| format_evidence(n, interner, registry))
                     .collect();
-                format!("@{}[{}]", qualified_ref(*extend, registry, interner), parts.join(", "))
+                format!(
+                    "@{}[{}]",
+                    qualified_ref(*extend, registry, interner),
+                    parts.join(", ")
+                )
             }
         }
     }
 }
 
-fn evidence_list_suffix(evidence: &[Evidence], interner: &Interner, registry: &ItemRegistry) -> String {
+fn evidence_list_suffix(
+    evidence: &[Evidence],
+    interner: &Interner,
+    registry: &ItemRegistry,
+) -> String {
     if evidence.is_empty() {
         return String::new();
     }

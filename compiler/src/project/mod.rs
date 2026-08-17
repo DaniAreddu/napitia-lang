@@ -912,4 +912,127 @@ mod tests {
         let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
         assert_eq!(result, Ok(crate::interpreter::Value::Int(5)));
     }
+
+    /// A project with two same-named, same-shaped `User` records, each
+    /// used (via an alias) as a parameter type, a return type, and a
+    /// `mutable`-bound (alloc/store/load) local -- the fixture shared by
+    /// every qualified-NIR test below (`rfcs/0007`).
+    fn write_same_named_record_project(project: &TempProject) {
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.User as SalesUser;\n\
+             import admin.User as AdminUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func make_sales() -> SalesUser { mutable s = SalesUser { id: 1 }; return s }\n\
+             func make_admin() -> AdminUser { mutable a = AdminUser { id: 2 }; return a }\n\
+             func main() -> i64 {\n\
+             \x20   return sales_id(make_sales()) + admin_id(make_admin())\n\
+             }\n",
+        );
+        project.write("src/sales.npt", "public record User { public id: i64 }\n");
+        project.write("src/admin.npt", "public record User { public id: i64 }\n");
+    }
+
+    fn compile_and_print(project: &TempProject) -> String {
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        crate::nir::print_module(&compiled.nir, &interner, &compiled.registry)
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_parameter_position() {
+        let project = TempProject::new("nir_qualify_params");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(text.contains("(%0: sales.User#"), "{text}");
+        assert!(text.contains("(%0: admin.User#"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_return_position() {
+        let project = TempProject::new("nir_qualify_returns");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(
+            text.contains("make_sales") && text.contains(") -> sales.User#"),
+            "{text}"
+        );
+        assert!(
+            text.contains("make_admin") && text.contains(") -> admin.User#"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn qualified_nir_distinguishes_same_named_types_in_allocations() {
+        let project = TempProject::new("nir_qualify_alloc");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(text.contains("alloc.sales.User#"), "{text}");
+        assert!(text.contains("alloc.admin.User#"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_never_prints_an_import_alias() {
+        let project = TempProject::new("nir_qualify_no_alias");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        assert!(!text.contains("SalesUser"), "{text}");
+        assert!(!text.contains("AdminUser"), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_declaration_and_reference_formatting_agree() {
+        // Whatever `sales.User`'s declaration-site id is (from its
+        // `record.create`), every reference to it -- its qualified
+        // parameter type, its qualified return type, its `alloc` -- must
+        // repeat that exact same qualified name, never a different
+        // spelling or a different id for the same item.
+        let project = TempProject::new("nir_qualify_agree");
+        write_same_named_record_project(&project);
+        let text = compile_and_print(&project);
+        let start = text.find("record.create @sales.User#").expect(&text);
+        let rest = &text[start + "record.create @".len()..];
+        let end = rest.find('(').expect(&text);
+        let sales_ref = &rest[..end];
+        assert!(text.contains(&format!("(%0: {sales_ref})")), "{text}");
+        assert!(text.contains(&format!("-> {sales_ref}")), "{text}");
+        assert!(text.contains(&format!("alloc.{sales_ref}")), "{text}");
+    }
+
+    #[test]
+    fn qualified_nir_is_byte_identical_across_repeated_compiles() {
+        let project = TempProject::new("nir_qualify_repeatable");
+        write_same_named_record_project(&project);
+        assert_eq!(compile_and_print(&project), compile_and_print(&project));
+    }
+
+    #[test]
+    fn qualified_nir_is_identical_regardless_of_import_order() {
+        let forward = TempProject::new("nir_qualify_order_forward");
+        write_same_named_record_project(&forward);
+
+        let reversed = TempProject::new("nir_qualify_order_reversed");
+        reversed.write("napitia.toml", MANIFEST);
+        reversed.write(
+            "src/main.npt",
+            "import admin.User as AdminUser;\n\
+             import sales.User as SalesUser;\n\
+             func sales_id(u: SalesUser) -> i64 { return u.id }\n\
+             func admin_id(u: AdminUser) -> i64 { return u.id }\n\
+             func make_sales() -> SalesUser { mutable s = SalesUser { id: 1 }; return s }\n\
+             func make_admin() -> AdminUser { mutable a = AdminUser { id: 2 }; return a }\n\
+             func main() -> i64 {\n\
+             \x20   return sales_id(make_sales()) + admin_id(make_admin())\n\
+             }\n",
+        );
+        reversed.write("src/sales.npt", "public record User { public id: i64 }\n");
+        reversed.write("src/admin.npt", "public record User { public id: i64 }\n");
+
+        assert_eq!(compile_and_print(&forward), compile_and_print(&reversed));
+    }
 }

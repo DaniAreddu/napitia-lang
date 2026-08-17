@@ -183,14 +183,49 @@ name, the unqualified form is a checked, reported ambiguity error.
 ### Types
 
 ```text
-Type = IDENT ;
+Type = IDENT [ "[" Type { "," Type } [ "," ] "]" ] ;
 ```
 
-Only named primitive types (`i8`..`usize`, `f32`, `f64`, `bool`, `char`,
-`str`, plus user record/variant names by identifier) are accepted in this
-milestone. Generic type arguments and any reference/pointer/ownership
-annotation types (`owned`, `borrow`, `shared` — see `spec/0004`) are not
-part of the grammar yet; see "Accepted design direction".
+Named primitive types (`i8`..`usize`, `f32`, `f64`, `bool`, `char`, `str`),
+user record/variant names by identifier, and — since Alpha 0.1.4 — an
+applied generic type (`Box[i64]`, `Pair[i64, str]`, `Box[Maybe[i64]]`) are
+accepted. A trailing comma inside the bracketed argument list is accepted;
+an empty `[]` is malformed. Any reference/pointer/ownership annotation
+type (`owned`, `borrow`, `shared` — see `spec/0004`) is not part of the
+grammar yet; see "Accepted design direction".
+
+### Generics (Alpha 0.1.4)
+
+```text
+TypeParamList = "[" IDENT { "," IDENT } [ "," ] "]" ;
+```
+
+`func`, `record`, and `variant` may each carry an optional `TypeParamList`
+immediately after their name (before `(`/`{`):
+
+```text
+func identity[T](value: T) -> T { value }
+record Box[T] { value: T }
+variant Maybe[T] { Some(T), None }
+```
+
+A type application appears in type position (`Box[i64]`, above) and, for
+a function name or a bare variant-case reference, in expression position
+too:
+
+```text
+identity(42);          // inferred
+identity[i64](42);     // explicit
+value m = Maybe[i64].Some(42);
+value n = Maybe[i64].None;
+```
+
+`<T>` angle-bracket syntax does not exist; partial, default, or wildcard
+type arguments do not exist; a type parameter is never itself generic
+(`T[i64]` is rejected). See `rfcs/0008-canonical-generics.md` for the full
+semantics (parameter identity, inference, exhaustiveness over an
+instantiated payload type, canonical instance identity, and parametric
+NIR) and `spec/0003`/`spec/0006` for the type-system and NIR-level detail.
 
 ### Statements and blocks
 
@@ -392,8 +427,17 @@ without treating a missing node as a silent success.
 
 ## Accepted design direction
 
-- Generic type parameters on functions, records, variants, and protocols
-  (`func identity<T>(x: T) -> T`).
+- Generic type parameters on `protocol`/`extend` (functions, records, and
+  variants gained square-bracket generics in Alpha 0.1.4 — see "Generics"
+  above and `rfcs/0008`; protocols remain name/kind-only in HIR, so a
+  generic protocol constraint has nothing to attach to yet).
+- Protocol/trait-style constraints on a generic type parameter (bounding
+  what a `T` may be instantiated with, and what operations become
+  provably safe for it) — Alpha 0.1.4's type parameters are entirely
+  unconstrained; see `rfcs/0008`'s honest limitations.
+- Native-code specialization/monomorphization of a generic instantiation
+  — Alpha 0.1.4's NIR stays fully parametric with no backend to
+  specialize for yet.
 - `owned`/`borrow`/`shared` type-position annotations at API boundaries,
   once `rfcs/0002-ownership-and-regions.md` is implemented — never
   pervasive lifetime parameters (`rfcs/0004`).

@@ -113,14 +113,16 @@ mod codes {
     /// call/construction site's positional type-argument list ambiguous
     /// about which argument substitutes which occurrence.
     pub const DUPLICATE_TYPE_PARAMETER: &str = "V0034";
-    /// A type used as a `Call`/`RecordCreate`/`VariantCreate` type
-    /// argument is nested deeper than `crate::limits::MAX_GENERIC_DEPTH`.
-    /// Reported once for the whole argument, never once per nested
-    /// level -- a real, structured diagnostic in place of the silent
-    /// early return every other depth-bounded check in this module still
-    /// falls back to past this same bound (defense in depth for those,
-    /// since this check runs first and rejects the type outright before
-    /// they would ever need to).
+    /// A type nested deeper than `crate::limits::MAX_GENERIC_DEPTH`,
+    /// found at *any* type root this verifier checks: a record field, a
+    /// variant case payload, a function parameter or return type, an
+    /// instruction's result type, or a `Call`/`RecordCreate`/
+    /// `VariantCreate` type argument. Reported once per root, never once
+    /// per nested level -- a real, structured diagnostic in place of the
+    /// silent early return every other depth-bounded check in this
+    /// module still falls back to past this same bound (defense in
+    /// depth for those, since this check runs first and rejects the
+    /// type outright before they would ever need to).
     pub const GENERIC_DEPTH_EXCEEDED: &str = "V0035";
 }
 
@@ -263,17 +265,16 @@ pub fn verify_module(
             record.type_params.iter().map(|(id, _)| *id).collect();
         for (field_name, ty) in &record.fields {
             let field_context = format!("{context}'s field `{}`", interner.resolve(*field_name));
-            check_no_bad_type(ty, source, &field_context, &mut diagnostics);
-            check_named_type_identity(
+            check_type_root(
                 ty,
                 &agg,
+                &own_params,
                 source,
                 interner,
                 registry,
                 &field_context,
                 &mut diagnostics,
             );
-            check_type_param_scope(ty, &own_params, source, &field_context, &mut diagnostics);
         }
     }
     for (id, variant) in &module.variants {
@@ -287,17 +288,16 @@ pub fn verify_module(
                     "{context}'s case `{}` payload position {i}",
                     interner.resolve(case.name)
                 );
-                check_no_bad_type(ty, source, &payload_context, &mut diagnostics);
-                check_named_type_identity(
+                check_type_root(
                     ty,
                     &agg,
+                    &own_params,
                     source,
                     interner,
                     registry,
                     &payload_context,
                     &mut diagnostics,
                 );
-                check_type_param_scope(ty, &own_params, source, &payload_context, &mut diagnostics);
             }
         }
     }
@@ -360,35 +360,27 @@ fn verify_function(
     let fn_context = format!("function `{name}`");
     check_no_duplicate_type_params(&function.type_params, source, &fn_context, diagnostics);
     let own_params: HashSet<TypeParamId> = function.type_params.iter().map(|(id, _)| *id).collect();
-    check_no_bad_type(&function.return_type, source, &fn_context, diagnostics);
-    check_named_type_identity(
+    check_type_root(
         &function.return_type,
         agg,
+        &own_params,
         source,
         interner,
         registry,
         &fn_context,
         diagnostics,
     );
-    check_type_param_scope(
-        &function.return_type,
-        &own_params,
-        source,
-        &fn_context,
-        diagnostics,
-    );
     for param in &function.params {
-        check_no_bad_type(&param.ty, source, &fn_context, diagnostics);
-        check_named_type_identity(
+        check_type_root(
             &param.ty,
             agg,
+            &own_params,
             source,
             interner,
             registry,
             &fn_context,
             diagnostics,
         );
-        check_type_param_scope(&param.ty, &own_params, source, &fn_context, diagnostics);
     }
 
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
@@ -476,17 +468,16 @@ fn verify_function(
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Value { result, ty, kind } => {
-                    check_no_bad_type(ty, source, &fn_context, diagnostics);
-                    check_named_type_identity(
+                    check_type_root(
                         ty,
                         agg,
+                        &own_params,
                         source,
                         interner,
                         registry,
                         &fn_context,
                         diagnostics,
                     );
-                    check_type_param_scope(ty, &own_params, source, &fn_context, diagnostics);
                     verify_value_kind(
                         *result,
                         ty,
@@ -1221,17 +1212,20 @@ fn exceeds_generic_depth(ty: &Ty, depth: usize) -> bool {
     }
 }
 
-/// The single, shared check every `Call`/`RecordCreate`/`VariantCreate`
-/// type argument goes through -- one place validating everything a type
-/// used as a use-site generic argument must satisfy, so the three
-/// instruction kinds can never drift into checking a different subset of
-/// these:
+/// The single, shared check every type root `verify_module` inspects
+/// goes through -- a record field, a variant case payload, a function
+/// parameter or return type, an instruction's result type, or a
+/// `Call`/`RecordCreate`/`VariantCreate` type argument. One place
+/// validating everything any of these must satisfy, so no call site can
+/// ever drift into checking a different subset of these, and no root is
+/// ever checked by only some of them:
 ///
 /// - not nested deeper than `MAX_GENERIC_DEPTH` (checked first, and
 ///   reported as its own dedicated diagnostic rather than the silent
 ///   early return every check below still falls back to past this same
 ///   bound as defense in depth -- a controlled single diagnostic for the
-///   whole argument, never one per nested level);
+///   whole root, never one per nested level, and no further checks run
+///   on a root already rejected this way);
 /// - no `Ty::Error` or unresolved `Ty::Var`, however deeply nested
 ///   (`check_no_bad_type`);
 /// - valid named/applied aggregate identity and correct nested generic
@@ -1239,8 +1233,14 @@ fn exceeds_generic_depth(ty: &Ty, depth: usize) -> bool {
 ///   declaration (`check_named_type_identity`);
 /// - no symbolic type parameter escaping the declaration that binds it
 ///   (`check_type_param_scope`).
+///
+/// This is the module's one authoritative type-integrity path: it never
+/// trusts the parser, HIR, type checker, or lowering to have already
+/// rejected an over-deep or otherwise malformed type, since every caller
+/// here is a `verify_module` entry point that hand-built NIR can reach
+/// directly, bypassing every earlier stage entirely (`rfcs/0008`).
 #[allow(clippy::too_many_arguments)]
-fn check_generic_type_argument(
+fn check_type_root(
     ty: &Ty,
     agg: &AggregateContext,
     own_params: &HashSet<TypeParamId>,
@@ -1477,7 +1477,7 @@ fn verify_value_kind(
                 result.0
             );
             for t in type_args {
-                check_generic_type_argument(
+                check_type_root(
                     t,
                     agg,
                     own_params,
@@ -1573,7 +1573,7 @@ fn verify_value_kind(
                 result.0
             );
             for t in type_args {
-                check_generic_type_argument(
+                check_type_root(
                     t,
                     agg,
                     own_params,
@@ -1755,7 +1755,7 @@ fn verify_value_kind(
                 result.0
             );
             for t in type_args {
-                check_generic_type_argument(
+                check_type_root(
                     t,
                     agg,
                     own_params,
@@ -3674,12 +3674,15 @@ mod tests {
     }
 
     /// Built programmatically: a `Ty::Applied` nested well past
-    /// `crate::limits::MAX_GENERIC_DEPTH`, which every recursive check
-    /// this verifier runs over a type (`check_no_bad_type`,
-    /// `check_named_type_identity`, `check_type_param_scope`) descends
-    /// into once per level. Must terminate (this test finishing at all
-    /// is the no-hang assertion), never overflow the native call stack,
-    /// regardless of what diagnostics -- if any -- it also produces.
+    /// `crate::limits::MAX_GENERIC_DEPTH`, used as a function's own
+    /// return type. `check_type_root`'s depth check runs before every
+    /// recursive check this verifier would otherwise run over a type
+    /// (`check_no_bad_type`, `check_named_type_identity`,
+    /// `check_type_param_scope`), each of which would otherwise descend
+    /// into it once per level. Must terminate (this test finishing at
+    /// all is the no-hang assertion), never overflow the native call
+    /// stack, and must produce exactly the dedicated `V0035` diagnostic
+    /// -- not silently pass, and not one diagnostic per nested level.
     #[test]
     fn a_pathologically_deep_applied_type_does_not_overflow_the_verifier() {
         let mut interner = Interner::new();
@@ -3699,12 +3702,196 @@ mod tests {
         }
         let mut function = valid_function(ItemId(0), name);
         function.return_type = ty;
-        // Not asserting on the diagnostics themselves -- only that this
-        // returns at all rather than hanging or crashing.
-        let _ = verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
     }
 
-    // -- Shared use-site generic-argument validation (`check_generic_type_argument`) --
+    // -- `check_type_root` over every type root `verify_module` inspects --
+
+    /// A `record Box[T] { payload: i64 }`-shaped layout (`payload` is
+    /// deliberately non-generic; only its *use* as a type root under
+    /// test needs to be generic-shaped) reused by every over-depth test
+    /// below to build a `Ty::Applied` nested `depth` levels deep.
+    fn deeply_applied_type(record: ItemId, depth: usize) -> Ty {
+        let mut ty = Ty::I64;
+        for _ in 0..depth {
+            ty = Ty::Applied(record, vec![ty]);
+        }
+        ty
+    }
+
+    fn box_layout(interner: &mut Interner) -> (ItemId, RecordLayout) {
+        let boxed = interner.intern("Box");
+        let t = interner.intern("T");
+        (
+            ItemId(100),
+            RecordLayout {
+                name: boxed,
+                type_params: vec![(TypeParamId(0), t)],
+                fields: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn an_over_depth_function_parameter_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.params.push(crate::nir::Param {
+            value: ValueId(1),
+            ty: deeply_applied_type(record, depth),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_function_return_type_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = deeply_applied_type(record, depth);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_record_field_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, mut layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let deep = interner.intern("deep");
+        layout
+            .fields
+            .push((deep, deeply_applied_type(record, depth)));
+        let function = valid_function(ItemId(0), name);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_variant_payload_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, record_layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let maybe = interner.intern("Maybe");
+        let some = interner.intern("Some");
+        let variant = ItemId(101);
+        let variant_layout = VariantLayout {
+            name: maybe,
+            type_params: Vec::new(),
+            cases: vec![CaseLayout {
+                name: some,
+                payload: vec![deeply_applied_type(record, depth)],
+            }],
+        };
+        let function = valid_function(ItemId(0), name);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let module = Module {
+            functions: vec![function],
+            records: vec![(record, record_layout)],
+            variants: vec![(variant, variant_layout)],
+        };
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    #[test]
+    fn an_over_depth_instruction_result_type_produces_generic_depth_exceeded() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
+        let mut function = valid_function(ItemId(0), name);
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: deeply_applied_type(record, depth),
+            kind: ValueKind::Const(Const::Int(1)),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.len() < depth,
+            "expected a single depth diagnostic, not one per nested level: {} diagnostics",
+            diagnostics.len()
+        );
+    }
+
+    /// A type nested *exactly* `MAX_GENERIC_DEPTH` levels deep is still
+    /// within bounds -- `exceeds_generic_depth` must reject strictly
+    /// past the limit, not at it, so this must produce no `V0035`.
+    #[test]
+    fn a_type_nested_exactly_at_the_generic_depth_limit_is_accepted() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (record, layout) = box_layout(&mut interner);
+        let mut function = valid_function(ItemId(0), name);
+        function.return_type = deeply_applied_type(record, crate::limits::MAX_GENERIC_DEPTH);
+        let diagnostics =
+            verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Shared type-root validation (`check_type_root`) at use-site generic arguments --
 
     /// `func g[T](x: i64) -> i64 { return x }` -- `T` occurs in neither
     /// its parameter nor its return type, so the declaration itself is

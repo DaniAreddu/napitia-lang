@@ -1,0 +1,20 @@
+// `Optional` is just a local spelling for `shapes.Maybe` (rfcs/0007):
+// exhaustiveness must key off the canonical declaration, not the alias
+// this file happens to construct it through, so a fully-covered match
+// on `Optional[bool]` must not be reported as missing a case.
+import shapes.Maybe as Optional;
+
+func inspect(v: Optional[bool]) -> i64 {
+    return match v {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    }
+}
+
+func main() -> i64 {
+    value a = Optional[bool].Some(true);
+    value b = Optional[bool].Some(false);
+    value c = Optional[bool].None;
+    return inspect(a) + inspect(b) + inspect(c)
+}

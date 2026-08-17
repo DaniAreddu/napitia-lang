@@ -1,0 +1,842 @@
+//! Capability-protocol registration, coherence, and requirement
+//! resolution (`rfcs/0009`).
+//!
+//! Protocols and extends reuse the existing generic machinery end to
+//! end: a protocol's own type parameters are ordinary `TypeParamId`s
+//! (`Ty::Param`), an extend's own type parameters are too, and
+//! `crate::types::substitute` is the exact substitution every other
+//! generic declaration already uses. What is genuinely new here is
+//! deciding, for one `uses` requirement at one call site, which
+//! `extend` (if any) answers it -- authority and overlap are checked
+//! once at registration, deterministically, before any call is ever
+//! resolved against them; resolution itself is a small recursive solver,
+//! memoized and budgeted, that never trusts a caller-supplied
+//! requirement to already be satisfiable.
+
+use std::collections::HashMap;
+
+use super::codes;
+use super::{Checker, RecordInfo, VariantInfo};
+use crate::diagnostics::Diagnostic;
+use crate::hir::{HirExtend, HirModule, ItemId, TypeParamId};
+use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
+use crate::source::{SourceId, Span};
+use crate::symbol::Symbol;
+use crate::types::{CapabilityRequirement, Evidence, Ty, substitute};
+
+/// One declared protocol's own type parameters and method signatures,
+/// each method's `params`/`ret` still in terms of the protocol's own
+/// `TypeParamId`s.
+pub(super) struct ProtocolInfo {
+    pub type_params: Vec<TypeParamId>,
+    pub methods: Vec<ProtocolMethodInfo>,
+    pub source: SourceId,
+}
+
+pub(super) struct ProtocolMethodInfo {
+    pub name: Symbol,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+}
+
+/// One accepted (authorized, individually complete) `extend`
+/// declaration, ready for the capability solver to select.
+pub(super) struct ExtendInfo {
+    pub id: ItemId,
+    pub type_params: Vec<TypeParamId>,
+    pub protocol: ItemId,
+    pub protocol_arguments: Vec<Ty>,
+    pub requirements: Vec<CapabilityRequirement>,
+    /// The underlying NIR-bound `ItemId` implementing each protocol
+    /// method, indexed by that method's own declaration-order index --
+    /// always fully populated (one entry per protocol method) by the
+    /// time an `ExtendInfo` is accepted into `Checker::extends`, since
+    /// an incomplete extend is diagnosed and excluded instead.
+    pub methods: Vec<ItemId>,
+    pub source: SourceId,
+    pub span: Span,
+}
+
+impl<'a> Checker<'a> {
+    /// Resolves every declared protocol's own method signatures, before
+    /// any function/extend body (which may call one) or any extend
+    /// (which must satisfy one) is processed.
+    pub(super) fn register_protocols(&mut self, hir: &HirModule) {
+        for p in &hir.protocols {
+            self.source = p.source;
+            let methods = p
+                .methods
+                .iter()
+                .map(|m| ProtocolMethodInfo {
+                    name: m.name,
+                    params: m.params.iter().map(|t| self.resolve_named_type(t)).collect(),
+                    ret: m
+                        .return_type
+                        .as_ref()
+                        .map(|t| self.resolve_named_type(t))
+                        .unwrap_or(Ty::Unit),
+                })
+                .collect();
+            self.protocols.insert(
+                p.id,
+                ProtocolInfo {
+                    type_params: p.type_params.iter().map(|tp| tp.id).collect(),
+                    methods,
+                    source: p.source,
+                },
+            );
+        }
+    }
+
+    /// Converts one HIR-level capability requirement into its canonical
+    /// form, validating the referenced protocol's own arity the same way
+    /// an ordinary generic aggregate reference is (`resolve_named_type`).
+    /// Returns `None` for an unknown protocol (a sentinel id from
+    /// `hir::lower`'s own recovery, or -- defensively -- any id this
+    /// checker's `self.protocols` never learned about) or a wrong
+    /// argument count; the caller is responsible for skipping a
+    /// requirement this returns `None` for rather than trusting a
+    /// placeholder.
+    fn resolve_requirement_ref(
+        &mut self,
+        requirement: &crate::hir::HirCapabilityRequirement,
+    ) -> Option<CapabilityRequirement> {
+        let arguments: Vec<Ty> = requirement
+            .arguments
+            .iter()
+            .map(|a| self.resolve_named_type(a))
+            .collect();
+        let Some(info) = self.protocols.get(&requirement.protocol) else {
+            // `hir::lower` already reported an unknown protocol for this
+            // id; nothing further to say here.
+            return None;
+        };
+        if arguments.len() != info.type_params.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PROTOCOL_ARITY_MISMATCH,
+                    self.source,
+                    requirement.span,
+                    format!(
+                        "this protocol requires {} type argument(s), found {}",
+                        info.type_params.len(),
+                        arguments.len()
+                    ),
+                )
+                .with_primary_label("wrong number of protocol type arguments"),
+            );
+            return None;
+        }
+        Some(CapabilityRequirement::new(requirement.protocol, arguments))
+    }
+
+    /// Resolves a `uses` clause's requirements (shared by an ordinary
+    /// function/extend method's own signature and an extend's own
+    /// head), dropping any entry that failed to resolve rather than
+    /// aborting the whole list -- one malformed requirement must never
+    /// hide every other, valid one.
+    pub(super) fn resolve_requirements(
+        &mut self,
+        requirements: &[crate::hir::HirCapabilityRequirement],
+    ) -> Vec<CapabilityRequirement> {
+        requirements
+            .iter()
+            .filter_map(|r| self.resolve_requirement_ref(r))
+            .collect()
+    }
+
+    /// Registers every `extend` declaration: resolves its head and own
+    /// requirements, checks it implements its protocol completely and
+    /// with compatible signatures, checks authority, and -- once every
+    /// extend is otherwise valid -- checks pairwise coherence (no two
+    /// accepted heads may ever match the same concrete requirement).
+    /// Only extends that pass every one of these is inserted into
+    /// `self.extends`, where the capability solver can find it -- an
+    /// unauthorized or incomplete extend is diagnosed and excluded, so
+    /// it can never also produce a spurious "missing capability" or
+    /// dispatch error downstream.
+    pub(super) fn register_extends(&mut self, hir: &HirModule) {
+        let mut accepted: Vec<ExtendInfo> = Vec::new();
+        for e in &hir.extends {
+            self.source = e.source;
+            let Some(protocol_info_type_params) =
+                self.protocols.get(&e.protocol).map(|p| p.type_params.clone())
+            else {
+                // Unknown protocol: `hir::lower` already reported this.
+                continue;
+            };
+            let protocol_arguments: Vec<Ty> = e
+                .protocol_arguments
+                .iter()
+                .map(|a| self.resolve_named_type(a))
+                .collect();
+            if protocol_arguments.len() != protocol_info_type_params.len() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROTOCOL_ARITY_MISMATCH,
+                        self.source,
+                        e.protocol_ref_span,
+                        format!(
+                            "this protocol requires {} type argument(s), found {}",
+                            protocol_info_type_params.len(),
+                            protocol_arguments.len()
+                        ),
+                    )
+                    .with_primary_label("wrong number of protocol type arguments"),
+                );
+                continue;
+            }
+            let extend_type_params: std::collections::HashSet<TypeParamId> =
+                e.type_params.iter().map(|tp| tp.id).collect();
+            let requirements = self.resolve_requirements(&e.requirements);
+
+            if !self.check_extension_authority(e, &protocol_arguments) {
+                continue;
+            }
+            let Some(methods) =
+                self.check_extension_completeness(e, &protocol_arguments, &extend_type_params)
+            else {
+                continue;
+            };
+
+            accepted.push(ExtendInfo {
+                id: e.id,
+                type_params: e.type_params.iter().map(|tp| tp.id).collect(),
+                protocol: e.protocol,
+                protocol_arguments,
+                requirements,
+                methods,
+                source: e.source,
+                span: e.span,
+            });
+        }
+        self.check_extend_overlaps(&accepted);
+        self.extends = accepted;
+    }
+
+    /// The authority rule (`rfcs/0009`): an extend is legal only when its
+    /// own declaring module owns at least one authority boundary -- the
+    /// protocol declaration itself, or the outermost nominal aggregate
+    /// used as the protocol's *first* type argument. A primitive first
+    /// argument has no declaring module of its own to lend authority, so
+    /// only the protocol-owning module may extend it. One file is always
+    /// exactly one module in this project layout (`rfcs/0006`), so
+    /// module identity is compared here by plain `SourceId` equality --
+    /// never by re-deriving a dotted module path.
+    fn check_extension_authority(&mut self, e: &HirExtend, protocol_arguments: &[Ty]) -> bool {
+        let Some(protocol_source) = self.protocols.get(&e.protocol).map(|p| p.source) else {
+            return false;
+        };
+        if e.source == protocol_source {
+            return true;
+        }
+        if let Some(first) = protocol_arguments.first()
+            && let Some(aggregate_source) = self.outermost_aggregate_source(first)
+            && e.source == aggregate_source
+        {
+            return true;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::UNAUTHORIZED_EXTENSION,
+                self.source,
+                e.protocol_ref_span,
+                "this module owns neither the protocol nor the outermost type of the protocol's first type argument, so it is not authorized to declare this extension",
+            )
+            .with_primary_label("unauthorized extension"),
+        );
+        false
+    }
+
+    /// The declaring module of `ty`'s own outermost nominal
+    /// record/variant, if it has one -- `None` for a primitive, a bare
+    /// type parameter, or `Ty::Error`, none of which have a module of
+    /// their own to lend authority.
+    fn outermost_aggregate_source(&self, ty: &Ty) -> Option<SourceId> {
+        match ty {
+            Ty::Named(item, _) | Ty::Applied(item, _) => self
+                .records
+                .get(item)
+                .map(|r: &RecordInfo| r.source)
+                .or_else(|| self.variants.get(item).map(|v: &VariantInfo| v.source)),
+            _ => None,
+        }
+    }
+
+    /// Checks that `e` implements every one of its protocol's methods
+    /// exactly once, with a compatible signature, and no extra methods
+    /// -- returns the resolved method table (protocol method index ->
+    /// implementing `ItemId`) only if every check passes; any failure
+    /// diagnoses and returns `None`, excluding this extend from the
+    /// solver entirely rather than letting a partially-checked extend
+    /// participate in dispatch.
+    fn check_extension_completeness(
+        &mut self,
+        e: &HirExtend,
+        protocol_arguments: &[Ty],
+        extend_type_params: &std::collections::HashSet<TypeParamId>,
+    ) -> Option<Vec<ItemId>> {
+        let Some(protocol_info) = self.protocols.get(&e.protocol) else {
+            return None;
+        };
+        let subst: HashMap<TypeParamId, Ty> = protocol_info
+            .type_params
+            .iter()
+            .copied()
+            .zip(protocol_arguments.iter().cloned())
+            .collect();
+        // Snapshot what the solver needs before mutably borrowing
+        // `self.diagnostics` below -- `protocol_info` itself borrows
+        // `self.protocols` immutably, which this function must stop
+        // holding before it can push a diagnostic.
+        let expected: Vec<(Symbol, Vec<Ty>, Ty)> = protocol_info
+            .methods
+            .iter()
+            .map(|m| {
+                (
+                    m.name,
+                    m.params.iter().map(|t| substitute(t, &subst)).collect(),
+                    substitute(&m.ret, &subst),
+                )
+            })
+            .collect();
+
+        let mut ok = true;
+        let mut by_name: HashMap<Symbol, Vec<&crate::hir::HirFunction>> = HashMap::new();
+        for method in &e.methods {
+            by_name.entry(method.name).or_default().push(method);
+        }
+        let mut method_ids = Vec::with_capacity(expected.len());
+        for (name, expected_params, expected_ret) in &expected {
+            let Some(candidates) = by_name.get(name) else {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_MISSING_METHOD,
+                        self.source,
+                        e.protocol_ref_span,
+                        format!("this extension is missing an implementation of `{text}`"),
+                    )
+                    .with_primary_label("missing method"),
+                );
+                ok = false;
+                continue;
+            };
+            if candidates.len() > 1 {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_DUPLICATE_METHOD,
+                        self.source,
+                        candidates[1].span,
+                        format!("`{text}` is implemented more than once in this extension"),
+                    )
+                    .with_primary_label("duplicate method")
+                    .with_label(candidates[0].span, "first implemented here"),
+                );
+                ok = false;
+            }
+            let method = candidates[0];
+            // Read back from `self.functions` (`build_signatures` already
+            // resolved every extend method's own signature there) rather
+            // than re-resolving `method`'s own AST/HIR types here --
+            // resolving the same possibly-invalid type twice would
+            // otherwise diagnose it twice.
+            let Some(method_sig) = self.functions.get(&method.id) else {
+                ok = false;
+                continue;
+            };
+            let actual_params = method_sig.params.clone();
+            let actual_ret = method_sig.ret.clone();
+            let signature_ok = actual_params.len() == expected_params.len()
+                && actual_params
+                    .iter()
+                    .zip(expected_params.iter())
+                    .all(|(a, b)| a == b)
+                && &actual_ret == expected_ret;
+            if !signature_ok {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_SIGNATURE_MISMATCH,
+                        self.source,
+                        method.span,
+                        format!(
+                            "`{text}`'s signature does not match its protocol method's declared signature"
+                        ),
+                    )
+                    .with_primary_label("incompatible method signature"),
+                );
+                ok = false;
+            }
+            method_ids.push(method.id);
+        }
+        let expected_names: std::collections::HashSet<Symbol> =
+            expected.iter().map(|(n, _, _)| *n).collect();
+        for method in &e.methods {
+            if !expected_names.contains(&method.name) {
+                let text = self.interner.resolve(method.name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_EXTRA_METHOD,
+                        self.source,
+                        method.span,
+                        format!("`{text}` is not a method of this protocol"),
+                    )
+                    .with_primary_label("unknown protocol method"),
+                );
+                ok = false;
+            }
+        }
+        // A method's own parameter/return types are never allowed to
+        // reference a symbolic type parameter this extend didn't itself
+        // declare -- true by construction for anything `hir::lower`
+        // produced (a method never opens its own type-parameter scope,
+        // so every `Ty::Param` it resolves is already the extend's own),
+        // but this checker never trusts that invariant to hold for
+        // hand-built HIR bypassing `hir::lower` entirely (mirrors
+        // `nir::verify`'s own `check_type_param_scope`, applied here).
+        for method in &e.methods {
+            let Some(sig) = self.functions.get(&method.id) else {
+                continue;
+            };
+            if !sig.params.iter().all(|p| type_params_within(p, extend_type_params))
+                || !type_params_within(&sig.ret, extend_type_params)
+            {
+                let text = self.interner.resolve(method.name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_SIGNATURE_MISMATCH,
+                        self.source,
+                        method.span,
+                        format!(
+                            "`{text}` uses a symbolic type parameter that does not belong to this extension"
+                        ),
+                    )
+                    .with_primary_label("escaping type parameter"),
+                );
+                ok = false;
+            }
+        }
+        if ok { Some(method_ids) } else { None }
+    }
+
+    /// Pairwise coherence: no two *accepted* extend heads targeting the
+    /// same protocol may ever be able to match the same concrete
+    /// requirement -- checked structurally (does there exist *some*
+    /// instantiation of each extend's own free type parameters making
+    /// their heads identical), never by enumerating concrete programs.
+    /// Two exactly-equal, fully-concrete heads are reported as an exact
+    /// duplicate; anything else that can still overlap (generic/
+    /// concrete, generic/generic) is reported as an overlap. Comparison
+    /// order is always accepted-list order (declaration order, `hir`'s
+    /// own `Vec`), never a `HashMap`'s, so the diagnostic is independent
+    /// of source/import order.
+    fn check_extend_overlaps(&mut self, accepted: &[ExtendInfo]) {
+        let mut by_protocol: HashMap<ItemId, Vec<usize>> = HashMap::new();
+        for (i, e) in accepted.iter().enumerate() {
+            by_protocol.entry(e.protocol).or_default().push(i);
+        }
+        let mut protocol_ids: Vec<ItemId> = by_protocol.keys().copied().collect();
+        protocol_ids.sort_unstable_by_key(|p| p.0);
+        for protocol in protocol_ids {
+            let idxs = &by_protocol[&protocol];
+            for a in 0..idxs.len() {
+                for b in (a + 1)..idxs.len() {
+                    let (ia, ib) = (idxs[a], idxs[b]);
+                    let x = &accepted[ia];
+                    let y = &accepted[ib];
+                    if !heads_can_overlap(
+                        &x.protocol_arguments,
+                        &x.type_params.iter().copied().collect(),
+                        &y.protocol_arguments,
+                        &y.type_params.iter().copied().collect(),
+                    ) {
+                        continue;
+                    }
+                    let exact_duplicate = x.type_params.is_empty()
+                        && y.type_params.is_empty()
+                        && x.protocol_arguments == y.protocol_arguments;
+                    let (code, message) = if exact_duplicate {
+                        (
+                            codes::DUPLICATE_EXTENSION,
+                            "this extension duplicates another extension for the exact same protocol and type arguments",
+                        )
+                    } else {
+                        (
+                            codes::OVERLAPPING_EXTENSION,
+                            "this extension can match the same concrete requirement as another extension; there is no specialization in Alpha 0.1.5",
+                        )
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::error(code, self.source, y.span, message)
+                            .with_primary_label("overlapping extension")
+                            .with_label_in(x.source, x.span, "first extension declared here"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The capability solver's public entry point: resolves `requirement`
+    /// against `own_requirements` (the *currently type-checked*
+    /// declaration's own, still possibly-symbolic `uses` clause -- always
+    /// checked for an exact structural match first, since forwarding an
+    /// existing requirement is always preferred to searching for a
+    /// concrete extension), recursing through conditional extends as
+    /// needed. `span` is only ever used for the diagnostics this
+    /// specific call site's own resolution produces.
+    pub(super) fn resolve_requirement(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        own_requirements: &[CapabilityRequirement],
+        span: Span,
+    ) -> Option<Evidence> {
+        if let Some(index) = own_requirements.iter().position(|r| r == requirement) {
+            return Some(Evidence::Forwarded(index));
+        }
+        if requirement_is_symbolic(requirement) {
+            let text = self.describe_requirement(requirement);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNDECLARED_CAPABILITY_USE,
+                    self.source,
+                    span,
+                    format!(
+                        "this use requires the capability {text}, which is not declared in this function's own `uses` clause; add `uses {text}`"
+                    ),
+                )
+                .with_primary_label("undeclared capability use"),
+            );
+            return None;
+        }
+        let mut steps = 0usize;
+        let mut path = Vec::new();
+        self.resolve_concrete(requirement, span, 0, &mut steps, &mut path)
+    }
+
+    /// Resolves a fully-concrete requirement against `self.extends`,
+    /// recursively resolving whatever further requirements the selected
+    /// extend itself declares. Memoized by [`CapabilityRequirement`]
+    /// identity (`self.capability_cache`): once a concrete requirement is
+    /// resolved (successfully or not) anywhere in one compilation, it is
+    /// never re-solved. `path` is the active recursion's own concrete
+    /// requirement stack, for a deterministic cyclic-requirement
+    /// diagnostic; `depth`/`steps` enforce
+    /// [`MAX_CAPABILITY_DEPTH`]/[`MAX_CAPABILITY_RESOLUTION_STEPS`] --
+    /// a budget failure is always its own diagnostic, never reported as
+    /// "no matching extension".
+    fn resolve_concrete(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        span: Span,
+        depth: usize,
+        steps: &mut usize,
+        path: &mut Vec<CapabilityRequirement>,
+    ) -> Option<Evidence> {
+        if let Some(cached) = self.capability_cache.get(requirement) {
+            return cached.clone().ok();
+        }
+        if path.contains(requirement) {
+            let mut cycle: Vec<String> = path
+                .iter()
+                .skip_while(|r| *r != requirement)
+                .map(|r| self.describe_requirement(r))
+                .collect();
+            cycle.push(self.describe_requirement(requirement));
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CYCLIC_CAPABILITY_REQUIREMENT,
+                    self.source,
+                    span,
+                    format!(
+                        "this capability requirement is cyclic: {}",
+                        cycle.join(" -> ")
+                    ),
+                )
+                .with_primary_label("cyclic capability requirement"),
+            );
+            return None;
+        }
+        if depth > MAX_CAPABILITY_DEPTH {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CAPABILITY_DEPTH_EXCEEDED,
+                    self.source,
+                    span,
+                    format!(
+                        "resolving this capability requirement exceeded the maximum depth of {MAX_CAPABILITY_DEPTH}"
+                    ),
+                )
+                .with_primary_label("capability resolution depth exceeded"),
+            );
+            self.capability_cache.insert(requirement.clone(), Err(()));
+            return None;
+        }
+        *steps += 1;
+        if *steps > MAX_CAPABILITY_RESOLUTION_STEPS {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CAPABILITY_WORK_BUDGET_EXCEEDED,
+                    self.source,
+                    span,
+                    format!(
+                        "resolving this capability requirement exceeded the maximum work budget of {MAX_CAPABILITY_RESOLUTION_STEPS} steps"
+                    ),
+                )
+                .with_primary_label("capability resolution work budget exceeded"),
+            );
+            self.capability_cache.insert(requirement.clone(), Err(()));
+            return None;
+        }
+        path.push(requirement.clone());
+        let outcome = self.select_extension(requirement, span, depth, steps, path);
+        path.pop();
+        self.capability_cache
+            .insert(requirement.clone(), outcome.clone().ok_or(()));
+        outcome
+    }
+
+    fn select_extension(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        span: Span,
+        depth: usize,
+        steps: &mut usize,
+        path: &mut Vec<CapabilityRequirement>,
+    ) -> Option<Evidence> {
+        let mut matches: Vec<usize> = Vec::new();
+        for (i, extend) in self.extends.iter().enumerate() {
+            if extend.protocol != requirement.protocol {
+                continue;
+            }
+            if match_extend_head(&extend.protocol_arguments, &requirement.arguments, 0).is_some() {
+                matches.push(i);
+            }
+        }
+        if matches.is_empty() {
+            let text = self.describe_requirement(requirement);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::MISSING_CAPABILITY,
+                    self.source,
+                    span,
+                    format!("no extension satisfies the capability requirement {text}"),
+                )
+                .with_primary_label("missing capability extension"),
+            );
+            return None;
+        }
+        if matches.len() > 1 {
+            let text = self.describe_requirement(requirement);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::AMBIGUOUS_CAPABILITY,
+                    self.source,
+                    span,
+                    format!("more than one extension satisfies the capability requirement {text}"),
+                )
+                .with_primary_label("ambiguous capability extension"),
+            );
+            return None;
+        }
+        let index = matches[0];
+        let extend_id = self.extends[index].id;
+        let subst = match_extend_head(
+            &self.extends[index].protocol_arguments,
+            &requirement.arguments,
+            0,
+        )?;
+        let nested_requirements: Vec<CapabilityRequirement> = self.extends[index]
+            .requirements
+            .iter()
+            .map(|r| CapabilityRequirement::new(r.protocol, substitute_all(&r.arguments, &subst)))
+            .collect();
+        let mut nested = Vec::with_capacity(nested_requirements.len());
+        for req in &nested_requirements {
+            nested.push(self.resolve_concrete(req, span, depth + 1, steps, path)?);
+        }
+        Some(Evidence::Extension {
+            extend: extend_id,
+            nested,
+        })
+    }
+
+    /// A human-readable rendering of a [`CapabilityRequirement`] for a
+    /// diagnostic message (`Equal[i64]`) -- uses this checker's own
+    /// registry so a cross-module protocol is always named by its
+    /// canonical qualified name, never a possibly-aliased local one.
+    pub(super) fn describe_requirement(&self, requirement: &CapabilityRequirement) -> String {
+        let name = self.registry.qualified_name(requirement.protocol, self.interner);
+        if requirement.arguments.is_empty() {
+            return name;
+        }
+        let args: Vec<String> = requirement
+            .arguments
+            .iter()
+            .map(|a| self.display_for_diagnostic(a))
+            .collect();
+        format!("{name}[{}]", args.join(", "))
+    }
+}
+
+/// Whether `ty` still contains a symbolic `Ty::Param` anywhere in its
+/// structure -- a requirement built from such a type can never be
+/// resolved by searching concrete extends (only forwarding, from an
+/// exact match in the current declaration's own `uses` clause, can ever
+/// satisfy it).
+fn requirement_is_symbolic(requirement: &CapabilityRequirement) -> bool {
+    requirement.arguments.iter().any(ty_is_symbolic)
+}
+
+fn ty_is_symbolic(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param(..) => true,
+        Ty::Applied(_, args) => args.iter().any(ty_is_symbolic),
+        _ => false,
+    }
+}
+
+/// Whether every symbolic `Ty::Param` in `ty` belongs to `allowed` --
+/// mirrors `nir::verify`'s `check_type_param_scope`, applied here to an
+/// extend method's own declared signature before it is ever trusted as
+/// implementing a protocol method.
+fn type_params_within(ty: &Ty, allowed: &std::collections::HashSet<TypeParamId>) -> bool {
+    match ty {
+        Ty::Param(id, _) => allowed.contains(id),
+        Ty::Applied(_, args) => args.iter().all(|a| type_params_within(a, allowed)),
+        _ => true,
+    }
+}
+
+fn substitute_all(tys: &[Ty], subst: &HashMap<TypeParamId, Ty>) -> Vec<Ty> {
+    tys.iter().map(|t| substitute(t, subst)).collect()
+}
+
+/// One-directional structural match: does `pattern` (an extend head's
+/// own `protocol_arguments`, which may contain `Ty::Param`s the extend
+/// itself declares) match `concrete` (a fully-concrete requirement's own
+/// arguments), and if so, what does each of the extend's own type
+/// parameters bind to? `depth`-bounded by [`MAX_GENERIC_DEPTH`], the
+/// same way every other stage that walks a nested type application is.
+fn match_extend_head(
+    pattern: &[Ty],
+    concrete: &[Ty],
+    depth: usize,
+) -> Option<HashMap<TypeParamId, Ty>> {
+    let mut subst = HashMap::new();
+    if pattern.len() != concrete.len() {
+        return None;
+    }
+    for (p, c) in pattern.iter().zip(concrete.iter()) {
+        match_one(p, c, &mut subst, depth)?;
+    }
+    Some(subst)
+}
+
+fn match_one(
+    pattern: &Ty,
+    concrete: &Ty,
+    subst: &mut HashMap<TypeParamId, Ty>,
+    depth: usize,
+) -> Option<()> {
+    if depth > MAX_GENERIC_DEPTH {
+        return None;
+    }
+    match pattern {
+        Ty::Param(id, _) => {
+            if let Some(existing) = subst.get(id) {
+                if existing == concrete { Some(()) } else { None }
+            } else {
+                subst.insert(*id, concrete.clone());
+                Some(())
+            }
+        }
+        Ty::Applied(pi, pargs) => {
+            let Ty::Applied(ci, cargs) = concrete else {
+                return None;
+            };
+            if pi != ci || pargs.len() != cargs.len() {
+                return None;
+            }
+            for (p, c) in pargs.iter().zip(cargs.iter()) {
+                match_one(p, c, subst, depth + 1)?;
+            }
+            Some(())
+        }
+        other => {
+            if other == concrete { Some(()) } else { None }
+        }
+    }
+}
+
+/// Whether two extend heads (each with its own free type parameters)
+/// *could* ever match the same concrete requirement -- a symmetric
+/// structural unification where either side's own parameter may bind to
+/// anything the other side offers at that position. Conservative by
+/// design: this is a "could these ever collide" check, not an attempt to
+/// enumerate every concrete program that would actually call both, which
+/// is exactly how coherence checking must work to be sound (`rfcs/0009`
+/// has no specialization to fall back on if it guessed wrong).
+fn heads_can_overlap(
+    a_args: &[Ty],
+    a_params: &std::collections::HashSet<TypeParamId>,
+    b_args: &[Ty],
+    b_params: &std::collections::HashSet<TypeParamId>,
+) -> bool {
+    if a_args.len() != b_args.len() {
+        return false;
+    }
+    let mut a_subst = HashMap::new();
+    let mut b_subst = HashMap::new();
+    a_args
+        .iter()
+        .zip(b_args.iter())
+        .all(|(a, b)| unify_heads(a, b, a_params, b_params, &mut a_subst, &mut b_subst, 0))
+}
+
+fn unify_heads(
+    a: &Ty,
+    b: &Ty,
+    a_params: &std::collections::HashSet<TypeParamId>,
+    b_params: &std::collections::HashSet<TypeParamId>,
+    a_subst: &mut HashMap<TypeParamId, Ty>,
+    b_subst: &mut HashMap<TypeParamId, Ty>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return false;
+    }
+    if let Ty::Param(id, _) = a
+        && a_params.contains(id)
+    {
+        return match a_subst.get(id) {
+            Some(existing) => existing == b,
+            None => {
+                a_subst.insert(*id, b.clone());
+                true
+            }
+        };
+    }
+    if let Ty::Param(id, _) = b
+        && b_params.contains(id)
+    {
+        return match b_subst.get(id) {
+            Some(existing) => existing == a,
+            None => {
+                b_subst.insert(*id, a.clone());
+                true
+            }
+        };
+    }
+    match (a, b) {
+        (Ty::Applied(ia, aargs), Ty::Applied(ib, bargs)) => {
+            ia == ib
+                && aargs.len() == bargs.len()
+                && aargs.iter().zip(bargs.iter()).all(|(x, y)| {
+                    unify_heads(x, y, a_params, b_params, a_subst, b_subst, depth + 1)
+                })
+        }
+        _ => a == b,
+    }
+}

@@ -21,8 +21,12 @@ use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::generics::GenericInstanceKey;
 use crate::types::{
-    Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name, substitute,
+    CapabilityRequirement, Evidence, Ty, TyVar, display_ty, is_integer, is_numeric,
+    primitive_from_name, substitute,
 };
+
+mod capability;
+use capability::{ExtendInfo, ProtocolInfo};
 
 mod codes {
     pub const TYPE_MISMATCH: &str = "T0001";
@@ -52,6 +56,21 @@ mod codes {
     pub const CANNOT_INFER_TYPE_ARGUMENT: &str = "T0026";
     pub const UNSUPPORTED_ON_TYPE_PARAMETER: &str = "T0027";
     pub const GENERIC_INSTANCE_BUDGET_EXCEEDED: &str = "T0028";
+    pub const PROTOCOL_METHOD_NOT_A_VALUE: &str = "T0029";
+    pub const PROTOCOL_ARITY_MISMATCH: &str = "T0030";
+    pub const EXTENSION_MISSING_METHOD: &str = "T0031";
+    pub const EXTENSION_DUPLICATE_METHOD: &str = "T0032";
+    pub const EXTENSION_EXTRA_METHOD: &str = "T0033";
+    pub const EXTENSION_SIGNATURE_MISMATCH: &str = "T0034";
+    pub const UNAUTHORIZED_EXTENSION: &str = "T0035";
+    pub const DUPLICATE_EXTENSION: &str = "T0036";
+    pub const OVERLAPPING_EXTENSION: &str = "T0037";
+    pub const UNDECLARED_CAPABILITY_USE: &str = "T0038";
+    pub const MISSING_CAPABILITY: &str = "T0039";
+    pub const AMBIGUOUS_CAPABILITY: &str = "T0040";
+    pub const CYCLIC_CAPABILITY_REQUIREMENT: &str = "T0041";
+    pub const CAPABILITY_DEPTH_EXCEEDED: &str = "T0042";
+    pub const CAPABILITY_WORK_BUDGET_EXCEEDED: &str = "T0043";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -95,6 +114,11 @@ struct FunctionSig {
     /// may reference these via `Ty::Param`; a call site substitutes a
     /// concrete argument for each before unifying.
     type_params: Vec<TypeParamId>,
+    /// This function's own `uses` capability requirements (`rfcs/0009`),
+    /// in declared order, still in terms of its own `type_params` --
+    /// substituted the same way `params`/`ret` are at a call site, then
+    /// resolved into evidence for that specific call.
+    requirements: Vec<CapabilityRequirement>,
     span: Span,
     /// Where this function was declared -- a different file than the
     /// call site's, in every cross-module call. A diagnostic pointing at
@@ -141,6 +165,17 @@ pub struct TypeckResult {
     /// rather than re-inferring or re-resolving it independently. Empty
     /// for a non-generic call/construction.
     pub call_type_args: HashMap<ExprId, Vec<Ty>>,
+    /// For every call whose callee declares one or more capability
+    /// requirements (`rfcs/0009`), the resolved [`Evidence`] for each,
+    /// in the callee's own declared order -- keyed by the call
+    /// expression's own `ExprId`, the same way `call_type_args` is.
+    /// Empty for a call to a function/extend method with no
+    /// requirements.
+    pub call_evidence: HashMap<ExprId, Vec<Evidence>>,
+    /// For every explicit protocol-call expression
+    /// (`Equal[T].equal(..)`), the one resolved [`Evidence`] answering
+    /// it -- keyed by the call expression's own `ExprId`.
+    pub protocol_call_evidence: HashMap<ExprId, Evidence>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`], the same as
@@ -191,6 +226,7 @@ pub fn check_module_with_registry(
         locals: HashMap::new(),
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
+        current_requirements: Vec::new(),
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
@@ -198,18 +234,31 @@ pub fn check_module_with_registry(
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
         call_type_args: HashMap::new(),
+        call_evidence: HashMap::new(),
+        protocol_call_evidence: HashMap::new(),
         pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
         entry_main,
         generic_params: HashMap::new(),
         generic_instances: std::collections::HashSet::new(),
+        protocols: HashMap::new(),
+        extends: Vec::new(),
+        capability_cache: HashMap::new(),
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
+    checker.register_protocols(hir);
     checker.build_signatures(hir);
+    checker.register_extends(hir);
     for function in &hir.functions {
         checker.source = function.source;
         checker.check_function(function);
+    }
+    for extend in &hir.extends {
+        for method in &extend.methods {
+            checker.source = method.source;
+            checker.check_function(method);
+        }
     }
     checker.finalize_defaults();
 
@@ -246,6 +295,8 @@ pub fn check_module_with_registry(
         expr_types,
         pattern_case: checker.pattern_case,
         call_type_args,
+        call_evidence: checker.call_evidence,
+        protocol_call_evidence: checker.protocol_call_evidence,
     }
 }
 
@@ -288,6 +339,12 @@ struct Checker<'a> {
     locals: HashMap<LocalId, LocalInfo>,
     pending_defaults: Vec<(TyVar, Ty)>,
     current_return_type: Ty,
+    /// The currently-checked function/extend method's own capability
+    /// requirements (`rfcs/0009`), still possibly symbolic in terms of
+    /// its own type parameters -- how `resolve_requirement` decides a
+    /// call inside this body can *forward* one of these rather than
+    /// searching for a concrete extension.
+    current_requirements: Vec<CapabilityRequirement>,
     /// Every declared record's fields, resolved to `Ty` and in
     /// declaration order -- the layout NIR's `record.create`/
     /// `record.field` will follow.
@@ -314,6 +371,10 @@ struct Checker<'a> {
     pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
     /// See [`TypeckResult::call_type_args`].
     call_type_args: HashMap<ExprId, Vec<Ty>>,
+    /// See [`TypeckResult::call_evidence`].
+    call_evidence: HashMap<ExprId, Vec<Evidence>>,
+    /// See [`TypeckResult::protocol_call_evidence`].
+    protocol_call_evidence: HashMap<ExprId, Evidence>,
     /// Starting work budget for each match's exhaustiveness analysis.
     /// Always `exhaustive::MAX_USEFULNESS_STEPS` in `check_module`; a
     /// smaller value is a controlled test seam for exercising
@@ -336,6 +397,22 @@ struct Checker<'a> {
     /// (`crate::limits::MAX_GENERIC_INSTANCES`), never an independent
     /// counter duplicated per call site.
     generic_instances: std::collections::HashSet<GenericInstanceKey>,
+    /// Every declared protocol's own type parameters and method
+    /// signatures (`rfcs/0009`), keyed by its canonical `ItemId` -- built
+    /// once, before any extend or function body is checked.
+    protocols: HashMap<ItemId, ProtocolInfo>,
+    /// Every extend declaration this compilation accepts as coherent and
+    /// authorized (`rfcs/0009`) -- one that failed authority/overlap/
+    /// completeness validation is diagnosed but excluded here, so the
+    /// capability solver below never compounds one error into another.
+    extends: Vec<ExtendInfo>,
+    /// Memoizes the capability solver's own concrete-requirement
+    /// resolution (`capability::resolve_concrete_requirement`) by
+    /// canonical [`CapabilityRequirement`] identity -- a requirement
+    /// already resolved once (successfully or not) is never re-solved,
+    /// the same reason `generic_instances` exists for ordinary generic
+    /// instantiation.
+    capability_cache: HashMap<CapabilityRequirement, Result<Evidence, ()>>,
 }
 
 #[derive(Clone)]
@@ -372,6 +449,8 @@ struct VariantInfo {
     /// This variant's own generic parameters, in declaration order.
     /// Empty for a non-generic variant.
     type_params: Vec<TypeParamId>,
+    /// See [`RecordInfo::source`].
+    source: SourceId,
 }
 
 impl<'a> Checker<'a> {
@@ -439,6 +518,7 @@ impl<'a> Checker<'a> {
                     name: v.name,
                     cases,
                     type_params: v.type_params.iter().map(|p| p.id).collect(),
+                    source: v.source,
                 },
             );
             self.variant_display.insert(
@@ -495,16 +575,53 @@ impl<'a> Checker<'a> {
                 .as_ref()
                 .map(|t| self.resolve_named_type(t))
                 .unwrap_or(Ty::Unit);
+            let requirements = self.resolve_requirements(&f.requirements);
             self.functions.insert(
                 f.id,
                 FunctionSig {
                     params,
                     ret,
                     type_params: f.type_params.iter().map(|p| p.id).collect(),
+                    requirements,
                     span: f.span,
                     source: f.source,
                 },
             );
+        }
+        // Every extend method is registered exactly like an ordinary
+        // function -- it shares its owning extend's own `type_params`
+        // (see `HirFunction::type_params`'s own doc comment) and
+        // `requirements` (already resolved into `HirFunction::requirements`
+        // by `hir::lower`), so `check_function` needs no extend-specific
+        // path at all.
+        for e in &hir.extends {
+            self.source = e.source;
+            let extend_type_params: Vec<TypeParamId> =
+                e.type_params.iter().map(|p| p.id).collect();
+            for m in &e.methods {
+                let params = m
+                    .params
+                    .iter()
+                    .map(|p| self.resolve_named_type(&p.ty))
+                    .collect();
+                let ret = m
+                    .return_type
+                    .as_ref()
+                    .map(|t| self.resolve_named_type(t))
+                    .unwrap_or(Ty::Unit);
+                let requirements = self.resolve_requirements(&m.requirements);
+                self.functions.insert(
+                    m.id,
+                    FunctionSig {
+                        params,
+                        ret,
+                        type_params: extend_type_params.clone(),
+                        requirements,
+                        span: m.span,
+                        source: m.source,
+                    },
+                );
+            }
         }
     }
 
@@ -655,6 +772,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.current_return_type = sig.ret.clone();
+        self.current_requirements = sig.requirements.clone();
         if !f.uses.is_empty() || !f.raises.is_empty() {
             self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
         }
@@ -840,6 +958,26 @@ impl<'a> Checker<'a> {
                         ),
                     )
                     .with_primary_label("function used as a value"),
+                );
+                Ty::Error
+            }
+            // There are no first-class/dynamic protocol methods in
+            // Alpha 0.1.5; only `Call` special-cases a
+            // `ProtocolMethodRef` callee directly (`rfcs/0009`), so
+            // reaching this arm bare means one was referenced without
+            // being called.
+            HirExpr::ProtocolMethodRef { name, span, .. } => {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROTOCOL_METHOD_NOT_A_VALUE,
+                        self.source,
+                        *span,
+                        format!(
+                            "`{text}` is a protocol method and must be called directly, not used as a value"
+                        ),
+                    )
+                    .with_primary_label("protocol method used as a value"),
                 );
                 Ty::Error
             }
@@ -1326,6 +1464,137 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Resolves every one of a callee's own capability `requirements`
+    /// (substituted via this specific call's own `subst`, then fully
+    /// resolved -- a callee's requirement can still be symbolic in terms
+    /// of what *this* call itself is generic over) against the
+    /// currently-checked declaration's own forwarding environment,
+    /// falling back to the concrete-extension solver. Returns `None`,
+    /// having already recorded a diagnostic, the moment any single
+    /// requirement fails -- never a partial evidence list, matching the
+    /// same all-or-nothing contract every other part of a call's own
+    /// success (`ok`) already follows.
+    fn resolve_call_evidence(
+        &mut self,
+        requirements: &[CapabilityRequirement],
+        subst: &HashMap<TypeParamId, Ty>,
+        span: Span,
+    ) -> Option<Vec<Evidence>> {
+        let own_requirements = self.current_requirements.clone();
+        let mut evidence = Vec::with_capacity(requirements.len());
+        for req in requirements {
+            let substituted = CapabilityRequirement::new(
+                req.protocol,
+                req.arguments
+                    .iter()
+                    .map(|t| deep_resolve(&self.ctx, &substitute(t, subst)))
+                    .collect(),
+            );
+            evidence.push(self.resolve_requirement(&substituted, &own_requirements, span)?);
+        }
+        Some(evidence)
+    }
+
+    /// An explicit protocol-call expression, `Protocol[Args].method(..)`
+    /// (`rfcs/0009`) -- the only protocol-call syntax in Alpha 0.1.5.
+    /// Checks the method's own parameter/return types (substituting
+    /// `Args` into the protocol's own declared signature), then resolves
+    /// exactly which extension answers this specific
+    /// `Protocol[Args]` requirement, recording the result for
+    /// `nir::lower` to attach to the corresponding NIR instruction.
+    #[allow(clippy::too_many_arguments)]
+    fn check_protocol_call(
+        &mut self,
+        call_id: ExprId,
+        protocol: ItemId,
+        arguments: &[HirType],
+        method: usize,
+        name: Symbol,
+        ref_span: Span,
+        args: &[HirExpr],
+        span: Span,
+    ) -> Ty {
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
+        let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
+        let never_or_error = |never: bool| if never { Ty::Never } else { Ty::Error };
+
+        let resolved_arguments: Vec<Ty> =
+            arguments.iter().map(|a| self.resolve_named_type(a)).collect();
+        let Some(type_param_count) = self.protocols.get(&protocol).map(|p| p.type_params.len())
+        else {
+            return never_or_error(any_arg_never);
+        };
+        if resolved_arguments.len() != type_param_count {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PROTOCOL_ARITY_MISMATCH,
+                    self.source,
+                    ref_span,
+                    format!(
+                        "this protocol requires {type_param_count} type argument(s), found {}",
+                        resolved_arguments.len()
+                    ),
+                )
+                .with_primary_label("wrong number of protocol type arguments"),
+            );
+            return never_or_error(any_arg_never);
+        }
+        let subst: HashMap<TypeParamId, Ty> = self
+            .protocols
+            .get(&protocol)
+            .map(|p| p.type_params.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(resolved_arguments.iter().cloned())
+            .collect();
+        let Some((expected_params, expected_ret)) =
+            self.protocols.get(&protocol).and_then(|p| p.methods.get(method)).map(|m| {
+                (
+                    m.params.iter().map(|t| substitute(t, &subst)).collect::<Vec<_>>(),
+                    substitute(&m.ret, &subst),
+                )
+            })
+        else {
+            return never_or_error(any_arg_never);
+        };
+
+        let text = format!("`{}`", self.interner.resolve(name));
+        if expected_params.len() != args.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    self.source,
+                    span,
+                    format!(
+                        "{text} expects {} argument(s), found {}",
+                        expected_params.len(),
+                        args.len()
+                    ),
+                )
+                .with_primary_label("wrong number of arguments"),
+            );
+        } else {
+            for (arg_ty, param_ty) in arg_tys.iter().zip(expected_params.iter()) {
+                self.unify_report(
+                    param_ty,
+                    arg_ty,
+                    span,
+                    "argument type does not match the protocol method's declared parameter type",
+                );
+            }
+        }
+
+        let requirement = CapabilityRequirement::new(protocol, resolved_arguments);
+        let own_requirements = self.current_requirements.clone();
+        let Some(evidence) = self.resolve_requirement(&requirement, &own_requirements, ref_span)
+        else {
+            return never_or_error(any_arg_never);
+        };
+        self.protocol_call_evidence.insert(call_id, evidence);
+
+        if any_arg_never { Ty::Never } else { expected_ret }
+    }
+
     fn check_call(
         &mut self,
         call_id: ExprId,
@@ -1341,6 +1610,19 @@ impl<'a> Checker<'a> {
         } = callee
         {
             return self.check_variant_construct(call_id, *variant, *case, type_args, args, span);
+        }
+        if let HirExpr::ProtocolMethodRef {
+            protocol,
+            arguments,
+            method,
+            name,
+            span: ref_span,
+            ..
+        } = callee
+        {
+            return self.check_protocol_call(
+                call_id, *protocol, arguments, *method, *name, *ref_span, args, span,
+            );
         }
 
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
@@ -1447,6 +1729,14 @@ impl<'a> Checker<'a> {
                 self.call_type_args.insert(call_id, resolved_args);
             } else {
                 ok = false;
+            }
+        }
+        if ok && !sig.requirements.is_empty() {
+            match self.resolve_call_evidence(&sig.requirements, &subst, span) {
+                Some(evidence) => {
+                    self.call_evidence.insert(call_id, evidence);
+                }
+                None => ok = false,
             }
         }
         if !ok {
@@ -2987,6 +3277,7 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
+            current_requirements: Vec::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -2994,8 +3285,13 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             call_type_args: HashMap::new(),
+            call_evidence: HashMap::new(),
+            protocol_call_evidence: HashMap::new(),
             generic_params: HashMap::new(),
             generic_instances: std::collections::HashSet::new(),
+            protocols: HashMap::new(),
+            extends: Vec::new(),
+            capability_cache: HashMap::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -3037,6 +3333,7 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
+            current_requirements: Vec::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -3044,8 +3341,13 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             call_type_args: HashMap::new(),
+            call_evidence: HashMap::new(),
+            protocol_call_evidence: HashMap::new(),
             generic_params: HashMap::new(),
             generic_instances: std::collections::HashSet::new(),
+            protocols: HashMap::new(),
+            extends: Vec::new(),
+            capability_cache: HashMap::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }
@@ -3901,6 +4203,8 @@ mod tests {
             span: Span::dummy(),
         };
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: vec![record],
             variants: vec![],

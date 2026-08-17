@@ -206,14 +206,39 @@ fn resolve_one_import(
             declared_span: variant.span,
         });
     }
+    if let Some(protocol) = target_hir
+        .protocols
+        .iter()
+        .find(|p| p.name == declared_name)
+    {
+        if !protocol.public {
+            return Err(Box::new(private_item_diagnostic(
+                importing_source,
+                import.span,
+                item_name,
+                &dotted,
+                *target_source,
+                protocol.name_span,
+            )));
+        }
+        return Ok(ImportedItem {
+            local_name,
+            kind: ImportedItemKind::Protocol {
+                item: protocol.id,
+                declared_name: protocol.name,
+            },
+            import_span: import.span,
+            local_name_span,
+            declared_source: *target_source,
+            declared_span: protocol.name_span,
+        });
+    }
     if let Some(other) = target_hir
         .other_items
         .iter()
         .find(|o| o.name == declared_name)
     {
         let kind_text = match other.kind {
-            OtherItemKind::Protocol => "protocol",
-            OtherItemKind::Extend => "extend block",
             OtherItemKind::Import => "import",
         };
         return Err(Box::new(
@@ -222,8 +247,7 @@ fn resolve_one_import(
                 importing_source,
                 import.span,
                 format!(
-                    "`{item_name}` in module `{dotted}` is {} `{kind_text}`, which cannot be imported in Alpha 0.1.2",
-                    if matches!(other.kind, OtherItemKind::Extend) { "an" } else { "a" }
+                    "`{item_name}` in module `{dotted}` is a `{kind_text}`, which cannot be imported in Alpha 0.1.2"
                 ),
             )
             .with_primary_label("not an importable kind")

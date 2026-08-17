@@ -2547,6 +2547,8 @@ mod tests {
             diagnostics: Vec::new(),
             functions_by_name: HashMap::new(),
             type_names: HashMap::new(),
+            protocol_names: HashMap::new(),
+            protocol_methods: HashMap::new(),
             record_fields: HashMap::new(),
             variant_cases: HashMap::new(),
             case_lookup: HashMap::new(),

@@ -171,6 +171,8 @@ mod tests {
         let source = map.add_file("sales/user.npt", "");
         let name = interner.intern("User");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![HirRecord {
                 id: ItemId(0),
@@ -201,6 +203,8 @@ mod tests {
         let source = map.add_file("t.npt", "");
         let name = interner.intern("add");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![HirFunction {
                 id: ItemId(0),
                 name,
@@ -211,6 +215,7 @@ mod tests {
                 params: Vec::new(),
                 return_type: None,
                 uses: Vec::new(),
+                requirements: Vec::new(),
                 raises: Vec::new(),
                 body: crate::hir::HirBlock {
                     id: crate::hir::ExprId(0),
@@ -236,6 +241,8 @@ mod tests {
         let admin_source = map.add_file("admin/user.npt", "");
         let name = interner.intern("User");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![
                 HirRecord {
@@ -287,6 +294,8 @@ mod tests {
         let name = interner.intern("Shape");
         let case_name = interner.intern("Circle");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: Vec::new(),
             variants: vec![HirVariant {

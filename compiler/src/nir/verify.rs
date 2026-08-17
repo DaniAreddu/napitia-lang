@@ -144,7 +144,11 @@ struct KnownFunction {
     return_type: Ty,
     /// This function's own capability requirements (`rfcs/0009`), in
     /// declared order -- a `Call` targeting it must carry exactly this
-    /// many evidence entries.
+    /// many evidence entries. Not yet read: independent evidence
+    /// verification (arity/forwarded-index/extend-identity/depth-budget
+    /// checks, V0036 and up) is a tracked follow-up, not implemented in
+    /// this commit -- see this module's own `ValueKind::Call` arm.
+    #[allow(dead_code)]
     requirements: Vec<CapabilityRequirement>,
 }
 
@@ -155,7 +159,11 @@ struct KnownFunction {
 struct AggregateContext<'a> {
     records: HashMap<ItemId, &'a RecordLayout>,
     variants: HashMap<ItemId, &'a VariantLayout>,
+    /// Not yet read outside registration -- reserved for the same
+    /// follow-up evidence verification as `KnownFunction::requirements`.
+    #[allow(dead_code)]
     protocols: HashMap<ItemId, &'a ProtocolLayout>,
+    #[allow(dead_code)]
     extends: HashMap<ItemId, &'a ExtendLayout>,
 }
 

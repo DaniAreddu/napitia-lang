@@ -2,6 +2,7 @@
 
 use super::{Parser, recovery};
 use crate::lexer::TokenKind;
+use crate::source::Span;
 use crate::syntax::ast::{
     Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
     Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, VariantDecl, WhileStmt,
@@ -49,6 +50,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'func'
         let name = self.expect_ident("a function name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LParen, "`(`")?;
         let params = self.parse_param_list()?;
         self.expect(&TokenKind::RParen, "`)`")?;
@@ -72,6 +78,7 @@ impl<'a> Parser<'a> {
         Some(FunctionDecl {
             public,
             name,
+            type_params,
             params,
             return_type,
             uses,
@@ -79,6 +86,75 @@ impl<'a> Parser<'a> {
             body,
             span,
         })
+    }
+
+    /// `[T, U]` after a `func`/`record`/`variant` name -- the
+    /// declaration's own generic parameters (`rfcs/0008`). Every entry is
+    /// a plain identifier; an empty `[]` is itself malformed (if a
+    /// declaration isn't generic, the brackets are simply omitted) but
+    /// still recovers rather than aborting the whole declaration. A
+    /// trailing comma (`[T,]`) is accepted, matching every other
+    /// comma-separated list in this grammar.
+    fn parse_type_param_list(&mut self) -> Option<Vec<Ident>> {
+        self.expect(&TokenKind::LBracket, "`[`")?;
+        let mut params = Vec::new();
+        if self.check(&TokenKind::RBracket) {
+            self.error_expected("a type parameter");
+        } else {
+            loop {
+                let name = self.expect_ident("a type parameter name")?;
+                params.push(name);
+                if self.eat(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]`");
+        Some(params)
+    }
+
+    /// `[i64, str]`, in either type position (`Box[i64]`) or expression
+    /// position (`identity[i64]`, `Maybe[i64]`) -- `rfcs/0008`. Same
+    /// empty-list-is-malformed, trailing-comma-is-fine rules as
+    /// [`Self::parse_type_param_list`]. Returns the parsed arguments
+    /// alongside the whole `[...]`'s own span (from `[` through `]`),
+    /// distinct from any one argument's span, so an arity diagnostic can
+    /// underline the complete application.
+    pub(super) fn parse_type_arg_list(&mut self) -> Option<(Vec<Type>, Span)> {
+        let lbracket_span = self.expect(&TokenKind::LBracket, "`[`")?.span;
+        let mut args = Vec::new();
+        if self.check(&TokenKind::RBracket) {
+            self.error_expected("a type argument");
+        } else {
+            loop {
+                match self.parse_type() {
+                    Some(ty) => args.push(ty),
+                    None => {
+                        recovery::synchronize_to_bracket_list_item(self);
+                        if self.check(&TokenKind::RBracket) || self.at_eof() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if self.eat(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RBracket, "`]`")
+            .map(|t| t.span)
+            .unwrap_or(self.current_span());
+        Some((args, lbracket_span.join(end)))
     }
 
     /// A `func` signature with no body, used inside `protocol` blocks.
@@ -130,7 +206,15 @@ impl<'a> Parser<'a> {
 
     pub(super) fn parse_type(&mut self) -> Option<Type> {
         let name = self.expect_ident("a type name")?;
-        Some(Type { name })
+        let mut span = name.span;
+        let args = if self.check(&TokenKind::LBracket) {
+            let (args, bracket_span) = self.parse_type_arg_list()?;
+            span = span.join(bracket_span);
+            args
+        } else {
+            Vec::new()
+        };
+        Some(Type { name, args, span })
     }
 
     fn parse_path(&mut self) -> Option<Path> {
@@ -166,6 +250,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'record'
         let name = self.expect_ident("a record name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -197,6 +286,7 @@ impl<'a> Parser<'a> {
         Some(RecordDecl {
             public,
             name,
+            type_params,
             fields,
             span: start.join(end),
         })
@@ -206,6 +296,11 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'variant'
         let name = self.expect_ident("a variant name")?;
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -251,6 +346,7 @@ impl<'a> Parser<'a> {
         Some(VariantDecl {
             public,
             name,
+            type_params,
             cases,
             span: start.join(end),
         })

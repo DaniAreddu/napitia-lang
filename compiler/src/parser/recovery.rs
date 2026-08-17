@@ -97,6 +97,27 @@ pub(super) fn synchronize_to_list_item(p: &mut Parser) {
     }
 }
 
+/// Like [`synchronize_to_list_item`], but for a bracket-delimited list
+/// (a generic parameter list `[T, U]` or a type-argument list
+/// `[i64, str]`, `rfcs/0008`) rather than a brace-delimited one: stops at
+/// the next `,` (consumed) or a closing `]` (left for the caller), never
+/// mistaking a stray `}`/`)` elsewhere in the file for this list's own
+/// end.
+pub(super) fn synchronize_to_bracket_list_item(p: &mut Parser) {
+    loop {
+        match p.current() {
+            TokenKind::Eof | TokenKind::RBracket => return,
+            TokenKind::Comma => {
+                p.advance();
+                return;
+            }
+            _ => {
+                p.advance();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

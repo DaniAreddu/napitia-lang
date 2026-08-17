@@ -2401,4 +2401,99 @@ mod tests {
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0011");
     }
+
+    // -- Generic parameter lowering (`rfcs/0008`) -----------------------
+
+    #[test]
+    fn same_spelled_type_parameters_in_different_declarations_get_distinct_ids() {
+        // `first[T]` and `second[T]` are unrelated declarations that
+        // just happen to spell their own parameter the same way --
+        // `TypeParamId` identity must come from *which declaration*
+        // introduced it, never from the spelling alone.
+        let (hir, diags) = lower(
+            "func first[T](x: T) -> T { return x } \
+             func second[T](x: T) -> T { return x }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let ids: Vec<TypeParamId> = hir.functions.iter().map(|f| f.type_params[0].id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "each declaration's own T must get its own TypeParamId"
+        );
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_function_is_rejected() {
+        let (_, diags) = lower("func f[T, T](x: T) -> T { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_record_is_rejected() {
+        let (_, diags) = lower("record Box[T, T] { payload: T }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn duplicate_type_parameter_name_in_one_variant_is_rejected() {
+        let (_, diags) = lower("variant Maybe[T, T] { Some(T), None }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0016");
+    }
+
+    #[test]
+    fn a_primitive_name_as_a_type_parameter_is_rejected() {
+        let (_, diags) = lower("func f[i64](x: i64) -> i64 { return x }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0017");
+    }
+
+    #[test]
+    fn a_type_parameter_used_outside_its_own_declaration_does_not_leak_across_declarations() {
+        // `T` from `first`'s own declaration has no meaning in `second`,
+        // which declares no type parameter of its own at all -- `T`
+        // there must resolve as an ordinary unresolved name (deferred to
+        // typeck's own T0006), never silently reuse `first`'s parameter
+        // as if `second` had declared it too.
+        let (hir, diags) = lower(
+            "func first[T](x: T) -> T { return x } \
+             func second(x: T) -> T { return x }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let second = &hir.functions[1];
+        assert!(
+            matches!(second.params[0].ty, HirType::Unresolved { .. }),
+            "expected `T` in `second` to be unresolved, not reuse `first`'s parameter: {:?}",
+            second.params[0].ty
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_type_parameters_has_an_empty_type_params_list() {
+        let (hir, diags) = lower("record Point { x: i64 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert!(hir.records[0].type_params.is_empty());
+    }
+
+    #[test]
+    fn a_generic_record_lowers_its_own_type_parameters() {
+        let (hir, diags) = lower("record Box[T] { payload: T }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.records[0].type_params.len(), 1);
+    }
+
+    #[test]
+    fn an_applied_type_reference_resolves_to_an_aggregate_type_with_args() {
+        let (hir, diags) =
+            lower("record Box[T] { payload: T } func f(b: Box[i64]) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let f = &hir.functions[0];
+        match &f.params[0].ty {
+            HirType::Aggregate { args, .. } => assert_eq!(args.len(), 1),
+            other => panic!("expected an applied aggregate type, got {other:?}"),
+        }
+    }
 }

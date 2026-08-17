@@ -1141,4 +1141,189 @@ mod tests {
 
         assert_eq!(compile_and_print(&forward), compile_and_print(&reversed));
     }
+
+    /// The exact source text a diagnostic's label span covers, sliced
+    /// out of `text` -- used to assert *which token* a label points at
+    /// without hand-computing byte offsets (`rfcs/0007`).
+    fn label_text(text: &str, span_start: u32, span_end: u32) -> &str {
+        &text[span_start as usize..span_end as usize]
+    }
+
+    #[test]
+    fn alias_collision_labels_precisely_the_alias_token_not_the_whole_import() {
+        let project = TempProject::new("alias_span_alias_vs_alias");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.f as shared;\n\
+                          import b.g as shared;\n\
+                          func main() -> i64 { return shared() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func f() -> i64 { return 1 }\n");
+        project.write("src/b.npt", "public func g() -> i64 { return 2 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        // The new (conflicting) import's own primary span is just its
+        // alias token, `shared` on line 2 -- not the whole `import b.g
+        // as shared;` statement.
+        assert_eq!(
+            label_text(
+                main_text,
+                diags[0].primary_span.start,
+                diags[0].primary_span.end
+            ),
+            "shared"
+        );
+        // The "already imported here" label is the *first* import's own
+        // alias token -- also just `shared`, not its whole statement.
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "shared"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_an_unaliased_import_labels_each_side_precisely() {
+        let project = TempProject::new("alias_span_alias_vs_unaliased");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.thing;\n\
+                          import b.other as thing;\n\
+                          func main() -> i64 { return thing() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func thing() -> i64 { return 1 }\n");
+        project.write("src/b.npt", "public func other() -> i64 { return 2 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        // The new aliased import's primary span is its alias token.
+        assert_eq!(
+            label_text(
+                main_text,
+                diags[0].primary_span.start,
+                diags[0].primary_span.end
+            ),
+            "thing"
+        );
+        // The earlier, unaliased import has no alias to point at -- its
+        // label is the imported item's own written name (also `thing`,
+        // the last path segment of `import a.thing;`), never the whole
+        // statement.
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "thing"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_function_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_function");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.thing as helper;\n\
+                          func helper() -> i64 { return 0 }\n\
+                          func main() -> i64 { return helper() }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public func thing() -> i64 { return 1 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "helper"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_record_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_record");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.Thing as Helper;\n\
+                          record Helper { x: i64 }\n\
+                          func main() -> i64 { return 0 }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public record Thing { public y: i64 }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "Helper"
+        );
+    }
+
+    #[test]
+    fn alias_collision_with_a_local_variant_labels_the_alias_token() {
+        let project = TempProject::new("alias_span_alias_vs_local_variant");
+        project.write("napitia.toml", MANIFEST);
+        let main_text = "import a.Thing as Helper;\n\
+                          variant Helper { A, B }\n\
+                          func main() -> i64 { return 0 }\n";
+        project.write("src/main.npt", main_text);
+        project.write("src/a.npt", "public variant Thing { X, Y }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0007");
+        let already_imported = diags[0]
+            .labels
+            .iter()
+            .find(|l| l.message == "already imported here")
+            .expect("expected an \"already imported here\" label");
+        assert_eq!(
+            label_text(
+                main_text,
+                already_imported.span.start,
+                already_imported.span.end
+            ),
+            "Helper"
+        );
+    }
 }

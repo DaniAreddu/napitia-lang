@@ -333,7 +333,9 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .find(|(id, _)| *id == extend)
                     .map(|(_, layout)| layout)
-                    .ok_or_else(|| invalid("protocol call evidence references an unknown extend"))?;
+                    .ok_or_else(|| {
+                        invalid("protocol call evidence references an unknown extend")
+                    })?;
                 let method_item = extend_layout.methods.get(*method).ok_or_else(|| {
                     invalid("protocol call method index out of range for its extend")
                 })?;
@@ -343,7 +345,9 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .find(|f| f.id == *method_item)
                     .ok_or_else(|| {
-                        invalid("protocol call's implementing function is not present in this module")
+                        invalid(
+                            "protocol call's implementing function is not present in this module",
+                        )
                     })?;
                 self.call_function(callee, arg_values, nested)
             }

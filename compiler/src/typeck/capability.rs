@@ -69,7 +69,11 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|m| ProtocolMethodInfo {
                     name: m.name,
-                    params: m.params.iter().map(|t| self.resolve_named_type(t)).collect(),
+                    params: m
+                        .params
+                        .iter()
+                        .map(|t| self.resolve_named_type(t))
+                        .collect(),
                     ret: m
                         .return_type
                         .as_ref()
@@ -159,8 +163,10 @@ impl<'a> Checker<'a> {
         let mut accepted: Vec<ExtendInfo> = Vec::new();
         for e in &hir.extends {
             self.source = e.source;
-            let Some(protocol_info_type_params) =
-                self.protocols.get(&e.protocol).map(|p| p.type_params.clone())
+            let Some(protocol_info_type_params) = self
+                .protocols
+                .get(&e.protocol)
+                .map(|p| p.type_params.clone())
             else {
                 // Unknown protocol: `hir::lower` already reported this.
                 continue;
@@ -400,7 +406,10 @@ impl<'a> Checker<'a> {
             let Some(sig) = self.functions.get(&method.id) else {
                 continue;
             };
-            if !sig.params.iter().all(|p| type_params_within(p, extend_type_params))
+            if !sig
+                .params
+                .iter()
+                .all(|p| type_params_within(p, extend_type_params))
                 || !type_params_within(&sig.ret, extend_type_params)
             {
                 let text = self.interner.resolve(method.name);
@@ -667,7 +676,9 @@ impl<'a> Checker<'a> {
     /// registry so a cross-module protocol is always named by its
     /// canonical qualified name, never a possibly-aliased local one.
     pub(super) fn describe_requirement(&self, requirement: &CapabilityRequirement) -> String {
-        let name = self.registry.qualified_name(requirement.protocol, self.interner);
+        let name = self
+            .registry
+            .qualified_name(requirement.protocol, self.interner);
         if requirement.arguments.is_empty() {
             return name;
         }
@@ -765,7 +776,11 @@ fn match_one(
             Some(())
         }
         other => {
-            if other == concrete { Some(()) } else { None }
+            if other == concrete {
+                Some(())
+            } else {
+                None
+            }
         }
     }
 }

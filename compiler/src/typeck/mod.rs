@@ -596,8 +596,7 @@ impl<'a> Checker<'a> {
         // path at all.
         for e in &hir.extends {
             self.source = e.source;
-            let extend_type_params: Vec<TypeParamId> =
-                e.type_params.iter().map(|p| p.id).collect();
+            let extend_type_params: Vec<TypeParamId> = e.type_params.iter().map(|p| p.id).collect();
             for m in &e.methods {
                 let params = m
                     .params
@@ -1518,8 +1517,10 @@ impl<'a> Checker<'a> {
         let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
         let never_or_error = |never: bool| if never { Ty::Never } else { Ty::Error };
 
-        let resolved_arguments: Vec<Ty> =
-            arguments.iter().map(|a| self.resolve_named_type(a)).collect();
+        let resolved_arguments: Vec<Ty> = arguments
+            .iter()
+            .map(|a| self.resolve_named_type(a))
+            .collect();
         let Some(type_param_count) = self.protocols.get(&protocol).map(|p| p.type_params.len())
         else {
             return never_or_error(any_arg_never);
@@ -1547,10 +1548,16 @@ impl<'a> Checker<'a> {
             .into_iter()
             .zip(resolved_arguments.iter().cloned())
             .collect();
-        let Some((expected_params, expected_ret)) =
-            self.protocols.get(&protocol).and_then(|p| p.methods.get(method)).map(|m| {
+        let Some((expected_params, expected_ret)) = self
+            .protocols
+            .get(&protocol)
+            .and_then(|p| p.methods.get(method))
+            .map(|m| {
                 (
-                    m.params.iter().map(|t| substitute(t, &subst)).collect::<Vec<_>>(),
+                    m.params
+                        .iter()
+                        .map(|t| substitute(t, &subst))
+                        .collect::<Vec<_>>(),
                     substitute(&m.ret, &subst),
                 )
             })
@@ -1592,7 +1599,11 @@ impl<'a> Checker<'a> {
         };
         self.protocol_call_evidence.insert(call_id, evidence);
 
-        if any_arg_never { Ty::Never } else { expected_ret }
+        if any_arg_never {
+            Ty::Never
+        } else {
+            expected_ret
+        }
     }
 
     fn check_call(

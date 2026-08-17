@@ -1,0 +1,19 @@
+// Nested generic application: Box[Maybe[i64]], a generic record whose
+// own type argument is itself an applied generic variant
+// (Alpha 0.1.4, rfcs/0008).
+record Box[T] {
+    payload: T,
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+func main() -> i64 {
+    value b = Box[Maybe[i64]] { payload: Maybe[i64].Some(42) };
+    return match b.payload {
+        Some(n) => n,
+        None => 0,
+    }
+}

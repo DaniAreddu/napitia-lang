@@ -744,4 +744,172 @@ mod tests {
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "M0006");
     }
+
+    #[test]
+    fn the_same_variant_imported_under_two_aliases_is_not_falsely_ambiguous() {
+        // `Shape` is imported twice, as `Figure` and as `Form` -- both
+        // resolve to the exact same `ItemId`, so an *unqualified* case
+        // constructor and a `match` over it must both still work: the
+        // variant having two local names must never make its own cases
+        // look like they belong to two different variants.
+        let project = TempProject::new("alias_same_variant_two_aliases");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             func main() -> i64 {\n\
+             \x20   value first = Circle(4);\n\
+             \x20   value second = Form.Square(2);\n\
+             \x20   return match first {\n\
+             \x20       Circle(n) => n,\n\
+             \x20       Square(n) => n,\n\
+             \x20   } + match second {\n\
+             \x20       Circle(n) => n,\n\
+             \x20       Square(n) => n,\n\
+             \x20   }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(6)));
+    }
+
+    #[test]
+    fn qualified_construction_works_through_every_alias_of_the_same_variant() {
+        let project = TempProject::new("alias_same_variant_qualified");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             func main() -> i64 {\n\
+             \x20   value a = Figure.Circle(3);\n\
+             \x20   value b = Form.Circle(9);\n\
+             \x20   return match a { Circle(n) => n, Square(n) => n }\n\
+             \x20       + match b { Circle(n) => n, Square(n) => n }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(12)));
+    }
+
+    #[test]
+    fn two_genuinely_distinct_variants_sharing_a_case_name_remain_ambiguous() {
+        // Unlike the two-aliases-of-one-variant case above, `shapes.Shape`
+        // and `vehicles.Vehicle` are two real, different declarations that
+        // both happen to declare a case named `Circle` -- this must still
+        // be rejected, and the message must name both (sorted, deduplicated)
+        // local names.
+        let project = TempProject::new("alias_two_distinct_variants_ambiguous");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import vehicles.Vehicle as Ride;\n\
+             func main() -> i64 { value x = Circle(4); return 0 }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+        project.write(
+            "src/vehicles.npt",
+            "public variant Vehicle { Circle(i64), Truck(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0006");
+        assert_eq!(
+            diags[0].message,
+            "`Circle` is ambiguous: it names a case in more than one variant (Figure, Ride); \
+             use a qualified path (`Variant.Circle`)"
+        );
+    }
+
+    #[test]
+    fn the_ambiguous_constructor_diagnostic_is_identical_regardless_of_import_order() {
+        let render = |first: &str, second: &str| {
+            let project = TempProject::new("alias_ambiguity_order");
+            project.write("napitia.toml", MANIFEST);
+            project.write(
+                "src/main.npt",
+                &format!(
+                    "import {first};\n\
+                     import {second};\n\
+                     func main() -> i64 {{ value x = Circle(4); return 0 }}\n"
+                ),
+            );
+            project.write(
+                "src/shapes.npt",
+                "public variant Shape { Circle(i64), Square(i64) }\n",
+            );
+            project.write(
+                "src/vehicles.npt",
+                "public variant Vehicle { Circle(i64), Truck(i64) }\n",
+            );
+
+            let mut map = SourceMap::new();
+            let mut interner = Interner::new();
+            let diags =
+                compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            diags[0].message.clone()
+        };
+
+        let forward = render("shapes.Shape as Figure", "vehicles.Vehicle as Ride");
+        let reversed = render("vehicles.Vehicle as Ride", "shapes.Shape as Figure");
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn three_aliases_of_the_same_variant_do_not_panic_or_duplicate_candidates() {
+        // Guards `add_case_candidate`'s dedup directly against more than
+        // two aliases of the same declaration, and against
+        // `variant_name`'s internal lookup ever panicking when a variant
+        // has several local names in scope at once.
+        let project = TempProject::new("alias_same_variant_three_aliases");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import shapes.Shape as Figure;\n\
+             import shapes.Shape as Form;\n\
+             import shapes.Shape as Outline;\n\
+             func main() -> i64 {\n\
+             \x20   value x = Circle(5);\n\
+             \x20   return match x { Circle(n) => n, Square(n) => n }\n\
+             }\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "public variant Shape { Circle(i64), Square(i64) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(5)));
+    }
 }

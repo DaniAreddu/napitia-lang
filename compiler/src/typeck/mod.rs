@@ -256,10 +256,21 @@ pub fn check_module_with_registry(
 /// alone only ever follows a `Var -> Var -> concrete` chain at the top
 /// level (`rfcs/0008`).
 fn deep_resolve(ctx: &TypeContext, ty: &Ty) -> Ty {
-    match ctx.resolve(ty) {
-        Ty::Applied(item, args) => {
-            Ty::Applied(item, args.iter().map(|a| deep_resolve(ctx, a)).collect())
-        }
+    deep_resolve_at_depth(ctx, ty, 0)
+}
+
+fn deep_resolve_at_depth(ctx: &TypeContext, ty: &Ty, depth: usize) -> Ty {
+    let resolved = ctx.resolve(ty);
+    if depth >= crate::limits::MAX_GENERIC_DEPTH {
+        return resolved;
+    }
+    match resolved {
+        Ty::Applied(item, args) => Ty::Applied(
+            item,
+            args.iter()
+                .map(|a| deep_resolve_at_depth(ctx, a, depth + 1))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -838,12 +849,13 @@ impl<'a> Checker<'a> {
             // callee, so reaching this arm bare means the case was
             // referenced directly, e.g. `LookupResult.Missing`.
             HirExpr::CaseRef {
+                id,
                 variant,
                 case,
                 type_args,
                 span,
                 ..
-            } => self.check_case_ref(*variant, *case, type_args, *span),
+            } => self.check_case_ref(*id, *variant, *case, type_args, *span),
             HirExpr::Unary {
                 op, operand, span, ..
             } => self.check_unary(*op, operand, *span),
@@ -1031,6 +1043,21 @@ impl<'a> Checker<'a> {
                 lt
             }
             BinaryOp::Eq | BinaryOp::Ne => {
+                // Equality is not among the operations proven safe for
+                // every possible type an unconstrained `T` might be
+                // instantiated with (`rfcs/0008`) -- `left == right`
+                // must be rejected here, symbolically, the same way
+                // `left + right` already is by `require_numeric`, never
+                // deferred to a runtime comparison against whatever
+                // concrete type a particular call site happens to
+                // instantiate `T` with.
+                let resolved_lt = self.ctx.resolve(&lt);
+                let resolved_rt = self.ctx.resolve(&rt);
+                if self.report_unconstrained_type_parameter(&resolved_lt, span)
+                    || self.report_unconstrained_type_parameter(&resolved_rt, span)
+                {
+                    return Ty::Error;
+                }
                 if self.is_aggregate(&lt) || self.is_aggregate(&rt) {
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -1052,6 +1079,16 @@ impl<'a> Checker<'a> {
                 Ty::Bool
             }
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                // Ordering is exactly as unproven for an unconstrained
+                // `T` as equality is (`rfcs/0008`) -- rejected here,
+                // symbolically, before any instantiation.
+                let resolved_lt = self.ctx.resolve(&lt);
+                let resolved_rt = self.ctx.resolve(&rt);
+                if self.report_unconstrained_type_parameter(&resolved_lt, span)
+                    || self.report_unconstrained_type_parameter(&resolved_rt, span)
+                {
+                    return Ty::Error;
+                }
                 self.unify_report(
                     &lt,
                     &rt,
@@ -1317,11 +1354,20 @@ impl<'a> Checker<'a> {
         } = callee
         else {
             let callee_ty = self.check_expr(callee);
+            let resolved_callee_ty = self.ctx.resolve(&callee_ty);
+            // Callability is exactly as unproven for an unconstrained
+            // `T` as every other capability nothing yet guarantees it
+            // has (`rfcs/0008`) -- rejected with the same dedicated
+            // diagnostic every other operation on `T` is, before falling
+            // to the ordinary "not callable" message that would
+            // otherwise suggest `T` is simply the wrong concrete type.
             // Error/Never already trace back to a diagnostic recorded
             // elsewhere (an unresolved name, an unsupported feature, a
             // divergent expression) -- piling "not callable" on top
             // would just be noise about the same underlying problem.
-            if !matches!(callee_ty, Ty::Error | Ty::Never) {
+            if !matches!(callee_ty, Ty::Error | Ty::Never)
+                && !self.report_unconstrained_type_parameter(&resolved_callee_ty, span)
+            {
                 self.diagnostics.push(
                     Diagnostic::error(
                         codes::NOT_CALLABLE,
@@ -1424,6 +1470,7 @@ impl<'a> Checker<'a> {
     /// an explicit qualified application (`Maybe[i64].None`).
     fn check_case_ref(
         &mut self,
+        id: ExprId,
         variant: ItemId,
         case: usize,
         type_args: &[HirType],
@@ -1472,6 +1519,12 @@ impl<'a> Checker<'a> {
         if !self.record_generic_instance(key, span) {
             return Ty::Error;
         }
+        // Never leave a known-generic construction to default to an
+        // empty argument list downstream: NIR lowering reads this same
+        // map back by `id` and, without an entry here, silently treats
+        // this construction as if it applied no type arguments at all
+        // (`rfcs/0008`).
+        self.call_type_args.insert(id, resolved_args.clone());
         Ty::Applied(variant, resolved_args)
     }
 
@@ -1655,6 +1708,16 @@ impl<'a> Checker<'a> {
             return Ty::Never;
         }
         if matches!(base_ty, Ty::Error) {
+            return Ty::Error;
+        }
+        // Field access is exactly as unproven for an unconstrained `T`
+        // as every other capability nothing yet guarantees it has
+        // (`rfcs/0008`): rejected here with the same dedicated
+        // diagnostic `require_numeric`/`expect_bool` use, before falling
+        // to the ordinary "not a record" message that would otherwise
+        // suggest `T` is simply the wrong concrete type.
+        let resolved_base = self.ctx.resolve(&base_ty);
+        if self.report_unconstrained_type_parameter(&resolved_base, span) {
             return Ty::Error;
         }
         // A generic record's field type may itself reference the
@@ -1965,8 +2028,14 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|(id, info)| (*id, info.cases.iter().map(|(_, p)| p.clone()).collect()))
             .collect();
+        let variant_type_params: HashMap<ItemId, Vec<TypeParamId>> = self
+            .variants
+            .iter()
+            .map(|(id, info)| (*id, info.type_params.clone()))
+            .collect();
         let space = VariantSpace {
             payloads: variant_payloads,
+            type_params: variant_type_params,
         };
         let analysis = exhaustive::analyze_match_with_budget(
             &resolved_scrutinee,
@@ -2364,6 +2433,18 @@ impl<'a> Checker<'a> {
     ///   `ItemId` alone, and never an import alias -- the registry only
     ///   ever returns an item's own true declared identity.
     fn display_for_diagnostic(&self, ty: &Ty) -> String {
+        self.display_for_diagnostic_at_depth(ty, 0)
+    }
+
+    /// `depth`-bounded the same way every other stage that walks a
+    /// nested type application is (`crate::limits::MAX_GENERIC_DEPTH`):
+    /// diagnostics must never overflow the stack rendering a
+    /// pathologically (or maliciously) deep type, even one that itself
+    /// somehow slipped past every earlier guard.
+    fn display_for_diagnostic_at_depth(&self, ty: &Ty, depth: usize) -> String {
+        if depth > crate::limits::MAX_GENERIC_DEPTH {
+            return "...".to_string();
+        }
         if let Ty::Var(v) = ty {
             match self.ctx.kind_of(*v) {
                 Some(VarKind::Integer) => return display_ty(&Ty::I64, self.interner),
@@ -2381,7 +2462,7 @@ impl<'a> Checker<'a> {
             let head = self.registry.qualified_name(*item, self.interner);
             let args_text = args
                 .iter()
-                .map(|a| self.display_for_diagnostic(a))
+                .map(|a| self.display_for_diagnostic_at_depth(a, depth + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
             return format!("{head}[{args_text}]");
@@ -2390,6 +2471,15 @@ impl<'a> Checker<'a> {
     }
 
     fn expect_bool(&mut self, ty: &Ty, span: Span) {
+        // Logical/conditional use (`!T`, `T && ...`, `if T { ... }`, a
+        // `while` condition) is exactly as unproven for an unconstrained
+        // `T` as arithmetic is (`rfcs/0008`): rejected here, once,
+        // symbolically, rather than an ordinary "expected bool" mismatch
+        // that would suggest `T` is simply the wrong concrete type.
+        let resolved = self.ctx.resolve(ty);
+        if self.report_unconstrained_type_parameter(&resolved, span) {
+            return;
+        }
         self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
@@ -4022,6 +4112,332 @@ mod tests {
             diags[0].message,
             "the returned value does not match the function's declared return type: \
              expected `i64`, found `bool`"
+        );
+    }
+
+    // -- Unsupported operations on an unconstrained type parameter
+    // (T0027, `rfcs/0008`) --------------------------------------------
+
+    #[test]
+    fn equality_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        // The regression this fix exists for: `left == right` inside a
+        // generic function's own body must fail here, at generic-body
+        // checking time, never be deferred to a runtime comparison that
+        // only fails once some particular call site instantiates `T`
+        // with a record.
+        let diags = check(
+            "func same[T](left: T, right: T) -> bool { return left == right } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn inequality_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func differs[T](left: T, right: T) -> bool { return left != right } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn equality_on_an_unconstrained_type_parameter_is_rejected_even_when_instantiated_with_a_record()
+     {
+        // The declaration is rejected once, symbolically -- it must
+        // never even reach a call site for this to be caught, but this
+        // also proves that a call site instantiating `T` with a record
+        // does not somehow let it through as a "record equality"
+        // problem instead (that would be a *different*, misleading
+        // diagnostic for the same underlying issue).
+        let diags = check(
+            "record Point { x: i64 } \
+             func same[T](left: T, right: T) -> bool { return left == right } \
+             func main() -> i64 { \
+                 value p = Point { x: 1 }; \
+                 value q = Point { x: 1 }; \
+                 return if same(p, q) { 1 } else { 0 } \
+             }",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "T0027"),
+            "expected a T0027 diagnostic, got {diags:?}"
+        );
+        assert!(
+            diags.iter().all(|d| d.code != "T0001"),
+            "the generic body's own T0027 must not cascade into an unrelated call-site \
+             mismatch: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn ordering_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func less[T](left: T, right: T) -> bool { return left < right } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn logical_and_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        // Both operands are the same unconstrained `T`; `&&` checks each
+        // side independently, so this may report once per side -- what
+        // matters is that every diagnostic produced is T0027, and that
+        // there is at least one.
+        let diags = check(
+            "func both[T](left: T, right: T) -> bool { return left && right } \
+             func main() -> i64 { return 1 }",
+        );
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+        assert!(
+            diags.iter().all(|d| d.code == "T0027"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn logical_not_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func negate[T](x: T) -> bool { return !x } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn using_an_unconstrained_type_parameter_as_an_if_condition_is_rejected_symbolically() {
+        let diags = check(
+            "func pick[T](x: T) -> i64 { return if x { 1 } else { 0 } } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn field_access_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func get[T](x: T) -> i64 { return x.field } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn calling_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func invoke[T](x: T) -> i64 { return x() } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn bitwise_and_on_an_unconstrained_type_parameter_is_rejected_symbolically() {
+        let diags = check(
+            "func mask[T](left: T, right: T) -> T { return left & right } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0027");
+    }
+
+    #[test]
+    fn plain_movement_binding_and_return_of_an_unconstrained_type_parameter_is_valid() {
+        // The operations FIX 4 must *not* reject: passing, returning,
+        // and binding a value of an unconstrained `T` requires no proven
+        // capability at all.
+        let diags = check(
+            "func identity[T](x: T) -> T { \
+                 value bound = x; \
+                 return bound \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Exhaustiveness after generic substitution (`rfcs/0008`) --------
+
+    #[test]
+    fn generic_variant_match_is_exhaustive_using_the_instantiated_payload_type() {
+        // The regression this fix exists for: `Maybe[bool]`'s `Some`
+        // payload must be checked as the closed, two-value `bool` space
+        // it actually is once instantiated, not the declaration's own
+        // unresolved `Ty::Param`, which would never be considered fully
+        // covered by any finite set of arms.
+        let diags = check(
+            "variant Maybe[T] { Some(T), None } \
+             func inspect(v: Maybe[bool]) -> i64 { \
+                 return match v { \
+                     Some(true) => 1, \
+                     Some(false) => 2, \
+                     None => 0, \
+                 } \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn generic_variant_match_missing_a_bool_case_is_still_reported() {
+        let diags = check(
+            "variant Maybe[T] { Some(T), None } \
+             func inspect(v: Maybe[bool]) -> i64 { \
+                 return match v { \
+                     Some(true) => 1, \
+                     None => 0, \
+                 } \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0017");
+        assert!(
+            diags[0].message.contains("Some(false)"),
+            "expected the concrete missing witness `Some(false)`, got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn generic_variant_match_with_a_redundant_arm_after_both_bool_cases_is_unreachable() {
+        let diags = check(
+            "variant Maybe[T] { Some(T), None } \
+             func inspect(v: Maybe[bool]) -> i64 { \
+                 return match v { \
+                     Some(true) => 1, \
+                     Some(false) => 2, \
+                     Some(x) => 3, \
+                     None => 0, \
+                 } \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0018");
+    }
+
+    #[test]
+    fn nested_generic_variant_match_is_exhaustive_using_the_instantiated_payload_type() {
+        let diags = check(
+            "variant Maybe[T] { Some(T), None } \
+             func inspect(v: Maybe[Maybe[bool]]) -> i64 { \
+                 return match v { \
+                     Some(Some(true)) => 1, \
+                     Some(Some(false)) => 2, \
+                     Some(None) => 3, \
+                     None => 0, \
+                 } \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn nested_generic_variant_match_missing_one_inner_bool_case_is_reported() {
+        let diags = check(
+            "variant Maybe[T] { Some(T), None } \
+             func inspect(v: Maybe[Maybe[bool]]) -> i64 { \
+                 return match v { \
+                     Some(Some(true)) => 1, \
+                     Some(None) => 3, \
+                     None => 0, \
+                 } \
+             } \
+             func main() -> i64 { return 1 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0017");
+        assert!(
+            diags[0].message.contains("Some(false)"),
+            "expected a concrete missing witness naming the inner `false` case, got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn generic_variant_exhaustiveness_still_respects_the_usefulness_budget() {
+        // A hand-tightened budget (rather than a fixture that genuinely
+        // consumes MAX_USEFULNESS_STEPS) proves the work budget applies
+        // to a *generic* variant's substituted space the same way it
+        // already does for a non-generic one -- this fix only changes
+        // which space a payload position resolves to, never the
+        // recursive step-counting that enforces the budget itself.
+        let mut interner = Interner::new();
+        let name = interner.intern("Maybe");
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let registry = ItemRegistry::default();
+        let mut checker = checker_with_budget(&interner, &registry, source, 1);
+        let maybe = ItemId(0);
+        let t = TypeParamId(0);
+        checker.variants.insert(
+            maybe,
+            VariantInfo {
+                name,
+                cases: vec![(name, vec![Ty::Param(t, name)]), (name, vec![])],
+                type_params: vec![t],
+            },
+        );
+        let scrutinee = Ty::Applied(maybe, vec![Ty::Bool]);
+        let resolved_patterns = vec![
+            ResolvedPattern::Variant {
+                variant: maybe,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(true)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(false)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe,
+                case: 1,
+                args: vec![],
+            },
+        ];
+        let trivial_arm = || HirMatchArm {
+            pattern: HirPattern::Wildcard {
+                id: crate::hir::PatternId(0),
+                span: Span::dummy(),
+            },
+            body: HirMatchArmBody::Expr(HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            }),
+            span: Span::dummy(),
+        };
+        let arms = vec![trivial_arm(), trivial_arm(), trivial_arm()];
+        let coverage = checker.check_match_exhaustiveness(
+            &scrutinee,
+            &resolved_patterns,
+            &arms,
+            Span::dummy(),
+        );
+        assert!(
+            matches!(coverage, MatchCoverage::Failed),
+            "expected the tiny budget to fail this generic match's analysis"
+        );
+        assert!(
+            checker
+                .diagnostics
+                .iter()
+                .any(|d| d.code == codes::PATTERN_BUDGET_EXCEEDED),
+            "expected a budget-exceeded diagnostic, got {:?}",
+            checker.diagnostics
         );
     }
 }

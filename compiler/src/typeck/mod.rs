@@ -4194,6 +4194,7 @@ mod tests {
                 span: Span::dummy(),
             }),
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: crate::hir::HirBlock {
                 id: crate::hir::ExprId(0),
@@ -4702,6 +4703,7 @@ mod tests {
                 name,
                 cases: vec![(name, vec![Ty::Param(t, name)]), (name, vec![])],
                 type_params: vec![t],
+                source,
             },
         );
         let scrutinee = Ty::Applied(maybe, vec![Ty::Bool]);

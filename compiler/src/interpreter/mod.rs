@@ -613,6 +613,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -875,6 +877,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -910,6 +914,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -936,10 +942,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: vec![
                     Param {
                         value: ValueId(0),
@@ -976,10 +985,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: vec![Param {
                     value: ValueId(0),
                     ty: Ty::I64,
@@ -1014,10 +1026,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::Unit,
                 blocks: vec![BasicBlock {
@@ -1160,10 +1175,13 @@ mod tests {
         let name = interner.intern("f");
         let variant = ItemId(1);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![
@@ -1208,10 +1226,13 @@ mod tests {
         let record_a = ItemId(1);
         let record_b = ItemId(2);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![BasicBlock {

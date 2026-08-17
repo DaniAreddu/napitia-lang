@@ -222,11 +222,12 @@ pub fn compile_project(
         .expect("validate_entry_main already guaranteed exactly one entry `main`")
         .id;
 
-    let typeck_result = typeck::check_module(
+    let typeck_result = typeck::check_module_with_registry(
         &merged,
         loaded.manifest_source,
         interner,
         typeck::EntryMain::ByIdentity(Some(entry_item)),
+        &registry,
     );
     if !typeck_result.diagnostics.is_empty() {
         return Err(typeck_result.diagnostics);

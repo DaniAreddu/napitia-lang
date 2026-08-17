@@ -68,9 +68,22 @@ pub fn check_cycles(
         let types = field_types.get(&record.id).cloned().unwrap_or_default();
         let mut edges = Vec::new();
         for (field, ty) in record.fields.iter().zip(types.iter()) {
-            if let Ty::Named(target, _) = ty {
+            // A cycle through the *head* declaration of an applied
+            // generic type (`Node[T] { next: Node[T] }`) is exactly as
+            // infinite as a non-generic one -- Napitia still has no
+            // indirection to break it with regardless of what the type
+            // arguments are, so `Ty::Applied`'s own arguments are
+            // deliberately not walked into here (`rfcs/0008`): only
+            // whether the *declaration itself* recurs matters for this
+            // check.
+            let target = match ty {
+                Ty::Named(target, _) => Some(*target),
+                Ty::Applied(target, _) => Some(*target),
+                _ => None,
+            };
+            if let Some(target) = target {
                 edges.push(Edge {
-                    to: *target,
+                    to: target,
                     label: interner.resolve(field.name).to_string(),
                     span: field.span,
                 });
@@ -92,9 +105,14 @@ pub fn check_cycles(
         let mut edges = Vec::new();
         for (case, payload) in variant.cases.iter().zip(case_types.iter()) {
             for (i, ty) in payload.iter().enumerate() {
-                if let Ty::Named(target, _) = ty {
+                let target = match ty {
+                    Ty::Named(target, _) => Some(*target),
+                    Ty::Applied(target, _) => Some(*target),
+                    _ => None,
+                };
+                if let Some(target) = target {
                     edges.push(Edge {
-                        to: *target,
+                        to: target,
                         label: format!("{}.{}", interner.resolve(case.name), i),
                         span: case.span,
                     });
@@ -242,6 +260,7 @@ mod tests {
                 span: Span::dummy(),
                 source,
                 public: true,
+                type_params: Vec::new(),
                 fields: vec![HirField {
                     name: field_name,
                     span: Span::dummy(),
@@ -270,6 +289,7 @@ mod tests {
                 span: Span::dummy(),
                 source,
                 public: true,
+                type_params: Vec::new(),
                 cases: vec![HirCase {
                     name: case_name,
                     span: Span::dummy(),

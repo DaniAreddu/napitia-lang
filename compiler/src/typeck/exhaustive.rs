@@ -88,10 +88,24 @@ enum Space<'a> {
 }
 
 fn space<'a>(ty: &Ty, variants: &'a VariantSpace) -> Space<'a> {
-    match ty {
-        Ty::Bool => Space::Bool,
-        Ty::Named(item, _) => match variants.payloads.get(item) {
-            Some(cases) => Space::Variant(*item, cases),
+    // A generic variant's scrutinee is `Ty::Applied`, not `Ty::Named`,
+    // but its *case arity* (all this dispatch needs) is exactly the same
+    // regardless of the type arguments -- `variants.payloads` is keyed
+    // by the declaring `ItemId` either way (`rfcs/0008`). A payload
+    // position typed by one of the variant's own type parameters
+    // (`Ty::Param`) still correctly falls through to `Space::Open` below
+    // for any *nested* pattern against it: an unconstrained type
+    // parameter's own shape can never be exhaustively enumerated without
+    // a wildcard, which is the right answer, not a shortcut.
+    let item = match ty {
+        Ty::Named(item, _) => Some(*item),
+        Ty::Applied(item, _) => Some(*item),
+        _ => None,
+    };
+    match (ty, item) {
+        (Ty::Bool, _) => Space::Bool,
+        (_, Some(item)) => match variants.payloads.get(&item) {
+            Some(cases) => Space::Variant(item, cases),
             None => Space::Open,
         },
         _ => Space::Open,

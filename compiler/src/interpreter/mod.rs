@@ -269,7 +269,15 @@ impl<'a> Interpreter<'a> {
             ValueKind::Ge(a, b) => Ok(Value::Bool(
                 ord(&get(values, a)?, &get(values, b)?)? != Ordering::Less,
             )),
-            ValueKind::Call(item, args) => {
+            // Generic type arguments are compile-time-only bookkeeping:
+            // one parametric NIR function body is shared by every call
+            // regardless of them (`rfcs/0008`), and a runtime `Value`
+            // already carries everything execution needs (`ItemId` plus
+            // its positional fields/payload) -- so the interpreter reads
+            // straight past `type_args` here without needing to look at
+            // it at all, the same "generics erase at runtime" approach
+            // ordinary type-erased generics use.
+            ValueKind::Call(item, _type_args, args) => {
                 let arg_values = args
                     .iter()
                     .map(|id| get(values, id))
@@ -282,7 +290,7 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| invalid("call to a function not present in this module"))?;
                 self.call_function(callee, arg_values)
             }
-            ValueKind::RecordCreate(item, field_ids) => {
+            ValueKind::RecordCreate(item, _type_args, field_ids) => {
                 let fields = field_ids
                     .iter()
                     .map(|id| get(values, id))
@@ -309,6 +317,7 @@ impl<'a> Interpreter<'a> {
             ValueKind::VariantCreate {
                 variant,
                 case,
+                type_args: _,
                 payload,
             } => {
                 let payload = payload
@@ -515,6 +524,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -776,6 +786,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -810,6 +821,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -839,6 +851,7 @@ mod tests {
             functions: vec![Function {
                 id: ItemId(0),
                 name,
+                type_params: Vec::new(),
                 params: vec![
                     Param {
                         value: ValueId(0),
@@ -878,6 +891,7 @@ mod tests {
             functions: vec![Function {
                 id: ItemId(0),
                 name,
+                type_params: Vec::new(),
                 params: vec![Param {
                     value: ValueId(0),
                     ty: Ty::I64,
@@ -915,6 +929,7 @@ mod tests {
             functions: vec![Function {
                 id: ItemId(0),
                 name,
+                type_params: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::Unit,
                 blocks: vec![BasicBlock {
@@ -1060,6 +1075,7 @@ mod tests {
             functions: vec![Function {
                 id: ItemId(0),
                 name,
+                type_params: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![
@@ -1107,6 +1123,7 @@ mod tests {
             functions: vec![Function {
                 id: ItemId(0),
                 name,
+                type_params: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![BasicBlock {
@@ -1120,7 +1137,7 @@ mod tests {
                         Instruction::Value {
                             result: ValueId(1),
                             ty: Ty::Named(record_a, name),
-                            kind: ValueKind::RecordCreate(record_a, vec![ValueId(0)]),
+                            kind: ValueKind::RecordCreate(record_a, Vec::new(), vec![ValueId(0)]),
                         },
                         Instruction::Value {
                             result: ValueId(2),

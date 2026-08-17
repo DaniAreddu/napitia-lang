@@ -17,8 +17,8 @@ use std::fmt::Write as _;
 use super::block::{BasicBlock, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
 use super::{Function, Module};
-use crate::hir::{ItemId, ItemRegistry};
-use crate::symbol::Interner;
+use crate::hir::{ItemId, ItemRegistry, TypeParamId};
+use crate::symbol::{Interner, Symbol};
 use crate::types::{Ty, display_ty};
 
 /// Every declaration and reference to `id` renders through this one
@@ -45,8 +45,54 @@ fn qualified_ref(id: ItemId, registry: &ItemRegistry, interner: &Interner) -> St
 fn format_ty(ty: &Ty, interner: &Interner, registry: &ItemRegistry) -> String {
     match ty {
         Ty::Named(item, _) => qualified_ref(*item, registry, interner),
+        // A generic instantiation prints its declaration's own qualified
+        // reference, then its concrete arguments bracketed the same way
+        // a call/construction site's own applied arguments do
+        // (`@collections.Box#8[str]`, `rfcs/0008`) -- nested applications
+        // (`Box[Maybe[i64]]`) format unambiguously since each argument
+        // recurses through this same function.
+        Ty::Applied(item, args) => format!(
+            "{}{}",
+            qualified_ref(*item, registry, interner),
+            type_args_suffix(args, interner, registry)
+        ),
+        // A symbolic reference to the *enclosing declaration's own* type
+        // parameter (inside a parametric body/layout, before any call
+        // site substitutes a concrete argument) prints as its bare
+        // declared name -- `T`, never a registry lookup, since a type
+        // parameter has no module-qualified identity of its own.
+        Ty::Param(_, name) => interner.resolve(*name).to_string(),
         other => display_ty(other, interner),
     }
+}
+
+/// `[i64, str]` (or nested `[Maybe[i64]]`) for a list of concrete type
+/// arguments -- empty for a non-generic call/construction/type, which
+/// prints no brackets at all rather than empty ones.
+fn type_args_suffix(args: &[Ty], interner: &Interner, registry: &ItemRegistry) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = args
+        .iter()
+        .map(|a| format_ty(a, interner, registry))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// `[T, U]` for a generic declaration's own parameter list, in stable
+/// declared order -- printed on the declaration itself
+/// (`func @core.identity#12[T](...)`), distinct from
+/// [`type_args_suffix`]'s concrete arguments at a use site.
+fn declared_type_params_suffix(type_params: &[(TypeParamId, Symbol)], interner: &Interner) -> String {
+    if type_params.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = type_params
+        .iter()
+        .map(|(_, name)| interner.resolve(*name))
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 pub fn print_module(module: &Module, interner: &Interner, registry: &ItemRegistry) -> String {
@@ -74,8 +120,9 @@ fn print_function(
         .join(", ");
     let _ = writeln!(
         out,
-        "func @{}({params}) -> {} {{",
+        "func @{}{}({params}) -> {} {{",
         qualified_ref(function.id, registry, interner),
+        declared_type_params_suffix(&function.type_params, interner),
         format_ty(&function.return_type, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
@@ -223,26 +270,28 @@ fn format_value_kind(
                 b.0
             )
         }
-        ValueKind::Call(function, args) => {
+        ValueKind::Call(function, type_args, args) => {
             let args = args
                 .iter()
                 .map(|v: &ValueId| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "call @{}({args})",
-                qualified_ref(*function, registry, interner)
+                "call @{}{}({args})",
+                qualified_ref(*function, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
-        ValueKind::RecordCreate(record, fields) => {
+        ValueKind::RecordCreate(record, type_args, fields) => {
             let fields = fields
                 .iter()
                 .map(|v| format!("%{}", v.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "record.create @{}({fields})",
-                qualified_ref(*record, registry, interner)
+                "record.create @{}{}({fields})",
+                qualified_ref(*record, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
         ValueKind::RecordField {
@@ -257,6 +306,7 @@ fn format_value_kind(
         ValueKind::VariantCreate {
             variant,
             case,
+            type_args,
             payload,
         } => {
             let payload = payload
@@ -265,8 +315,9 @@ fn format_value_kind(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "variant.create @{}.{case}({payload})",
-                qualified_ref(*variant, registry, interner)
+                "variant.create @{}{}.{case}({payload})",
+                qualified_ref(*variant, registry, interner),
+                type_args_suffix(type_args, interner, registry)
             )
         }
         ValueKind::VariantPayload {
@@ -358,6 +409,7 @@ mod tests {
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &typeck_result.pattern_case,
+            &typeck_result.call_type_args,
             &interner,
             id,
         )

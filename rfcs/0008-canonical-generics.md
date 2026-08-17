@@ -217,6 +217,32 @@ given the same recursive, depth-bounded treatment, so a resolved
 `Ty::Applied`'s own arguments are never left with a stale, unresolved
 `Ty::Var` chain inside them.
 
+### Occurs-check and transactional unification
+
+Recursing into `Ty::Applied`'s own arguments means a variable can be
+found nested arbitrarily deep inside the other side of a unification —
+`occurs()` checks, before every bind, whether the variable being bound
+already appears (transitively, through the current substitution state)
+inside the type it would be bound to, so `unify(Var(v), Box[Var(v)])`
+fails outright instead of producing a cyclic substitution that would
+later hang whatever tries to resolve it. This also catches an *indirect*
+cycle through a merged variable (`v` unified with `w`, then `w` unified
+against `Box[v]`): `occurs` resolves at every level of its own recursion,
+not just the top the way `TypeContext::resolve` alone does, so it chases
+back through `w`'s own slot and finds `w` again.
+
+Recursing into `Ty::Applied`'s arguments also means a single top-level
+`unify` call can attempt several nested binds before one of them fails
+(`Pair[V, V]` against `Pair[i64, bool]` binds `V = i64` from the first
+argument pair, then fails on the second). The public `unify` entry point
+is transactional: it checkpoints `TypeContext` (a cheap clone of its
+substitution/kind tables — `unify` never allocates a fresh variable
+partway through its own recursion, so a checkpoint is never invalidated
+by those tables changing length underneath it) before attempting
+anything, and restores it on any `Err`, so a failed call can never leave
+a partial bind behind regardless of how much of its own recursion
+already succeeded.
+
 After unification: `T0025` (`CONFLICTING_INFERRED_ARGUMENTS`) reports two
 arguments disagreeing about the same parameter (`choose(1, true)` for
 `choose[T](left: T, right: T) -> T`); `T0026`
@@ -326,6 +352,19 @@ threads its own `ExprId` and records its resolved arguments into
 lowering never silently defaults a known-generic construction to an empty
 argument list.
 
+All three lowering sites (`lower_call`, `lower_variant_construct` — which
+handles the bare unit-case reference above too — and
+`lower_record_literal`) read their own call site's type arguments back
+through one shared, checked helper, `resolve_call_type_args`: absent
+metadata is valid only for a non-generic reference (an empty argument
+list); a generic reference with missing metadata, or metadata whose
+length doesn't match the declaration's own type parameter count, is a
+structured internal-lowering error (the existing `I0002` family) rather
+than silently defaulting to empty or being silently truncated by
+`Vec::zip` to whichever side happens to be shorter — either of which
+would otherwise produce a partially-specialized NIR value with no
+diagnostic at all.
+
 The interpreter erases generic arguments at runtime: a `Value::Record`/
 `Value::Variant` already carries only an `ItemId` and positional field
 values, with no type arguments at all, so `Box[i64]` and `Box[str]`
@@ -373,6 +412,26 @@ arguments and bounded by `MAX_GENERIC_DEPTH`:
   `DUPLICATE_TYPE_PARAMETER`), which would otherwise make positional
   substitution ambiguous.
 
+Every type argument at a `Call`/`RecordCreate`/`VariantCreate` use site —
+not just the instruction's declared result type — goes through one
+shared helper, `check_generic_type_argument`, so the three instruction
+kinds can never drift into checking a different subset of the above for
+their own type arguments (an earlier version of this verifier ran only
+`check_type_param_scope` on them, leaving a `Ty::Error`/unresolved
+`Ty::Var`/unknown-declaration/wrong-nested-arity argument unchecked at
+exactly the site most directly under a program's own control).
+`check_generic_type_argument` validates depth *first*: past
+`MAX_GENERIC_DEPTH`, it reports a dedicated, single diagnostic (`V0035`,
+`GENERIC_DEPTH_EXCEEDED`) for the whole argument — never one per nested
+level — rather than the silent early return every other depth-bounded
+check in this module still falls back to, past this same bound, as
+defense in depth once this check has already rejected the type outright.
+
+Malformed hand-built NIR that exercises any of the above (the only way
+most of it is reachable at all — a well-typed program lowered normally
+satisfies every one of these by construction) fails with one or more
+`V`-code diagnostics and never reaches interpretation.
+
 A type parameter that is declared but genuinely never occurs in any
 field, payload, parameter, or return type (a "phantom" parameter, e.g.
 `record Marker[T] { tag: i64 }`) is accepted — the verifier never
@@ -413,14 +472,34 @@ correctly closes the cycle back to `Node` itself. The classic head-only
 cases (`Node[T] { next: Node[T] }`, `List[T] { Cons(T, List[T]), Nil }`)
 are still caught, immediately, as a self-loop on the starting instance.
 
-A layout that never repeats an exact instance but keeps growing instead
-(`record Wrap[T] { inner: Wrap[Box[T]] }`) is exactly as unlayoutable as
-a literal cycle, so a traversal path deeper than `MAX_GENERIC_DEPTH` is
-reported the same way (`T0020`, with a message distinguishing "never
-stops growing" from a literal cycle path) — the same shared budget every
-other stage that walks a nested type application is bounded by. The
-traversal is iterative (an explicit stack, never native recursion),
-deterministic (declaration order, never `HashMap` iteration order), and
+A layout that never repeats an *exact* instance but keeps substituting a
+growing argument instead (`record Wrap[T] { inner: Wrap[Box[T]] }`) is
+exactly as unlayoutable as a literal cycle, and is caught the same
+structural way, immediately: a *declaration* (`ItemId`, regardless of its
+own current arguments) reappearing anywhere on the currently-active
+traversal path is itself the proof of an infinite layout — `Wrap`
+reappears the moment its own first field is substituted, at the very
+first step, long before any numeric bound would matter. This is
+deliberately **not** a depth/length limit on the path itself: an earlier
+version of this check used `path.len() >= MAX_GENERIC_DEPTH` as a proxy
+for "infinite," which incorrectly rejected every sufficiently long but
+genuinely *finite* chain of distinct aggregate declarations —
+`MAX_GENERIC_DEPTH` bounds nested type-*application* syntax/substitution
+depth (how deeply `Box[Maybe[...]]]` may itself nest), not how many
+aggregate declarations a containment graph may legitimately contain. A
+chain of over a hundred distinct, non-recurring declarations terminating
+in a primitive is accepted regardless of its length; only an actual
+declaration recurrence — whether via the exact same instantiation
+(`Node` closing back to `Node`) or a different, even strictly larger one
+(`Wrap[T]` closing back to `Wrap[Box[T]]`) — is ever reported.
+
+The reported cycle's own starting point is canonicalized to the member
+with the smallest `ItemId` (rotating both the displayed path and which
+edge is described as "closing" it), so which declaration a cycle is
+shown starting from never depends on which one the outer traversal
+(declaration order) happened to visit first. The traversal itself is
+iterative (an explicit stack, never native recursion), deterministic
+(declaration order, never `HashMap` iteration order), and
 `Black`-memoized across starting points so the same already-fully-explored
 subtree is never re-walked.
 
@@ -454,15 +533,24 @@ pub(crate) const MAX_GENERIC_DEPTH: usize = 64;
 pub(crate) const MAX_GENERIC_INSTANCES: usize = 4096;
 ```
 
-`MAX_GENERIC_DEPTH` bounds: parsing a type application
+`MAX_GENERIC_DEPTH` bounds *nested type-application syntax/substitution
+depth* — how many levels deep a single `Ty::Applied` may nest
+(`Box[Maybe[i64]]` is two levels) — never the number of distinct
+declarations a structure may pass through: parsing a type application
 (`parse_type_arg_list`, `P0001`, exercised exactly at the limit and one
 past it); `hir::lower`'s own type-application resolution (`R0019`);
 `typeck::unify`'s recursion into nested `Ty::Applied` arguments;
-`typeck::exhaustive`/`typeck::cycles`'s substitution-aware traversal
-(`T0020`); every recursive display/verification walk in `nir::verify`,
-`nir::printer`, and `types::display_ty`. `MAX_GENERIC_INSTANCES` bounds
-the total number of distinct `GenericInstanceKey`s one compilation may
-record (`T0028`).
+`nir::verify`'s use-site type-argument depth check (`V0035`) and every
+other recursive check in that module; every recursive display walk in
+`nir::printer` and `types::display_ty`. `typeck::cycles`'s infinite-
+layout detection (`T0020`) is a deliberate exception: it does *not* use
+this constant to bound the number of aggregate declarations a
+containment graph may legitimately contain (a long but finite chain of
+over a hundred distinct declarations is accepted regardless of its
+length) — see "Infinite generic aggregate layouts" above for the
+structural (declaration-recurrence) rule it uses instead.
+`MAX_GENERIC_INSTANCES` bounds the total number of distinct
+`GenericInstanceKey`s one compilation may record (`T0028`).
 
 ## Required examples
 
@@ -503,6 +591,7 @@ V0031  generic arity mismatch (a call, construction, or applied type)
 V0032  a symbolic type parameter escaping its owning declaration
 V0033  a generic declaration referenced without type arguments
 V0034  a declaration's own type parameter list contains a duplicate
+V0035  a use-site type argument nested past the generic depth limit
 ```
 
 ## Honest limitations

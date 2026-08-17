@@ -51,7 +51,12 @@ pub(super) struct ExtendInfo {
     /// method, indexed by that method's own declaration-order index --
     /// always fully populated (one entry per protocol method) by the
     /// time an `ExtendInfo` is accepted into `Checker::extends`, since
-    /// an incomplete extend is diagnosed and excluded instead.
+    /// an incomplete extend is diagnosed and excluded instead. Not read
+    /// anywhere yet: `nir::lower` independently re-derives this same
+    /// mapping from HIR directly, so this is currently only
+    /// `check_extension_completeness`'s own natural byproduct, kept for
+    /// a possible future cross-check rather than discarded.
+    #[allow(dead_code)]
     pub methods: Vec<ItemId>,
     pub source: SourceId,
     pub span: Span,
@@ -282,9 +287,7 @@ impl<'a> Checker<'a> {
         protocol_arguments: &[Ty],
         extend_type_params: &std::collections::HashSet<TypeParamId>,
     ) -> Option<Vec<ItemId>> {
-        let Some(protocol_info) = self.protocols.get(&e.protocol) else {
-            return None;
-        };
+        let protocol_info = self.protocols.get(&e.protocol)?;
         let subst: HashMap<TypeParamId, Ty> = protocol_info
             .type_params
             .iter()

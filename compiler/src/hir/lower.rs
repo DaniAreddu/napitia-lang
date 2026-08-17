@@ -695,7 +695,9 @@ impl<'a> Lowering<'a> {
                         codes::TYPE_PARAMETER_APPLIED,
                         self.source,
                         ty.span,
-                        format!("`{text}` is a primitive type and cannot be applied to type arguments"),
+                        format!(
+                            "`{text}` is a primitive type and cannot be applied to type arguments"
+                        ),
                     )
                     .with_primary_label("primitive type applied to arguments"),
                 );

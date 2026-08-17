@@ -101,7 +101,12 @@ caught by the pre-existing `M0007` duplicate-name check, with no special
 case for "one side is an alias." `M0007`'s diagnostic labels both
 declarations by their real source location, in both directions (alias vs
 alias, alias vs plain import, alias vs local declaration) — never a
-silent "last one wins." An alias literally spelled like a primitive type
+silent "last one wins," and precisely: the label sits on the alias
+identifier itself (`import a.b as Alias;` labels `Alias`), or, for an
+unaliased import, on the imported item's own written name — never the
+whole `import` statement, which used to be the only span available and
+pointed a collision at an entire line regardless of which token was
+actually responsible. An alias literally spelled like a primitive type
 name (`import x.User as i64;`) still never shadows the primitive: the
 primitive namespace is checked before the module's own aggregate
 namespace regardless of whether the aggregate name reached that namespace
@@ -109,6 +114,43 @@ via an alias or its own declared name (a rule 0.1.2 already established
 for declared/imported names; 0.1.3 only had to confirm it still holds
 when the name arrived through an alias, which it does — the check never
 distinguishes the two).
+
+### Multiple aliases of one variant
+
+Importing the very same variant under two different aliases is legal —
+`import shapes.Shape as Figure; import shapes.Shape as Form;` — and both
+resolve to the exact same `ItemId`. This must not make the variant's own
+*cases* look ambiguous: an unqualified `Circle(4)` still resolves cleanly
+even though `Shape` (and therefore `Circle`) is reachable under two local
+names at once, and `Figure.Circle`/`Form.Circle` both construct the same
+case through either alias.
+
+**Bug found and fixed while implementing this**: `hir::lower`'s
+`case_lookup` table (case name → every `(variant ItemId, case index)` it
+could mean, used to resolve an unqualified constructor and to detect
+genuine ambiguity across *different* variants) was populated once per
+*import*, not once per *variant* — so importing one variant under two
+aliases pushed the same `(ItemId, index)` candidate twice, and an
+unqualified `Circle` then looked ambiguous against itself purely because
+its variant had two local names in scope. Fixed by deduplicating at
+insertion (`add_case_candidate`, shared by both imported and
+locally-declared cases): `case_lookup` now holds each unique `(ItemId,
+index)` pair exactly once regardless of how many aliases reach it, so
+`candidates.len() > 1` only ever fires for two *distinct* variants
+sharing a case name, which remains correctly rejected.
+
+A second, related bug: `variant_name` (used only to build the
+ambiguous-constructor diagnostic's message) reverse-searched
+`type_names` — a `HashMap` — to find *some* local name for a candidate
+`ItemId`. A variant reachable under more than one alias has more than one
+matching key, so which one the message showed depended on that
+`HashMap`'s iteration order — unspecified, and in practice randomized
+per process. Fixed by collecting every matching name and picking the
+lexicographically smallest, deterministically; the ambiguous-constructor
+message's own candidate list is likewise sorted and deduplicated before
+display, so the reported text is independent of both `case_lookup`'s
+insertion order (a function of import declaration order) and
+`variant_name`'s internal traversal.
 
 ## Nominal identity
 
@@ -204,16 +246,18 @@ whichever consumer needed a name.
 `napitia ir`'s output now names every function, record, variant, call,
 construction, field/payload access, and pattern switch by its full
 qualified identity, `module.path.name#id`, not a bare (and, pre-0.1.3,
-potentially ambiguous) name:
+potentially ambiguous) name — and, just as importantly, every place a
+*type itself* is printed (a parameter, a return type, an `alloc`, a
+typed operator) is qualified too, not only item declarations/references:
 
 ```text
-func @admin.user.user_id#1(%0: User) -> i64 {
+func @admin.user.user_id#1(%0: admin.user.User#0) -> i64 {
 bb0:
     %1 = record.field @admin.user.User#0.0 %0
     ret %1
 }
 
-func @sales.user.user_id#3(%0: User) -> i64 {
+func @sales.user.user_id#3(%0: sales.user.User#2) -> i64 {
 bb0:
     %1 = record.field @sales.user.User#2.0 %0
     ret %1
@@ -233,41 +277,80 @@ bb0:
 ```
 
 Two same-named items from different modules (`sales.user.User` and
-`admin.user.User` here) always print distinguishably, and the `#id`
-suffix means two references can never be confused even in the
-(impossible, but never assumed away) case that two qualified names
-somehow collided. Aliases never appear in this output at all — the
-qualified name always comes from `ItemRegistry::qualified_name`, which by
-construction can only ever produce an item's true declared identity.
-Single-file compilation still prints valid, readable NIR: with an empty
-module path, `@add#0` is what a bare `func add` becomes (the `#id` suffix
-is not new to single-file mode's *format*, just newly documented here —
-0.1.2's printer already suffixed ids the same way).
+`admin.user.User` here) always print distinguishably — in a parameter
+position (`%0: admin.user.User#0` above), a return position, an
+allocation (`alloc.sales.user.User#2`, not shown above but printed the
+same way when a `mutable` binding forces one), and every other typed
+instruction — and the `#id` suffix means two references can never be
+confused even in the (impossible, but never assumed away) case that two
+qualified names somehow collided. Aliases never appear in this output at
+all — the qualified name always comes from `ItemRegistry::qualified_name`,
+which by construction can only ever produce an item's true declared
+identity. Single-file compilation still prints valid, readable NIR: with
+an empty module path, `@add#0` is what a bare `func add` becomes, and a
+bare `record User`'s own parameter/return/alloc positions print `User#0`
+(the `#id` suffix is not new to single-file mode's *format*, just newly
+documented here — 0.1.2's printer already suffixed ids the same way).
 
 `nir::printer` and `nir::verify` both gained an `&ItemRegistry` parameter
 threaded alongside their existing `&Interner` one; every prior call to
 `interner.resolve(name)` for an item name became
-`registry.qualified_name(id, interner)`. This is a real, if mechanical,
-signature change that ripples through every caller (`driver.rs`,
-`project/mod.rs`, `cli.rs`) simultaneously, since Rust compiles the whole
-crate as a unit — there is no smaller change that keeps every
-intermediate state buildable, so it landed as one commit explained as
-such rather than split into an artificially broken sequence.
+`registry.qualified_name(id, interner)`, and every prior call to
+`display_ty` for a type in the printer became a new registry-aware
+`format_ty` (primitives unchanged, `Ty::Named` renders through the same
+`qualified_ref` every item reference uses). This is a real, if
+mechanical, signature change that ripples through every caller
+(`driver.rs`, `project/mod.rs`, `cli.rs`) simultaneously, since Rust
+compiles the whole crate as a unit — there is no smaller change that
+keeps every intermediate state buildable, so it landed as one commit
+explained as such rather than split into an artificially broken
+sequence.
 
 ## Better qualified diagnostics
 
-`M0007` (duplicate/conflicting import or declaration) already labels both
-the conflicting and the original declaration by real source location —
-0.1.3 didn't need to change its wording to already correctly identify an
-alias's conflict by the alias's own import site. Diagnostics do not, as of
-this milestone, additionally spell out "`SalesUser` refers to
+`M0007` (duplicate/conflicting import or declaration) labels both the
+conflicting and the original declaration by real source location — and
+precisely: the alias identifier itself for an aliased import, or the
+imported item's own written name for an unaliased one, never the whole
+`import` statement (`ImportedItem::local_name_span`, threaded through
+`NameOrigin::Imported` and `import_collision_diagnostic`). Only the whole
+import's own span (`import_span`) is still used where the entire import
+genuinely is the failing construct — module-not-found, private-item
+access — since there is no more specific token to blame there.
+
+Typeck's own diagnostics are qualified too: `check_module_with_registry`
+(the real implementation `check_module` now wraps, passing an
+empty-module-path registry for single-file compilation) threads
+`&ItemRegistry` into `Checker`, and `display_for_diagnostic` — the one
+formatter every typeck diagnostic that names a type goes through, so none
+of them could drift into a different format — renders a `Ty::Named`
+through `registry.qualified_name` instead of its bare declared name.
+Project compilation passes its own already-built project-wide registry
+(built before typeck runs, for exactly this purpose), so a genuine cross-
+module mismatch now reads unambiguously:
+
+```text
+error[T0001]: argument type does not match the parameter's declared type: expected `admin.user.User`, found `sales.user.User`
+```
+
+This applies to every typeck diagnostic that names a type, not only
+`T0001` — argument/return/assignment/field-access/match-scrutinee
+mismatches, "not callable", "expected a numeric/integer type", all go
+through the same formatter. Single-file compilation's diagnostics are
+unaffected in wording (its registry has no module path, so every name is
+still just its own bare declared name), and a primitive-type diagnostic's
+text is completely unchanged either way. Diagnostics do not, as of this
+milestone, additionally spell out "`SalesUser` refers to
 `sales.user.User`" the way the milestone brief allows but does not
-require — see "Honest limitations" below for exactly where a canonical
-qualified name is (NIR, verifier) and is not yet (typeck) surfaced. No
-diagnostic anywhere exposes a raw `ItemId` as a user-facing name; the
-worst case (an `ItemId` the registry never learned about, which a
-well-formed compilation cannot produce) degrades to a labeled placeholder
-(`<item #N>`), never a panic.
+require — no existing diagnostic needed it to remain correct or
+unambiguous, so it was not added speculatively. No diagnostic anywhere
+exposes a raw `ItemId` as a user-facing name, nor does any typeck
+diagnostic attach a bare `#id` the way textual NIR does (there is no
+canonical-name collision for a qualified name to disambiguate, since two
+distinct items always have distinct declaring-module paths, names, or
+both); the worst case in NIR/verifier output (an `ItemId` the registry
+never learned about, which a well-formed compilation cannot produce)
+degrades to a labeled placeholder (`<item #N>`), never a panic.
 
 ## Duplicate physical-module identity protection
 
@@ -314,8 +397,14 @@ extends it to the new surface area:
 - `hir::registry::build` is a deterministic function of the HIR's own
   `Vec` order; `ItemRegistry` is consulted only by point lookup.
 - Textual NIR remains byte-identical across repeated compiles of the same
-  project (existing determinism tests re-verified against the new
-  qualified format).
+  project, and identical regardless of which import is written first
+  (verified for a two-same-named-cross-module-records project, forward
+  and reversed import order, byte-for-byte).
+- The ambiguous-constructor diagnostic's reported variant-name pair (two
+  genuinely distinct variants sharing a case name) is independent of
+  import declaration order (verified the same way as `M0013` above:
+  the same scenario built two ways, imports reversed, asserting an
+  identical message).
 
 ## Required examples
 
@@ -351,17 +440,6 @@ it exactly (`P0001`, `M0007`).
 
 ## Honest limitations
 
-- Typeck's own diagnostics (e.g. `T0001`'s "expected `X`, found `Y`") are
-  not yet qualified by module path: two same-named, differently-declared
-  types in a genuine mismatch both print as their bare declared name
-  (`expected User, found User`), which is confusing but not incorrect —
-  the underlying `ItemId`s are still exactly right, and the values are
-  still correctly rejected as incompatible. Fixing this needs threading
-  `&ItemRegistry` through `typeck::check_module` and every one of its
-  internal diagnostic-formatting call sites (on the order of ten-plus),
-  which is a real, mechanical, but out-of-scope-for-this-milestone
-  refactor — NIR printing and verification needed exactly this and got
-  it; typeck's turn is future work.
 - An alias is never surfaced in a diagnostic alongside its canonical name
   (e.g. "`SalesUser` refers to `sales.user.User`") — the milestone brief
   allows this ("may") but does not require it, and no existing diagnostic

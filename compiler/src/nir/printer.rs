@@ -84,7 +84,10 @@ fn type_args_suffix(args: &[Ty], interner: &Interner, registry: &ItemRegistry) -
 /// declared order -- printed on the declaration itself
 /// (`func @core.identity#12[T](...)`), distinct from
 /// [`type_args_suffix`]'s concrete arguments at a use site.
-fn declared_type_params_suffix(type_params: &[(TypeParamId, Symbol)], interner: &Interner) -> String {
+fn declared_type_params_suffix(
+    type_params: &[(TypeParamId, Symbol)],
+    interner: &Interner,
+) -> String {
     if type_params.is_empty() {
         return String::new();
     }

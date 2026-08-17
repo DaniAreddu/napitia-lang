@@ -1155,8 +1155,10 @@ impl<'a> Lowering<'a> {
             .get(&call_expr.id())
             .cloned()
             .unwrap_or_default();
-        let subst: HashMap<crate::hir::TypeParamId, Ty> =
-            type_params.into_iter().zip(type_args.iter().cloned()).collect();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -1192,13 +1194,13 @@ impl<'a> Lowering<'a> {
                 v.type_params.iter().map(|(id, _)| *id).collect();
             v.cases.get(case).map(|c| (ids, c.payload.clone()))
         }) {
-                Some(found) => found,
-                None => {
-                    return Err(self.internal_error(&format!(
-                        "variant construction references unknown variant/case ({variant:?}, {case})"
-                    )));
-                }
-            };
+            Some(found) => found,
+            None => {
+                return Err(self.internal_error(&format!(
+                    "variant construction references unknown variant/case ({variant:?}, {case})"
+                )));
+            }
+        };
         // Resolved once by `typeck` and read back here, never re-inferred
         // (`rfcs/0008`) -- empty for a non-generic variant.
         let type_args = self
@@ -1206,8 +1208,10 @@ impl<'a> Lowering<'a> {
             .get(&call_expr.id())
             .cloned()
             .unwrap_or_default();
-        let subst: HashMap<crate::hir::TypeParamId, Ty> =
-            type_params.into_iter().zip(type_args.iter().cloned()).collect();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
         // The complete shape is validated before a single argument is
         // evaluated: too few arguments would otherwise leave `payload`
         // shorter than the case's declared arity, and too many would
@@ -1308,8 +1312,10 @@ impl<'a> Lowering<'a> {
             .iter()
             .map(|(id, _)| *id)
             .collect();
-        let subst: HashMap<crate::hir::TypeParamId, Ty> =
-            type_params.into_iter().zip(type_args.iter().cloned()).collect();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
 
         let mut by_index: Vec<Option<ValueId>> = vec![None; field_count];
         for f in fields {

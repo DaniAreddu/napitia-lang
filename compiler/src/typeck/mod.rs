@@ -3368,4 +3368,38 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    #[test]
+    fn single_file_mismatch_shows_the_bare_type_name_with_no_module_prefix() {
+        // Single-file compilation (`check_module`'s own empty-module-path
+        // registry, `rfcs/0007`) has no project-level module path at all
+        // -- a nominal type mismatch must still read exactly as it did
+        // before qualified diagnostics existed, never a stray `.` or an
+        // empty-string prefix.
+        let diags = check(
+            "record User { id: i64 } \
+             record Point { x: i64 } \
+             func take_user(u: User) -> i64 { return u.id } \
+             func f() -> i64 { value p = Point { x: 1 }; return take_user(p) }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `User`, found `Point`"
+        );
+    }
+
+    #[test]
+    fn primitive_type_mismatch_diagnostics_are_unaffected_by_qualification() {
+        let diags = check("func f() -> i64 { return true }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "the returned value does not match the function's declared return type: \
+             expected `i64`, found `bool`"
+        );
+    }
 }

@@ -9,9 +9,10 @@
 
 use std::collections::HashMap;
 
-use crate::hir::ItemId;
+use crate::hir::{ItemId, TypeParamId};
 use crate::limits::MAX_PATTERN_DEPTH;
 use crate::types::Ty;
+use crate::types::generics::substitute;
 
 /// A pattern with every name resolved: a `Bind`/`Wildcard` HIR pattern
 /// that did not resolve to a payload-less variant case becomes
@@ -67,7 +68,19 @@ pub const MAX_USEFULNESS_STEPS: usize = 100_000;
 /// itself, independent of the step budget above.
 pub struct VariantSpace {
     /// Case index -> that case's payload types, in declaration order.
+    /// For a generic variant, these are the declaration's own *symbolic*
+    /// payload types (may contain `Ty::Param`) -- never pre-substituted
+    /// for any one instantiation, since the same declaration is shared
+    /// by every scrutinee that happens to name it (`rfcs/0008`).
     pub payloads: HashMap<ItemId, Vec<Vec<Ty>>>,
+    /// Each variant's own declared type parameters, in declaration
+    /// order -- so a payload position's symbolic `Ty::Param` can be
+    /// substituted with *this particular scrutinee's* own concrete type
+    /// arguments (from its `Ty::Applied`) before this analysis decides
+    /// whether that position's own sub-space is closed or open. Empty
+    /// for a non-generic variant, for which substitution is always a
+    /// no-op.
+    pub type_params: HashMap<ItemId, Vec<TypeParamId>>,
 }
 
 pub enum Usefulness {
@@ -81,22 +94,24 @@ pub enum Usefulness {
 }
 
 /// Constructor space of `ty`, as far as this analysis cares.
-enum Space<'a> {
+enum Space {
     Bool,
-    Variant(ItemId, &'a [Vec<Ty>]),
+    /// Every case's payload types, already substituted against this
+    /// particular scrutinee's own concrete type arguments if it is a
+    /// generic `Ty::Applied` -- never the declaration's raw symbolic
+    /// shape, so a payload position typed by the variant's own type
+    /// parameter closes to whatever concrete space it actually is here
+    /// (`Maybe[bool]`'s `Some` payload is `bool`, a closed 2-value
+    /// space, not open) instead of always falling back to `Space::Open`.
+    Variant(ItemId, Vec<Vec<Ty>>),
     Open,
 }
 
-fn space<'a>(ty: &Ty, variants: &'a VariantSpace) -> Space<'a> {
+fn space(ty: &Ty, variants: &VariantSpace) -> Space {
     // A generic variant's scrutinee is `Ty::Applied`, not `Ty::Named`,
     // but its *case arity* (all this dispatch needs) is exactly the same
     // regardless of the type arguments -- `variants.payloads` is keyed
-    // by the declaring `ItemId` either way (`rfcs/0008`). A payload
-    // position typed by one of the variant's own type parameters
-    // (`Ty::Param`) still correctly falls through to `Space::Open` below
-    // for any *nested* pattern against it: an unconstrained type
-    // parameter's own shape can never be exhaustively enumerated without
-    // a wildcard, which is the right answer, not a shortcut.
+    // by the declaring `ItemId` either way (`rfcs/0008`).
     let item = match ty {
         Ty::Named(item, _) => Some(*item),
         Ty::Applied(item, _) => Some(*item),
@@ -105,7 +120,29 @@ fn space<'a>(ty: &Ty, variants: &'a VariantSpace) -> Space<'a> {
     match (ty, item) {
         (Ty::Bool, _) => Space::Bool,
         (_, Some(item)) => match variants.payloads.get(&item) {
-            Some(cases) => Space::Variant(item, cases),
+            Some(cases) => {
+                let concrete_args: &[Ty] = match ty {
+                    Ty::Applied(_, args) => args,
+                    _ => &[],
+                };
+                let subst: HashMap<TypeParamId, Ty> = variants
+                    .type_params
+                    .get(&item)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .zip(concrete_args.iter().cloned())
+                    .collect();
+                let cases = if subst.is_empty() {
+                    cases.clone()
+                } else {
+                    cases
+                        .iter()
+                        .map(|payload| payload.iter().map(|t| substitute(t, &subst)).collect())
+                        .collect()
+                };
+                Space::Variant(item, cases)
+            }
             None => Space::Open,
         },
         _ => Space::Open,
@@ -177,6 +214,32 @@ fn is_useful_at_depth(
                 .and_then(|cases| cases.get(*case))
                 .cloned()
                 .unwrap_or_default();
+            // `payload_tys` is the declaration's own *symbolic* shape
+            // (may contain `Ty::Param`); substituted here with *this
+            // occurrence's own* concrete type arguments (from `ty0`,
+            // when it is this same variant applied) before being handed
+            // down as the payload positions' own occurrence types --
+            // otherwise a payload typed by the variant's own type
+            // parameter would stay open/unenumerable even once a
+            // concrete scrutinee (`Maybe[bool]`) makes it a closed `bool`
+            // space (`rfcs/0008`).
+            let concrete_args: &[Ty] = match ty0 {
+                Ty::Applied(item, args) if item == variant => args,
+                _ => &[],
+            };
+            let subst: HashMap<TypeParamId, Ty> = variants
+                .type_params
+                .get(variant)
+                .into_iter()
+                .flatten()
+                .copied()
+                .zip(concrete_args.iter().cloned())
+                .collect();
+            let payload_tys: Vec<Ty> = if subst.is_empty() {
+                payload_tys
+            } else {
+                payload_tys.iter().map(|t| substitute(t, &subst)).collect()
+            };
             let mut new_tys = payload_tys;
             new_tys.extend_from_slice(rest_tys);
             match is_useful_at_depth(
@@ -237,9 +300,9 @@ fn is_useful_at_depth(
         // so it is immediately found useful with no wasted work.
         ResolvedPattern::Wildcard => match space(ty0, variants) {
             Space::Bool => try_each_bool(matrix, rest, rest_tys, variants, budget, depth),
-            Space::Variant(item, cases) => {
-                try_each_case(matrix, item, cases, rest, rest_tys, variants, budget, depth)
-            }
+            Space::Variant(item, cases) => try_each_case(
+                matrix, item, &cases, rest, rest_tys, variants, budget, depth,
+            ),
             Space::Open => {
                 let defaulted = default_matrix(matrix);
                 match is_useful_at_depth(&defaulted, rest, rest_tys, variants, budget, depth + 1) {
@@ -525,7 +588,144 @@ mod tests {
     fn variant_space(cases_per_item: Vec<(ItemId, Vec<Vec<Ty>>)>) -> VariantSpace {
         VariantSpace {
             payloads: cases_per_item.into_iter().collect(),
+            type_params: HashMap::new(),
         }
+    }
+
+    /// Like `variant_space`, but for a generic variant whose payload
+    /// positions may contain `Ty::Param` -- `type_params` is that
+    /// variant's own declared parameter list, in declaration order, so a
+    /// scrutinee's concrete `Ty::Applied` arguments substitute correctly.
+    fn generic_variant_space(
+        item: ItemId,
+        type_params: Vec<TypeParamId>,
+        cases: Vec<Vec<Ty>>,
+    ) -> VariantSpace {
+        VariantSpace {
+            payloads: HashMap::from([(item, cases)]),
+            type_params: HashMap::from([(item, type_params)]),
+        }
+    }
+
+    /// `Maybe[T] { Some(T), None }` instantiated as `Maybe[bool]`
+    /// against `Some(true) | Some(false) | None` -- must be recognized
+    /// as exhaustive: `Some`'s payload substitutes to a closed `bool`
+    /// space (two values, both covered), never left open just because
+    /// the declaration's own payload type is the symbolic `T`
+    /// (`rfcs/0008`).
+    #[test]
+    fn generic_variant_payload_substitutes_to_a_closed_bool_space() {
+        let maybe_item = ItemId(0);
+        let t = TypeParamId(0);
+        let mut interner = crate::symbol::Interner::new();
+        let t_symbol = interner.intern("T");
+        let space = generic_variant_space(
+            maybe_item,
+            vec![t],
+            vec![vec![Ty::Param(t, t_symbol)], vec![]],
+        );
+        let scrutinee = Ty::Applied(maybe_item, vec![Ty::Bool]);
+        let patterns = [
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(true)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(false)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 1,
+                args: vec![],
+            },
+        ];
+        let result = analyze_match(&scrutinee, &patterns, &space);
+        assert!(result.missing.is_none(), "missing: {:?}", result.missing);
+        assert!(result.unreachable.is_empty());
+    }
+
+    /// The same `Maybe[bool]` scrutinee, but genuinely missing
+    /// `Some(false)` -- must report exactly that concrete witness, never
+    /// a bare `Some(_)` (which would be the *old*, unsubstituted-space
+    /// answer) and never silently accept the match as exhaustive.
+    #[test]
+    fn generic_variant_missing_one_bool_case_reports_the_concrete_witness() {
+        let maybe_item = ItemId(0);
+        let t = TypeParamId(0);
+        let mut interner = crate::symbol::Interner::new();
+        let t_symbol = interner.intern("T");
+        let space = generic_variant_space(
+            maybe_item,
+            vec![t],
+            vec![vec![Ty::Param(t, t_symbol)], vec![]],
+        );
+        let scrutinee = Ty::Applied(maybe_item, vec![Ty::Bool]);
+        let patterns = [
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(true)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 1,
+                args: vec![],
+            },
+        ];
+        let result = analyze_match(&scrutinee, &patterns, &space);
+        assert_eq!(
+            result.missing,
+            Some(ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(false)],
+            })
+        );
+    }
+
+    /// Once both `Some(true)`/`Some(false)` are covered, a further
+    /// `Some(x)` catch-all is unreachable -- proving the *unreachable*
+    /// side of this analysis also sees the substituted, closed `bool`
+    /// space, not just the missing-pattern side.
+    #[test]
+    fn generic_variant_wildcard_after_both_bool_cases_is_unreachable() {
+        let maybe_item = ItemId(0);
+        let t = TypeParamId(0);
+        let mut interner = crate::symbol::Interner::new();
+        let t_symbol = interner.intern("T");
+        let space = generic_variant_space(
+            maybe_item,
+            vec![t],
+            vec![vec![Ty::Param(t, t_symbol)], vec![]],
+        );
+        let scrutinee = Ty::Applied(maybe_item, vec![Ty::Bool]);
+        let patterns = [
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(true)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Bool(false)],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 0,
+                args: vec![ResolvedPattern::Wildcard],
+            },
+            ResolvedPattern::Variant {
+                variant: maybe_item,
+                case: 1,
+                args: vec![],
+            },
+        ];
+        let result = analyze_match(&scrutinee, &patterns, &space);
+        assert_eq!(result.unreachable, vec![2]);
     }
 
     #[test]

@@ -202,6 +202,19 @@ pub fn is_numeric(ty: &Ty) -> bool {
 
 /// The name this type is written as in Napitia source, for diagnostics.
 pub fn display_ty(ty: &Ty, interner: &Interner) -> String {
+    display_ty_at_depth(ty, interner, 0)
+}
+
+/// `depth`-bounded the same way every other stage that walks a nested
+/// type application is (`crate::limits::MAX_GENERIC_DEPTH`): this is a
+/// shared, low-level formatter every stage's own diagnostics/printing
+/// falls back to, so it never assumes an already-validated, shallow
+/// `Ty::Applied` -- a hand-built one reaching here still degrades to a
+/// truncated `...` render rather than recursing without bound.
+fn display_ty_at_depth(ty: &Ty, interner: &Interner, depth: usize) -> String {
+    if depth > crate::limits::MAX_GENERIC_DEPTH {
+        return "...".to_string();
+    }
     match ty {
         Ty::I8 => "i8".to_string(),
         Ty::I16 => "i16".to_string(),
@@ -231,7 +244,7 @@ pub fn display_ty(ty: &Ty, interner: &Interner) -> String {
             // of them still uses for the argument list itself.
             let args_text = args
                 .iter()
-                .map(|a| display_ty(a, interner))
+                .map(|a| display_ty_at_depth(a, interner, depth + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("<applied>[{args_text}]")

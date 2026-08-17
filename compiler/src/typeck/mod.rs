@@ -14,7 +14,7 @@ use unify::unify;
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirPattern, HirStmt, HirType, ItemId, LocalId,
+    HirPattern, HirStmt, HirType, ItemId, ItemRegistry, LocalId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -119,20 +119,48 @@ pub struct TypeckResult {
     pub pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
 }
 
-/// Type-checks an already name-resolved [`HirModule`]. Checking one
-/// function never stops at the first error: each expression is still
-/// visited (so later independent errors in the same function are still
-/// reported), and `Ty::Error`/`Ty::Never` unify with anything so one bad
-/// expression does not cascade into unrelated type mismatches.
+/// Type-checks an already name-resolved [`HirModule`], the same as
+/// [`check_module_with_registry`] but with an empty-module-path registry
+/// built from `hir` itself -- correct for single-file compilation, which
+/// has no project-level module path at all (`rfcs/0007`): every type a
+/// diagnostic names is just its own bare declared name, with no prefix.
+/// Kept as the stable entry point every pre-existing caller (the
+/// single-file driver, and this module's own several hundred unit
+/// tests) already uses unchanged.
 pub fn check_module(
     hir: &HirModule,
     source: SourceId,
     interner: &Interner,
     entry_main: EntryMain,
 ) -> TypeckResult {
+    let registry = crate::hir::registry::build(hir, &HashMap::new());
+    check_module_with_registry(hir, source, interner, entry_main, &registry)
+}
+
+/// Type-checks an already name-resolved [`HirModule`], naming types in
+/// diagnostics through `registry`'s canonical qualified names
+/// (`sales.user.User`, not just `User`) rather than the bare declared
+/// name every `Ty::Named` also carries -- what lets two same-named,
+/// differently-declared types produce a distinguishable "expected `X`,
+/// found `Y`" instead of the same ambiguous text twice (`rfcs/0007`).
+/// Project compilation passes its own already-built project-wide
+/// registry; single-file compilation goes through [`check_module`]'s
+/// empty-module-path wrapper instead. Checking one function never stops
+/// at the first error: each expression is still visited (so later
+/// independent errors in the same function are still reported), and
+/// `Ty::Error`/`Ty::Never` unify with anything so one bad expression
+/// does not cascade into unrelated type mismatches.
+pub fn check_module_with_registry(
+    hir: &HirModule,
+    source: SourceId,
+    interner: &Interner,
+    entry_main: EntryMain,
+    registry: &ItemRegistry,
+) -> TypeckResult {
     let mut checker = Checker {
         source,
         interner,
+        registry,
         ctx: TypeContext::new(),
         diagnostics: Vec::new(),
         functions: HashMap::new(),
@@ -185,6 +213,10 @@ pub fn check_module(
 struct Checker<'a> {
     source: SourceId,
     interner: &'a Interner,
+    /// Canonical, module-qualified identity for every item -- how every
+    /// `Ty::Named` this checker names in a diagnostic is displayed
+    /// (`rfcs/0007`), never a second name lookup of its own.
+    registry: &'a ItemRegistry,
     ctx: TypeContext,
     diagnostics: Vec<Diagnostic>,
     functions: HashMap<ItemId, FunctionSig>,
@@ -1750,11 +1782,23 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Like [`display_ty`], but shows a still-unresolved literal type
-    /// variable as the default it would take (`i64`/`f64`) rather than
-    /// `_` — unification failing is exactly what stops that default from
-    /// ever being applied, so the plain resolved form would otherwise
-    /// show a placeholder instead of the type the literal actually meant.
+    /// Every typeck diagnostic that names a type goes through this one
+    /// formatter, so none of them can drift into a different format than
+    /// another. Two behaviors [`display_ty`] alone doesn't have:
+    ///
+    /// - a still-unresolved literal type variable displays as the
+    ///   default it would take (`i64`/`f64`) rather than `_` --
+    ///   unification failing is exactly what stops that default from
+    ///   ever being applied, so the plain resolved form would otherwise
+    ///   show a placeholder instead of the type the literal actually
+    ///   meant;
+    /// - a nominal `Ty::Named` displays through `self.registry`'s
+    ///   canonical qualified name (`sales.user.User`, not just `User`),
+    ///   so two same-named, differently-declared types read as
+    ///   genuinely different in "expected `X`, found `Y`" rather than
+    ///   the same ambiguous text twice (`rfcs/0007`). Never the raw
+    ///   `ItemId` alone, and never an import alias -- the registry only
+    ///   ever returns an item's own true declared identity.
     fn display_for_diagnostic(&self, ty: &Ty) -> String {
         if let Ty::Var(v) = ty {
             match self.ctx.kind_of(*v) {
@@ -1762,6 +1806,9 @@ impl<'a> Checker<'a> {
                 Some(VarKind::Float) => return display_ty(&Ty::F64, self.interner),
                 None => {}
             }
+        }
+        if let Ty::Named(item, _) = ty {
+            return self.registry.qualified_name(*item, self.interner);
         }
         display_ty(ty, self.interner)
     }
@@ -1781,7 +1828,7 @@ impl<'a> Checker<'a> {
             span,
             format!(
                 "expected a numeric type, found `{}`",
-                display_ty(&resolved, self.interner)
+                self.display_for_diagnostic(&resolved)
             ),
         ));
     }
@@ -1805,7 +1852,7 @@ impl<'a> Checker<'a> {
             span,
             format!(
                 "expected an integer type, found `{}`",
-                display_ty(&resolved, self.interner)
+                self.display_for_diagnostic(&resolved)
             ),
         ));
     }
@@ -2226,9 +2273,11 @@ mod tests {
                 span: Span::dummy(),
             };
         }
+        let registry = ItemRegistry::default();
         let mut checker = Checker {
             source,
             interner: &interner,
+            registry: &registry,
             ctx: TypeContext::new(),
             diagnostics: Vec::new(),
             functions: HashMap::new(),
@@ -2266,10 +2315,16 @@ mod tests {
     /// test seam for exercising `MatchCoverage::Failed` deterministically
     /// against a trivial match, never a fixture that actually consumes
     /// 100,000 steps.
-    fn checker_with_budget(interner: &Interner, source: SourceId, budget: usize) -> Checker<'_> {
+    fn checker_with_budget<'a>(
+        interner: &'a Interner,
+        registry: &'a ItemRegistry,
+        source: SourceId,
+        budget: usize,
+    ) -> Checker<'a> {
         Checker {
             source,
             interner,
+            registry,
             ctx: TypeContext::new(),
             diagnostics: Vec::new(),
             functions: HashMap::new(),
@@ -2299,7 +2354,8 @@ mod tests {
         let interner = Interner::new();
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
-        let mut checker = checker_with_budget(&interner, source, 1);
+        let registry = ItemRegistry::default();
+        let mut checker = checker_with_budget(&interner, &registry, source, 1);
         let scrutinee = HirExpr::Bool {
             id: ExprId(0),
             value: true,
@@ -2361,7 +2417,8 @@ mod tests {
         let interner = Interner::new();
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
-        let mut checker = checker_with_budget(&interner, source, 1);
+        let registry = ItemRegistry::default();
+        let mut checker = checker_with_budget(&interner, &registry, source, 1);
         let scrutinee = HirExpr::Return {
             id: ExprId(0),
             value: Some(Box::new(HirExpr::Int {

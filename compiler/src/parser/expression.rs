@@ -160,10 +160,15 @@ impl<'a> Parser<'a> {
         expr
     }
 
-    /// `TypeName { field: expr, ... }`, called once the leading
-    /// identifier and the following `{` have already been recognized as
-    /// a record literal (not a block).
-    fn parse_record_literal(&mut self, type_name: crate::syntax::ast::Ident) -> Expr {
+    /// `TypeName { field: expr, ... }` (optionally `TypeName[Args] {
+    /// ... }`, `rfcs/0008`), called once the leading identifier (and any
+    /// `[Args]`) and the following `{` have already been recognized as a
+    /// record literal (not a block).
+    fn parse_record_literal(
+        &mut self,
+        type_name: crate::syntax::ast::Ident,
+        type_args: Vec<crate::syntax::ast::Type>,
+    ) -> Expr {
         let start = type_name.span;
         self.advance(); // '{'
         let mut fields = Vec::new();
@@ -190,6 +195,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(self.current_span());
         Expr::RecordLiteral {
             type_name,
+            type_args,
             fields,
             span: start.join(end),
         }
@@ -251,8 +257,26 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(symbol) => {
                 self.advance();
                 let ident = crate::syntax::ast::Ident { symbol, span };
-                if !self.no_struct_literal && self.check(&TokenKind::LBrace) {
-                    self.parse_record_literal(ident)
+                if self.check(&TokenKind::LBracket) {
+                    // Type arguments bind tighter than the record-literal
+                    // `{` or the postfix `.`/`(...)` that might follow --
+                    // `Box[i64] { .. }`, `identity[i64](..)`, and
+                    // `Maybe[i64].Some(..)` all resolve their `[..]`
+                    // right here, before any of those (`rfcs/0008`).
+                    let Some((args, bracket_span)) = self.parse_type_arg_list() else {
+                        return Expr::Error { span };
+                    };
+                    if !self.no_struct_literal && self.check(&TokenKind::LBrace) {
+                        self.parse_record_literal(ident, args)
+                    } else {
+                        Expr::TypeApply {
+                            base: Box::new(Expr::Ident(ident)),
+                            args,
+                            span: span.join(bracket_span),
+                        }
+                    }
+                } else if !self.no_struct_literal && self.check(&TokenKind::LBrace) {
+                    self.parse_record_literal(ident, Vec::new())
                 } else {
                     Expr::Ident(ident)
                 }

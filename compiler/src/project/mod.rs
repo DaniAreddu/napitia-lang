@@ -699,6 +699,111 @@ mod tests {
         let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0001");
+        // Both same-named `User` records must read as genuinely
+        // different in the message text, not the same ambiguous `User`
+        // on both sides (`rfcs/0007`); no raw ItemId anywhere in it,
+        // since typeck diagnostics -- unlike textual NIR -- never
+        // attach a bare `#id`.
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `sales.User`, found `admin.User`"
+        );
+        assert!(!diags[0].message.contains('#'));
+    }
+
+    #[test]
+    fn cross_module_same_named_record_mismatch_names_both_nested_module_paths() {
+        // Nested module paths (`sales.user`/`admin.user`, not flat
+        // `sales`/`admin`) -- the exact worked example rfcs/0007 itself
+        // documents.
+        let project = TempProject::new("typeck_qualify_nested_records");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.user.User as SalesUser;\n\
+             import admin.user.User;\n\
+             import admin.user.user_id;\n\
+             func main() -> i64 { value s = SalesUser { id: 1 }; return user_id(s) }\n",
+        );
+        project.write(
+            "src/admin/user.npt",
+            "public record User { public id: i64 }\n\
+             public func user_id(u: User) -> i64 { return u.id }\n",
+        );
+        project.write(
+            "src/sales/user.npt",
+            "public record User { public id: i64 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `admin.user.User`, found `sales.user.User`"
+        );
+    }
+
+    #[test]
+    fn cross_module_same_named_variants_show_both_qualified_names() {
+        let project = TempProject::new("typeck_qualify_variants");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import sales.Status as SalesStatus;\n\
+             import admin.accept;\n\
+             func main() -> i64 { value s = SalesStatus.Open; return accept(s) }\n",
+        );
+        project.write(
+            "src/admin.npt",
+            "public variant Status { Open, Closed }\n\
+             public func accept(s: Status) -> i64 { return 0 }\n",
+        );
+        project.write("src/sales.npt", "public variant Status { Open, Closed }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "T0001");
+        assert_eq!(
+            diags[0].message,
+            "argument type does not match the parameter's declared type: \
+             expected `admin.Status`, found `sales.Status`"
+        );
+    }
+
+    #[test]
+    fn aliases_of_the_same_declaration_remain_type_compatible() {
+        // Unlike the mismatch tests above: `models.User` imported twice,
+        // under two different local aliases, is still exactly one
+        // declaration -- passing a value built through one alias where
+        // the other is expected must compile cleanly, never T0001.
+        let project = TempProject::new("typeck_alias_same_decl_compatible");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import models.User as Account;\n\
+             import models.User as Profile;\n\
+             import models.user_id;\n\
+             func main() -> i64 { value p = Profile { id: 7 }; return user_id(p) }\n",
+        );
+        project.write(
+            "src/models.npt",
+            "public record User { public id: i64 }\n\
+             public func user_id(u: User) -> i64 { return u.id }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Int(7)));
     }
 
     #[test]

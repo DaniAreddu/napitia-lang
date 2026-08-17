@@ -500,14 +500,50 @@ mod tests {
         assert_eq!(diags[0].code, "M0003");
     }
 
+    /// `rfcs/0009`: a protocol is a real, importable item, the same way
+    /// a function/record/variant already is -- superseding an earlier
+    /// Alpha 0.1.2-era test (of the same underlying scenario) that
+    /// asserted the opposite, back when `protocol` was still name-only
+    /// in HIR and any attempt to import one was rejected as M0005.
     #[test]
-    fn importing_a_protocol_is_m0005_not_silently_ignored() {
+    fn resolves_a_public_protocol_import() {
         let mut map = SourceMap::new();
         let mut interner = Interner::new();
         let (target_hir, target_source) = lowered_target(
             &mut map,
             &mut interner,
-            "protocol Drawable { func draw() -> i64; }",
+            "public protocol Drawable[T] { func draw(target: T) -> i64; }",
+        );
+        let importing_source = map.add_file("main.npt", "");
+        let mut module_paths = HashMap::new();
+        module_paths.insert("shapes".to_string(), ModuleId(0));
+        let mut lowered = HashMap::new();
+        lowered.insert(ModuleId(0), (target_hir, target_source));
+
+        let imports = vec![import_ref(&["shapes", "Drawable"], Span::dummy())];
+        let resolved = resolve_imports(
+            &imports,
+            importing_source,
+            &module_paths,
+            &lowered,
+            &mut interner,
+        )
+        .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            resolved[0].kind,
+            ImportedItemKind::Protocol { .. }
+        ));
+    }
+
+    #[test]
+    fn importing_a_private_protocol_is_m0006() {
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let (target_hir, target_source) = lowered_target(
+            &mut map,
+            &mut interner,
+            "protocol Drawable[T] { func draw(target: T) -> i64; }",
         );
         let importing_source = map.add_file("main.npt", "");
         let mut module_paths = HashMap::new();
@@ -525,6 +561,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
-        assert_eq!(diags[0].code, "M0005");
+        assert_eq!(diags[0].code, "M0006");
     }
 }

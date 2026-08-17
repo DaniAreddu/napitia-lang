@@ -21,18 +21,25 @@ pub struct Path {
     pub span: Span,
 }
 
-/// A named type reference. Only primitive and user record/variant names
-/// by identifier are supported in this milestone (`spec/0002`); generics,
-/// and `owned`/`borrow`/`shared` annotations are not part of the grammar
-/// yet.
+/// A named type reference: a primitive or user record/variant name, with
+/// an optional bracketed type-argument list (`Box[i64]`,
+/// `Pair[i64, str]`, `Box[Maybe[i64]]` -- `rfcs/0008`). `args` is empty
+/// for a plain (non-generic-application) reference; `owned`/`borrow`/
+/// `shared` annotations are still not part of the grammar (`spec/0002`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Type {
     pub name: Ident,
+    pub args: Vec<Type>,
+    /// The full reference's span -- `name`'s own span when there is no
+    /// `[...]`, or `name` joined through the closing `]` when there is.
+    /// Kept distinct from `name.span` so an arity/application diagnostic
+    /// can underline the whole `Name[Args]`, not just `Name`.
+    pub span: Span,
 }
 
 impl Type {
     pub fn span(&self) -> Span {
-        self.name.span
+        self.span
     }
 }
 
@@ -55,6 +62,9 @@ pub enum Item {
 pub struct FunctionDecl {
     pub public: bool,
     pub name: Ident,
+    /// `[T, U]` after the function name, if any (`rfcs/0008`). Empty for
+    /// an ordinary, non-generic function.
+    pub type_params: Vec<Ident>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     /// Effect/capability paths from a `uses` clause. Parsed, not yet
@@ -78,6 +88,8 @@ pub struct Param {
 pub struct RecordDecl {
     pub public: bool,
     pub name: Ident,
+    /// See [`FunctionDecl::type_params`].
+    pub type_params: Vec<Ident>,
     pub fields: Vec<Field>,
     pub span: Span,
 }
@@ -94,6 +106,8 @@ pub struct Field {
 pub struct VariantDecl {
     pub public: bool,
     pub name: Ident,
+    /// See [`FunctionDecl::type_params`].
+    pub type_params: Vec<Ident>,
     pub cases: Vec<Case>,
     pub span: Span,
 }
@@ -268,13 +282,28 @@ pub enum Expr {
     Continue {
         span: Span,
     },
-    /// `TypeName { field: expr, ... }`. Only a bare identifier followed
-    /// directly by `{` in a position where struct literals are allowed
-    /// (see `Parser`'s `no_struct_literal` flag) parses as this; `{` in
-    /// every other postfix/primary position is a block.
+    /// `TypeName { field: expr, ... }`. Only a bare identifier (with an
+    /// optional `[Args]` type-application) followed directly by `{` in a
+    /// position where struct literals are allowed (see `Parser`'s
+    /// `no_struct_literal` flag) parses as this; `{` in every other
+    /// postfix/primary position is a block.
     RecordLiteral {
         type_name: Ident,
+        /// `[i64]`/`[i64, str]` written directly after `type_name`, if
+        /// any (`rfcs/0008`). Empty for a non-generic record.
+        type_args: Vec<Type>,
         fields: Vec<FieldInit>,
+        span: Span,
+    },
+    /// An identifier immediately followed by a bracketed type-argument
+    /// list in a non-record-literal position (`identity[i64]`,
+    /// `Maybe[i64]` as the base of `.Some(...)`) -- `rfcs/0008`. Type
+    /// arguments bind tighter than the postfix `.`/`(...)` that follows,
+    /// so `Maybe[i64].Some(42)` parses as
+    /// `Call(Field(TypeApply(Ident(Maybe), [i64]), Some), [42])`.
+    TypeApply {
+        base: Box<Expr>,
+        args: Vec<Type>,
         span: Span,
     },
     /// A malformed expression the parser recovered from. Carries no
@@ -312,6 +341,7 @@ impl Expr {
             | Expr::Break { span, .. }
             | Expr::Continue { span }
             | Expr::RecordLiteral { span, .. }
+            | Expr::TypeApply { span, .. }
             | Expr::Error { span } => *span,
             Expr::Ident(ident) => ident.span,
             Expr::If(if_expr) => if_expr.span,

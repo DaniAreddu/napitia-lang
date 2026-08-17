@@ -1,0 +1,16 @@
+// INVALID: an ever-growing (never literally repeating) instantiation
+// chain -- Wrap[T], Wrap[Box[T]], Wrap[Box[Box[T]]], ... never closes a
+// literal cycle, but is exactly as unlayoutable as one. Rejected once it
+// exceeds the shared generic-depth budget, never a hang or a stack
+// overflow (Alpha 0.1.4, rfcs/0008).
+record Wrap[T] {
+    inner: Wrap[Box[T]],
+}
+
+record Box[T] {
+    payload: T,
+}
+
+func main() -> i64 {
+    return 0
+}

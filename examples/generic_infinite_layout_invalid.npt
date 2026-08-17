@@ -1,0 +1,15 @@
+// INVALID: a parameter-mediated infinite layout. Box[T] alone is not
+// cyclic (its own field is just T), but Node's concrete field makes
+// Node -> Box[Node] -> Node an infinite cycle. Rejected as T0020
+// (Alpha 0.1.4, rfcs/0008).
+record Box[T] {
+    payload: T,
+}
+
+record Node {
+    next: Box[Node],
+}
+
+func main() -> i64 {
+    return 0
+}

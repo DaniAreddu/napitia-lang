@@ -5,7 +5,7 @@ use crate::lexer::TokenKind;
 use crate::source::Span;
 use crate::syntax::ast::{
     Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
-    Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, VariantDecl, WhileStmt,
+    Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, UsesClause, VariantDecl, WhileStmt,
 };
 
 /// Whether `expr`'s surface syntax already ends in a `}` (`if`/`match`/
@@ -64,7 +64,7 @@ impl<'a> Parser<'a> {
             None
         };
         let uses = if self.eat(&TokenKind::Uses) {
-            self.parse_path_list()?
+            self.parse_uses_list()?
         } else {
             Vec::new()
         };
@@ -260,12 +260,31 @@ impl<'a> Parser<'a> {
         Some(Path { segments, span })
     }
 
-    fn parse_path_list(&mut self) -> Option<Vec<Path>> {
-        let mut paths = vec![self.parse_path()?];
+    /// One `uses` clause entry: a dotted path, optionally followed by a
+    /// bracketed type-argument list (`Equal[T]`, `rfcs/0009`). A bare
+    /// dotted path with no brackets is `spec/0005`'s pre-existing,
+    /// still-unchecked effect declaration (`Database.Read`); which of
+    /// the two this is is left for a later stage to decide from
+    /// `args.is_empty()`, not this parse.
+    fn parse_uses_clause(&mut self) -> Option<UsesClause> {
+        let path = self.parse_path()?;
+        let mut span = path.span;
+        let args = if self.check(&TokenKind::LBracket) {
+            let (args, bracket_span) = self.parse_type_arg_list()?;
+            span = span.join(bracket_span);
+            args
+        } else {
+            Vec::new()
+        };
+        Some(UsesClause { path, args, span })
+    }
+
+    fn parse_uses_list(&mut self) -> Option<Vec<UsesClause>> {
+        let mut clauses = vec![self.parse_uses_clause()?];
         while self.eat(&TokenKind::Comma) {
-            paths.push(self.parse_path()?);
+            clauses.push(self.parse_uses_clause()?);
         }
-        Some(paths)
+        Some(clauses)
     }
 
     fn parse_ident_list(&mut self) -> Option<Vec<Ident>> {
@@ -386,6 +405,7 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
         self.advance(); // 'protocol'
         let name = self.expect_ident("a protocol name")?;
+        let type_params = self.parse_type_param_list()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut members = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.at_eof() {
@@ -404,19 +424,31 @@ impl<'a> Parser<'a> {
         Some(ProtocolDecl {
             public,
             name,
+            type_params,
             members,
             span: start.join(end),
         })
     }
 
+    /// `extend Equal[i64] { ... }` or `extend[T] Equal[Box[T]] uses
+    /// Equal[T] { ... }` (`rfcs/0009`). `[T]` right after `extend` is
+    /// this extension's *own* explicit type parameters -- never inferred
+    /// from an otherwise-unknown name inside `protocol`'s own argument
+    /// list, which instead fails to resolve later, in `hir::lower`, the
+    /// same way any other unknown type name would.
     fn parse_extend(&mut self) -> Option<ExtendDecl> {
         let start = self.current_span();
         self.advance(); // 'extend'
-        let type_name = self.expect_ident("a type name")?;
-        let protocol = if self.eat(&TokenKind::With) {
-            Some(self.parse_path()?)
+        let type_params = if self.check(&TokenKind::LBracket) {
+            self.parse_type_param_list()?
         } else {
-            None
+            Vec::new()
+        };
+        let protocol = self.parse_type()?;
+        let uses = if self.eat(&TokenKind::Uses) {
+            self.parse_uses_list()?
+        } else {
+            Vec::new()
         };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut functions = Vec::new();
@@ -434,8 +466,9 @@ impl<'a> Parser<'a> {
             .map(|t| t.span)
             .unwrap_or(self.current_span());
         Some(ExtendDecl {
-            type_name,
+            type_params,
             protocol,
+            uses,
             functions,
             span: start.join(end),
         })
@@ -667,7 +700,8 @@ mod tests {
             panic!("expected function")
         };
         assert_eq!(f.uses.len(), 1);
-        assert_eq!(f.uses[0].segments.len(), 2);
+        assert_eq!(f.uses[0].path.segments.len(), 2);
+        assert!(f.uses[0].args.is_empty());
         assert_eq!(f.raises.len(), 1);
     }
 
@@ -724,34 +758,51 @@ mod tests {
 
     #[test]
     fn parses_protocol_declaration() {
-        let (module, diags) = parse("protocol Encodable { func encode() -> str; }");
-        assert!(diags.is_empty());
+        let (module, diags) = parse("protocol Encodable[T] { func encode(value: T) -> str; }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let Item::Protocol(p) = &module.items[0] else {
             panic!("expected protocol")
         };
+        assert_eq!(p.type_params.len(), 1);
         assert_eq!(p.members.len(), 1);
     }
 
     #[test]
-    fn parses_extend_with_protocol() {
-        let (module, diags) =
-            parse("extend Point with Printable { func show() -> str { return \"\" } }");
+    fn a_protocol_with_no_type_parameters_is_a_parse_error() {
+        let (_module, diags) = parse("protocol Encodable { func encode() -> str; }");
+        assert!(
+            diags.iter().any(|d| d.code == "P0001"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn parses_a_concrete_extend_declaration() {
+        let (module, diags) = parse(
+            "extend Equal[i64] { func equal(left: i64, right: i64) -> bool { return left == right } }",
+        );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let Item::Extend(e) = &module.items[0] else {
             panic!("expected extend")
         };
-        assert!(e.protocol.is_some());
+        assert!(e.type_params.is_empty());
+        assert_eq!(e.uses.len(), 0);
         assert_eq!(e.functions.len(), 1);
     }
 
     #[test]
-    fn parses_extend_without_protocol() {
-        let (module, diags) = parse("extend Point { func origin() -> i64 { return 0 } }");
-        assert!(diags.is_empty());
+    fn parses_a_conditional_generic_extend_declaration_with_a_uses_clause() {
+        let (module, diags) = parse(
+            "extend[T] Equal[Box[T]] uses Equal[T] { func equal(left: Box[T], right: Box[T]) -> bool { return true } }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let Item::Extend(e) = &module.items[0] else {
             panic!("expected extend")
         };
-        assert!(e.protocol.is_none());
+        assert_eq!(e.type_params.len(), 1);
+        assert_eq!(e.protocol.args.len(), 1);
+        assert_eq!(e.uses.len(), 1);
+        assert_eq!(e.uses[0].args.len(), 1);
     }
 
     #[test]

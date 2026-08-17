@@ -279,13 +279,7 @@ pub fn verify_module(
                     &payload_context,
                     &mut diagnostics,
                 );
-                check_type_param_scope(
-                    ty,
-                    &own_params,
-                    source,
-                    &payload_context,
-                    &mut diagnostics,
-                );
+                check_type_param_scope(ty, &own_params, source, &payload_context, &mut diagnostics);
             }
         }
     }
@@ -346,8 +340,7 @@ fn verify_function(
     }
 
     let fn_context = format!("function `{name}`");
-    let own_params: HashSet<TypeParamId> =
-        function.type_params.iter().map(|(id, _)| *id).collect();
+    let own_params: HashSet<TypeParamId> = function.type_params.iter().map(|(id, _)| *id).collect();
     check_no_bad_type(&function.return_type, source, &fn_context, diagnostics);
     check_named_type_identity(
         &function.return_type,
@@ -358,7 +351,13 @@ fn verify_function(
         &fn_context,
         diagnostics,
     );
-    check_type_param_scope(&function.return_type, &own_params, source, &fn_context, diagnostics);
+    check_type_param_scope(
+        &function.return_type,
+        &own_params,
+        source,
+        &fn_context,
+        diagnostics,
+    );
     for param in &function.params {
         check_no_bad_type(&param.ty, source, &fn_context, diagnostics);
         check_named_type_identity(
@@ -950,7 +949,11 @@ fn check_named_type_identity(
                 .records
                 .get(item)
                 .map(|r| (r.name, r.type_params.len()))
-                .or_else(|| agg.variants.get(item).map(|v| (v.name, v.type_params.len())));
+                .or_else(|| {
+                    agg.variants
+                        .get(item)
+                        .map(|v| (v.name, v.type_params.len()))
+                });
             match declared {
                 None => diagnostics.push(Diagnostic::error(
                     codes::UNKNOWN_NAMED_TYPE,
@@ -1021,7 +1024,15 @@ fn check_named_type_identity(
                 Some(_) => {}
             }
             for arg in args {
-                check_named_type_identity(arg, agg, source, interner, registry, context, diagnostics);
+                check_named_type_identity(
+                    arg,
+                    agg,
+                    source,
+                    interner,
+                    registry,
+                    context,
+                    diagnostics,
+                );
             }
         }
         _ => {}
@@ -1271,8 +1282,10 @@ fn verify_value_kind(
                 ));
                 return;
             };
-            let call_context =
-                format!("function `{function_name}`: %{}'s call type argument", result.0);
+            let call_context = format!(
+                "function `{function_name}`: %{}'s call type argument",
+                result.0
+            );
             for t in type_args {
                 check_type_param_scope(t, own_params, source, &call_context, diagnostics);
             }

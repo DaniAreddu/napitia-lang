@@ -1,0 +1,7 @@
+[package]
+name = "generic_same_named_records_across_modules"
+version = "0.1.0"
+
+[project]
+source-root = "src"
+entry = "main.npt"

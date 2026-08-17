@@ -1,0 +1,7 @@
+public record Box[T] {
+    public payload: T,
+}
+
+public func sales_unwrap[T](box: Box[T]) -> T {
+    return box.payload
+}

@@ -25,6 +25,7 @@ pub enum ItemKind {
     Function,
     Record,
     Variant,
+    Protocol,
 }
 
 impl ItemKind {
@@ -33,6 +34,7 @@ impl ItemKind {
             ItemKind::Function => "function",
             ItemKind::Record => "record",
             ItemKind::Variant => "variant",
+            ItemKind::Protocol => "protocol",
         }
     }
 }
@@ -137,6 +139,18 @@ pub fn build(hir: &HirModule, module_path_of: &HashMap<SourceId, String>) -> Ite
                 kind: ItemKind::Variant,
                 source: v.source,
                 span: v.span,
+            },
+        );
+    }
+    for p in &hir.protocols {
+        registry.entries.insert(
+            p.id,
+            ItemIdentity {
+                module_path: module_path_of.get(&p.source).cloned().unwrap_or_default(),
+                name: p.name,
+                kind: ItemKind::Protocol,
+                source: p.source,
+                span: p.name_span,
             },
         );
     }

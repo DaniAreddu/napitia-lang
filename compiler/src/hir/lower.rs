@@ -10,10 +10,10 @@
 use std::collections::HashMap;
 
 use super::{
-    AggregateKind, ExprId, HirBinding, HirBlock, HirCase, HirElse, HirExpr, HirField, HirFieldInit,
-    HirFunction, HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirRecord, HirStmt,
-    HirType, HirTypeParam, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId,
-    TypeParamId,
+    AggregateKind, ExprId, HirBinding, HirBlock, HirCapabilityRequirement, HirCase, HirElse,
+    HirExpr, HirExtend, HirField, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
+    HirModule, HirParam, HirPattern, HirProtocol, HirProtocolMethod, HirRecord, HirStmt, HirType,
+    HirTypeParam, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId, TypeParamId,
 };
 use crate::diagnostics::Diagnostic;
 use crate::limits::MAX_GENERIC_DEPTH;
@@ -21,6 +21,7 @@ use crate::resolve::Scopes;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast;
+use crate::syntax::ast::Path;
 use crate::types::primitive_from_name;
 
 mod codes {
@@ -44,6 +45,13 @@ mod codes {
     pub const TYPE_PARAMETER_APPLIED: &str = "R0018";
     pub const GENERIC_DEPTH_EXCEEDED: &str = "R0019";
     pub const INVALID_TYPE_APPLICATION: &str = "R0020";
+    pub const DUPLICATE_PROTOCOL_METHOD: &str = "R0021";
+    pub const UNKNOWN_PROTOCOL: &str = "R0022";
+    pub const CAPABILITY_REQUIREMENT_DOTTED_PATH: &str = "R0023";
+    pub const UNKNOWN_PROTOCOL_METHOD: &str = "R0024";
+    pub const EXTEND_METHOD_OWN_TYPE_PARAMS: &str = "R0025";
+    pub const PROTOCOL_NOT_A_VALUE: &str = "R0026";
+    pub const EXTEND_METHOD_OWN_USES_CLAUSE: &str = "R0027";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -122,6 +130,11 @@ pub enum ImportedItemKind {
         /// `(case name, declaration index)`, in declaration order.
         cases: Vec<(Symbol, usize)>,
     },
+    Protocol {
+        item: ItemId,
+        /// See `Record::declared_name`.
+        declared_name: Symbol,
+    },
 }
 
 /// Where a name in this module's namespace came from -- needed to
@@ -170,6 +183,8 @@ pub fn lower_module_with_imports(
         diagnostics: Vec::new(),
         functions_by_name: HashMap::new(),
         type_names: HashMap::new(),
+        protocol_names: HashMap::new(),
+        protocol_methods: HashMap::new(),
         record_fields: HashMap::new(),
         variant_cases: HashMap::new(),
         case_lookup: HashMap::new(),
@@ -206,6 +221,22 @@ struct Lowering<'a> {
     /// every `HirType::Aggregate` so `Ty::Named`'s display symbol never
     /// depends on which local spelling resolved it (`rfcs/0007`).
     type_names: HashMap<Symbol, (ItemId, TypeNameKind, Symbol)>,
+    /// The module's protocol namespace (`rfcs/0009`): every declared
+    /// `protocol` name, or the local (possibly aliased) name of one
+    /// imported, mapped to its `ItemId` plus its own canonical declared
+    /// name (see `type_names`'s own doc comment for why the latter is
+    /// kept). Deliberately separate from `type_names`: a protocol is
+    /// never itself a value type (no dynamic protocol objects in Alpha
+    /// 0.1.5), so it is never a candidate when resolving an ordinary
+    /// field/param/return type reference, only the extend head, `uses`
+    /// clause, and protocol-call positions that explicitly look here.
+    protocol_names: HashMap<Symbol, (ItemId, Symbol)>,
+    /// Per-protocol method name -> declaration index, populated once
+    /// every protocol is fully lowered (before any function or extend
+    /// body, which may reference it via a `Protocol[Args].method` call,
+    /// `rfcs/0009`) -- mirrors `variant_cases`'s own role for case
+    /// names.
+    protocol_methods: HashMap<ItemId, HashMap<Symbol, usize>>,
     /// Per-record field name -> declaration index, for resolving a
     /// record literal's field initializers.
     record_fields: HashMap<ItemId, HashMap<Symbol, usize>>,
@@ -299,12 +330,21 @@ impl<'a> Lowering<'a> {
                     }
                     self.variant_cases.insert(item, case_indices);
                 }
+                ImportedItemKind::Protocol {
+                    item,
+                    declared_name,
+                } => {
+                    self.protocol_names
+                        .insert(imported.local_name, (item, declared_name));
+                }
             }
         }
 
         let mut function_decls: Vec<(ItemId, &ast::FunctionDecl)> = Vec::new();
         let mut record_decls: Vec<(ItemId, &ast::RecordDecl)> = Vec::new();
         let mut variant_decls: Vec<(ItemId, &ast::VariantDecl)> = Vec::new();
+        let mut protocol_decls: Vec<(ItemId, &ast::ProtocolDecl)> = Vec::new();
+        let mut extend_decls: Vec<(ItemId, &ast::ExtendDecl)> = Vec::new();
         let mut other_items = Vec::new();
 
         // First pass: mint every item's `ItemId` and populate the
@@ -339,11 +379,12 @@ impl<'a> Lowering<'a> {
                 ast::Item::Protocol(p) => {
                     let id = self.fresh_item();
                     self.check_duplicate(&mut names, p.name, id);
-                    other_items.push(other_item(id, p.name, p.span, OtherItemKind::Protocol));
+                    self.protocol_names.insert(p.name.symbol, (id, p.name.symbol));
+                    protocol_decls.push((id, p));
                 }
                 ast::Item::Extend(e) => {
                     let id = self.fresh_item();
-                    other_items.push(other_item(id, e.type_name, e.span, OtherItemKind::Extend));
+                    extend_decls.push((id, e));
                 }
                 ast::Item::Import(i) => {
                     let id = self.fresh_item();
@@ -409,15 +450,34 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|(id, v)| self.lower_variant(id, v))
             .collect();
+        // Protocols are lowered before any function or extend body: a
+        // `Protocol[Args].method(...)` call anywhere in either needs
+        // `self.protocol_methods`'s name -> index table already built
+        // (`rfcs/0009`), the same way `variant_cases` must already be
+        // populated before any body that qualifies a case constructor.
+        let protocols: Vec<HirProtocol> = protocol_decls
+            .into_iter()
+            .map(|(id, p)| self.lower_protocol(id, p))
+            .collect();
+        for protocol in &protocols {
+            let table = protocol.methods.iter().map(|m| (m.name, m.index)).collect();
+            self.protocol_methods.insert(protocol.id, table);
+        }
         let functions = function_decls
             .into_iter()
             .map(|(id, f)| self.lower_function(id, f))
+            .collect();
+        let extends: Vec<HirExtend> = extend_decls
+            .into_iter()
+            .map(|(id, e)| self.lower_extend(id, e))
             .collect();
 
         HirModule {
             functions,
             records,
             variants,
+            protocols,
+            extends,
             other_items,
         }
     }
@@ -824,12 +884,13 @@ impl<'a> Lowering<'a> {
         self.type_param_scope.clear();
     }
 
-    fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
-        let type_params = self.lower_type_params(&f.type_params);
-        let mut scopes = Scopes::new();
+    /// Lowers one parameter list against a fresh `local` per parameter,
+    /// diagnosing (but not aborting on) a repeated name -- shared by
+    /// `lower_function` and `lower_extend_method`, the two places a
+    /// parameter list is ever lowered.
+    fn lower_params(&mut self, params: &[ast::Param], scopes: &mut Scopes) -> Vec<HirParam> {
         let mut seen_params: HashMap<Symbol, Span> = HashMap::new();
-        let params = f
-            .params
+        params
             .iter()
             .map(|p| {
                 if let Some(&first_span) = seen_params.get(&p.name.symbol) {
@@ -857,8 +918,70 @@ impl<'a> Lowering<'a> {
                     ty,
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// Splits one `uses` clause's entries into this declaration's own
+    /// capability requirements (`rfcs/0009`: a single name followed by a
+    /// bracketed type-argument list) and its bare effect paths
+    /// (`spec/0005`'s pre-existing, still-unchecked declarations, e.g.
+    /// `Database.Read`, left completely untouched by this milestone).
+    /// Must run while the enclosing declaration's own `type_param_scope`
+    /// is still active, since a requirement's own arguments may
+    /// reference it (`uses Equal[T]`).
+    fn lower_uses_clause(
+        &mut self,
+        clauses: &[ast::UsesClause],
+    ) -> (Vec<HirCapabilityRequirement>, Vec<Path>) {
+        let mut requirements = Vec::new();
+        let mut effects = Vec::new();
+        for clause in clauses {
+            if clause.args.is_empty() {
+                effects.push(clause.path.clone());
+                continue;
+            }
+            if clause.path.segments.len() != 1 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::CAPABILITY_REQUIREMENT_DOTTED_PATH,
+                        self.source,
+                        clause.span,
+                        "a capability requirement names a single protocol, not a dotted path",
+                    )
+                    .with_primary_label("dotted capability requirement"),
+                );
+                continue;
+            }
+            let name = clause.path.segments[0];
+            let Some(&(protocol, _)) = self.protocol_names.get(&name.symbol) else {
+                let text = self.interner.resolve(name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_PROTOCOL,
+                        self.source,
+                        name.span,
+                        format!("`{text}` is not a declared protocol"),
+                    )
+                    .with_primary_label("unknown protocol"),
+                );
+                continue;
+            };
+            let arguments = clause.args.iter().map(|a| self.resolve_type_ref(a)).collect();
+            requirements.push(HirCapabilityRequirement {
+                protocol,
+                arguments,
+                span: clause.span,
+            });
+        }
+        (requirements, effects)
+    }
+
+    fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
+        let type_params = self.lower_type_params(&f.type_params);
+        let mut scopes = Scopes::new();
+        let params = self.lower_params(&f.params, &mut scopes);
         let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
+        let (requirements, uses) = self.lower_uses_clause(&f.uses);
         let body = self.lower_block(&f.body, &mut scopes);
         self.clear_type_param_scope();
         HirFunction {
@@ -870,7 +993,172 @@ impl<'a> Lowering<'a> {
             public: f.public,
             params,
             return_type,
-            uses: f.uses.clone(),
+            uses,
+            requirements,
+            raises: f.raises.clone(),
+            body,
+            span: f.span,
+        }
+    }
+
+    /// Lowers one `protocol Name[T, ...] { func sig(...) -> RT; ... }`
+    /// declaration (`rfcs/0009`): its own type parameters, then each
+    /// method signature in that same scope. A repeated method name is
+    /// diagnosed but does not stop lowering the rest -- every method
+    /// still gets a canonical `index`, so a later duplicate never
+    /// silently shifts an earlier method's identity.
+    fn lower_protocol(&mut self, id: ItemId, p: &ast::ProtocolDecl) -> HirProtocol {
+        let type_params = self.lower_type_params(&p.type_params);
+        let mut seen_methods: HashMap<Symbol, Span> = HashMap::new();
+        let mut methods = Vec::with_capacity(p.members.len());
+        for (index, member) in p.members.iter().enumerate() {
+            if let Some(&first_span) = seen_methods.get(&member.name.symbol) {
+                let text = self.interner.resolve(member.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_PROTOCOL_METHOD,
+                        self.source,
+                        member.name.span,
+                        format!("protocol method `{text}` is declared more than once"),
+                    )
+                    .with_primary_label("duplicate method")
+                    .with_label(first_span, "first declared here"),
+                );
+            } else {
+                seen_methods.insert(member.name.symbol, member.name.span);
+            }
+            let params = member
+                .params
+                .iter()
+                .map(|prm| self.resolve_type_ref(&prm.ty))
+                .collect();
+            let return_type = member.return_type.as_ref().map(|t| self.resolve_type_ref(t));
+            methods.push(HirProtocolMethod {
+                index,
+                name: member.name.symbol,
+                name_span: member.name.span,
+                params,
+                return_type,
+                span: member.span,
+            });
+        }
+        self.clear_type_param_scope();
+        HirProtocol {
+            id,
+            name: p.name.symbol,
+            name_span: p.name.span,
+            type_params,
+            methods,
+            span: p.span,
+            source: self.source,
+            public: p.public,
+        }
+    }
+
+    /// Lowers one `extend Equal[i64] { ... }` / `extend[T] Equal[Box[T]]
+    /// uses Equal[T] { ... }` declaration (`rfcs/0009`). An unknown
+    /// protocol name still produces an `HirExtend` (forward progress),
+    /// carrying the sentinel [`unresolved_protocol_id`] as its
+    /// `protocol` -- `typeck` never looks that id up in its own merged
+    /// protocol table, since the diagnostic was already recorded here.
+    fn lower_extend(&mut self, id: ItemId, e: &ast::ExtendDecl) -> HirExtend {
+        let type_params = self.lower_type_params(&e.type_params);
+        let protocol = match self.protocol_names.get(&e.protocol.name.symbol) {
+            Some(&(item, _)) => item,
+            None => {
+                let text = self.interner.resolve(e.protocol.name.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_PROTOCOL,
+                        self.source,
+                        e.protocol.name.span,
+                        format!("`{text}` is not a declared protocol"),
+                    )
+                    .with_primary_label("unknown protocol"),
+                );
+                unresolved_protocol_id()
+            }
+        };
+        let protocol_arguments = e
+            .protocol
+            .args
+            .iter()
+            .map(|a| self.resolve_type_ref(a))
+            .collect();
+        let (requirements, _effects) = self.lower_uses_clause(&e.uses);
+        let methods = e
+            .functions
+            .iter()
+            .map(|f| self.lower_extend_method(f, &requirements))
+            .collect();
+        self.clear_type_param_scope();
+        HirExtend {
+            id,
+            type_params,
+            protocol,
+            protocol_arguments,
+            protocol_ref_span: e.protocol.span,
+            requirements,
+            methods,
+            span: e.span,
+            source: self.source,
+        }
+    }
+
+    /// Lowers one method body inside an `extend` block. Unlike an
+    /// ordinary function, it never introduces its own type-parameter
+    /// scope: its body resolves `T` against the *enclosing extend's*
+    /// own `type_param_scope` (already active -- see `lower_extend`),
+    /// so `HirFunction::type_params` is always empty here, and any type
+    /// parameters explicitly (and invalidly) written on the method
+    /// itself are diagnosed rather than silently accepted. Likewise, a
+    /// method never declares its own `uses` clause: `requirements` is
+    /// always the *enclosing extend's own* (`lower_extend`'s `uses
+    /// Equal[T]`), passed in directly rather than derived from this
+    /// method's own (expected-empty) `f.uses`.
+    fn lower_extend_method(
+        &mut self,
+        f: &ast::FunctionDecl,
+        requirements: &[HirCapabilityRequirement],
+    ) -> HirFunction {
+        let id = self.fresh_item();
+        if !f.type_params.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::EXTEND_METHOD_OWN_TYPE_PARAMS,
+                    self.source,
+                    f.span,
+                    "an extend method may not declare its own type parameters; use the extend's own `extend[...]` parameters instead",
+                )
+                .with_primary_label("unexpected type parameters"),
+            );
+        }
+        if !f.uses.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::EXTEND_METHOD_OWN_USES_CLAUSE,
+                    self.source,
+                    f.span,
+                    "an extend method may not declare its own `uses` clause; the extend's own `uses` clause already applies to every one of its methods",
+                )
+                .with_primary_label("unexpected `uses` clause"),
+            );
+        }
+        let mut scopes = Scopes::new();
+        let params = self.lower_params(&f.params, &mut scopes);
+        let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
+        let body = self.lower_block(&f.body, &mut scopes);
+        HirFunction {
+            id,
+            name: f.name.symbol,
+            name_span: f.name.span,
+            type_params: Vec::new(),
+            source: self.source,
+            public: false,
+            params,
+            return_type,
+            uses: Vec::new(),
+            requirements: requirements.to_vec(),
             raises: f.raises.clone(),
             body,
             span: f.span,
@@ -1124,6 +1412,9 @@ impl<'a> Lowering<'a> {
                 span,
             };
         }
+        if self.protocol_names.contains_key(&ident.symbol) {
+            return self.protocol_not_a_value(*ident, span);
+        }
         let text = self.interner.resolve(ident.symbol);
         self.diagnostics.push(
             Diagnostic::error(
@@ -1133,6 +1424,29 @@ impl<'a> Lowering<'a> {
                 format!("cannot find `{text}` in this scope"),
             )
             .with_primary_label("not found"),
+        );
+        HirExpr::Error {
+            id: self.fresh_expr_id(),
+            span,
+        }
+    }
+
+    /// `rfcs/0009`: there are no dynamic/first-class protocol references
+    /// in Alpha 0.1.5 -- a protocol name is only ever meaningful as
+    /// `Protocol[Args].method(...)`, never standing alone (bare, or
+    /// applied but not immediately qualified by a method).
+    fn protocol_not_a_value(&mut self, ident: ast::Ident, span: Span) -> HirExpr {
+        let text = self.interner.resolve(ident.symbol);
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::PROTOCOL_NOT_A_VALUE,
+                self.source,
+                span,
+                format!(
+                    "`{text}` is a protocol, not a value; call one of its methods explicitly (`{text}[..].method(..)`)"
+                ),
+            )
+            .with_primary_label("protocol used as a value"),
         );
         HirExpr::Error {
             id: self.fresh_expr_id(),
@@ -1164,6 +1478,9 @@ impl<'a> Lowering<'a> {
         // RFC 0005's "Namespaces" section).
         if let Some(candidates) = self.case_lookup.get(&ident.symbol) {
             return self.resolve_case_candidates(ident, candidates.clone());
+        }
+        if self.protocol_names.contains_key(&ident.symbol) {
+            return self.protocol_not_a_value(ident, ident.span);
         }
         let text = self.interner.resolve(ident.symbol);
         self.diagnostics.push(
@@ -1294,6 +1611,13 @@ impl<'a> Lowering<'a> {
         if let Some(base_ident) = base_ident
             && scopes.lookup(base_ident.symbol).is_none()
             && !self.functions_by_name.contains_key(&base_ident.symbol)
+            && let Some(&(protocol, _)) = self.protocol_names.get(&base_ident.symbol)
+        {
+            return self.resolve_protocol_method(protocol, *base_ident, type_args_ast, name, span);
+        }
+        if let Some(base_ident) = base_ident
+            && scopes.lookup(base_ident.symbol).is_none()
+            && !self.functions_by_name.contains_key(&base_ident.symbol)
             && let Some(&(item, kind, _)) = self.type_names.get(&base_ident.symbol)
         {
             return match kind {
@@ -1322,6 +1646,56 @@ impl<'a> Lowering<'a> {
             id: self.fresh_expr_id(),
             base: Box::new(self.lower_expr(base, scopes)),
             name: name.symbol,
+            span,
+        }
+    }
+
+    /// Resolves `Protocol[Args].method` (`rfcs/0009`) -- mirrors
+    /// `resolve_qualified_case`. Arity of `Args` against the protocol's
+    /// own declared type-parameter count is left to `typeck`, the same
+    /// way an ordinary aggregate type application's arity is (see
+    /// `resolve_type_ref_at_depth`'s own doc comment); an unknown method
+    /// name is rejected here, immediately, the same way an unknown case
+    /// name is.
+    fn resolve_protocol_method(
+        &mut self,
+        protocol: ItemId,
+        base_ident: ast::Ident,
+        type_args_ast: &[ast::Type],
+        method_name: ast::Ident,
+        span: Span,
+    ) -> HirExpr {
+        let arguments = type_args_ast
+            .iter()
+            .map(|a| self.resolve_type_ref(a))
+            .collect();
+        let Some(&method) = self
+            .protocol_methods
+            .get(&protocol)
+            .and_then(|methods| methods.get(&method_name.symbol))
+        else {
+            let base_text = self.interner.resolve(base_ident.symbol);
+            let method_text = self.interner.resolve(method_name.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_METHOD,
+                    self.source,
+                    method_name.span,
+                    format!("protocol `{base_text}` has no method named `{method_text}`"),
+                )
+                .with_primary_label("unknown protocol method"),
+            );
+            return HirExpr::Error {
+                id: self.fresh_expr_id(),
+                span,
+            };
+        };
+        HirExpr::ProtocolMethodRef {
+            id: self.fresh_expr_id(),
+            protocol,
+            arguments,
+            method,
+            name: method_name.symbol,
             span,
         }
     }
@@ -1720,6 +2094,19 @@ fn other_item(id: ItemId, name: ast::Ident, span: Span, kind: OtherItemKind) -> 
         span,
         kind,
     }
+}
+
+/// A placeholder `ItemId` for an `extend` whose protocol head named no
+/// declared protocol (`hir::lower::lower_extend`'s own diagnostic
+/// already covers this). Never a real item's id (every real id starts
+/// counting from zero and this module's own item count never
+/// approaches `u32::MAX`), and never looked up in a merged protocol
+/// table by any later stage -- every consumer of `HirExtend::protocol`
+/// is expected to skip an extend it can't resolve, the same way a
+/// dangling reference elsewhere in this compiler degrades rather than
+/// panics.
+fn unresolved_protocol_id() -> ItemId {
+    ItemId(u32::MAX)
 }
 
 #[cfg(test)]

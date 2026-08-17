@@ -16,11 +16,11 @@ use crate::hir::{ItemId, ItemRegistry, TypeParamId};
 use crate::limits::MAX_GENERIC_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::types::{Ty, is_integer, is_numeric, substitute};
+use crate::types::{CapabilityRequirement, Ty, is_integer, is_numeric, substitute};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
-use super::{Function, Module, RecordLayout, VariantLayout};
+use super::{ExtendLayout, Function, Module, ProtocolLayout, RecordLayout, VariantLayout};
 
 mod codes {
     pub const DUPLICATE_FUNCTION_ID: &str = "V0001";
@@ -124,6 +124,12 @@ mod codes {
     /// depth for those, since this check runs first and rejects the
     /// type outright before they would ever need to).
     pub const GENERIC_DEPTH_EXCEEDED: &str = "V0035";
+    /// A protocol or extend reuses an id already used by another
+    /// protocol/extend in this module (`rfcs/0009`). Independent
+    /// evidence/signature verification for `Call`/`protocol.call`
+    /// (V0036 and up) lands in a follow-up commit.
+    pub const DUPLICATE_PROTOCOL_ID: &str = "V0045";
+    pub const DUPLICATE_EXTEND_ID: &str = "V0046";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -136,15 +142,21 @@ struct KnownFunction {
     type_params: Vec<TypeParamId>,
     params: Vec<Ty>,
     return_type: Ty,
+    /// This function's own capability requirements (`rfcs/0009`), in
+    /// declared order -- a `Call` targeting it must carry exactly this
+    /// many evidence entries.
+    requirements: Vec<CapabilityRequirement>,
 }
 
-/// Every declared record's/variant's layout, by `ItemId`, for validating
-/// aggregate operations against the module's own declared shape rather
-/// than trusting whatever `record.create`/`variant.create` happened to
+/// Every declared record's/variant's/protocol's/extend's layout, by
+/// `ItemId`, for validating an operation against the module's own
+/// declared shape rather than trusting whatever instruction happened to
 /// be built with.
 struct AggregateContext<'a> {
     records: HashMap<ItemId, &'a RecordLayout>,
     variants: HashMap<ItemId, &'a VariantLayout>,
+    protocols: HashMap<ItemId, &'a ProtocolLayout>,
+    extends: HashMap<ItemId, &'a ExtendLayout>,
 }
 
 /// Verifies every function in `module`, collecting every diagnostic it
@@ -172,6 +184,8 @@ pub fn verify_module(
         Function,
         Record,
         Variant,
+        Protocol,
+        Extend,
     }
     let mut item_roles: HashMap<ItemId, ItemRole> = HashMap::new();
     let mut check_item_identity =
@@ -213,6 +227,7 @@ pub fn verify_module(
                 type_params: function.type_params.iter().map(|(id, _)| *id).collect(),
                 params: function.params.iter().map(|p| p.ty.clone()).collect(),
                 return_type: function.return_type.clone(),
+                requirements: function.requirements.clone(),
             },
         );
     }
@@ -247,10 +262,40 @@ pub fn verify_module(
         }
         check_item_identity(*id, ItemRole::Variant, &name, &mut diagnostics);
     }
+    let mut seen_protocol_ids = HashSet::new();
+    for (id, _protocol) in &module.protocols {
+        let name = registry.qualified_name(*id, interner);
+        if !seen_protocol_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_PROTOCOL_ID,
+                source,
+                Span::dummy(),
+                format!(
+                    "protocol `{name}` reuses an id already used by another protocol in this module"
+                ),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Protocol, &name, &mut diagnostics);
+    }
+    let mut seen_extend_ids = HashSet::new();
+    for (id, _extend) in &module.extends {
+        let name = format!("extend #{}", id.0);
+        if !seen_extend_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_EXTEND_ID,
+                source,
+                Span::dummy(),
+                format!("{name} reuses an id already used by another extend in this module"),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Extend, &name, &mut diagnostics);
+    }
 
     let agg = AggregateContext {
         records: module.records.iter().map(|(id, r)| (*id, r)).collect(),
         variants: module.variants.iter().map(|(id, v)| (*id, v)).collect(),
+        protocols: module.protocols.iter().map(|(id, p)| (*id, p)).collect(),
+        extends: module.extends.iter().map(|(id, e)| (*id, e)).collect(),
     };
 
     // Every record field's and every variant case payload's own
@@ -802,11 +847,12 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         | ValueKind::Le(a, b)
         | ValueKind::Gt(a, b)
         | ValueKind::Ge(a, b) => vec![*a, *b],
-        ValueKind::Call(_, _, args) => args.clone(),
+        ValueKind::Call(_, _, args, _) => args.clone(),
         ValueKind::RecordCreate(_, _, fields) => fields.clone(),
         ValueKind::RecordField { base, .. } => vec![*base],
         ValueKind::VariantCreate { payload, .. } => payload.clone(),
         ValueKind::VariantPayload { base, .. } => vec![*base],
+        ValueKind::ProtocolCall { args, .. } => args.clone(),
     }
 }
 
@@ -1456,7 +1502,10 @@ fn verify_value_kind(
                 );
             }
         }
-        ValueKind::Call(callee, type_args, args) => {
+        // TODO(rfcs/0009): `_evidence` is not yet independently verified
+        // here (evidence arity/type/forwarded-index/cycle checks land in
+        // a follow-up commit) -- tracked, not silently forgotten.
+        ValueKind::Call(callee, type_args, args, _evidence) => {
             for arg in args {
                 require_value(*arg, diagnostics);
             }
@@ -1924,6 +1973,12 @@ fn verify_value_kind(
                 )),
             }
         }
+        // TODO(rfcs/0009): protocol/method/evidence validation for
+        // protocol.call is not yet implemented (tracked as a follow-up
+        // commit) -- operands are still checked generically by this
+        // function's own caller via `operands_of`, but this specific
+        // instruction kind has no independent semantic check here yet.
+        ValueKind::ProtocolCall { .. } => {}
     }
 }
 

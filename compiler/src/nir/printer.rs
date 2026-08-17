@@ -600,6 +600,8 @@ mod tests {
             &typeck_result.expr_types,
             &typeck_result.pattern_case,
             &typeck_result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )

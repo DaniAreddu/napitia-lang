@@ -431,3 +431,120 @@ fn deeply_nested_pattern_terminates_diagnostically_at_every_stage() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// -- Generics (`rfcs/0008`) ---------------------------------------------
+
+#[test]
+fn generic_identity_check_ir_and_run_all_succeed() {
+    let path = fixture("generic_identity.npt");
+    assert!(napitia(&["check", &path]).status.success());
+    assert!(napitia(&["ir", &path]).status.success());
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn generic_box_check_ir_and_run_all_succeed() {
+    let path = fixture("generic_box.npt");
+    assert!(napitia(&["check", &path]).status.success());
+    assert!(napitia(&["ir", &path]).status.success());
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+}
+
+#[test]
+fn generic_maybe_exhaustive_match_check_ir_and_run_all_succeed() {
+    let path = fixture("generic_maybe_exhaustive.npt");
+    assert!(napitia(&["check", &path]).status.success());
+    assert!(napitia(&["ir", &path]).status.success());
+    let ran = napitia(&["run", &path]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "1");
+}
+
+#[test]
+fn generic_arity_mismatch_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("generic_arity_mismatch.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0024]"));
+}
+
+#[test]
+fn generic_inference_conflict_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("generic_inference_conflict.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0026]") || stderr(&output).contains("error[T0025]"));
+}
+
+#[test]
+fn generic_infinite_layout_is_a_diagnostic() {
+    let output = napitia(&["check", &fixture("generic_infinite_layout.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0020]"));
+}
+
+/// Every invalid generic fixture above must fail at `check` already, and
+/// never leak an internal `Ixxxx`/`Vxxxx` diagnostic for these ordinary,
+/// user-triggerable errors.
+#[test]
+fn invalid_generic_fixtures_fail_at_check_with_no_leaked_internal_diagnostic() {
+    for name in [
+        "generic_arity_mismatch.npt",
+        "generic_inference_conflict.npt",
+        "generic_infinite_layout.npt",
+    ] {
+        let path = fixture(name);
+        let output = napitia(&["check", &path]);
+        assert_eq!(output.status.code(), Some(1), "`{name}` should fail check");
+        let err = stderr(&output);
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{name}` leaked an internal diagnostic: {err}"
+        );
+    }
+}
+
+/// A generic type application nested far past
+/// `crate::limits::MAX_GENERIC_DEPTH`, generated here rather than
+/// committed as a giant fixture file. Every stage that could ever parse
+/// it must terminate with an ordinary diagnostic and a non-zero exit
+/// code, never a panic, a Rust backtrace, or a hang.
+#[test]
+fn deeply_nested_generic_type_application_terminates_diagnostically() {
+    let depth = 200;
+    let mut ty = "i64".to_string();
+    for _ in 0..depth {
+        ty = format!("Box[{ty}]");
+    }
+    let source = format!(
+        "record Box[T] {{ payload: T }}\n\
+         func f(x: {ty}) -> i64 {{ return 0 }}\n\
+         func main() -> i64 {{ return 0 }}\n"
+    );
+    let path =
+        std::env::temp_dir().join(format!("napitia_deep_generic_{}.npt", std::process::id()));
+    std::fs::write(&path, &source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            !output.status.success(),
+            "`{cmd}` unexpectedly succeeded on a type nested {depth} levels deep"
+        );
+        assert_ne!(
+            output.status.code(),
+            None,
+            "`{cmd}` was killed by a signal (likely a stack overflow), not a clean exit"
+        );
+        let err = stderr(&output);
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

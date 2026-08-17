@@ -71,10 +71,17 @@ pub struct ImportedItem {
     pub local_name: Symbol,
     pub kind: ImportedItemKind,
     /// The `import` statement's own span, in the *importing* module --
-    /// used both as this name's "declared here" location for further
-    /// collision diagnostics, and as a diagnostic's own primary
-    /// location when the import itself is what's rejected.
+    /// used as a diagnostic's own primary location when the import
+    /// itself (module resolution, privacy) is what's rejected.
     pub import_span: Span,
+    /// The precise span of `local_name` itself: the alias identifier's
+    /// own span for `import a.b as alias;`, or the imported item's own
+    /// written name's span when there is no alias -- never the whole
+    /// `import_span`. Used as this name's "declared here"/"already
+    /// imported here" location for a collision diagnostic, so `import
+    /// a.b as Alias;` colliding with something else labels `Alias`
+    /// itself, not the entire statement (`rfcs/0007`).
+    pub local_name_span: Span,
     /// Where the imported item was actually declared -- a different
     /// file than the importing module's own, in every real case. Used
     /// for a cross-file "declared here" label when this import
@@ -117,7 +124,7 @@ pub enum ImportedItemKind {
 enum NameOrigin {
     Local(Span),
     Imported {
-        import_span: Span,
+        local_name_span: Span,
         declared_source: SourceId,
         declared_span: Span,
     },
@@ -223,13 +230,13 @@ impl<'a> Lowering<'a> {
             if let Some(existing) = names.get(&imported.local_name).cloned() {
                 self.diagnostics.push(self.import_collision_diagnostic(
                     imported.local_name,
-                    imported.import_span,
+                    imported.local_name_span,
                     &existing,
                 ));
                 continue;
             }
             let origin = NameOrigin::Imported {
-                import_span: imported.import_span,
+                local_name_span: imported.local_name_span,
                 declared_source: imported.declared_source,
                 declared_span: imported.declared_span,
             };
@@ -550,7 +557,7 @@ impl<'a> Lowering<'a> {
         existing: &NameOrigin,
     ) -> Diagnostic {
         let NameOrigin::Imported {
-            import_span,
+            local_name_span,
             declared_source,
             declared_span,
         } = existing
@@ -565,8 +572,8 @@ impl<'a> Lowering<'a> {
             format!("`{text}` conflicts with a name already imported into this module"),
         )
         .with_primary_label("conflicting name")
-        .with_label(*import_span, "already imported here");
-        if *declared_source == self.source && *import_span == *declared_span {
+        .with_label(*local_name_span, "already imported here");
+        if *declared_source == self.source && *local_name_span == *declared_span {
             diag
         } else {
             diag.with_label_in(*declared_source, *declared_span, "declared here")
@@ -1457,6 +1464,7 @@ mod tests {
                         fields: Vec::new(),
                     },
                     import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
                     declared_source: other_source,
                     declared_span: Span::dummy(),
                 }]
@@ -1931,6 +1939,7 @@ mod tests {
                     local_name: add_name,
                     kind: ImportedItemKind::Function(target),
                     import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
                     declared_source: other_source,
                     declared_span: Span::dummy(),
                 }],
@@ -1957,6 +1966,7 @@ mod tests {
                         local_name: name,
                         kind: ImportedItemKind::Function(ItemId(1)),
                         import_span: Span::new(0, 1),
+                        local_name_span: Span::new(0, 1),
                         declared_source: other_source,
                         declared_span: Span::dummy(),
                     },
@@ -1964,6 +1974,7 @@ mod tests {
                         local_name: name,
                         kind: ImportedItemKind::Function(ItemId(2)),
                         import_span: Span::new(1, 2),
+                        local_name_span: Span::new(1, 2),
                         declared_source: other_source,
                         declared_span: Span::dummy(),
                     },
@@ -1983,6 +1994,7 @@ mod tests {
                     local_name: name,
                     kind: ImportedItemKind::Function(ItemId(1)),
                     import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
                     declared_source: other_source,
                     declared_span: Span::dummy(),
                 }]
@@ -2058,6 +2070,7 @@ mod tests {
                         fields: vec![(field_x, 0, true), (field_y, 1, false)],
                     },
                     import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
                     declared_source: other_source,
                     declared_span: Span::dummy(),
                 }]

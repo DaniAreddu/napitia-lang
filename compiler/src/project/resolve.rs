@@ -111,6 +111,16 @@ fn resolve_one_import(
         Some((alias_text, _)) => interner.intern(alias_text),
         None => declared_name,
     };
+    // The precise span a collision diagnostic should label this name
+    // with: the alias identifier's own span when there is one, otherwise
+    // the imported item's own written name (`import.item_span`) -- never
+    // the whole `import` statement's span, which used to be the only
+    // option and pointed a collision at the entire line instead of the
+    // one token actually responsible (`rfcs/0007`).
+    let local_name_span = match &import.alias {
+        Some((_, alias_span)) => *alias_span,
+        None => import.item_span,
+    };
 
     if let Some(function) = target_hir
         .functions
@@ -131,6 +141,7 @@ fn resolve_one_import(
             local_name,
             kind: ImportedItemKind::Function(function.id),
             import_span: import.span,
+            local_name_span,
             declared_source: *target_source,
             declared_span: function.name_span,
         });
@@ -160,6 +171,7 @@ fn resolve_one_import(
                 fields,
             },
             import_span: import.span,
+            local_name_span,
             declared_source: *target_source,
             declared_span: record.span,
         });
@@ -189,6 +201,7 @@ fn resolve_one_import(
                 cases,
             },
             import_span: import.span,
+            local_name_span,
             declared_source: *target_source,
             declared_span: variant.span,
         });

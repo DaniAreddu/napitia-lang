@@ -412,25 +412,24 @@ arguments and bounded by `MAX_GENERIC_DEPTH`:
   `DUPLICATE_TYPE_PARAMETER`), which would otherwise make positional
   substitution ambiguous.
 
-Every type argument at a `Call`/`RecordCreate`/`VariantCreate` use site —
-not just the instruction's declared result type — goes through one
-shared helper, `check_generic_type_argument`, so the three instruction
-kinds can never drift into checking a different subset of the above for
-their own type arguments (an earlier version of this verifier ran only
-`check_type_param_scope` on them, leaving a `Ty::Error`/unresolved
-`Ty::Var`/unknown-declaration/wrong-nested-arity argument unchecked at
-exactly the site most directly under a program's own control).
-`check_generic_type_argument` validates depth *first*: past
-`MAX_GENERIC_DEPTH`, it reports a dedicated, single diagnostic (`V0035`,
-`GENERIC_DEPTH_EXCEEDED`) for the whole argument — never one per nested
-level — rather than the silent early return every other depth-bounded
-check in this module still falls back to, past this same bound, as
-defense in depth once this check has already rejected the type outright.
-
-Malformed hand-built NIR that exercises any of the above (the only way
-most of it is reachable at all — a well-typed program lowered normally
-satisfies every one of these by construction) fails with one or more
-`V`-code diagnostics and never reaches interpretation.
+Every type root this verifier inspects — a record field, a variant case
+payload, a function parameter or return type, an instruction's declared
+result type, and every type argument at a `Call`/`RecordCreate`/
+`VariantCreate` use site — goes through one shared helper,
+`check_type_root`, so no root can ever drift into checking a different
+subset of the above (an earlier version of this verifier ran only
+`check_type_param_scope` on use-site type arguments, and never ran a
+depth check at all outside that one call site, leaving a
+`Ty::Error`/unresolved `Ty::Var`/unknown-declaration/wrong-nested-arity/
+over-depth type unchecked at every other root: fields, payloads,
+signatures, and instruction result types alike).
+`check_type_root` validates depth *first*: past `MAX_GENERIC_DEPTH`, it
+reports a dedicated, single diagnostic (`V0035`, `GENERIC_DEPTH_EXCEEDED`)
+for the whole root — never one per nested level — and skips the
+remaining checks below for that root entirely, rather than falling
+through to the silent early return every one of them still falls back to
+past this same bound, as defense in depth for any caller that does not
+go through `check_type_root`.
 
 A type parameter that is declared but genuinely never occurs in any
 field, payload, parameter, or return type (a "phantom" parameter, e.g.
@@ -439,11 +438,15 @@ requires every declared parameter to actually occur anywhere; it is only
 required to be applied consistently at every reference to the
 declaration.
 
-Malformed hand-built NIR (the only way most of the above is actually
-reachable — a well-typed program lowered normally satisfies every one of
-these by construction) fails with one or more `V`-code diagnostics and
-never reaches interpretation, matching every other structural invariant
-this verifier already enforced before this milestone.
+Malformed hand-built NIR that exercises any of the above (the only way
+most of it is reachable at all — a well-typed program lowered normally
+satisfies every one of these by construction) fails with one or more
+`V`-code diagnostics and never reaches interpretation, matching every
+other structural invariant this verifier already enforced before this
+milestone. This never relies on the parser, HIR, type checker, or
+lowering having already rejected the type — every one of these roots is
+itself a `verify_module` entry point that hand-built NIR reaches
+directly, bypassing every earlier stage.
 
 ## Infinite generic aggregate layouts
 
@@ -513,9 +516,12 @@ extended to the new surface area:
 - Textual NIR's declared/applied type-parameter brackets print in stable
   declaration order, never a `HashMap`'s iteration order, and are
   byte-identical across repeated compiles of the same program.
-- The infinite-layout traversal's reported path and the
-  budget-exceeded diagnostic are both a deterministic function of
-  declaration order, independent of `HashMap` iteration.
+- The infinite-layout traversal's reported path, and which declaration
+  its cycle is canonicalized to start from, are both a deterministic
+  function of declaration order, independent of `HashMap` iteration —
+  there is no depth-budget diagnostic to be deterministic about, since
+  cycle detection is purely structural (see "Infinite generic aggregate
+  layouts" above).
 - Aliases never appear in generic diagnostics or textual NIR — every name
   comes from `ItemRegistry`'s canonical qualified name, exactly as
   established in `rfcs/0007`.
@@ -540,8 +546,11 @@ declarations a structure may pass through: parsing a type application
 (`parse_type_arg_list`, `P0001`, exercised exactly at the limit and one
 past it); `hir::lower`'s own type-application resolution (`R0019`);
 `typeck::unify`'s recursion into nested `Ty::Applied` arguments;
-`nir::verify`'s use-site type-argument depth check (`V0035`) and every
-other recursive check in that module; every recursive display walk in
+`nir::verify`'s `check_type_root` depth check (`V0035`), run over every
+type root the verifier inspects — record fields, variant payloads,
+function parameters/return types, instruction result types, and use-site
+type arguments alike — and every other recursive check in that module;
+every recursive display walk in
 `nir::printer` and `types::display_ty`. `typeck::cycles`'s infinite-
 layout detection (`T0020`) is a deliberate exception: it does *not* use
 this constant to bound the number of aggregate declarations a
@@ -591,7 +600,9 @@ V0031  generic arity mismatch (a call, construction, or applied type)
 V0032  a symbolic type parameter escaping its owning declaration
 V0033  a generic declaration referenced without type arguments
 V0034  a declaration's own type parameter list contains a duplicate
-V0035  a use-site type argument nested past the generic depth limit
+V0035  a type root (field, payload, parameter, return type, instruction
+       result type, or use-site type argument) nested past the generic
+       depth limit
 ```
 
 ## Honest limitations

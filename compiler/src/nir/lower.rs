@@ -65,6 +65,7 @@ pub fn lower_module(
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
     pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    call_type_args: &HashMap<ExprId, Vec<Ty>>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -99,6 +100,7 @@ pub fn lower_module(
             r.id,
             RecordLayout {
                 name: r.name,
+                type_params: r.type_params.iter().map(|p| (p.id, p.name)).collect(),
                 fields,
             },
         );
@@ -123,6 +125,7 @@ pub fn lower_module(
             v.id,
             VariantLayout {
                 name: v.name,
+                type_params: v.type_params.iter().map(|p| (p.id, p.name)).collect(),
                 cases,
             },
         );
@@ -140,13 +143,15 @@ pub fn lower_module(
             .as_ref()
             .map(|t| resolve_named_type(interner, t))
             .unwrap_or(Ty::Unit);
-        function_sigs.insert(f.id, (params, ret));
+        let type_params = f.type_params.iter().map(|p| p.id).collect();
+        function_sigs.insert(f.id, (type_params, params, ret));
     }
 
     let mut lowering = Lowering {
         local_types,
         expr_types,
         pattern_case,
+        call_type_args,
         interner,
         source,
         records: record_layouts,
@@ -288,7 +293,28 @@ fn validate_item_identities(
 /// same defense-in-depth posture as the rest of this module.
 fn resolve_named_type(interner: &Interner, ty: &crate::hir::HirType) -> Ty {
     match ty {
-        crate::hir::HirType::Aggregate { item, name, .. } => Ty::Named(*item, *name),
+        crate::hir::HirType::Aggregate {
+            item, name, args, ..
+        } => {
+            if args.is_empty() {
+                Ty::Named(*item, *name)
+            } else {
+                // A generic declaration's own layout keeps its field/
+                // payload/parameter types *symbolic* (one canonical
+                // schema, never duplicated per instantiation, `rfcs/0008`)
+                // -- but a reference *to* that declaration (a parameter
+                // typed `Box[i64]`, say) is always a concrete application,
+                // resolved recursively the same way `hir::lower`/`typeck`
+                // already do.
+                Ty::Applied(
+                    *item,
+                    args.iter()
+                        .map(|a| resolve_named_type(interner, a))
+                        .collect(),
+                )
+            }
+        }
+        crate::hir::HirType::Param { id, name, .. } => Ty::Param(*id, *name),
         crate::hir::HirType::Unresolved { name, .. } => {
             let text = interner.resolve(*name);
             primitive_from_name(text).unwrap_or(Ty::Error)
@@ -300,11 +326,21 @@ struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
     pattern_case: &'a HashMap<PatternId, (ItemId, usize)>,
+    /// Every generic call/construction's own concrete type arguments, as
+    /// `typeck` resolved them, keyed by that expression's `ExprId`
+    /// (`rfcs/0008`) -- read back here rather than re-inferred, the same
+    /// "typeck already decided, lowering only reads it back" discipline
+    /// `expr_types`/`local_types` already follow.
+    call_type_args: &'a HashMap<ExprId, Vec<Ty>>,
     interner: &'a Interner,
     source: SourceId,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
-    function_sigs: HashMap<ItemId, (Vec<Ty>, Ty)>,
+    /// `(this function's own generic parameters, its param types, its
+    /// return type)`. The parameter/return types may reference the
+    /// first element via `Ty::Param`; a call site substitutes its own
+    /// `call_type_args` for them (`rfcs/0008`).
+    function_sigs: HashMap<ItemId, (Vec<crate::hir::TypeParamId>, Vec<Ty>, Ty)>,
 }
 
 #[derive(Copy, Clone)]
@@ -523,6 +559,7 @@ impl<'a> Lowering<'a> {
         Ok(Function {
             id: f.id,
             name: f.name,
+            type_params: f.type_params.iter().map(|p| (p.id, p.name)).collect(),
             params,
             return_type,
             blocks,
@@ -1104,22 +1141,37 @@ impl<'a> Lowering<'a> {
             }
             return Err(self.internal_error("call target does not resolve to a function"));
         };
-        let (param_tys, ret_ty) = self
+        let (type_params, param_tys, _ret_ty) = self
             .function_sigs
             .get(item)
             .cloned()
-            .unwrap_or_else(|| (Vec::new(), Ty::Error));
+            .unwrap_or_else(|| (Vec::new(), Vec::new(), Ty::Error));
+        // Resolved once by `typeck` (inferred or explicit) and read back
+        // here, never re-inferred -- the same "typeck already decided"
+        // discipline every other type in this module already follows
+        // (`rfcs/0008`). Empty for a non-generic call.
+        let type_args = self
+            .call_type_args
+            .get(&call_expr.id())
+            .cloned()
+            .unwrap_or_default();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> =
+            type_params.into_iter().zip(type_args.iter().cloned()).collect();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
+            let hint = param_tys
+                .get(i)
+                .map(|t| crate::types::substitute(t, &subst))
+                .unwrap_or(Ty::Error);
             match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => arg_values.push(v),
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        Ok(LoweredExpr::Value(
-            fb.push_value(ret_ty, ValueKind::Call(*item, arg_values)),
-        ))
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(call_expr),
+            ValueKind::Call(*item, type_args, arg_values),
+        )))
     }
 
     fn lower_variant_construct(
@@ -1135,14 +1187,27 @@ impl<'a> Lowering<'a> {
         // hand-built HIR bypassing typeck must get a structured
         // diagnostic instead of an out-of-bounds panic or a fabricated
         // payload-type hint for an unknown case.
-        let payload_tys = match self.variants.get(&variant).and_then(|v| v.cases.get(case)) {
-            Some(c) => c.payload.clone(),
-            None => {
-                return Err(self.internal_error(&format!(
-                    "variant construction references unknown variant/case ({variant:?}, {case})"
-                )));
-            }
-        };
+        let (type_params, payload_tys) = match self.variants.get(&variant).and_then(|v| {
+            let ids: Vec<crate::hir::TypeParamId> =
+                v.type_params.iter().map(|(id, _)| *id).collect();
+            v.cases.get(case).map(|c| (ids, c.payload.clone()))
+        }) {
+                Some(found) => found,
+                None => {
+                    return Err(self.internal_error(&format!(
+                        "variant construction references unknown variant/case ({variant:?}, {case})"
+                    )));
+                }
+            };
+        // Resolved once by `typeck` and read back here, never re-inferred
+        // (`rfcs/0008`) -- empty for a non-generic variant.
+        let type_args = self
+            .call_type_args
+            .get(&call_expr.id())
+            .cloned()
+            .unwrap_or_default();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> =
+            type_params.into_iter().zip(type_args.iter().cloned()).collect();
         // The complete shape is validated before a single argument is
         // evaluated: too few arguments would otherwise leave `payload`
         // shorter than the case's declared arity, and too many would
@@ -1157,7 +1222,10 @@ impl<'a> Lowering<'a> {
         }
         let mut payload = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = payload_tys.get(i).cloned().unwrap_or(Ty::Error);
+            let hint = payload_tys
+                .get(i)
+                .map(|t| crate::types::substitute(t, &subst))
+                .unwrap_or(Ty::Error);
             match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => payload.push(v),
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -1168,6 +1236,7 @@ impl<'a> Lowering<'a> {
             ValueKind::VariantCreate {
                 variant,
                 case,
+                type_args,
                 payload,
             },
         )))
@@ -1225,9 +1294,27 @@ impl<'a> Lowering<'a> {
             );
         }
 
+        // Resolved once by `typeck` and read back here, never re-inferred
+        // (`rfcs/0008`) -- empty for a non-generic record. Generic record
+        // construction always supplies this explicitly (`Box[i64] { .. }`),
+        // so it is never itself inferred the way a call's can be.
+        let type_args = self
+            .call_type_args
+            .get(&literal_expr.id())
+            .cloned()
+            .unwrap_or_default();
+        let type_params: Vec<crate::hir::TypeParamId> = self.records[&record]
+            .type_params
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let subst: HashMap<crate::hir::TypeParamId, Ty> =
+            type_params.into_iter().zip(type_args.iter().cloned()).collect();
+
         let mut by_index: Vec<Option<ValueId>> = vec![None; field_count];
         for f in fields {
-            let hint = self.records[&record].fields[f.field_index].1.clone();
+            let declared = self.records[&record].fields[f.field_index].1.clone();
+            let hint = crate::types::substitute(&declared, &subst);
             match self.lower_expr_hinted(fb, &f.value, &hint)? {
                 LoweredExpr::Value(v) => by_index[f.field_index] = Some(v),
                 // A diverging initializer means the whole construction
@@ -1242,7 +1329,7 @@ impl<'a> Lowering<'a> {
             .collect();
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(literal_expr),
-            ValueKind::RecordCreate(record, ordered),
+            ValueKind::RecordCreate(record, type_args, ordered),
         )))
     }
 
@@ -2007,6 +2094,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -2041,6 +2129,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -2074,6 +2163,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -2127,7 +2217,7 @@ mod tests {
             .iter()
             .find_map(|i| match i {
                 Instruction::Value {
-                    kind: ValueKind::RecordCreate(record, args),
+                    kind: ValueKind::RecordCreate(record, _, args),
                     ..
                 } => Some((*record, args.clone())),
                 _ => None,
@@ -2798,6 +2888,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         )
@@ -2848,6 +2939,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         );
@@ -2906,6 +2998,7 @@ mod tests {
             name_span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             params: vec![],
             return_type: None,
             uses: vec![],
@@ -2927,6 +3020,7 @@ mod tests {
             span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             fields: vec![],
         }
     }
@@ -2938,6 +3032,7 @@ mod tests {
             span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             cases: vec![],
         }
     }
@@ -2966,6 +3061,7 @@ mod tests {
             name_span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             params: vec![],
             return_type: None,
             uses: vec![],
@@ -2986,6 +3082,7 @@ mod tests {
             variant,
             case,
             name,
+            type_args: Vec::new(),
             span: Span::dummy(),
         }
     }
@@ -3018,6 +3115,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3059,6 +3157,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3086,6 +3185,7 @@ mod tests {
             span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             cases: vec![crate::hir::HirCase {
                 name: case_name,
                 span: Span::dummy(),
@@ -3115,6 +3215,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3146,6 +3247,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3183,6 +3285,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3220,6 +3323,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3254,6 +3358,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3290,6 +3395,7 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3337,6 +3443,7 @@ mod tests {
                 &local_types,
                 &expr_types,
                 &pattern_case,
+                &HashMap::new(),
                 &interner,
                 source,
             )
@@ -3384,6 +3491,7 @@ mod tests {
             records,
             variants,
             function_sigs: HashMap::new(),
+            call_type_args: Box::leak(Box::new(HashMap::new())),
         }
     }
 
@@ -3398,6 +3506,7 @@ mod tests {
             variant_item,
             VariantLayout {
                 name: interner.intern("V"),
+                type_params: Vec::new(),
                 cases: vec![CaseLayout {
                     name: interner.intern("A"),
                     payload: vec![Ty::I64],
@@ -3441,6 +3550,7 @@ mod tests {
             record_item,
             RecordLayout {
                 name: interner.intern("Point"),
+                type_params: Vec::new(),
                 fields: vec![(interner.intern("x"), Ty::I64)],
             },
         );
@@ -3501,6 +3611,7 @@ mod tests {
             record_item,
             RecordLayout {
                 name: interner.intern("Point"),
+                type_params: Vec::new(),
                 fields: vec![
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
@@ -3560,6 +3671,7 @@ mod tests {
             record_item,
             RecordLayout {
                 name: interner.intern("Point"),
+                type_params: Vec::new(),
                 fields: vec![
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
@@ -3648,6 +3760,7 @@ mod tests {
             variant_item,
             VariantLayout {
                 name: interner.intern("V"),
+                type_params: Vec::new(),
                 cases: vec![CaseLayout {
                     name: interner.intern("A"),
                     payload: vec![Ty::I64],
@@ -3697,6 +3810,7 @@ mod tests {
             variant_item,
             VariantLayout {
                 name: interner.intern("V"),
+                type_params: Vec::new(),
                 cases: vec![CaseLayout {
                     name: interner.intern("A"),
                     payload: vec![Ty::I64, Ty::I64],
@@ -3757,6 +3871,7 @@ mod tests {
             item: variant_item,
             kind: crate::hir::AggregateKind::Variant,
             name: variant_sym,
+            args: Vec::new(),
             span: Span::dummy(),
         };
         let i64_name = crate::hir::HirType::Unresolved {
@@ -3769,6 +3884,7 @@ mod tests {
             span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             cases: vec![
                 crate::hir::HirCase {
                     name: wrap_name,
@@ -3830,6 +3946,7 @@ mod tests {
             name_span: Span::dummy(),
             source,
             public: true,
+            type_params: Vec::new(),
             params: vec![crate::hir::HirParam {
                 local: param_local,
                 name: variant_sym,
@@ -3859,11 +3976,13 @@ mod tests {
         let mut expr_types = HashMap::new();
         expr_types.insert(scrutinee_id, Ty::Named(variant_item, variant_sym));
 
+        let call_type_args = HashMap::new();
         let result = lower_module(
             &module,
             &local_types,
             &expr_types,
             &pattern_case,
+            &call_type_args,
             &interner,
             source,
         );
@@ -4009,6 +4128,7 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &result.pattern_case,
+            &result.call_type_args,
             &interner,
             id,
         );

@@ -1326,4 +1326,137 @@ mod tests {
             "Helper"
         );
     }
+
+    #[test]
+    fn wrong_variant_with_a_single_alternative_owner_keeps_its_wording() {
+        let project = TempProject::new("wrong_variant_single_owner");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import first.First;\n\
+             import target.Target;\n\
+             func main() -> i64 { value x = Target.Shared; return 0 }\n",
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variant `First`, not `Target`"
+        );
+    }
+
+    /// Shared fixture for the multi-owner `WRONG_VARIANT` tests below:
+    /// `First` and `Second` both declare `Shared`; `Target` does not.
+    fn write_wrong_variant_multi_owner_project(project: &TempProject, first_import_first: bool) {
+        project.write("napitia.toml", MANIFEST);
+        let imports = if first_import_first {
+            "import first.First;\nimport second.Second;\n"
+        } else {
+            "import second.Second;\nimport first.First;\n"
+        };
+        project.write(
+            "src/main.npt",
+            &format!(
+                "{imports}import target.Target;\n\
+                 func main() -> i64 {{ value x = Target.Shared; return 0 }}\n"
+            ),
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write(
+            "src/second.npt",
+            "public variant Second { Shared(i64), Alt }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+    }
+
+    #[test]
+    fn wrong_variant_with_two_alternative_owners_lists_them_deterministically() {
+        let project = TempProject::new("wrong_variant_two_owners");
+        write_wrong_variant_multi_owner_project(&project, true);
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variants `First`, `Second`, not `Target`"
+        );
+    }
+
+    #[test]
+    fn wrong_variant_message_is_identical_regardless_of_import_order() {
+        let forward = TempProject::new("wrong_variant_order_forward");
+        write_wrong_variant_multi_owner_project(&forward, true);
+        let reversed = TempProject::new("wrong_variant_order_reversed");
+        write_wrong_variant_multi_owner_project(&reversed, false);
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let forward_diags =
+            compile_project(&forward.manifest_path(), &mut map, &mut interner).unwrap_err();
+        let reversed_diags =
+            compile_project(&reversed.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(forward_diags.len(), 1, "unexpected: {forward_diags:?}");
+        assert_eq!(reversed_diags.len(), 1, "unexpected: {reversed_diags:?}");
+        assert_eq!(forward_diags[0].message, reversed_diags[0].message);
+        assert_eq!(
+            forward_diags[0].message,
+            "`Shared` is a case of variants `First`, `Second`, not `Target`"
+        );
+    }
+
+    #[test]
+    fn wrong_variant_never_duplicates_an_owner_reached_through_two_aliases() {
+        // `First` is imported twice, under two different aliases -- it
+        // must still be named exactly once in the owner list, alongside
+        // `Second` (a genuinely distinct variant), never twice.
+        let project = TempProject::new("wrong_variant_duplicate_alias");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import first.First as Figure;\n\
+             import first.First as Form;\n\
+             import second.Second;\n\
+             import target.Target;\n\
+             func main() -> i64 { value x = Target.Shared; return 0 }\n",
+        );
+        project.write(
+            "src/first.npt",
+            "public variant First { Shared(i64), Other }\n",
+        );
+        project.write(
+            "src/second.npt",
+            "public variant Second { Shared(i64), Alt }\n",
+        );
+        project.write("src/target.npt", "public variant Target { Solo }\n");
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0013");
+        // `First` has no unaliased import in scope here -- only its two
+        // aliases, `Figure` and `Form` -- so the owner list names it by
+        // whichever local spelling `variant_name` deterministically picks
+        // (`Figure`, lexicographically smallest), exactly once, never
+        // both `Figure` and `Form` for the same underlying ItemId.
+        assert_eq!(
+            diags[0].message,
+            "`Shared` is a case of variants `Figure`, `Second`, not `Target`"
+        );
+    }
 }

@@ -1056,21 +1056,36 @@ impl<'a> Lowering<'a> {
         let case_text = self.interner.resolve(case_name.symbol);
         let variant_text = self.interner.resolve(base_ident.symbol);
         if let Some(elsewhere) = self.case_lookup.get(&case_name.symbol) {
-            let owner = elsewhere
+            // Every *distinct* variant (other than the one actually
+            // named) that also declares this case, resolved through the
+            // same deterministic local-name lookup `variant_name` itself
+            // uses -- never picked via `.find()` on `elsewhere`, whose
+            // order is `case_lookup`'s own insertion order (a function of
+            // import declaration order, and of how many aliases happen to
+            // reach the same variant). Sorted and deduplicated so the
+            // message text is independent of both.
+            let mut owner_names: Vec<&str> = elsewhere
                 .iter()
-                .find(|(v, _)| *v != variant)
-                .map(|(v, _)| self.variant_name(*v));
-            if let Some(owner_name) = owner {
+                .map(|(v, _)| *v)
+                .filter(|v| *v != variant)
+                .map(|id| self.variant_name(id))
+                .collect();
+            owner_names.sort_unstable();
+            owner_names.dedup();
+            if !owner_names.is_empty() {
+                let message = if let [only] = owner_names.as_slice() {
+                    format!("`{case_text}` is a case of variant `{only}`, not `{variant_text}`")
+                } else {
+                    let owners = owner_names
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("`{case_text}` is a case of variants {owners}, not `{variant_text}`")
+                };
                 self.diagnostics.push(
-                    Diagnostic::error(
-                        codes::WRONG_VARIANT,
-                        self.source,
-                        case_name.span,
-                        format!(
-                            "`{case_text}` is a case of variant `{owner_name}`, not `{variant_text}`"
-                        ),
-                    )
-                    .with_primary_label("wrong variant"),
+                    Diagnostic::error(codes::WRONG_VARIANT, self.source, case_name.span, message)
+                        .with_primary_label("wrong variant"),
                 );
                 return HirExpr::Error {
                     id: self.fresh_expr_id(),

@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{HirModule, ItemId, TypeParamId};
-use crate::limits::MAX_GENERIC_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::types::Ty;
@@ -114,13 +113,21 @@ fn substitute_edges(
 /// declaration instantiated two different ways is correctly treated as
 /// two different graph nodes.
 ///
-/// A layout that never repeats an exact instance but keeps growing
-/// instead (`record Wrap[T] { inner: Wrap[Box[T]] }`) is exactly as
-/// unlayoutable as a literal cycle, so a traversal path deeper than
-/// [`MAX_GENERIC_DEPTH`] is reported the same way -- the same shared
-/// budget every other stage that walks a nested type application is
-/// bounded by, so no single check can recurse further than the rest of
-/// the compiler already agrees is meaningful.
+/// A layout that never repeats an *exact* instance but keeps
+/// substituting a growing argument instead (`record Wrap[T] { inner:
+/// Wrap[Box[T]] }`) is exactly as unlayoutable as a literal cycle, and is
+/// caught the same structural way, immediately: a *declaration*
+/// (`ItemId`, regardless of its own current arguments) reappearing
+/// anywhere on the active traversal path is itself the proof of an
+/// infinite layout -- `Wrap` reappears the moment its own first field is
+/// substituted, at the very first step, long before any numeric bound
+/// would matter. This is deliberately not a depth/length limit on the
+/// path itself: a long but genuinely finite chain of distinct
+/// declarations (`A -> B -> C -> ... -> i64`) never revisits any one
+/// declaration and must be accepted no matter how many distinct
+/// declarations it passes through -- `MAX_GENERIC_DEPTH` bounds nested
+/// type *application* syntax/substitution depth, not the number of
+/// aggregate declarations a containment graph may legitimately contain.
 pub fn check_cycles(
     hir: &HirModule,
     field_types: &HashMap<ItemId, Vec<Ty>>,
@@ -194,18 +201,17 @@ pub fn check_cycles(
 
     let mut color: HashMap<GenericInstanceKey, Color> = HashMap::new();
     let mut diagnostics = Vec::new();
-    // Dedup key: the declaration whose own traversal is responsible for
-    // the report (the cycle's closing target for a genuine repeat, or
-    // the declaration whose subtree hit the depth budget) -- so the same
-    // underlying problem reached from more than one starting point is
-    // reported once, not once per entry point.
+    // Dedup key: the declaration whose own recurrence closed a reported
+    // cycle -- so the same underlying problem reached from more than one
+    // starting point is reported once, not once per entry point.
     let mut reported: HashSet<ItemId> = HashSet::new();
 
     // Iterative DFS (an explicit stack, never native recursion) so a
     // pathologically long dependency chain cannot exhaust the Rust call
-    // stack -- work is bounded by `MAX_GENERIC_DEPTH` on any one path,
-    // and by the number of distinct instances actually reachable
-    // (finite for every non-infinite layout) overall.
+    // stack. Work is bounded by the number of distinct instances actually
+    // reachable, which is finite for every genuinely non-infinite layout
+    // -- see `path.iter().any` below, which is what actually proves that,
+    // not any numeric depth limit.
     for &start in &order {
         let start_key = symbolic_self(start, &decls[&start]);
         if color.get(&start_key).copied().unwrap_or(Color::White) != Color::White {
@@ -213,6 +219,16 @@ pub fn check_cycles(
         }
         color.insert(start_key.clone(), Color::Gray);
         let mut path: Vec<GenericInstanceKey> = vec![start_key.clone()];
+        // The (label, span) of the edge that pushed `path[i]` onto the
+        // path, parallel to `path` itself -- `incoming[0]` is never read
+        // (the very first element of a whole traversal has no incoming
+        // edge of its own), kept only so every other index lines up.
+        // Needed to reconstruct the *correct* closing edge after
+        // canonicalizing which member of a cycle is displayed first
+        // (below): that rotation can pick a different pair of adjacent
+        // members to call "the closing edge" than whichever one the
+        // traversal itself happened to close on.
+        let mut incoming: Vec<(String, Span)> = vec![(String::new(), Span::dummy())];
         let mut edges_stack: Vec<Vec<(GenericInstanceKey, String, Span)>> =
             vec![substitute_edges(&start_key, &decls)];
         let mut idx_stack: Vec<usize> = vec![0];
@@ -227,6 +243,7 @@ pub fn check_cycles(
             if idx >= edges.len() {
                 color.insert(current, Color::Black);
                 path.pop();
+                incoming.pop();
                 edges_stack.pop();
                 idx_stack.pop();
                 continue;
@@ -234,38 +251,80 @@ pub fn check_cycles(
             let (target, label, span) = edges[idx].clone();
             *idx_stack.last_mut().unwrap() += 1;
 
+            // A *declaration* (regardless of its own current type
+            // arguments) reappearing anywhere on the currently-active
+            // path is itself the proof of an infinite layout: Napitia has
+            // no indirection to break the recurrence with, so reaching
+            // the same declaration again while still in the middle of
+            // laying it out once already -- whether via the exact same
+            // instantiation (`Node` closing back to `Node`) or a
+            // different, even strictly larger one (`Wrap[T]` closing back
+            // to `Wrap[Box[T]]`) -- is infinite either way. Checked before
+            // any instance-level memoization, so this never depends on
+            // how deep the path happens to be.
+            if let Some(start_idx) = path
+                .iter()
+                .position(|k| k.declaration == target.declaration)
+            {
+                if reported.insert(target.declaration) {
+                    let cycle_slice = &path[start_idx..];
+                    // The same cyclic sequence of declarations can be
+                    // entered at any one of its own members, depending
+                    // purely on which declaration the outer traversal
+                    // happened to visit first (declaration order) --
+                    // rotated here to a canonical starting point (the
+                    // member with the smallest `ItemId`) so the reported
+                    // cycle never depends on that traversal order.
+                    let rotate = cycle_slice
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, k)| k.declaration.0)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let mut rotated: Vec<GenericInstanceKey> = cycle_slice[rotate..].to_vec();
+                    rotated.extend_from_slice(&cycle_slice[..rotate]);
+                    // The edge that closes the (rotated) cycle back to
+                    // its own new starting point is the original closing
+                    // edge only when no rotation happened; otherwise it
+                    // is the edge that originally pushed
+                    // `cycle_slice[rotate]` onto the path -- a real edge
+                    // already traversed, just not the one the DFS itself
+                    // happened to detect the closure on.
+                    let (closing_target, closing_label, closing_span) = if rotate == 0 {
+                        (target.clone(), label.clone(), span)
+                    } else {
+                        let (l, s) = incoming[start_idx + rotate].clone();
+                        (cycle_slice[rotate].clone(), l, s)
+                    };
+                    diagnostics.push(cycle_diagnostic(
+                        &rotated,
+                        &closing_target,
+                        &decls,
+                        &closing_label,
+                        closing_span,
+                        interner,
+                    ));
+                }
+                continue;
+            }
+
             match color.get(&target).copied().unwrap_or(Color::White) {
                 Color::White => {
-                    if path.len() >= MAX_GENERIC_DEPTH {
-                        if reported.insert(start) {
-                            diagnostics
-                                .push(budget_diagnostic(start, &decls, &label, span, interner));
-                        }
-                        continue;
-                    }
                     color.insert(target.clone(), Color::Gray);
                     edges_stack.push(substitute_edges(&target, &decls));
                     idx_stack.push(0);
+                    incoming.push((label, span));
                     path.push(target);
                 }
-                Color::Gray => {
-                    // Found a cycle: `target` is still on the current
-                    // path. Report it once per distinct cycle entry
-                    // point, using the path from `target`'s first
-                    // occurrence back to itself.
-                    if let Some(start_idx) = path.iter().position(|k| *k == target)
-                        && reported.insert(target.declaration)
-                    {
-                        diagnostics.push(cycle_diagnostic(
-                            &path[start_idx..],
-                            &decls,
-                            &label,
-                            span,
-                            interner,
-                        ));
-                    }
-                }
+                // Already fully explored (from this start or an earlier
+                // one) and proven finite -- never re-walked.
                 Color::Black => {}
+                // Only reachable if `target`'s exact instance is Gray
+                // without its declaration already having matched above,
+                // which cannot happen (an instance's declaration is
+                // always itself on the path whenever that instance is
+                // Gray) -- kept only so this match stays exhaustive.
+                Color::Gray => {}
             }
         }
     }
@@ -316,8 +375,15 @@ fn arg_display(ty: &Ty, decls: &HashMap<ItemId, Decl>, interner: &Interner) -> S
     }
 }
 
+/// `cycle` is the path from a declaration's first occurrence through to
+/// (but not including) the edge that re-reaches that same declaration;
+/// `target` is the instance that closing edge actually reaches -- the
+/// same declaration `cycle[0]` names, but not necessarily the exact same
+/// arguments (`Wrap[T]` closing back to `Wrap[Box[T]]`, say), so it is
+/// rendered separately rather than assumed identical to `cycle[0]`.
 fn cycle_diagnostic(
     cycle: &[GenericInstanceKey],
+    target: &GenericInstanceKey,
     decls: &HashMap<ItemId, Decl>,
     closing_label: &str,
     closing_span: Span,
@@ -331,14 +397,18 @@ fn cycle_diagnostic(
         }
         path_text.push_str(&instance_display(key, decls, interner));
     }
-    // The cycle always closes back to its own entry point (`cycle[0]`,
-    // the same instance the closing edge targets) -- never to whichever
-    // instance happened to be current when the closing edge was found,
-    // which for an indirect cycle is a different, *later* step on the
-    // path (e.g. `A -> B -> A` must render as exactly that, not
-    // `A -> B -> B`).
+    // The cycle closes back to the same *declaration* it started from
+    // (`cycle[0].declaration`), which for an indirect cycle is a
+    // different, *later* step's own declaration on the path than
+    // whichever one was current when the closing edge was found (e.g.
+    // `A -> B -> A` must render as exactly that, not `A -> B -> B`) --
+    // and, for a recurrence through a generic declaration instantiated
+    // differently each time, may show different arguments here than
+    // `cycle[0]`'s own (`Wrap[T] -> Wrap[Box[T]]`, not `Wrap[T] ->
+    // Wrap[T]`), since `target` is what the closing edge actually
+    // reaches, not a repeat of the starting instance's own arguments.
     path_text.push_str(" -> ");
-    path_text.push_str(&instance_display(&cycle[0], decls, interner));
+    path_text.push_str(&instance_display(target, decls, interner));
 
     let head_name = interner.resolve(decls[&cycle[0].declaration].name);
     let mut diag = Diagnostic::error(
@@ -362,36 +432,6 @@ fn cycle_diagnostic(
         );
     }
     diag
-}
-
-/// A traversal path deeper than `MAX_GENERIC_DEPTH` without ever
-/// repeating an exact instance -- an expanding substitution
-/// (`Wrap[T] { inner: Wrap[Box[T]] }`) that would keep growing forever
-/// rather than closing a literal cycle. Reported the same way an actual
-/// cycle is (this is exactly as unlayoutable), naming the declaration
-/// whose own traversal hit the bound rather than any one particular
-/// instance along the way, since there is no single instance that
-/// "closes" an expansion that never repeats.
-fn budget_diagnostic(
-    start: ItemId,
-    decls: &HashMap<ItemId, Decl>,
-    closing_label: &str,
-    closing_span: Span,
-    interner: &Interner,
-) -> Diagnostic {
-    let decl = &decls[&start];
-    let head_name = interner.resolve(decl.name);
-    Diagnostic::error(
-        INFINITE_AGGREGATE_LAYOUT,
-        decl.source,
-        closing_span,
-        format!(
-            "`{head_name}` has an infinite layout: substituting concrete type arguments through \
-             `.{closing_label}` never stops growing within {MAX_GENERIC_DEPTH} levels, and \
-             Napitia has no indirection feature yet to break the cycle with"
-        ),
-    )
-    .with_primary_label("this field/payload never stops expanding")
 }
 
 #[cfg(test)]
@@ -522,6 +562,97 @@ mod tests {
             "{}",
             diags[0].message
         );
+    }
+
+    /// 128 distinct records, each pointing to the next, terminating in
+    /// `i64` -- must be accepted no matter how many distinct
+    /// declarations it passes through. `MAX_GENERIC_DEPTH` bounds nested
+    /// type-application syntax/substitution depth; it is not, and must
+    /// never be conflated with, a maximum number of aggregate
+    /// declarations in a containment graph.
+    #[test]
+    fn a_long_finite_chain_of_distinct_records_is_accepted() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let count = 128usize;
+        let names: Vec<Symbol> = (0..count)
+            .map(|i| interner.intern(&format!("Chain{i}")))
+            .collect();
+        let mut records = Vec::new();
+        let mut field_types = HashMap::new();
+        for i in 0..count {
+            let field_ty = if i + 1 < count {
+                Ty::Named(ItemId((i + 1) as u32), names[i + 1])
+            } else {
+                Ty::I64
+            };
+            let (r, ty) = record(i as u32, names[i], names[i], field_ty, source);
+            field_types.insert(r.id, vec![ty]);
+            records.push(r);
+        }
+        let hir = HirModule {
+            functions: Vec::new(),
+            records,
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let diagnostics = check_cycles(&hir, &field_types, &HashMap::new(), &interner);
+        assert!(
+            diagnostics.is_empty(),
+            "a long but finite chain must not be reported as infinite: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_declaration_order_does_not_change_the_reported_cycle() {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let c = interner.intern("C");
+        // Deliberately distinct field names per edge (not all "next") --
+        // this is what actually exercises reconstructing the *correct*
+        // closing edge's own label after canonicalizing which member of
+        // the cycle is displayed first, rather than trivially passing
+        // because every edge happens to share one name.
+        let to_b = interner.intern("to_b");
+        let to_c = interner.intern("to_c");
+        let to_a = interner.intern("to_a");
+        let (record_a, ty_a) = record(0, a, to_b, Ty::Named(ItemId(1), b), source);
+        let (record_b, ty_b) = record(1, b, to_c, Ty::Named(ItemId(2), c), source);
+        let (record_c, ty_c) = record(2, c, to_a, Ty::Named(ItemId(0), a), source);
+        let mut field_types = HashMap::new();
+        field_types.insert(record_a.id, vec![ty_a]);
+        field_types.insert(record_b.id, vec![ty_b]);
+        field_types.insert(record_c.id, vec![ty_c]);
+
+        let forward = HirModule {
+            functions: Vec::new(),
+            records: vec![record_a.clone(), record_b.clone(), record_c.clone()],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let reversed = HirModule {
+            functions: Vec::new(),
+            records: vec![record_c, record_b, record_a],
+            variants: Vec::new(),
+            other_items: Vec::new(),
+        };
+        let forward_diags = check_cycles(&forward, &field_types, &HashMap::new(), &interner);
+        let reversed_diags = check_cycles(&reversed, &field_types, &HashMap::new(), &interner);
+        assert_eq!(
+            forward_diags.len(),
+            1,
+            "unexpected diagnostics: {forward_diags:?}"
+        );
+        assert_eq!(
+            reversed_diags.len(),
+            1,
+            "unexpected diagnostics: {reversed_diags:?}"
+        );
+        assert_eq!(forward_diags[0].message, reversed_diags[0].message);
     }
 
     #[test]
@@ -865,13 +996,15 @@ mod tests {
     }
 
     /// `record Wrap[T] { inner: Wrap[Box[T]] } record Box[T] { payload: T }`
-    /// -- every instance along this path is distinct (`Wrap[T]`,
-    /// `Wrap[Box[T]]`, `Wrap[Box[Box[T]]]`, ...), so a literal-repeat
-    /// check alone would recurse forever; this must instead terminate
-    /// (the test finishing at all is the no-hang assertion) by hitting
-    /// the shared generic-depth budget.
+    /// -- every *instance* along this path is distinct (`Wrap[T]`,
+    /// `Wrap[Box[T]]`, `Wrap[Box[Box[T]]]`, ...), so a literal-instance-
+    /// repeat check alone would recurse forever; detected immediately
+    /// instead, at the very first re-visit, because `Wrap` (the
+    /// *declaration*, regardless of its own arguments) reappears on the
+    /// active path right away -- never a depth budget, and never
+    /// recursing anywhere near one.
     #[test]
-    fn expanding_generic_substitution_hits_the_depth_budget_not_a_hang() {
+    fn expanding_generic_substitution_is_detected_immediately_not_via_a_depth_budget() {
         let mut interner = Interner::new();
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
@@ -921,8 +1054,7 @@ mod tests {
             "unexpected diagnostics: {diagnostics:?}"
         );
         assert!(
-            diagnostics[0].message.contains("Wrap")
-                && diagnostics[0].message.contains("never stops growing"),
+            diagnostics[0].message.contains("Wrap[T] -> Wrap[Box[T]]"),
             "{}",
             diagnostics[0].message
         );

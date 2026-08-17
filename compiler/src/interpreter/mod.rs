@@ -1161,4 +1161,87 @@ mod tests {
             "expected a structured error, not a panic, got {outcome:?}"
         );
     }
+
+    // -- Generic execution (`rfcs/0008`) --------------------------------
+
+    #[test]
+    fn a_generic_identity_function_runs_end_to_end() {
+        assert_eq!(
+            run(
+                "func identity[T](x: T) -> T { return x } func main() -> i64 { return identity[i64](42) }"
+            ),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn a_generic_record_construction_and_field_access_runs_end_to_end() {
+        assert_eq!(
+            run("record Box[T] { payload: T } \
+                 func main() -> i64 { value b = Box[i64] { payload: 42 }; return b.payload }"),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn a_generic_variant_construction_and_exhaustive_match_runs_end_to_end() {
+        assert_eq!(
+            run("variant Maybe[T] { Some(T), None } \
+                 func main() -> i64 { \
+                     return match Maybe[i64].Some(42) { \
+                         Some(n) => n, \
+                         None => 0, \
+                     } \
+                 }"),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn a_bare_generic_unit_case_runs_end_to_end() {
+        assert_eq!(
+            run("variant Maybe[T] { Some(T), None } \
+                 func main() -> i64 { \
+                     return match Maybe[i64].None { \
+                         Some(n) => n, \
+                         None => 7, \
+                     } \
+                 }"),
+            Ok(Value::Int(7))
+        );
+    }
+
+    #[test]
+    fn a_generic_record_nested_inside_another_generic_record_runs_end_to_end() {
+        assert_eq!(
+            run("record Box[T] { payload: T } \
+                 variant Maybe[T] { Some(T), None } \
+                 func main() -> i64 { \
+                     value b = Box[Maybe[i64]] { payload: Maybe[i64].Some(42) }; \
+                     return match b.payload { \
+                         Some(n) => n, \
+                         None => 0, \
+                     } \
+                 }"),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn distinct_generic_instantiations_do_not_confuse_each_others_runtime_values() {
+        // `Box[i64]` and `Box[bool]` share one lowered `Box` layout at
+        // runtime (generics erase at runtime, `rfcs/0008`) -- this must
+        // never let a `bool`'s runtime representation be misread as an
+        // `i64` or vice versa.
+        assert_eq!(
+            run("record Box[T] { payload: T } \
+                 func unwrap_bool(b: Box[bool]) -> bool { return b.payload } \
+                 func main() -> i64 { \
+                     value flag = Box[bool] { payload: true }; \
+                     value number = Box[i64] { payload: 42 }; \
+                     return if unwrap_bool(flag) { number.payload } else { 0 } \
+                 }"),
+            Ok(Value::Int(42))
+        );
+    }
 }

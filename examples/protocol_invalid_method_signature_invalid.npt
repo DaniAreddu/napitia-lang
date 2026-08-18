@@ -1,0 +1,16 @@
+// INVALID: `equal` must return `bool`, matching the protocol; this
+// extension declares it returning `i64` instead. Rejected as T0034
+// (Alpha 0.1.5, rfcs/0009).
+protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> i64 {
+        return 0
+    }
+}
+
+func main() -> bool {
+    return Equal[i64].equal(1, 1)
+}

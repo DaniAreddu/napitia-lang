@@ -159,7 +159,14 @@ pub fn lower_module(
                 .map(|r| resolve_requirement(interner, r))
                 .collect(),
         );
-        function_raises.insert(f.id, f.raises.iter().map(|r| r.variant).collect());
+        function_raises.insert(
+            f.id,
+            canonical_raises(
+                f.raises.iter().map(|r| r.variant).collect(),
+                &variant_layouts,
+                interner,
+            ),
+        );
     }
 
     // Every declared protocol's layout, in declaration order -- built
@@ -245,7 +252,14 @@ pub fn lower_module(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
-            function_raises.insert(m.id, m.raises.iter().map(|r| r.variant).collect());
+            function_raises.insert(
+                m.id,
+                canonical_raises(
+                    m.raises.iter().map(|r| r.variant).collect(),
+                    &variant_layouts,
+                    interner,
+                ),
+            );
             if let Some(index) = proto_method_names.iter().position(|n| *n == m.name) {
                 methods_by_index[index] = Some(m.id);
             }
@@ -526,6 +540,37 @@ fn resolve_requirement(
             .map(|a| resolve_named_type(interner, a))
             .collect(),
     )
+}
+
+/// Canonicalizes a function's own raised-effect set (`rfcs/0010`) by
+/// each variant's own declared name -- never by raw `ItemId`, which is
+/// only ever assigned in whatever order declarations/imports happened
+/// to be discovered in, and can differ across two otherwise-identical
+/// compilations that merely reorder those without changing what the
+/// program means. `Function.raises`'s own stored order is what
+/// `lower_invoke` iterates to build each `Invoke`'s own `err_targets`,
+/// so this is what actually keeps two semantically identical programs'
+/// NIR (block/value numbering, not just the printed signature) byte-
+/// identical under such reordering -- HIR's own `raises` stays in
+/// source declaration order throughout (needed for its own diagnostics'
+/// span-accurate reporting); only this NIR-facing copy is canonicalized.
+/// A tie (two variants sharing a bare name, only reachable through an
+/// aliased cross-module import naming both in one `raises` clause)
+/// falls back to `ItemId` purely as a last-resort, still-deterministic
+/// tiebreaker, never as the primary key.
+fn canonical_raises(
+    mut raises: Vec<ItemId>,
+    variant_layouts: &HashMap<ItemId, VariantLayout>,
+    interner: &Interner,
+) -> Vec<ItemId> {
+    raises.sort_by_key(|item| {
+        let name = variant_layouts
+            .get(item)
+            .map(|layout| interner.resolve(layout.name).to_string())
+            .unwrap_or_default();
+        (name, item.0)
+    });
+    raises
 }
 
 struct Lowering<'a> {
@@ -809,7 +854,11 @@ impl<'a> Lowering<'a> {
             requirements,
             params,
             return_type,
-            raises: f.raises.iter().map(|r| r.variant).collect(),
+            raises: canonical_raises(
+                f.raises.iter().map(|r| r.variant).collect(),
+                &self.variants,
+                self.interner,
+            ),
             blocks,
         })
     }

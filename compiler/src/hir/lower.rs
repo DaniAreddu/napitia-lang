@@ -2782,6 +2782,53 @@ mod tests {
     }
 
     #[test]
+    fn two_aliases_of_the_same_imported_error_in_one_raises_clause_is_a_duplicate() {
+        // `import errors.Failure; import errors.Failure as MyFailure;`
+        // -- two distinct local names, but the same underlying `ItemId`
+        // (`rfcs/0007`): naming both in one `raises` clause is exactly
+        // as duplicate as writing the same name twice.
+        let (hir, diags) = lower_with_imports(
+            "func f() raises Failure, MyFailure { }",
+            |interner, other_source| {
+                let declared_name = interner.intern("Failure");
+                let alias_name = interner.intern("MyFailure");
+                let value_name = interner.intern("Value");
+                vec![
+                    ImportedItem {
+                        local_name: declared_name,
+                        kind: ImportedItemKind::Variant {
+                            item: ItemId(0),
+                            declared_name,
+                            cases: vec![(value_name, 0)],
+                            type_param_count: 0,
+                        },
+                        import_span: Span::dummy(),
+                        local_name_span: Span::dummy(),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                    ImportedItem {
+                        local_name: alias_name,
+                        kind: ImportedItemKind::Variant {
+                            item: ItemId(0),
+                            declared_name,
+                            cases: vec![(value_name, 0)],
+                            type_param_count: 0,
+                        },
+                        import_span: Span::dummy(),
+                        local_name_span: Span::dummy(),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                ]
+            },
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0029");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
     fn a_public_function_raising_a_private_variant_leaks_it() {
         let (_, diags) = lower("variant Secret { X }\npublic func f() raises Secret { }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");

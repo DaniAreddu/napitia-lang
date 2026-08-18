@@ -724,6 +724,17 @@ fn raises_exhaustive_handler_example_runs_end_to_end() {
     assert_raises_example_runs("raises_exhaustive_handler.npt", "36");
 }
 
+/// A generic fallible function's own `Invoke` must substitute its own
+/// success slot's type through the call site's own concrete type
+/// arguments -- a regression test for a bug Fix 6's own new coverage
+/// found: an unsubstituted symbolic `Ty::Param` success slot leaked
+/// V0032/V0066/V0008 from `ir`/`run` even though `check` accepted the
+/// program cleanly.
+#[test]
+fn raises_generic_fallible_function_example_runs_end_to_end() {
+    assert_raises_example_runs("raises_generic_fallible_function.npt", "42");
+}
+
 #[test]
 fn raises_non_exhaustive_handler_example_is_t0053() {
     let output = napitia(&[

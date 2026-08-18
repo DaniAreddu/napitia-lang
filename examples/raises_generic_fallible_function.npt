@@ -1,0 +1,14 @@
+variant Failure {
+    Broken,
+}
+
+func identity[T](input: T) -> T raises Failure {
+    return input;
+}
+
+func main() -> i64 {
+    return handle identity[i64](42) {
+        success v => v,
+        failure Failure.Broken => -1,
+    };
+}

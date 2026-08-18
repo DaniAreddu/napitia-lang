@@ -8,6 +8,10 @@ fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn example(name: &str) -> String {
+    format!("{}/../examples/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
 fn napitia(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_napitia"))
         .args(args)
@@ -547,4 +551,129 @@ fn deeply_nested_generic_type_application_terminates_diagnostically() {
     }
 
     let _ = std::fs::remove_file(&path);
+}
+
+// -- Capability protocols (`rfcs/0009`) -----------------------------------
+
+/// Every valid protocol example must `check`, `ir`, and `run` cleanly,
+/// leaking no internal `Vxxxx` diagnostic, and return exactly the given
+/// value.
+fn assert_protocol_example_runs(name: &str, expected_run_output: &str) {
+    let path = example(name);
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed for {name}: {}",
+        stderr(&checked)
+    );
+
+    let ired = napitia(&["ir", &path]);
+    assert!(
+        ired.status.success(),
+        "ir failed for {name}: {}",
+        stderr(&ired)
+    );
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "{name} leaked an internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(
+        ran.status.success(),
+        "run failed for {name}: {}",
+        stderr(&ran)
+    );
+    assert_eq!(stdout(&ran).trim(), expected_run_output);
+}
+
+#[test]
+fn protocol_equal_example_runs_end_to_end() {
+    assert_protocol_example_runs("protocol_equal.npt", "true");
+}
+
+#[test]
+fn protocol_conditional_extension_example_runs_end_to_end() {
+    assert_protocol_example_runs("protocol_conditional_extension.npt", "true");
+}
+
+#[test]
+fn protocol_generic_forwarding_example_runs_end_to_end() {
+    assert_protocol_example_runs("protocol_generic_forwarding.npt", "true");
+}
+
+#[test]
+fn protocol_missing_capability_example_is_t0039() {
+    let output = napitia(&["check", &example("protocol_missing_capability_invalid.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0039]"));
+}
+
+#[test]
+fn protocol_overlap_example_is_t0037() {
+    let output = napitia(&["check", &example("protocol_overlap_invalid.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0037]"));
+}
+
+#[test]
+fn protocol_invalid_method_signature_example_is_t0034() {
+    let output = napitia(&[
+        "check",
+        &example("protocol_invalid_method_signature_invalid.npt"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0034]"));
+}
+
+#[test]
+fn protocol_entry_main_capability_example_is_t0045() {
+    let output = napitia(&[
+        "check",
+        &example("protocol_entry_main_capability_invalid.npt"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0045]"));
+}
+
+/// Every invalid protocol example above must fail at every stage
+/// (`check`, `ir`, `run`), with a non-zero exit code and no leaked
+/// internal (`Ixxxx`/`Vxxxx`) diagnostic, and deterministic output
+/// across two runs.
+#[test]
+fn invalid_protocol_examples_fail_at_every_stage_with_no_leaked_internal_diagnostic() {
+    for name in [
+        "protocol_missing_capability_invalid.npt",
+        "protocol_overlap_invalid.npt",
+        "protocol_invalid_method_signature_invalid.npt",
+        "protocol_entry_main_capability_invalid.npt",
+    ] {
+        let path = example(name);
+        for cmd in ["check", "ir", "run"] {
+            let first = napitia(&[cmd, &path]);
+            assert_eq!(
+                first.status.code(),
+                Some(1),
+                "`{cmd}` on `{name}` should fail with exit code 1"
+            );
+            let err = stderr(&first);
+            assert!(
+                !err.contains("I0") && !err.contains("V0"),
+                "`{cmd}` on `{name}` leaked an internal diagnostic: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+                "`{cmd}` on `{name}` panicked instead of reporting a diagnostic: {err}"
+            );
+
+            let second = napitia(&[cmd, &path]);
+            assert_eq!(
+                stderr(&first),
+                stderr(&second),
+                "`{cmd}` on `{name}` was not deterministic across two runs"
+            );
+        }
+    }
 }

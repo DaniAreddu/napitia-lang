@@ -439,6 +439,13 @@ impl<'a> Lowering<'a> {
             if let Some(ret) = &f.return_type {
                 self.check_public_api_leak(ret, &local_public);
             }
+            // `rfcs/0010`: a public function's own `raises` clause is
+            // just as much a part of its public API as its parameter/
+            // return types -- a private error type named there is
+            // exposed to every caller exactly the same way.
+            for raised in &f.raises {
+                self.check_raises_public_api_leak(*raised, &local_public);
+            }
         }
         for (_, r) in &record_decls {
             if !r.public {
@@ -535,6 +542,31 @@ impl<'a> Lowering<'a> {
         // resolution itself is (`rfcs/0008`).
         for arg in &ty.args {
             self.check_public_api_leak(arg, local_public);
+        }
+    }
+
+    /// The `raises`-clause counterpart of [`Self::check_public_api_leak`]
+    /// (`rfcs/0010`): a bare identifier, never generic, so there is no
+    /// argument list to recurse into and no primitive-name precedence to
+    /// consider (a raised type is always a variant).
+    fn check_raises_public_api_leak(
+        &mut self,
+        raised: ast::Ident,
+        local_public: &HashMap<Symbol, bool>,
+    ) {
+        if let Some(&is_public) = local_public.get(&raised.symbol)
+            && !is_public
+        {
+            let text = self.interner.resolve(raised.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    crate::project::codes::PRIVATE_TYPE_LEAKED,
+                    self.source,
+                    raised.span,
+                    format!("`{text}` is private, but is exposed here through a public API"),
+                )
+                .with_primary_label("private type used in a public signature"),
+            );
         }
     }
 
@@ -2580,6 +2612,13 @@ mod tests {
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "R0029");
         assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn a_public_function_raising_a_private_variant_leaks_it() {
+        let (_, diags) = lower("variant Secret { X }\npublic func f() raises Secret { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0012");
     }
 
     #[test]

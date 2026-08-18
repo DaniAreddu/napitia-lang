@@ -59,6 +59,14 @@ mod codes {
     pub const UNKNOWN_RAISES_TYPE: &str = "R0028";
     /// The same variant appears twice in one `raises` clause.
     pub const DUPLICATE_RAISES_ENTRY: &str = "R0029";
+    /// A `raises` entry names a variant declaring one or more type
+    /// parameters (`rfcs/0010`'s own explicit non-goal: generic error
+    /// variants are out of scope). The `raises` grammar has no bracketed
+    /// type-argument position at all (`raises Box[T]` cannot even parse
+    /// as an entry), so this only ever fires for the *bare* declaration
+    /// itself being generic (`raises Failure` where `variant
+    /// Failure[T] { .. }`).
+    pub const GENERIC_RAISES_TYPE: &str = "R0030";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -136,6 +144,12 @@ pub enum ImportedItemKind {
         declared_name: Symbol,
         /// `(case name, declaration index)`, in declaration order.
         cases: Vec<(Symbol, usize)>,
+        /// This variant's own declared type-parameter count (`rfcs/0010`)
+        /// -- `resolve_raises` needs this for an imported candidate the
+        /// same way it needs it for a local one, since a `raises` entry
+        /// is a bare identifier with no way to tell genericity from the
+        /// reference site alone.
+        type_param_count: usize,
     },
     Protocol {
         item: ItemId,
@@ -202,6 +216,7 @@ pub fn lower_module_with_imports(
         protocol_methods: HashMap::new(),
         record_fields: HashMap::new(),
         variant_cases: HashMap::new(),
+        variant_type_param_count: HashMap::new(),
         case_lookup: HashMap::new(),
         imported_record_field_public: HashMap::new(),
         type_param_scope: HashMap::new(),
@@ -258,6 +273,13 @@ struct Lowering<'a> {
     /// Per-variant case name -> declaration index, for resolving a
     /// qualified (`Variant.Case`) or scrutinee-typed pattern reference.
     variant_cases: HashMap<ItemId, HashMap<Symbol, usize>>,
+    /// Every declared/imported variant's own type-parameter count
+    /// (`rfcs/0010`) -- `resolve_raises` needs this for every candidate
+    /// regardless of whether it is declared in this module or imported,
+    /// since a `raises` entry can never spell type arguments explicitly
+    /// (there is no way to tell from the bare identifier alone whether
+    /// its declaration is generic without looking this up).
+    variant_type_param_count: HashMap<ItemId, usize>,
     /// Case name -> every `(variant, case index)` it names anywhere in
     /// the module, for resolving an *unqualified* constructor reference
     /// and detecting ambiguity when it names more than one variant.
@@ -333,11 +355,13 @@ impl<'a> Lowering<'a> {
                     item,
                     declared_name,
                     cases,
+                    type_param_count,
                 } => {
                     self.type_names.insert(
                         imported.local_name,
                         (item, TypeNameKind::Variant, declared_name),
                     );
+                    self.variant_type_param_count.insert(item, type_param_count);
                     let mut case_indices = HashMap::new();
                     for (name, index) in cases {
                         case_indices.insert(name, index);
@@ -476,6 +500,13 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|(id, v)| self.lower_variant(id, v))
             .collect();
+        // Populated before any function is lowered (functions are next,
+        // below) -- `resolve_raises` needs every local variant's own
+        // type-parameter count already known.
+        for variant in &variants {
+            self.variant_type_param_count
+                .insert(variant.id, variant.type_params.len());
+        }
         // Protocols are lowered before any function or extend body: a
         // `Protocol[Args].method(...)` call anywhere in either needs
         // `self.protocol_methods`'s name -> index table already built
@@ -773,6 +804,33 @@ impl<'a> Lowering<'a> {
                         format!("`{text}` is not a variant type and cannot be raised"),
                     )
                     .with_primary_label("not a variant type"),
+                );
+                continue;
+            }
+            // Generic error variants are explicitly out of scope
+            // (`rfcs/0010`): the `raises` grammar has no bracketed
+            // type-argument position at all, so there is no way to
+            // spell `raises Failure[i64]` in the first place -- this
+            // catches the *declaration* itself being generic
+            // (`raises Failure` naming a `variant Failure[T] { .. }`),
+            // which the grammar alone cannot rule out.
+            let type_param_count = self
+                .variant_type_param_count
+                .get(&item)
+                .copied()
+                .unwrap_or(0);
+            if type_param_count > 0 {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::GENERIC_RAISES_TYPE,
+                        self.source,
+                        ident.span,
+                        format!(
+                            "`{text}` declares {type_param_count} type parameter(s); generic error variants are not supported in a `raises` clause"
+                        ),
+                    )
+                    .with_primary_label("generic raised type"),
                 );
                 continue;
             }
@@ -2615,6 +2673,73 @@ mod tests {
     }
 
     #[test]
+    fn a_raises_entry_naming_a_local_generic_variant_is_a_diagnostic() {
+        let (_, diags) = lower("variant Failure[T] { Value(T) }\nfunc f() raises Failure { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0030");
+    }
+
+    #[test]
+    fn a_raises_entry_naming_an_imported_generic_variant_is_a_diagnostic() {
+        let (_, diags) =
+            lower_with_imports("func f() raises Failure { }", |interner, other_source| {
+                let failure_name = interner.intern("Failure");
+                let value_name = interner.intern("Value");
+                vec![ImportedItem {
+                    local_name: failure_name,
+                    kind: ImportedItemKind::Variant {
+                        item: ItemId(0),
+                        declared_name: failure_name,
+                        cases: vec![(value_name, 0)],
+                        type_param_count: 1,
+                    },
+                    import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            });
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0030");
+    }
+
+    #[test]
+    fn a_non_generic_variant_in_raises_remains_valid() {
+        let (hir, diags) = lower("variant Failure { Missing }\nfunc f() raises Failure { }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn an_aliased_import_of_a_non_generic_error_in_raises_remains_valid() {
+        // `import errors.Failure as MyFailure;` -- the alias is a purely
+        // local spelling (`rfcs/0007`); resolution and genericity must
+        // both go by the imported item's own identity, never the alias.
+        let (hir, diags) =
+            lower_with_imports("func f() raises MyFailure { }", |interner, other_source| {
+                let declared_name = interner.intern("Failure");
+                let alias_name = interner.intern("MyFailure");
+                let value_name = interner.intern("Value");
+                vec![ImportedItem {
+                    local_name: alias_name,
+                    kind: ImportedItemKind::Variant {
+                        item: ItemId(0),
+                        declared_name,
+                        cases: vec![(value_name, 0)],
+                        type_param_count: 0,
+                    },
+                    import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            });
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+        assert_eq!(hir.functions[0].raises[0].variant, ItemId(0));
+    }
+
+    #[test]
     fn a_public_function_raising_a_private_variant_leaks_it() {
         let (_, diags) = lower("variant Secret { X }\npublic func f() raises Secret { }");
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
@@ -2842,6 +2967,7 @@ mod tests {
             protocol_methods: HashMap::new(),
             record_fields: HashMap::new(),
             variant_cases: HashMap::new(),
+            variant_type_param_count: HashMap::new(),
             case_lookup: HashMap::new(),
             imported_record_field_public: HashMap::new(),
             next_item_id: 0,

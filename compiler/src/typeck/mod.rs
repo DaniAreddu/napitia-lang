@@ -6379,4 +6379,37 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    /// `uses` (capability requirements) and `raises` (typed failure)
+    /// remain fully independent concepts on an ordinary named function:
+    /// declaring both together, and actually using both in the body,
+    /// must still type-check cleanly (`rfcs/0010`'s protocol-interaction
+    /// section).
+    #[test]
+    fn an_ordinary_function_may_combine_a_capability_requirement_and_a_raises_clause() {
+        let diags = check(
+            "variant Failure { Broken }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func compare(left: i64, right: i64) -> bool uses Equal[i64] raises Failure {
+                if Equal[i64].equal(left, right) {
+                    return true
+                }
+                raise Failure.Broken
+            }
+            func main() -> i64 {
+                return handle compare(1, 1) {
+                    success v => 0,
+                    failure Failure.Broken => 1,
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
 }

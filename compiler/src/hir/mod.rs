@@ -266,11 +266,14 @@ pub struct HirFunction {
     /// function's public signature -- never inferred from its body.
     pub requirements: Vec<HirCapabilityRequirement>,
     /// This function's own declared raised-error set (`rfcs/0010`), each
-    /// entry resolved to its canonical declaring variant -- a duplicate
-    /// entry (same resolved `ItemId`) is diagnosed but still kept here
-    /// (deduplication into a canonical `EffectSet` is `typeck`'s job, the
-    /// same division of labor `requirements` above already has for
-    /// capability protocols), in declared order.
+    /// entry resolved to its canonical declaring variant, in declared
+    /// order. A duplicate entry (same resolved `ItemId`, however it was
+    /// spelled) is diagnosed by `hir::lower` itself and dropped here --
+    /// unlike `requirements` above (whose own deduplication into a
+    /// canonical set is deferred to `typeck`), a `raises` clause has no
+    /// further meaning to preserve for a name this function already
+    /// declared, so there is nothing to gain by keeping the second
+    /// occurrence around for a later stage to also reject.
     pub raises: Vec<HirRaisesEntry>,
     pub body: HirBlock,
     pub span: Span,

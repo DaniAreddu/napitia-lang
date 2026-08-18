@@ -71,6 +71,15 @@ mod codes {
     pub const CYCLIC_CAPABILITY_REQUIREMENT: &str = "T0041";
     pub const CAPABILITY_DEPTH_EXCEEDED: &str = "T0042";
     pub const CAPABILITY_WORK_BUDGET_EXCEEDED: &str = "T0043";
+    /// A protocol-call expression names a protocol id, or a method
+    /// index within it, that this module never registered
+    /// (`rfcs/0009`). Never reachable through `hir::lower`'s own
+    /// resolution of ordinary source (which already rejects an unknown
+    /// protocol/method with its own `R0022`/`R0024`) -- this is defense
+    /// in depth against hand-built HIR that bypasses that stage
+    /// entirely, so such a program still gets a diagnostic instead of a
+    /// silently invented `Ty::Error` with nothing said about why.
+    pub const UNKNOWN_PROTOCOL_OR_METHOD: &str = "T0044";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -1501,6 +1510,16 @@ impl<'a> Checker<'a> {
     /// exactly which extension answers this specific
     /// `Protocol[Args]` requirement, recording the result for
     /// `nir::lower` to attach to the corresponding NIR instruction.
+    ///
+    /// All-or-nothing, the same way an ordinary call already is: any
+    /// arity/type mismatch (protocol type arguments, method argument
+    /// count, or an individual argument's type) makes the whole call
+    /// `Ty::Error` and skips capability resolution entirely -- evidence
+    /// is only ever resolved, and only ever recorded into
+    /// `protocol_call_evidence`, for a call whose own signature already
+    /// checked out. A call that never gets that far leaves no evidence
+    /// behind for `nir::lower` to find, the same "no partial success"
+    /// contract every other checked construct in this module follows.
     #[allow(clippy::too_many_arguments)]
     fn check_protocol_call(
         &mut self,
@@ -1521,8 +1540,29 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|a| self.resolve_named_type(a))
             .collect();
+        // An invalid protocol type argument (an unknown type name,
+        // already diagnosed by `resolve_named_type` itself) must not
+        // also cascade into a "missing capability"/"ambiguous capability"
+        // diagnostic about the `Ty::Error` it produced -- the same
+        // "one bad expression, one diagnostic" discipline every other
+        // construct in this checker already follows.
+        if resolved_arguments.iter().any(|t| matches!(t, Ty::Error)) {
+            return never_or_error(any_arg_never);
+        }
         let Some(type_param_count) = self.protocols.get(&protocol).map(|p| p.type_params.len())
         else {
+            // Never reachable through `hir::lower`'s own resolution of
+            // ordinary source (already rejected as R0022); only a
+            // hand-built HIR bypassing it reaches here.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_OR_METHOD,
+                    self.source,
+                    ref_span,
+                    "this protocol-call expression names a protocol this module never registered",
+                )
+                .with_primary_label("unknown protocol"),
+            );
             return never_or_error(any_arg_never);
         };
         if resolved_arguments.len() != type_param_count {
@@ -1562,10 +1602,24 @@ impl<'a> Checker<'a> {
                 )
             })
         else {
+            // Never reachable through `hir::lower`'s own resolution of
+            // ordinary source (already rejected as R0024); only a
+            // hand-built HIR with an out-of-range method index reaches
+            // here.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_OR_METHOD,
+                    self.source,
+                    ref_span,
+                    "this protocol-call expression names a method index its protocol does not declare",
+                )
+                .with_primary_label("unknown protocol method"),
+            );
             return never_or_error(any_arg_never);
         };
 
         let text = format!("`{}`", self.interner.resolve(name));
+        let mut ok = true;
         if expected_params.len() != args.len() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -1580,15 +1634,21 @@ impl<'a> Checker<'a> {
                 )
                 .with_primary_label("wrong number of arguments"),
             );
+            ok = false;
         } else {
             for (arg_ty, param_ty) in arg_tys.iter().zip(expected_params.iter()) {
-                self.unify_report(
+                if !self.unify_report(
                     param_ty,
                     arg_ty,
                     span,
                     "argument type does not match the protocol method's declared parameter type",
-                );
+                ) {
+                    ok = false;
+                }
             }
+        }
+        if !ok {
+            return never_or_error(any_arg_never);
         }
 
         let requirement = CapabilityRequirement::new(protocol, resolved_arguments);
@@ -2949,6 +3009,33 @@ mod tests {
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
         check_module(&hir, id, &interner, EntryMain::ByName)
+    }
+
+    /// Like `check_full`, but also returns the lowered `HirModule` --
+    /// needed by tests that must pick out one specific expression's own
+    /// `ExprId` (to inspect `expr_types`/`protocol_call_evidence`) rather
+    /// than only the module-wide diagnostics/evidence counts.
+    fn check_full_with_hir(text: &str) -> (crate::hir::HirModule, TypeckResult) {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        (hir, result)
     }
 
     #[test]
@@ -4756,5 +4843,267 @@ mod tests {
             "expected a budget-exceeded diagnostic, got {:?}",
             checker.diagnostics
         );
+    }
+
+    // -- Capability protocols: coherence, protocol calls (`rfcs/0009`) --
+
+    fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics.iter().map(|d| d.code).collect()
+    }
+
+    use crate::hir::HirExpr;
+
+    /// Walks into a `return`/block tail looking for the first `Call`
+    /// expression -- every test in this module builds a `main` whose
+    /// entire body is `return Protocol[Args].method(..)`, so this always
+    /// finds that one call.
+    fn find_call(expr: &HirExpr) -> Option<&HirExpr> {
+        match expr {
+            HirExpr::Call { .. } => Some(expr),
+            HirExpr::Return { value: Some(v), .. } => find_call(v),
+            HirExpr::Block(b) => b.tail.as_deref().and_then(find_call),
+            _ => None,
+        }
+    }
+
+    /// The Fix 4 regression, exercised through the real pipeline:
+    /// extend[T] P[T, T] and extend[U] P[U, i64] both cover the concrete
+    /// instantiation P[i64, i64].
+    #[test]
+    fn generic_generic_overlap_at_a_shared_concrete_instantiation_is_rejected() {
+        let diags = check(
+            "protocol P[A, B] {
+                func test(left: A, right: B) -> bool;
+            }
+            extend[T] P[T, T] {
+                func test(left: T, right: T) -> bool {
+                    return true
+                }
+            }
+            extend[U] P[U, i64] {
+                func test(left: U, right: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0037"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_overlapping_concrete_heads_are_accepted() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[bool] {
+                func test(left: bool) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn exact_duplicate_extensions_are_rejected_as_duplicate_not_overlap() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0036"),
+            "unexpected diagnostics: {diags:?}"
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0037"),
+            "an exact duplicate should not also be reported as a general overlap: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_declaration_order_still_detects_the_overlap() {
+        let diags = check(
+            "protocol P[A, B] {
+                func test(left: A, right: B) -> bool;
+            }
+            extend[U] P[U, i64] {
+                func test(left: U, right: i64) -> bool {
+                    return true
+                }
+            }
+            extend[T] P[T, T] {
+                func test(left: T, right: T) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0037"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    /// Fix 7: the overlap diagnostic's own primary span/source must
+    /// belong to the second declared extension, never whichever extend
+    /// happened to be registered last overall.
+    #[test]
+    fn overlap_diagnostic_is_reported_at_the_second_extensions_own_span() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let diag = diags
+            .iter()
+            .find(|d| d.code == "T0036")
+            .expect("expected a duplicate-extension diagnostic");
+        // The second extend block starts well after position 0; its own
+        // primary span must reflect that, not a stale span left over
+        // from whatever was registered last.
+        assert!(
+            diag.primary_span.start > 0,
+            "expected the second extension's own span, got {:?}",
+            diag.primary_span
+        );
+    }
+
+    // -- Fix 6: a failed protocol call is fully poisoned --
+
+    #[test]
+    fn protocol_call_arity_mismatch_poisons_the_expression_and_records_no_evidence() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1, 1)
+            }",
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expects")),
+            "expected an arity diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.protocol_call_evidence.is_empty(),
+            "a call that failed arity checking must not record evidence"
+        );
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(
+            result.expr_types.get(&call.id()),
+            Some(&Ty::Error),
+            "an arity-mismatched protocol call must resolve to Ty::Error"
+        );
+    }
+
+    #[test]
+    fn protocol_call_argument_type_mismatch_poisons_the_expression() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, true)
+            }",
+        );
+        assert!(
+            codes_of(&result.diagnostics).contains(&"T0001"),
+            "expected a type-mismatch diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.protocol_call_evidence.is_empty(),
+            "a call with a mismatched argument must not record evidence"
+        );
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(result.expr_types.get(&call.id()), Some(&Ty::Error));
+    }
+
+    #[test]
+    fn a_valid_protocol_call_records_exactly_one_evidence_entry() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.protocol_call_evidence.len(), 1);
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(result.expr_types.get(&call.id()), Some(&Ty::Bool));
     }
 }

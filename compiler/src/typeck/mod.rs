@@ -416,12 +416,24 @@ struct Checker<'a> {
     /// capability solver below never compounds one error into another.
     extends: Vec<ExtendInfo>,
     /// Memoizes the capability solver's own concrete-requirement
-    /// resolution (`capability::resolve_concrete_requirement`) by
-    /// canonical [`CapabilityRequirement`] identity -- a requirement
-    /// already resolved once (successfully or not) is never re-solved,
-    /// the same reason `generic_instances` exists for ordinary generic
-    /// instantiation.
-    capability_cache: HashMap<CapabilityRequirement, Result<Evidence, ()>>,
+    /// resolution (`capability::resolve_concrete`) by canonical
+    /// [`CapabilityRequirement`] identity -- but *only* a successful
+    /// resolution, deliberately never a failure. Every failure the
+    /// solver can produce (missing/ambiguous capability, a cyclic
+    /// requirement, a depth- or work-budget overrun) is either
+    /// path-dependent (a requirement that overruns the budget through
+    /// one deep/wide recursive chain may still resolve cleanly when
+    /// reached directly, at depth zero, from a different call site) or
+    /// must still produce its own diagnostic at every call site that
+    /// hits it (a second, otherwise-unrelated call needing an already-
+    /// known-missing capability must not fail silently just because an
+    /// earlier call already reported it) -- caching either kind of
+    /// failure globally would either poison an independent later solve
+    /// or swallow a diagnostic a caller is entitled to. A successful
+    /// concrete resolution has neither problem: it depends only on
+    /// `requirement` and the fixed, already-registered `self.extends`,
+    /// never on the path or budget remaining at the point it was found.
+    capability_cache: HashMap<CapabilityRequirement, Evidence>,
 }
 
 #[derive(Clone)]
@@ -5105,5 +5117,147 @@ mod tests {
         let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
             .expect("expected a call expression");
         assert_eq!(result.expr_types.get(&call.id()), Some(&Ty::Bool));
+    }
+
+    // -- Fix 9: the capability cache never poisons an independent solve --
+
+    #[test]
+    fn two_call_sites_needing_the_same_missing_capability_each_get_their_own_diagnostic() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let missing: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "T0039").collect();
+        assert_eq!(
+            missing.len(),
+            2,
+            "each call site needing the missing capability must get its own diagnostic, not just the first: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_for_a_missing_capability_do_not_depend_on_call_order() {
+        let forward = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let reversed = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let forward_messages: Vec<&str> = forward.iter().map(|d| d.message.as_str()).collect();
+        let reversed_messages: Vec<&str> = reversed.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(forward.len(), reversed.len());
+        assert_eq!(
+            forward_messages
+                .iter()
+                .collect::<std::collections::HashSet<_>>(),
+            reversed_messages
+                .iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "the same set of diagnostic messages must be produced regardless of declaration order"
+        );
+    }
+
+    #[test]
+    fn successful_evidence_is_reused_across_call_sites() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A requirement chain deep enough to exceed `MAX_CAPABILITY_DEPTH`
+    /// must fail with its own budget diagnostic at the call site that
+    /// actually recurses that deep -- and must never poison a
+    /// completely independent, shallow resolution of the exact same
+    /// base requirement (`Equal0[i64]`, reached directly by `shallow()`
+    /// at depth zero) that the deep chain's own recursion also happens
+    /// to bottom out at. The chain is exactly `MAX_CAPABILITY_DEPTH + 1`
+    /// levels deep so its own recursion's depth-exceeded check fires
+    /// precisely at `Equal0[i64]` -- the same requirement `shallow()`
+    /// resolves directly -- rather than at some other node partway down
+    /// a longer chain, which would prove nothing about this specific
+    /// node ever being poisoned. Generated programmatically rather than
+    /// hand-written, the same way other pathologically deep fixtures in
+    /// this codebase are.
+    #[test]
+    fn a_depth_budget_failure_does_not_poison_an_independent_shallow_resolution() {
+        let depth = crate::limits::MAX_CAPABILITY_DEPTH + 1;
+        let mut source = String::new();
+        source.push_str("protocol Equal0[T] {\n    func equal(left: T, right: T) -> bool;\n}\n");
+        source.push_str(
+            "extend Equal0[i64] {\n    func equal(left: i64, right: i64) -> bool {\n        return left == right\n    }\n}\n",
+        );
+        for i in 1..=depth {
+            let prev = i - 1;
+            source.push_str(&format!(
+                "protocol Equal{i}[T] {{\n    func equal(left: T, right: T) -> bool;\n}}\n"
+            ));
+            source.push_str(&format!(
+                "extend[T] Equal{i}[T] uses Equal{prev}[T] {{\n    func equal(left: T, right: T) -> bool {{\n        return Equal{prev}[T].equal(left, right)\n    }}\n}}\n"
+            ));
+        }
+        source.push_str(&format!(
+            "func chain() -> bool {{\n    return Equal{depth}[i64].equal(1, 1)\n}}\n"
+        ));
+        source.push_str("func shallow() -> bool {\n    return Equal0[i64].equal(2, 2)\n}\n");
+        source.push_str("func main() -> i64 {\n    return 0\n}\n");
+
+        let diags = check(&source);
+        assert!(
+            diags.iter().any(|d| d.code == "T0042"),
+            "expected a depth-budget-exceeded diagnostic: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == "T0039"),
+            "the independent shallow resolution must not be poisoned into a missing-capability diagnostic: {diags:?}"
+        );
     }
 }

@@ -538,10 +538,17 @@ impl<'a> Checker<'a> {
 
     /// Resolves a fully-concrete requirement against `self.extends`,
     /// recursively resolving whatever further requirements the selected
-    /// extend itself declares. Memoized by [`CapabilityRequirement`]
-    /// identity (`self.capability_cache`): once a concrete requirement is
-    /// resolved (successfully or not) anywhere in one compilation, it is
-    /// never re-solved. `path` is the active recursion's own concrete
+    /// extend itself declares. Only a *successful* resolution is
+    /// memoized (`self.capability_cache`), by [`CapabilityRequirement`]
+    /// identity -- every failure this can produce is either
+    /// path-dependent (cyclic, depth-exceeded, work-budget-exceeded: the
+    /// exact same requirement can still resolve cleanly from a different
+    /// call site, at a shallower depth or a fresh step budget) or must
+    /// still produce its own diagnostic at every call site that hits it
+    /// (missing/ambiguous capability: a second, unrelated call needing
+    /// an already-known-missing capability must not fail silently just
+    /// because an earlier call already reported it), so none of them are
+    /// ever cached. `path` is the active recursion's own concrete
     /// requirement stack, for a deterministic cyclic-requirement
     /// diagnostic; `depth`/`steps` enforce
     /// [`MAX_CAPABILITY_DEPTH`]/[`MAX_CAPABILITY_RESOLUTION_STEPS`] --
@@ -556,7 +563,7 @@ impl<'a> Checker<'a> {
         path: &mut Vec<CapabilityRequirement>,
     ) -> Option<Evidence> {
         if let Some(cached) = self.capability_cache.get(requirement) {
-            return cached.clone().ok();
+            return Some(cached.clone());
         }
         if path.contains(requirement) {
             let mut cycle: Vec<String> = path
@@ -591,7 +598,6 @@ impl<'a> Checker<'a> {
                 )
                 .with_primary_label("capability resolution depth exceeded"),
             );
-            self.capability_cache.insert(requirement.clone(), Err(()));
             return None;
         }
         *steps += 1;
@@ -607,14 +613,15 @@ impl<'a> Checker<'a> {
                 )
                 .with_primary_label("capability resolution work budget exceeded"),
             );
-            self.capability_cache.insert(requirement.clone(), Err(()));
             return None;
         }
         path.push(requirement.clone());
         let outcome = self.select_extension(requirement, span, depth, steps, path);
         path.pop();
-        self.capability_cache
-            .insert(requirement.clone(), outcome.clone().ok_or(()));
+        if let Some(evidence) = &outcome {
+            self.capability_cache
+                .insert(requirement.clone(), evidence.clone());
+        }
         outcome
     }
 

@@ -124,10 +124,45 @@ mod codes {
     /// depth for those, since this check runs first and rejects the
     /// type outright before they would ever need to).
     pub const GENERIC_DEPTH_EXCEEDED: &str = "V0035";
+    /// An `extend`'s own `protocol` field does not match any declared
+    /// protocol in this module (`rfcs/0009`).
+    pub const UNKNOWN_EXTEND_PROTOCOL: &str = "V0036";
+    /// An `extend`'s `protocol_arguments` count does not match its own
+    /// protocol's declared type-parameter count.
+    pub const EXTEND_PROTOCOL_ARITY_MISMATCH: &str = "V0037";
+    /// One of an `extend`'s own `uses` requirements names a protocol
+    /// this module never declared.
+    pub const UNKNOWN_REQUIREMENT_PROTOCOL: &str = "V0038";
+    /// One of an `extend`'s own `uses` requirements supplies a number of
+    /// arguments that does not match its own named protocol's declared
+    /// type-parameter count.
+    pub const REQUIREMENT_ARITY_MISMATCH: &str = "V0039";
+    /// An `extend`'s method table has a different length than its own
+    /// protocol's declared method list -- every protocol method must
+    /// have exactly one implementing function, never more or fewer.
+    pub const EXTEND_METHOD_COUNT_MISMATCH: &str = "V0040";
+    /// An `extend`'s method table references a function id this module
+    /// never declared.
+    pub const EXTEND_METHOD_UNKNOWN_FUNCTION: &str = "V0041";
+    /// An `extend`'s method table references a function whose own
+    /// `type_params` are not exactly its owning extend's own
+    /// `type_params`, in the same order -- every extend method's body is
+    /// lowered sharing its extend's own type-parameter scope (never a
+    /// separate generic scope of its own), so any mismatch here means
+    /// this function was never actually built as this extend's method.
+    pub const EXTEND_METHOD_TYPE_PARAM_MISMATCH: &str = "V0042";
+    /// An `extend`'s method function's own declared parameter/return
+    /// types do not match its protocol method's declared signature once
+    /// substituted with this extend's own `protocol_arguments`.
+    pub const EXTEND_METHOD_SIGNATURE_MISMATCH: &str = "V0043";
+    /// The same underlying function id answers two different method
+    /// slots in the same extend's own method table -- every protocol
+    /// method an extend implements must be a distinct function.
+    pub const DUPLICATE_EXTEND_METHOD_REFERENCE: &str = "V0044";
     /// A protocol or extend reuses an id already used by another
     /// protocol/extend in this module (`rfcs/0009`). Independent
     /// evidence/signature verification for `Call`/`protocol.call`
-    /// (V0036 and up) lands in a follow-up commit.
+    /// (V0047 and up) lands in a follow-up commit.
     pub const DUPLICATE_PROTOCOL_ID: &str = "V0045";
     pub const DUPLICATE_EXTEND_ID: &str = "V0046";
 }
@@ -144,10 +179,10 @@ struct KnownFunction {
     return_type: Ty,
     /// This function's own capability requirements (`rfcs/0009`), in
     /// declared order -- a `Call` targeting it must carry exactly this
-    /// many evidence entries. Not yet read: independent evidence
-    /// verification (arity/forwarded-index/extend-identity/depth-budget
-    /// checks, V0036 and up) is a tracked follow-up, not implemented in
-    /// this commit -- see this module's own `ValueKind::Call` arm.
+    /// many evidence entries. Not yet read: independent `Call`/
+    /// `protocol.call` evidence verification (arity/forwarded-index/
+    /// extend-identity/depth-budget checks) is a tracked follow-up, not
+    /// implemented in this commit.
     #[allow(dead_code)]
     requirements: Vec<CapabilityRequirement>,
 }
@@ -159,10 +194,10 @@ struct KnownFunction {
 struct AggregateContext<'a> {
     records: HashMap<ItemId, &'a RecordLayout>,
     variants: HashMap<ItemId, &'a VariantLayout>,
-    /// Not yet read outside registration -- reserved for the same
-    /// follow-up evidence verification as `KnownFunction::requirements`.
-    #[allow(dead_code)]
     protocols: HashMap<ItemId, &'a ProtocolLayout>,
+    /// Not yet read outside registration -- reserved for the follow-up
+    /// `Call`/`protocol.call` evidence verification that resolves an
+    /// `Evidence::Extension` against its own declared extend.
     #[allow(dead_code)]
     extends: HashMap<ItemId, &'a ExtendLayout>,
 }
@@ -393,6 +428,188 @@ pub fn verify_module(
                 &method_context,
                 &mut diagnostics,
             );
+        }
+    }
+
+    // Every `extend`'s own declared shape must independently hold
+    // (`rfcs/0009`): its `protocol` must actually exist, its own
+    // `protocol_arguments`/`requirements` must be well-formed types
+    // referencing that protocol (and any other) with the right arity,
+    // its method table must have exactly one entry per protocol method,
+    // and each entry must reference a real, distinct function actually
+    // built as this extend's own method (sharing its exact type-param
+    // scope) with a signature matching the protocol method it
+    // implements once substituted through this extend's own head.
+    for (id, extend) in &module.extends {
+        let context = format!("extend #{}", id.0);
+        check_no_duplicate_type_params(&extend.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            extend.type_params.iter().map(|(id, _)| *id).collect();
+
+        let arg_context = format!("{context}'s protocol argument");
+        for ty in &extend.protocol_arguments {
+            check_type_root(
+                ty,
+                &agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &arg_context,
+                &mut diagnostics,
+            );
+        }
+        for requirement in &extend.requirements {
+            let requirement_context = format!("{context}'s `uses` requirement");
+            for ty in &requirement.arguments {
+                check_type_root(
+                    ty,
+                    &agg,
+                    &own_params,
+                    source,
+                    interner,
+                    registry,
+                    &requirement_context,
+                    &mut diagnostics,
+                );
+            }
+            match agg.protocols.get(&requirement.protocol) {
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_REQUIREMENT_PROTOCOL,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{requirement_context} names a protocol id {} that does not exist in this module",
+                        requirement.protocol.0
+                    ),
+                )),
+                Some(required_protocol)
+                    if required_protocol.type_params.len() != requirement.arguments.len() =>
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::REQUIREMENT_ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "{requirement_context} supplies {} argument(s) to `{}`, which declares {}",
+                            requirement.arguments.len(),
+                            registry.qualified_name(requirement.protocol, interner),
+                            required_protocol.type_params.len()
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let Some(protocol) = agg.protocols.get(&extend.protocol) else {
+            diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_EXTEND_PROTOCOL,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} names a protocol id {} that does not exist in this module",
+                    extend.protocol.0
+                ),
+            ));
+            continue;
+        };
+        if protocol.type_params.len() != extend.protocol_arguments.len() {
+            diagnostics.push(Diagnostic::error(
+                codes::EXTEND_PROTOCOL_ARITY_MISMATCH,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} supplies {} argument(s) to `{}`, which declares {}",
+                    extend.protocol_arguments.len(),
+                    registry.qualified_name(extend.protocol, interner),
+                    protocol.type_params.len()
+                ),
+            ));
+        }
+        if protocol.methods.len() != extend.methods.len() {
+            diagnostics.push(Diagnostic::error(
+                codes::EXTEND_METHOD_COUNT_MISMATCH,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} implements {} method(s), but `{}` declares {}",
+                    extend.methods.len(),
+                    registry.qualified_name(extend.protocol, interner),
+                    protocol.methods.len()
+                ),
+            ));
+        }
+        let subst: HashMap<TypeParamId, Ty> = protocol
+            .type_params
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(extend.protocol_arguments.iter().cloned())
+            .collect();
+        let extend_type_param_ids: Vec<TypeParamId> =
+            extend.type_params.iter().map(|(id, _)| *id).collect();
+        let mut seen_method_functions: HashSet<ItemId> = HashSet::new();
+        for (index, method_id) in extend.methods.iter().enumerate() {
+            if !seen_method_functions.insert(*method_id) {
+                diagnostics.push(Diagnostic::error(
+                    codes::DUPLICATE_EXTEND_METHOD_REFERENCE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} uses the same function ({}) for two different method slots",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            let Some(implementing) = known_functions.get(method_id) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_UNKNOWN_FUNCTION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] references function id {}, which does not exist in this module",
+                        method_id.0
+                    ),
+                ));
+                continue;
+            };
+            if implementing.type_params != extend_type_param_ids {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_TYPE_PARAM_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not share its own extend's type-parameter scope",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            let Some(protocol_method) = protocol.methods.get(index) else {
+                // Already reported above as EXTEND_METHOD_COUNT_MISMATCH;
+                // there is no protocol method at this index to check the
+                // signature against.
+                continue;
+            };
+            let expected_params: Vec<Ty> = protocol_method
+                .params
+                .iter()
+                .map(|t| substitute(t, &subst))
+                .collect();
+            let expected_return = substitute(&protocol_method.return_type, &subst);
+            if implementing.params != expected_params || implementing.return_type != expected_return
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_SIGNATURE_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not match `{}`'s method `{}` signature once substituted",
+                        registry.qualified_name(*method_id, interner),
+                        registry.qualified_name(extend.protocol, interner),
+                        interner.resolve(protocol_method.name)
+                    ),
+                ));
+            }
         }
     }
 
@@ -4455,5 +4672,238 @@ mod tests {
         let diagnostics =
             verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
         assert!(codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED));
+    }
+
+    // -- Fix 3: extend layout validation (`rfcs/0009`) -------------------
+
+    /// `func equal_i64(left: i64, right: i64) -> bool { return left ==
+    /// right }`, the implementing function for `extend Equal[i64]`
+    /// below.
+    fn equal_i64_method(interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(1),
+            name: interner.intern("equal_i64"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                crate::nir::Param {
+                    value: ValueId(0),
+                    ty: Ty::I64,
+                },
+                crate::nir::Param {
+                    value: ValueId(1),
+                    ty: Ty::I64,
+                },
+            ],
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Eq(ValueId(0), ValueId(1)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        }
+    }
+
+    /// `extend Equal[i64] { func equal(left: i64, right: i64) -> bool
+    /// {..} }` -- a concrete extend of [`valid_equal_protocol`], for
+    /// tests that mutate exactly one thing about an otherwise-valid
+    /// extend declaration.
+    fn valid_equal_i64_extend() -> (ItemId, ExtendLayout) {
+        (
+            ItemId(10),
+            ExtendLayout {
+                protocol: ItemId(0),
+                type_params: Vec::new(),
+                protocol_arguments: vec![Ty::I64],
+                requirements: Vec::new(),
+                methods: vec![ItemId(1)],
+            },
+        )
+    }
+
+    #[test]
+    fn a_valid_extend_layout_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_extend_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.protocol = ItemId(999);
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            Vec::new(),
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_EXTEND_PROTOCOL));
+    }
+
+    #[test]
+    fn an_extend_supplying_the_wrong_number_of_protocol_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.protocol_arguments = vec![Ty::I64, Ty::I64];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_PROTOCOL_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_requirement_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_REQUIREMENT_PROTOCOL));
+    }
+
+    #[test]
+    fn an_extend_requirement_with_the_wrong_arity_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, Vec::new())];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::REQUIREMENT_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_with_the_wrong_method_table_length_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = Vec::new();
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_referencing_an_unknown_function_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = vec![ItemId(999)];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_UNKNOWN_FUNCTION));
+    }
+
+    #[test]
+    fn an_extend_method_function_not_sharing_its_extends_type_parameter_scope_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.type_params = vec![(TypeParamId(77), interner.intern("U"))];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_TYPE_PARAM_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_a_signature_not_matching_its_protocol_method_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        // Declares `(i64, i64) -> i64` where the protocol (substituted
+        // for `Equal[i64]`) requires `(i64, i64) -> bool`.
+        method.return_type = Ty::I64;
+        method.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::I64,
+            kind: ValueKind::Add(ValueId(0), ValueId(1)),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_SIGNATURE_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_using_the_same_function_for_two_method_slots_is_rejected() {
+        let mut interner = Interner::new();
+        let t = TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let protocol_id = ItemId(0);
+        let protocol = ProtocolLayout {
+            name: interner.intern("Equal"),
+            type_params: vec![(t, t_symbol)],
+            methods: vec![
+                ProtocolMethodLayout {
+                    name: interner.intern("equal"),
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                },
+                ProtocolMethodLayout {
+                    name: interner.intern("not_equal"),
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                },
+            ],
+        };
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = vec![ItemId(1), ItemId(1)];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_EXTEND_METHOD_REFERENCE));
     }
 }

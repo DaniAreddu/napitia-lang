@@ -2853,7 +2853,15 @@ impl<'a> Checker<'a> {
         if !any_invalid && !wildcard_seen && !required.is_subset(&covered) {
             let mut missing: Vec<(ItemId, usize)> =
                 required.difference(&covered).copied().collect();
-            missing.sort_unstable_by_key(|(item, case)| (item.0, *case));
+            // Sorted by each candidate's own stable qualified name, never
+            // by raw `ItemId` (which is only ever assigned in whatever
+            // order declarations/imports happened to be discovered in,
+            // and can differ across two runs that reorder either without
+            // changing what the program actually means) -- the witness
+            // this reports must be identical regardless of that order.
+            missing.sort_unstable_by_key(|(item, case)| {
+                (self.registry.qualified_name(*item, self.interner), *case)
+            });
             if let Some((variant, case)) = missing.first() {
                 let type_text = self.registry.qualified_name(*variant, self.interner);
                 let case_text = self
@@ -6266,6 +6274,47 @@ mod tests {
             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The non-exhaustive-handler witness (which specific `Type.Case` is
+    /// reported missing) must be identical regardless of the unrelated
+    /// order the raised variants happen to be *declared* in -- sorted by
+    /// each candidate's own stable qualified name, never by raw
+    /// `ItemId` (`rfcs/0010`), which is only ever assigned in
+    /// declaration-discovery order.
+    #[test]
+    fn non_exhaustive_handler_witness_is_identical_regardless_of_declaration_order() {
+        let forward = check(
+            "variant FileError { Missing }
+            variant NetworkError { Timeout }
+            func fetch() -> i64 raises FileError, NetworkError {
+                raise FileError.Missing
+            }
+            func main() -> i64 {
+                return handle fetch() {
+                    success v => v,
+                }
+            }",
+        );
+        let reversed = check(
+            "variant NetworkError { Timeout }
+            variant FileError { Missing }
+            func fetch() -> i64 raises FileError, NetworkError {
+                raise FileError.Missing
+            }
+            func main() -> i64 {
+                return handle fetch() {
+                    success v => v,
+                }
+            }",
+        );
+        assert_eq!(forward.len(), 1, "unexpected diagnostics: {forward:?}");
+        assert_eq!(reversed.len(), 1, "unexpected diagnostics: {reversed:?}");
+        assert_eq!(
+            forward[0].message, reversed[0].message,
+            "the reported missing case must not depend on unrelated declaration order"
+        );
+        assert!(forward[0].message.contains("FileError.Missing"));
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use super::{Parser, recovery};
 use crate::lexer::TokenKind;
 use crate::syntax::ast::{
-    AssignOp, BinaryOp, ElseBranch, Expr, FieldInit, IfExpr, MatchArm, MatchArmBody, MatchExpr,
-    Pattern, UnaryOp,
+    AssignOp, BinaryOp, ElseBranch, Expr, FailurePattern, FieldInit, HandleArm, HandleExpr, IfExpr,
+    MatchArm, MatchArmBody, MatchExpr, Pattern, UnaryOp,
 };
 
 impl<'a> Parser<'a> {
@@ -309,11 +309,143 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Expr::Continue { span }
             }
+            TokenKind::Raise => self.parse_raise_expr(),
+            TokenKind::Handle => Expr::Handle(Box::new(self.parse_handle_expr())),
             _ => {
                 self.error_expected("an expression");
                 Expr::Error { span }
             }
         }
+    }
+
+    /// `raise <expr>` (`rfcs/0010`) -- unlike `return`/`break`, the
+    /// operand is mandatory: a bare `raise` names no value to raise.
+    fn parse_raise_expr(&mut self) -> Expr {
+        let start = self.current_span();
+        self.advance(); // 'raise'
+        let operand = self.parse_expression();
+        let span = start.join(operand.span());
+        Expr::Raise {
+            operand: Box::new(operand),
+            span,
+        }
+    }
+
+    fn parse_handle_expr(&mut self) -> HandleExpr {
+        let start = self.current_span();
+        self.advance(); // 'handle'
+        let operand = Box::new(self.parse_expression_no_struct_literal());
+        self.expect(&TokenKind::LBrace, "`{`");
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+            let before = self.pos;
+            if let Some(arm) = self.parse_handle_arm() {
+                arms.push(arm);
+            }
+            self.eat(&TokenKind::Comma);
+            if self.pos == before {
+                self.advance();
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RBrace, "`}`")
+            .map(|t| t.span)
+            .unwrap_or(self.current_span());
+        HandleExpr {
+            operand,
+            arms,
+            span: start.join(end),
+        }
+    }
+
+    fn parse_handle_arm(&mut self) -> Option<HandleArm> {
+        match self.current() {
+            TokenKind::Success => {
+                let start = self.current_span();
+                self.advance();
+                let pattern = self.parse_pattern()?;
+                self.expect(&TokenKind::FatArrow, "`=>`")?;
+                let body = self.parse_arm_body();
+                let span = start.join(Self::arm_body_span(&body));
+                Some(HandleArm::Success {
+                    pattern,
+                    body,
+                    span,
+                })
+            }
+            TokenKind::Failure => {
+                let start = self.current_span();
+                self.advance();
+                let pattern = self.parse_failure_pattern()?;
+                self.expect(&TokenKind::FatArrow, "`=>`")?;
+                let body = self.parse_arm_body();
+                let span = start.join(Self::arm_body_span(&body));
+                Some(HandleArm::Failure {
+                    pattern,
+                    body,
+                    span,
+                })
+            }
+            _ => {
+                self.error_expected("`success` or `failure`");
+                None
+            }
+        }
+    }
+
+    fn parse_arm_body(&mut self) -> MatchArmBody {
+        if self.check(&TokenKind::LBrace) {
+            MatchArmBody::Block(self.parse_block())
+        } else {
+            MatchArmBody::Expr(self.parse_expression())
+        }
+    }
+
+    fn arm_body_span(body: &MatchArmBody) -> crate::source::Span {
+        match body {
+            MatchArmBody::Expr(e) => e.span(),
+            MatchArmBody::Block(b) => b.span,
+        }
+    }
+
+    /// `_` or `ErrorType.Case[(pattern, ...)]` (`rfcs/0010`). Payload
+    /// patterns reuse `parse_pattern`, but are restricted to a bare bind
+    /// or `_` later, in `hir::lower` -- this milestone has no nested
+    /// refutable matching on a raised value's own payload.
+    fn parse_failure_pattern(&mut self) -> Option<FailurePattern> {
+        let span = self.current_span();
+        if let TokenKind::Ident(symbol) = self.current().clone()
+            && self.interner.resolve(symbol) == "_"
+        {
+            self.advance();
+            return Some(FailurePattern::Wildcard { span });
+        }
+        let error_type = self.expect_ident("an error type name")?;
+        self.expect(&TokenKind::Dot, "`.`")?;
+        let case = self.expect_ident("a case name")?;
+        let mut args = Vec::new();
+        let mut end = case.span;
+        if self.eat(&TokenKind::LParen) {
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    args.push(self.parse_pattern()?);
+                    if self.eat(&TokenKind::Comma) {
+                        if self.check(&TokenKind::RParen) {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+            end = self.expect(&TokenKind::RParen, "`)`")?.span;
+        }
+        Some(FailurePattern::Case {
+            error_type,
+            case,
+            args,
+            span: span.join(end),
+        })
     }
 
     fn parse_return_expr(&mut self) -> Expr {
@@ -548,7 +680,7 @@ fn assign_op(kind: &TokenKind) -> Option<AssignOp> {
 #[cfg(test)]
 mod tests {
     use super::super::tests::parse;
-    use crate::syntax::ast::{BinaryOp, Expr, Item, Stmt};
+    use crate::syntax::ast::{BinaryOp, Expr, FailurePattern, HandleArm, Item, Stmt};
 
     fn single_expr(text: &str) -> Expr {
         let src = format!("func f() -> i64 {{ {text} }}");
@@ -701,6 +833,60 @@ mod tests {
     fn try_operator_parses_as_postfix() {
         let expr = single_expr("f()?");
         assert!(matches!(expr, Expr::Try { .. }));
+    }
+
+    #[test]
+    fn raise_expression_parses_its_mandatory_operand() {
+        let expr = single_expr("raise FileError.Missing");
+        let Expr::Raise { operand, .. } = expr else {
+            panic!("expected raise, got {expr:?}")
+        };
+        assert!(matches!(*operand, Expr::Field { .. }));
+    }
+
+    #[test]
+    fn handle_expression_parses_success_and_failure_arms() {
+        let expr = single_expr("handle f() { success v => v, failure FileError.Missing => 0 }");
+        let Expr::Handle(h) = expr else {
+            panic!("expected handle, got {expr:?}")
+        };
+        assert_eq!(h.arms.len(), 2);
+        assert!(matches!(h.arms[0], HandleArm::Success { .. }));
+        assert!(matches!(h.arms[1], HandleArm::Failure { .. }));
+    }
+
+    #[test]
+    fn handle_failure_arm_accepts_a_wildcard_catch_all() {
+        let expr = single_expr("handle f() { success _ => 0, failure _ => 1 }");
+        let Expr::Handle(h) = expr else {
+            panic!("expected handle, got {expr:?}")
+        };
+        let HandleArm::Failure { pattern, .. } = &h.arms[1] else {
+            panic!("expected a failure arm")
+        };
+        assert!(matches!(pattern, FailurePattern::Wildcard { .. }));
+    }
+
+    #[test]
+    fn handle_failure_arm_parses_a_payload_carrying_case() {
+        let expr =
+            single_expr("handle f() { success v => v, failure NetworkError.Timeout(ms) => ms }");
+        let Expr::Handle(h) = expr else {
+            panic!("expected handle, got {expr:?}")
+        };
+        let HandleArm::Failure { pattern, .. } = &h.arms[1] else {
+            panic!("expected a failure arm")
+        };
+        let FailurePattern::Case {
+            error_type: _,
+            case: _,
+            args,
+            ..
+        } = pattern
+        else {
+            panic!("expected a case pattern")
+        };
+        assert_eq!(args.len(), 1);
     }
 
     #[test]

@@ -99,6 +99,12 @@ mod codes {
     /// never mentions has nothing to bind it to any concrete type, so
     /// nothing could ever supply it, symbolically or otherwise.
     pub const UNCONSTRAINED_EXTEND_PARAMETER: &str = "T0046";
+    /// Coherence checking between two extends of the same protocol could
+    /// not be decided within the shared depth/work budget
+    /// (`typeck::capability::heads_can_overlap`). Both extends involved
+    /// are excluded from the solver rather than risk asserting coherence
+    /// (or incoherence) this checker could not actually prove.
+    pub const OVERLAP_WORK_BUDGET_EXCEEDED: &str = "T0047";
 }
 
 /// Which function(s), if any, must satisfy the executable entry

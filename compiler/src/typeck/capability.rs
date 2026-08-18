@@ -285,8 +285,17 @@ impl<'a> Checker<'a> {
                 span: e.span,
             });
         }
-        self.check_extend_overlaps(&accepted);
-        self.extends = accepted;
+        let excluded = self.check_extend_overlaps(&accepted);
+        self.extends = if excluded.is_empty() {
+            accepted
+        } else {
+            accepted
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !excluded.contains(i))
+                .map(|(_, e)| e)
+                .collect()
+        };
     }
 
     /// The authority rule (`rfcs/0009`): an extend is legal only when its
@@ -508,7 +517,17 @@ impl<'a> Checker<'a> {
     /// order is always accepted-list order (declaration order, `hir`'s
     /// own `Vec`), never a `HashMap`'s, so the diagnostic is independent
     /// of source/import order.
-    fn check_extend_overlaps(&mut self, accepted: &[ExtendInfo]) {
+    /// Returns the set of `accepted` indices that must be excluded from
+    /// the solver -- both an overlapping pair (only the later one, `y`,
+    /// matching the existing diagnostic convention) and, for a pair whose
+    /// overlap could not be decided within budget, *both* extends
+    /// involved (`rfcs/0009`'s coherence guarantee cannot be claimed for
+    /// either one, so neither is safe to leave registered).
+    fn check_extend_overlaps(
+        &mut self,
+        accepted: &[ExtendInfo],
+    ) -> std::collections::HashSet<usize> {
+        let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut by_protocol: HashMap<ItemId, Vec<usize>> = HashMap::new();
         for (i, e) in accepted.iter().enumerate() {
             by_protocol.entry(e.protocol).or_default().push(i);
@@ -522,27 +541,39 @@ impl<'a> Checker<'a> {
                     let (ia, ib) = (idxs[a], idxs[b]);
                     let x = &accepted[ia];
                     let y = &accepted[ib];
-                    if !heads_can_overlap(
+                    let outcome = heads_can_overlap(
                         &x.protocol_arguments,
                         &x.type_params.iter().copied().collect(),
                         &y.protocol_arguments,
                         &y.type_params.iter().copied().collect(),
-                    ) {
-                        continue;
-                    }
-                    let exact_duplicate = x.type_params.is_empty()
-                        && y.type_params.is_empty()
-                        && x.protocol_arguments == y.protocol_arguments;
-                    let (code, message) = if exact_duplicate {
-                        (
-                            codes::DUPLICATE_EXTENSION,
-                            "this extension duplicates another extension for the exact same protocol and type arguments",
-                        )
-                    } else {
-                        (
-                            codes::OVERLAPPING_EXTENSION,
-                            "this extension can match the same concrete requirement as another extension; there is no specialization in Alpha 0.1.5",
-                        )
+                    );
+                    let (code, message) = match outcome {
+                        OverlapOutcome::Disjoint => continue,
+                        OverlapOutcome::BudgetExceeded => {
+                            excluded.insert(ia);
+                            excluded.insert(ib);
+                            (
+                                codes::OVERLAP_WORK_BUDGET_EXCEEDED,
+                                "checking whether this extension could overlap another exceeded the maximum depth/work budget; both are excluded rather than risk an unproven incoherence",
+                            )
+                        }
+                        OverlapOutcome::Overlap => {
+                            let exact_duplicate = x.type_params.is_empty()
+                                && y.type_params.is_empty()
+                                && x.protocol_arguments == y.protocol_arguments;
+                            excluded.insert(ib);
+                            if exact_duplicate {
+                                (
+                                    codes::DUPLICATE_EXTENSION,
+                                    "this extension duplicates another extension for the exact same protocol and type arguments",
+                                )
+                            } else {
+                                (
+                                    codes::OVERLAPPING_EXTENSION,
+                                    "this extension can match the same concrete requirement as another extension; there is no specialization in Alpha 0.1.5",
+                                )
+                            }
+                        }
                     };
                     // `y.source`/`y.span`, never `self.source`: by the
                     // time this runs (after every extend in `accepted`
@@ -561,6 +592,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        excluded
     }
 
     /// The capability solver's public entry point: resolves `requirement`
@@ -884,21 +916,41 @@ fn match_one(
 /// a rename pass first. `unify_head_args` is the same one-directional
 /// matcher `match_extend_head` uses for a concrete requirement, seen
 /// from the general case where *both* sides may still be symbolic.
+/// The result of trying to prove two extend heads disjoint: a real
+/// tri-state, never collapsed to a plain `bool` -- `BudgetExceeded` must
+/// never be silently treated as `Disjoint` (which would let two
+/// extensions that might genuinely overlap both stay registered) nor as
+/// `Overlap` (which would reject two heads this checker simply couldn't
+/// finish analyzing). `rfcs/0009` claims both a depth and a work-step
+/// budget for this check; both are real here, and either one being
+/// exceeded produces `BudgetExceeded`, never a hang or a stack overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlapOutcome {
+    Disjoint,
+    Overlap,
+    BudgetExceeded,
+}
+
 fn heads_can_overlap(
     a_args: &[Ty],
     a_params: &std::collections::HashSet<TypeParamId>,
     b_args: &[Ty],
     b_params: &std::collections::HashSet<TypeParamId>,
-) -> bool {
+) -> OverlapOutcome {
     if a_args.len() != b_args.len() {
-        return false;
+        return OverlapOutcome::Disjoint;
     }
     let free: std::collections::HashSet<TypeParamId> = a_params.union(b_params).copied().collect();
     let mut subst = HashMap::new();
-    a_args
-        .iter()
-        .zip(b_args.iter())
-        .all(|(a, b)| unify_head_args(&mut subst, &free, a, b, 0))
+    let mut steps = 0usize;
+    for (a, b) in a_args.iter().zip(b_args.iter()) {
+        match unify_head_args(&mut subst, &free, a, b, 0, &mut steps) {
+            Ok(true) => {}
+            Ok(false) => return OverlapOutcome::Disjoint,
+            Err(()) => return OverlapOutcome::BudgetExceeded,
+        }
+    }
+    OverlapOutcome::Overlap
 }
 
 /// Follows `ty` through `subst`'s own chain of bindings until it reaches
@@ -931,22 +983,38 @@ fn resolve_head(subst: &HashMap<TypeParamId, Ty>, ty: &Ty) -> Ty {
 /// re-entry). Depth-bounded by [`MAX_GENERIC_DEPTH`]; past the bound,
 /// conservatively treated as occurring (rejects the unification rather
 /// than risk an unbounded walk).
+/// `Err(())` means the depth or work-step budget was exceeded while
+/// walking `ty` -- propagated straight up to `heads_can_overlap` as
+/// `OverlapOutcome::BudgetExceeded` by every caller, never coerced to
+/// `true`/`false` along the way (which would silently misreport this as
+/// "occurs"/"does not occur" and let an unsound overlap conclusion
+/// through).
 fn occurs_in_head(
     subst: &HashMap<TypeParamId, Ty>,
     var: TypeParamId,
     ty: &Ty,
     free: &std::collections::HashSet<TypeParamId>,
     depth: usize,
-) -> bool {
+    steps: &mut usize,
+) -> Result<bool, ()> {
     if depth > MAX_GENERIC_DEPTH {
-        return true;
+        return Err(());
+    }
+    *steps += 1;
+    if *steps > MAX_CAPABILITY_RESOLUTION_STEPS {
+        return Err(());
     }
     match resolve_head(subst, ty) {
-        Ty::Param(id, _) if free.contains(&id) => id == var,
-        Ty::Applied(_, args) => args
-            .iter()
-            .any(|a| occurs_in_head(subst, var, a, free, depth + 1)),
-        _ => false,
+        Ty::Param(id, _) if free.contains(&id) => Ok(id == var),
+        Ty::Applied(_, args) => {
+            for a in &args {
+                if occurs_in_head(subst, var, a, free, depth + 1, steps)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -957,49 +1025,61 @@ fn occurs_in_head(
 /// unifies, so a variable bound at one position is correctly chased at
 /// every later position that mentions it again -- the transitive
 /// chasing the previous, unsound implementation never did.
+/// `Err(())` means the depth or work-step budget was exceeded --
+/// propagated straight up through every recursive call and out of
+/// `heads_can_overlap` as `OverlapOutcome::BudgetExceeded`, never
+/// collapsed to `Ok(false)` ("disjoint") along the way.
 fn unify_head_args(
     subst: &mut HashMap<TypeParamId, Ty>,
     free: &std::collections::HashSet<TypeParamId>,
     a: &Ty,
     b: &Ty,
     depth: usize,
-) -> bool {
+    steps: &mut usize,
+) -> Result<bool, ()> {
     if depth > MAX_GENERIC_DEPTH {
-        return false;
+        return Err(());
+    }
+    *steps += 1;
+    if *steps > MAX_CAPABILITY_RESOLUTION_STEPS {
+        return Err(());
     }
     let ra = resolve_head(subst, a);
     let rb = resolve_head(subst, b);
     match (&ra, &rb) {
         (Ty::Param(ia, _), Ty::Param(ib, _)) if free.contains(ia) && free.contains(ib) => {
             if ia == ib {
-                return true;
+                return Ok(true);
             }
             subst.insert(*ia, rb);
-            true
+            Ok(true)
         }
         (Ty::Param(ia, _), _) if free.contains(ia) => {
-            if occurs_in_head(subst, *ia, &rb, free, depth + 1) {
-                return false;
+            if occurs_in_head(subst, *ia, &rb, free, depth + 1, steps)? {
+                return Ok(false);
             }
             subst.insert(*ia, rb);
-            true
+            Ok(true)
         }
         (_, Ty::Param(ib, _)) if free.contains(ib) => {
-            if occurs_in_head(subst, *ib, &ra, free, depth + 1) {
-                return false;
+            if occurs_in_head(subst, *ib, &ra, free, depth + 1, steps)? {
+                return Ok(false);
             }
             subst.insert(*ib, ra);
-            true
+            Ok(true)
         }
         (Ty::Applied(pa, aargs), Ty::Applied(pb, bargs)) => {
-            pa == pb
-                && aargs.len() == bargs.len()
-                && aargs
-                    .iter()
-                    .zip(bargs.iter())
-                    .all(|(x, y)| unify_head_args(subst, free, x, y, depth + 1))
+            if pa != pb || aargs.len() != bargs.len() {
+                return Ok(false);
+            }
+            for (x, y) in aargs.iter().zip(bargs.iter()) {
+                if !unify_head_args(subst, free, x, y, depth + 1, steps)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
-        _ => ra == rb,
+        _ => Ok(ra == rb),
     }
 }
 
@@ -1032,36 +1112,30 @@ mod tests {
     fn detects_the_transitive_overlap_regression() {
         let a_args = vec![param(0), param(0)]; // P[T, T]
         let b_args = vec![param(1), Ty::I64]; // P[U, i64]
-        assert!(heads_can_overlap(
-            &a_args,
-            &params(&[0]),
-            &b_args,
-            &params(&[1])
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[0]), &b_args, &params(&[1])),
+            OverlapOutcome::Overlap
+        );
     }
 
     #[test]
     fn reversed_argument_order_still_detects_the_same_overlap() {
         let a_args = vec![Ty::I64, param(1)]; // P[i64, U]
         let b_args = vec![param(0), param(0)]; // P[T, T]
-        assert!(heads_can_overlap(
-            &a_args,
-            &params(&[1]),
-            &b_args,
-            &params(&[0])
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[1]), &b_args, &params(&[0])),
+            OverlapOutcome::Overlap
+        );
     }
 
     #[test]
     fn a_fully_generic_head_overlaps_with_every_other_head() {
         let a_args = vec![param(0), param(0)]; // P[T, T]
         let b_args = vec![param(1), param(2)]; // P[U, V] (fully free)
-        assert!(heads_can_overlap(
-            &a_args,
-            &params(&[0]),
-            &b_args,
-            &params(&[1, 2])
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[0]), &b_args, &params(&[1, 2])),
+            OverlapOutcome::Overlap
+        );
     }
 
     #[test]
@@ -1069,12 +1143,10 @@ mod tests {
         // Q[Box[T]] vs Q[Box[i64]] -- overlap at T = i64.
         let a_args = vec![boxed(100, vec![param(0)])];
         let b_args = vec![boxed(100, vec![Ty::I64])];
-        assert!(heads_can_overlap(
-            &a_args,
-            &params(&[0]),
-            &b_args,
-            &HashSet::new()
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[0]), &b_args, &HashSet::new()),
+            OverlapOutcome::Overlap
+        );
     }
 
     #[test]
@@ -1083,24 +1155,20 @@ mod tests {
         // declaration identity, can never be the same concrete type.
         let a_args = vec![boxed(100, vec![param(0)])];
         let b_args = vec![boxed(101, vec![param(1)])];
-        assert!(!heads_can_overlap(
-            &a_args,
-            &params(&[0]),
-            &b_args,
-            &params(&[1])
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[0]), &b_args, &params(&[1])),
+            OverlapOutcome::Disjoint
+        );
     }
 
     #[test]
     fn concrete_heads_with_different_arguments_never_overlap() {
         let a_args = vec![Ty::I64, Ty::I64];
         let b_args = vec![Ty::Bool, Ty::Bool];
-        assert!(!heads_can_overlap(
-            &a_args,
-            &HashSet::new(),
-            &b_args,
-            &HashSet::new()
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &HashSet::new(), &b_args, &HashSet::new()),
+            OverlapOutcome::Disjoint
+        );
     }
 
     /// `R[T, Box[T]]` vs `R[Box[U], U]` would require `T = Box[U]` and
@@ -1110,30 +1178,27 @@ mod tests {
     fn occurs_check_rejects_a_self_referential_unification() {
         let a_args = vec![param(0), boxed(100, vec![param(0)])]; // R[T, Box[T]]
         let b_args = vec![boxed(100, vec![param(1)]), param(1)]; // R[Box[U], U]
-        assert!(!heads_can_overlap(
-            &a_args,
-            &params(&[0]),
-            &b_args,
-            &params(&[1])
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &params(&[0]), &b_args, &params(&[1])),
+            OverlapOutcome::Disjoint
+        );
     }
 
     #[test]
     fn exact_duplicate_concrete_heads_overlap() {
         let a_args = vec![Ty::I64];
         let b_args = vec![Ty::I64];
-        assert!(heads_can_overlap(
-            &a_args,
-            &HashSet::new(),
-            &b_args,
-            &HashSet::new()
-        ));
+        assert_eq!(
+            heads_can_overlap(&a_args, &HashSet::new(), &b_args, &HashSet::new()),
+            OverlapOutcome::Overlap
+        );
     }
 
-    /// A pathologically deep, but still finite, pair of matching nested
-    /// applications must resolve (or fail) without overflowing the
-    /// native stack -- bounded by `MAX_GENERIC_DEPTH`, the same as every
-    /// other stage that walks a nested type application.
+    /// A pathologically deep pair of matching nested applications must
+    /// resolve without overflowing the native stack -- and, since this
+    /// exceeds `MAX_GENERIC_DEPTH`, must report `BudgetExceeded` rather
+    /// than silently guessing `Disjoint` or `Overlap` for an input this
+    /// checker could not actually finish analyzing.
     #[test]
     fn deeply_nested_matching_heads_do_not_overflow_the_stack() {
         let depth = MAX_GENERIC_DEPTH + 50;
@@ -1143,9 +1208,10 @@ mod tests {
             a = boxed(100, vec![a]);
             b = boxed(100, vec![b]);
         }
-        // Not asserting the outcome itself -- only that this returns at
-        // all rather than hanging or crashing.
-        let _ = heads_can_overlap(&[a], &params(&[0]), &[b], &HashSet::new());
+        assert_eq!(
+            heads_can_overlap(&[a], &params(&[0]), &[b], &HashSet::new()),
+            OverlapOutcome::BudgetExceeded
+        );
     }
 
     #[test]
@@ -1157,7 +1223,35 @@ mod tests {
             a = boxed(100, vec![a]);
             b = boxed(100, vec![b]);
         }
-        let result = heads_can_overlap(&[a], &HashSet::new(), &[b], &HashSet::new());
-        assert!(!result, "different leaves at every depth can never overlap");
+        // Never silently `Disjoint`: the depth budget is exceeded long
+        // before the differing leaves would ever be compared, so this
+        // must be reported as undecided, not misreported as proven safe.
+        assert_eq!(
+            heads_can_overlap(&[a], &HashSet::new(), &[b], &HashSet::new()),
+            OverlapOutcome::BudgetExceeded
+        );
+    }
+
+    /// A head shallow enough to stay within the depth budget but with
+    /// enough sibling arguments at each level to exceed the work-step
+    /// budget must also report `BudgetExceeded`, not hang or silently
+    /// guess -- the counterpart to the depth-based tests above, proving
+    /// the work-step budget is real and independently enforced.
+    #[test]
+    fn wide_matching_heads_exceeding_the_work_budget_are_undecided() {
+        const WIDTH: usize = 4;
+        // `MAX_CAPABILITY_RESOLUTION_STEPS` worth of sibling arguments,
+        // all identical concrete leaves so every comparison would
+        // otherwise succeed -- purely a work-step budget exhaustion,
+        // never a depth or disjointness failure.
+        let levels = MAX_CAPABILITY_RESOLUTION_STEPS / WIDTH + 1;
+        let leaf = Ty::I64;
+        let args: Vec<Ty> = (0..levels)
+            .map(|_| boxed(100, vec![leaf.clone(); WIDTH]))
+            .collect();
+        assert_eq!(
+            heads_can_overlap(&args, &HashSet::new(), &args.clone(), &HashSet::new()),
+            OverlapOutcome::BudgetExceeded
+        );
     }
 }

@@ -3413,7 +3413,7 @@ fn check_same_as_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nir::{BasicBlock, CaseLayout, ProtocolMethodLayout};
+    use crate::nir::{BasicBlock, CaseLayout, InvokeErrTarget, ProtocolMethodLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -7111,5 +7111,290 @@ mod tests {
             &interner,
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    // -- Typed outcomes: Invoke/Raise (`rfcs/0010`) ---------------------
+
+    #[test]
+    fn an_ordinary_call_to_a_fallible_function_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Call(ItemId(0), Vec::new(), Vec::new(), Vec::new()),
+        });
+        caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::CALL_TO_FALLIBLE_FUNCTION),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_of_an_infallible_function_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let callee = valid_function(ItemId(0), g_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        });
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(1),
+            ok_target: BlockId(1),
+            err_targets: Vec::new(),
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_OF_INFALLIBLE_FUNCTION),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_missing_a_failure_target_for_a_declared_raise_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        });
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(1),
+            ok_target: BlockId(1),
+            // Missing a failure target for `shape_id`, which the callee
+            // declares -- an unhandled effect at this Invoke's own
+            // failure edge.
+            err_targets: Vec::new(),
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_ERR_TARGET_COVERAGE_MISMATCH),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_raise_of_a_type_not_in_the_functions_own_raises_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+
+        // `function.raises` stays empty -- this function never declared
+        // it may raise `Shape` at all.
+        let mut function = valid_function(ItemId(0), f_name);
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Named(shape_id, shape_name),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        });
+        function.blocks[0].terminator = Terminator::Raise { value: ValueId(1) };
+
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            Vec::new(),
+            vec![(shape_id, shape_layout)],
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNDECLARED_RAISE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_invoke_and_raise_round_trip_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let shape_ty = Ty::Named(shape_id, shape_name);
+
+        // `func g() -> i64 raises Shape { raise Shape.Empty }`
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+        callee.blocks[0].instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: shape_ty.clone(),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        }];
+        callee.blocks[0].terminator = Terminator::Raise { value: ValueId(0) };
+
+        // `func f() -> i64 { handle g() { success v => v, failure
+        // Shape.Circle(v) => v, failure Shape.Empty => -1 } }`, lowered
+        // by hand into the same Invoke/Switch shape `nir::lower` builds.
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: shape_ty.clone(),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![Instruction::Value {
+                result: ValueId(3),
+                ty: shape_ty,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Switch {
+                scrutinee: ValueId(3),
+                variant: shape_id,
+                cases: vec![BlockId(3), BlockId(4)],
+            },
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: vec![Instruction::Value {
+                result: ValueId(4),
+                ty: Ty::I64,
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(3),
+                    variant: shape_id,
+                    case: 0,
+                    index: 0,
+                },
+            }],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(4),
+            instructions: vec![Instruction::Value {
+                result: ValueId(5),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(5))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 }

@@ -1,0 +1,27 @@
+// Generic capability forwarding (Alpha 0.1.5, rfcs/0009):
+// `forwards_to_pair_equal[T]` still doesn't know a concrete type when it
+// calls `pair_equal[T]`, so it forwards its own `Equal[T]` requirement
+// through unchanged rather than resolving anything itself. Only once
+// `main` calls it at a concrete `i64` does the whole chain resolve to a
+// real extension.
+protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        return left == right
+    }
+}
+
+func pair_equal[T](a: T, b: T) -> bool uses Equal[T] {
+    return Equal[T].equal(a, b)
+}
+
+func forwards_to_pair_equal[T](a: T, b: T) -> bool uses Equal[T] {
+    return pair_equal(a, b)
+}
+
+func main() -> bool {
+    return forwards_to_pair_equal[i64](5, 5)
+}

@@ -67,6 +67,13 @@ mod codes {
     /// itself being generic (`raises Failure` where `variant
     /// Failure[T] { .. }`).
     pub const GENERIC_RAISES_TYPE: &str = "R0030";
+    /// An `extend` method declares its own `raises` clause. Protocol
+    /// declarations have no `raises` of their own yet (`rfcs/0010`'s own
+    /// honest limitation: there is no protocol/capability integration
+    /// for typed failure), so every implementing method must be
+    /// infallible too -- there is no protocol-visible effect for it to
+    /// narrow.
+    pub const EXTEND_METHOD_OWN_RAISES_CLAUSE: &str = "R0031";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -1320,6 +1327,25 @@ impl<'a> Lowering<'a> {
                 .with_primary_label("unexpected `uses` clause"),
             );
         }
+        // A protocol method has no `raises` signature of its own yet
+        // (`rfcs/0010`'s own honest limitation), so every implementing
+        // method must be infallible too -- diagnosed here, and never
+        // resolved into (even partial) raised-effect metadata: a
+        // fallible implementation could otherwise satisfy an apparently
+        // infallible protocol method, and `protocol.call` -- an ordinary
+        // value instruction with only one destination -- would have
+        // nowhere for a raised value to go.
+        if !f.raises.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::EXTEND_METHOD_OWN_RAISES_CLAUSE,
+                    self.source,
+                    f.span,
+                    "an extend method may not declare its own `raises` clause; protocol methods have no raised-effect signature yet",
+                )
+                .with_primary_label("unexpected `raises` clause"),
+            );
+        }
         let mut scopes = Scopes::new();
         let params = self.lower_params(&f.params, &mut scopes);
         let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
@@ -1335,7 +1361,7 @@ impl<'a> Lowering<'a> {
             return_type,
             uses: Vec::new(),
             requirements: requirements.to_vec(),
-            raises: self.resolve_raises(&f.raises),
+            raises: Vec::new(),
             body,
             span: f.span,
         }
@@ -2708,6 +2734,22 @@ mod tests {
         let (hir, diags) = lower("variant Failure { Missing }\nfunc f() raises Failure { }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn an_extend_method_declaring_its_own_raises_clause_is_a_diagnostic() {
+        let (hir, diags) = lower(
+            "variant Failure { Broken }\n\
+             protocol Operation[T] { func run(input: T) -> i64; }\n\
+             extend Operation[i64] { func run(input: i64) -> i64 raises Failure { return 0 } }\n\
+             func main() -> i64 { return 0 }",
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0031");
+        // Diagnosed, never resolved into raised-effect metadata -- the
+        // method still lowers, but with no raises at all, not a partial
+        // or fake one.
+        assert!(hir.extends[0].methods[0].raises.is_empty());
     }
 
     #[test]

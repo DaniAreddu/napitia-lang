@@ -1065,7 +1065,16 @@ impl<'a> Lowering<'a> {
             // unpropagated inner value would let either "succeed" while
             // lying about what it does.
             HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
+            // `rfcs/0010`: real Invoke/Raise-based lowering for these
+            // three lands in a follow-up commit within this same
+            // milestone -- `typeck` already stops every one of them
+            // before NIR lowering runs in the normal pipeline; this is
+            // defense in depth against a direct caller bypassing that
+            // gate, exactly like every other not-yet-lowered construct
+            // in this match.
             HirExpr::Try { span, .. } => Err(self.unsupported(*span, "postfix `?`")),
+            HirExpr::Raise { span, .. } => Err(self.unsupported(*span, "`raise`")),
+            HirExpr::Handle { span, .. } => Err(self.unsupported(*span, "`handle`")),
             HirExpr::If {
                 condition,
                 then_branch,

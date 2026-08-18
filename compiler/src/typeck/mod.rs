@@ -867,7 +867,25 @@ impl<'a> Checker<'a> {
         }
         self.current_return_type = sig.ret.clone();
         self.current_requirements = sig.requirements.clone();
-        self.current_raises = sig.raises.iter().copied().collect();
+        // A generic error variant is never a legal `raises` member
+        // (`rfcs/0010`'s own non-goal) -- `hir::lower`'s own
+        // `resolve_raises` already rejects this for ordinary source, but
+        // a direct caller lowering hand-built HIR could still hand this
+        // function a `raises` entry naming one. Filtered out here rather
+        // than trusted, so `check_raise`/`check_try`/`check_handle`
+        // below can never treat an applied generic variant as declared
+        // just because its outer `ItemId` happens to match.
+        self.current_raises = sig
+            .raises
+            .iter()
+            .copied()
+            .filter(|item| {
+                self.variants
+                    .get(item)
+                    .map(|info| info.type_params.is_empty())
+                    .unwrap_or(true)
+            })
+            .collect();
         if !f.uses.is_empty() {
             self.push_unsupported(f.name_span, "`uses` effect clauses");
         }

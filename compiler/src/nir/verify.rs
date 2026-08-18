@@ -130,10 +130,12 @@ mod codes {
     /// An `extend`'s `protocol_arguments` count does not match its own
     /// protocol's declared type-parameter count.
     pub const EXTEND_PROTOCOL_ARITY_MISMATCH: &str = "V0037";
-    /// One of an `extend`'s own `uses` requirements names a protocol
-    /// this module never declared.
+    /// One capability requirement (an `extend`'s own `uses` clause, or an
+    /// ordinary function's own `uses` clause) names a protocol this
+    /// module never declared.
     pub const UNKNOWN_REQUIREMENT_PROTOCOL: &str = "V0038";
-    /// One of an `extend`'s own `uses` requirements supplies a number of
+    /// One capability requirement (an `extend`'s own `uses` clause, or an
+    /// ordinary function's own `uses` clause) supplies a number of
     /// arguments that does not match its own named protocol's declared
     /// type-parameter count.
     pub const REQUIREMENT_ARITY_MISMATCH: &str = "V0039";

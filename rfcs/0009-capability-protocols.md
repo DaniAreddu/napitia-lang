@@ -434,8 +434,10 @@ T0047  overlap checking between two extends could not be decided within
 
 V0036  an extend names a protocol id that does not exist
 V0037  an extend's protocol-argument count does not match its protocol
-V0038  an extend's uses requirement names an unknown protocol
-V0039  an extend's uses requirement has the wrong argument count
+V0038  a uses requirement (an extend's own, or an ordinary function's
+       own) names an unknown protocol
+V0039  a uses requirement (an extend's own, or an ordinary function's
+       own) has the wrong argument count for its named protocol
 V0040  an extend's method-table length does not match its protocol
 V0041  an extend's method table references an unknown function
 V0042  an extend method's own type parameters do not match its extend

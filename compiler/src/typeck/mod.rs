@@ -5006,6 +5006,62 @@ mod tests {
         );
     }
 
+    /// Fix 1 (0.1.5 follow-up): reversing which of two exact-duplicate
+    /// extensions is declared first still produces the same diagnostic
+    /// code either way -- the *rendered* diagnostic (which span is
+    /// primary vs. "first declared here") intentionally still follows
+    /// declaration order, since the primary span always belongs to the
+    /// second-declared extend; only the diagnostic code is asserted
+    /// identical here, never the span/message text, which honestly does
+    /// change when the source itself is reordered.
+    #[test]
+    fn reversed_exact_duplicate_declaration_order_still_detects_the_duplicate() {
+        let forward = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return false
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let reversed = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return false
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&forward).contains(&"T0036"),
+            "unexpected diagnostics: {forward:?}"
+        );
+        assert!(
+            codes_of(&reversed).contains(&"T0036"),
+            "unexpected diagnostics: {reversed:?}"
+        );
+    }
+
     #[test]
     fn reversed_declaration_order_still_detects_the_overlap() {
         let diags = check(

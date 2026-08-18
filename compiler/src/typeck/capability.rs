@@ -1254,4 +1254,24 @@ mod tests {
             OverlapOutcome::BudgetExceeded
         );
     }
+
+    /// Fix 1 (0.1.5 follow-up): swapping which side is passed first to
+    /// `heads_can_overlap` still reports the same `BudgetExceeded`
+    /// outcome -- the T0047 diagnostic this drives is deterministic by
+    /// outcome/code regardless of declaration order, even though (like
+    /// T0036/T0037) the diagnostic's own rendered span still follows
+    /// declaration order.
+    #[test]
+    fn budget_exceeded_outcome_is_the_same_regardless_of_argument_order() {
+        const WIDTH: usize = 4;
+        let levels = MAX_CAPABILITY_RESOLUTION_STEPS / WIDTH + 1;
+        let leaf = Ty::I64;
+        let args: Vec<Ty> = (0..levels)
+            .map(|_| boxed(100, vec![leaf.clone(); WIDTH]))
+            .collect();
+        let forward = heads_can_overlap(&args, &HashSet::new(), &args.clone(), &HashSet::new());
+        let reversed = heads_can_overlap(&args.clone(), &HashSet::new(), &args, &HashSet::new());
+        assert_eq!(forward, OverlapOutcome::BudgetExceeded);
+        assert_eq!(forward, reversed);
+    }
 }

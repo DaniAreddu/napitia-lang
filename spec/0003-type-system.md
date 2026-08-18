@@ -204,7 +204,16 @@ itself.
   protocol's own module); two extends that could both match the same
   concrete instantiation are rejected as an overlap, checked by a sound
   bidirectional structural unifier over each extend's own head, entirely
-  independent of any call site.
+  independent of any call site. This unifier's own recursion is bounded
+  by a real depth *and* work-step budget, each independently tracked; a
+  pair it cannot decide within budget is reported as `T0047` and both
+  extends involved are excluded from the solver, never silently treated
+  as non-overlapping.
+- **Every extend parameter is head-determined**: an extend's own type
+  parameter must occur somewhere inside its protocol's own type
+  arguments (`extend[T] Equal[i64] uses Other[T]` declares a `T` nothing
+  could ever bind, since `T` never occurs in `Equal[i64]`) — rejected as
+  `T0046`, one diagnostic per unconstrained parameter.
 - **Exact forwarding only**: a still-generic function's own `uses`
   requirement can only be satisfied by forwarding an identical caller
   requirement, or by a concrete extension once every type involved is

@@ -350,12 +350,19 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   bounded by the same generic-depth limit every other stage that walks a
   type application shares.
 - **Protocols and extends** (Alpha 0.1.5, `rfcs/0009`): every protocol's
-  own type parameters and method parameter/return types, and every
-  extend's referenced protocol/`uses` requirements/protocol-argument
-  types/method table (correct length, each entry a real, distinct
-  function sharing its owning extend's exact type-parameter scope with a
-  signature matching its protocol method once substituted), are
-  independently re-checked the same way records/variants/generics are.
+  own type parameters and method parameter/return types; every ordinary
+  function's own `uses` requirements (referenced protocol exists with
+  correct arity, every argument a valid root scoped to the function's own
+  type parameters -- the same independent validation an extend's own
+  requirements already get); and every extend's referenced protocol/
+  `uses` requirements/protocol-argument types/method table (correct
+  length, each entry a real, distinct function sharing its owning
+  extend's exact type-parameter scope, declaring *exactly* its owning
+  extend's own requirements in the same order (`V0058`), with a signature
+  matching its protocol method once substituted) -- are all independently
+  re-checked the same way records/variants/generics are. Every extend's
+  own type parameter must also occur somewhere inside its protocol's own
+  type arguments (`V0059`, re-deriving `typeck`'s own `T0046`).
 - **Capability evidence** (Alpha 0.1.5, `rfcs/0009`): a `Call`'s evidence
   count is checked against its callee's own requirement count, and a
   `protocol.call`'s protocol/method index/argument and result types are
@@ -366,9 +373,11 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   `Forwarded` anywhere inside `nested`) — is checked recursively, bounded
   by the same capability depth/work budget the solver itself uses, with
   exactly one diagnostic per malformed evidence root, never one per
-  nested node.
+  nested node. `Extension` evidence is rejected outright (`V0060`) if the
+  required arguments are still symbolic -- only an exact `Forwarded`
+  match is legal until every argument is concrete.
 
-It reports structured diagnostics (`V0001`–`V0057` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0060` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

@@ -736,6 +736,48 @@ fn verify_function(
             diagnostics,
         );
     }
+    for requirement in &function.requirements {
+        let requirement_context = format!("{fn_context}'s `uses` requirement");
+        for ty in &requirement.arguments {
+            check_type_root(
+                ty,
+                agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &requirement_context,
+                diagnostics,
+            );
+        }
+        match agg.protocols.get(&requirement.protocol) {
+            None => diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_REQUIREMENT_PROTOCOL,
+                source,
+                Span::dummy(),
+                format!(
+                    "{requirement_context} names a protocol id {} that does not exist in this module",
+                    requirement.protocol.0
+                ),
+            )),
+            Some(required_protocol)
+                if required_protocol.type_params.len() != requirement.arguments.len() =>
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::REQUIREMENT_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{requirement_context} supplies {} argument(s) to `{}`, which declares {}",
+                        requirement.arguments.len(),
+                        registry.qualified_name(requirement.protocol, interner),
+                        required_protocol.type_params.len()
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
 
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
     let mut seen_block_ids = HashSet::new();
@@ -6057,5 +6099,169 @@ mod tests {
             &interner,
         );
         assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_HEAD_MISMATCH));
+    }
+
+    // -- Fix 1 (0.1.5 follow-up): every Function::requirements entry is
+    //    independently validated ---------------------------------------
+
+    fn function_with_requirement(
+        interner: &mut Interner,
+        type_params: Vec<(TypeParamId, Symbol)>,
+        requirements: Vec<CapabilityRequirement>,
+    ) -> Function {
+        Function {
+            id: ItemId(20),
+            name: interner.intern("f"),
+            type_params,
+            requirements,
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Const(Const::Bool(true)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_function_requirement_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])],
+        );
+        let diagnostics = verify_module_with(Vec::new(), Vec::new(), vec![function], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_REQUIREMENT_PROTOCOL));
+    }
+
+    #[test]
+    fn a_function_requirement_with_the_wrong_arity_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, Vec::new())],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::REQUIREMENT_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_function_requirement_with_an_error_type_argument_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, vec![Ty::Error])],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
+    }
+
+    #[test]
+    fn a_function_requirement_with_an_unresolved_type_variable_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Var(crate::types::TyVar(0))],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE));
+    }
+
+    #[test]
+    fn a_function_requirement_using_a_foreign_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let foreign = interner.intern("U");
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Param(TypeParamId(999), foreign)],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_function_requirement_nested_past_the_generic_depth_limit_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let box_item = ItemId(50);
+        let mut deep = Ty::I64;
+        for _ in 0..(MAX_GENERIC_DEPTH + 2) {
+            deep = Ty::Applied(box_item, vec![deep]);
+        }
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, vec![deep])],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED));
+    }
+
+    #[test]
+    fn a_valid_symbolic_function_requirement_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(30);
+        let t_symbol = interner.intern("T");
+        let function = function_with_requirement(
+            &mut interner,
+            vec![(t, t_symbol)],
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Param(t, t_symbol)],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

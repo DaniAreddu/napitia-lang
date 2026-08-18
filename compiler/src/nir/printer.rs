@@ -757,6 +757,39 @@ mod tests {
         );
     }
 
+    /// Not just the printed header (covered above) -- reversing a
+    /// fallible callee's own `raises` clause order must not change a
+    /// single byte of the *whole* module's NIR, including every
+    /// `Invoke`'s own `err_targets`/slot/block numbering, which iterates
+    /// `Function.raises`'s own stored order (`rfcs/0010`).
+    #[test]
+    fn reversing_a_callees_raises_clause_order_produces_byte_identical_nir() {
+        let program = |order: &str| {
+            format!(
+                "variant FileError {{ Missing }} \
+                 variant NetworkError {{ Timeout }} \
+                 func fetch(mode: i64) -> i64 raises {order} {{ \
+                     if mode == 0 {{ return 42; }} \
+                     if mode == 1 {{ raise FileError.Missing; }} \
+                     raise NetworkError.Timeout; \
+                 }} \
+                 func main() -> i64 {{ \
+                     return handle fetch(1) {{ \
+                         success v => v, \
+                         failure FileError.Missing => -1, \
+                         failure NetworkError.Timeout => -2, \
+                     }} \
+                 }}"
+            )
+        };
+        let forward = print(&program("FileError, NetworkError"));
+        let reversed = print(&program("NetworkError, FileError"));
+        assert_eq!(
+            forward, reversed,
+            "reversing a callee's own raises clause order must not change any NIR output"
+        );
+    }
+
     #[test]
     fn printer_output_is_deterministic() {
         let a = print("func f() -> i64 { return 1 + 2 }");

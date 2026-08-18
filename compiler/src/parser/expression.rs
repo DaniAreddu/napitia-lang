@@ -889,6 +889,47 @@ mod tests {
         assert_eq!(args.len(), 1);
     }
 
+    // -- Fix 8: malformed `handle` parser recovery (`rfcs/0010`) --------
+
+    /// A missing `=>` between a `handle` arm's pattern and its body is a
+    /// diagnostic, not a panic or a hang -- the parser must still make
+    /// progress and return control to its caller.
+    #[test]
+    fn handle_arm_missing_fat_arrow_is_a_diagnostic_not_a_hang() {
+        let src = "func f() -> i64 { handle g() { success v 1 } }";
+        let (_, diags) = super::super::tests::parse(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+    }
+
+    /// A `handle` expression missing its closing `}` is a diagnostic,
+    /// not a panic or a hang.
+    #[test]
+    fn handle_missing_closing_brace_is_a_diagnostic_not_a_hang() {
+        let src = "func f() -> i64 { handle g() { success v => v";
+        let (_, diags) = super::super::tests::parse(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+    }
+
+    /// An unclosed failure-payload argument list is a diagnostic, not a
+    /// panic or a hang.
+    #[test]
+    fn handle_failure_arm_unclosed_payload_list_is_a_diagnostic_not_a_hang() {
+        let src = "func f() -> i64 { handle g() { success v => v, failure Err.Case(x => 1 } }";
+        let (_, diags) = super::super::tests::parse(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+    }
+
+    /// A trailing comma followed by garbage inside a `handle`'s own
+    /// brace-delimited arm list must not hang the parser -- it always
+    /// makes forward progress (`parse_handle_expr`'s own `before`/`pos`
+    /// guard), one token at a time if nothing else parses.
+    #[test]
+    fn handle_with_garbage_between_arms_terminates_with_diagnostics() {
+        let src = "func f() -> i64 { handle g() { success v => v, 42, failure Err.Case => 1 } }";
+        let (_, diags) = super::super::tests::parse(src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+    }
+
     #[test]
     fn if_else_expression_in_tail_position() {
         let expr = single_expr("if true { 1 } else { 2 }");

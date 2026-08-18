@@ -235,6 +235,53 @@ mod codes {
     /// situation; a concrete extend can only ever be legitimately
     /// selected once every argument is fully concrete.
     pub const EXTENSION_FOR_SYMBOLIC_REQUIREMENT: &str = "V0060";
+    /// A function's own `raises` (`rfcs/0010`) names an `ItemId` that
+    /// does not match any variant declared in this module.
+    pub const UNKNOWN_RAISES_TYPE: &str = "V0061";
+    /// A function's own `raises` names the same `ItemId` more than once
+    /// -- the set of effects a function may raise is canonical, never a
+    /// multiset.
+    pub const DUPLICATE_RAISES_ENTRY: &str = "V0062";
+    /// An ordinary `ValueKind::Call` targets a function whose own
+    /// `raises` is non-empty. A fallible callee may only ever be invoked
+    /// through `Terminator::Invoke`, which alone has a failure edge to
+    /// route a raised value to -- an ordinary `Call` has nowhere for one
+    /// to go.
+    pub const CALL_TO_FALLIBLE_FUNCTION: &str = "V0063";
+    /// A `Terminator::Invoke` targets a function whose own `raises` is
+    /// empty. Since it can never actually raise, this callee should have
+    /// been an ordinary `Call` -- an `Invoke` with no failure edges is
+    /// never a valid lowering of anything typeck accepts.
+    pub const INVOKE_OF_INFALLIBLE_FUNCTION: &str = "V0064";
+    /// A `Terminator::Invoke`'s own `ok_slot` was never allocated with
+    /// `alloc` -- mirrors `UNKNOWN_SLOT` for the slot an ordinary `Store`
+    /// writes into: `Invoke`'s success edge writes into `ok_slot` in
+    /// exactly the same way.
+    pub const INVOKE_SUCCESS_SLOT_UNALLOCATED: &str = "V0065";
+    /// A `Terminator::Invoke`'s own `ok_slot` is declared a different
+    /// type than its callee's own (substituted) return type.
+    pub const INVOKE_SUCCESS_TYPE_MISMATCH: &str = "V0066";
+    /// A `Terminator::Invoke`'s own `err_targets` does not have exactly
+    /// one entry per variant in its callee's own declared `raises`, in
+    /// any order, with no duplicate or unknown variant -- every effect
+    /// the callee can actually raise must have exactly one destination,
+    /// and no destination may exist for an effect the callee can never
+    /// raise.
+    pub const INVOKE_ERR_TARGET_COVERAGE_MISMATCH: &str = "V0067";
+    /// One of a `Terminator::Invoke`'s own `err_targets` entries has a
+    /// `slot` that was never allocated with `alloc` (mirrors
+    /// `INVOKE_SUCCESS_SLOT_UNALLOCATED`, for a failure edge instead of
+    /// the success edge).
+    pub const INVOKE_FAILURE_SLOT_UNALLOCATED: &str = "V0068";
+    /// One of a `Terminator::Invoke`'s own `err_targets` entries has a
+    /// `slot` declared a different type than `Ty::Named`/`Ty::Applied` of
+    /// that entry's own `variant`.
+    pub const INVOKE_FAILURE_TYPE_MISMATCH: &str = "V0069";
+    /// A `Terminator::Raise`'s own `value` is not declared a type that
+    /// matches any variant in the currently verified function's own
+    /// `raises` set -- a function may only ever raise an effect it
+    /// actually declares (`rfcs/0010`).
+    pub const UNDECLARED_RAISE: &str = "V0070";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -252,6 +299,11 @@ struct KnownFunction {
     /// many evidence entries, each independently checked against the
     /// corresponding substituted requirement here.
     requirements: Vec<CapabilityRequirement>,
+    /// This function's own declared raised-error set (`rfcs/0010`) --
+    /// empty means infallible (only ever legally targeted by an ordinary
+    /// `Call`), non-empty means fallible (only ever legally targeted by
+    /// `Terminator::Invoke`).
+    raises: Vec<ItemId>,
 }
 
 /// Every declared record's/variant's/protocol's/extend's layout, by
@@ -336,6 +388,7 @@ pub fn verify_module(
                 params: function.params.iter().map(|p| p.ty.clone()).collect(),
                 return_type: function.return_type.clone(),
                 requirements: function.requirements.clone(),
+                raises: function.raises.clone(),
             },
         );
     }
@@ -845,6 +898,36 @@ fn verify_function(
         }
     }
 
+    // A function's own declared effect set (`rfcs/0010`) must be
+    // well-formed independently of whatever built this NIR: every entry
+    // must actually be a variant declared in this module, and the set
+    // must be canonical (no `ItemId` repeated) -- exactly the two
+    // invariants `hir::lower` already establishes for ordinary source,
+    // re-derived here since this verifier never trusts hand-built NIR to
+    // already satisfy them.
+    let mut seen_raises: HashSet<ItemId> = HashSet::new();
+    for raised in &function.raises {
+        if !agg.variants.contains_key(raised) {
+            diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_RAISES_TYPE,
+                source,
+                Span::dummy(),
+                format!(
+                    "{fn_context}'s `raises` names id {}, which is not a variant declared in this module",
+                    raised.0
+                ),
+            ));
+        }
+        if !seen_raises.insert(*raised) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_RAISES_ENTRY,
+                source,
+                Span::dummy(),
+                format!("{fn_context}'s `raises` names the same type more than once"),
+            ));
+        }
+    }
+
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
     let mut seen_block_ids = HashSet::new();
     for block in &function.blocks {
@@ -1125,6 +1208,273 @@ fn verify_function(
                     }
                 }
             }
+            Terminator::Invoke {
+                callee,
+                type_args,
+                args,
+                evidence,
+                ok_slot,
+                ok_target,
+                err_targets,
+            } => {
+                for arg in args {
+                    require_value(*arg, diagnostics);
+                }
+                let Some(sig) = known_functions.get(callee) else {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_FUNCTION_REF,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function with id {}, which does not exist in this module",
+                            callee.0
+                        ),
+                    ));
+                    continue;
+                };
+                if sig.raises.is_empty() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_OF_INFALLIBLE_FUNCTION,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes `{}`, which declares no `raises` and can never actually fail -- use `call` instead",
+                            registry.qualified_name(*callee, interner)
+                        ),
+                    ));
+                }
+                let invoke_context = format!("function `{name}`'s invoke type argument");
+                for t in type_args {
+                    check_type_root(
+                        t,
+                        agg,
+                        &own_params,
+                        source,
+                        interner,
+                        registry,
+                        &invoke_context,
+                        diagnostics,
+                    );
+                }
+                let arity_matches = type_args.len() == sig.type_params.len();
+                let subst: HashMap<TypeParamId, Ty> = if arity_matches {
+                    sig.type_params
+                        .iter()
+                        .copied()
+                        .zip(type_args.iter().cloned())
+                        .collect()
+                } else {
+                    diagnostics.push(Diagnostic::error(
+                        codes::GENERIC_ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function declaring {} type parameter(s) with {} type argument(s)",
+                            sig.type_params.len(),
+                            type_args.len()
+                        ),
+                    ));
+                    HashMap::new()
+                };
+                let (return_ty, param_tys): (Ty, Vec<Ty>) = if arity_matches {
+                    (
+                        substitute(&sig.return_type, &subst),
+                        sig.params.iter().map(|p| substitute(p, &subst)).collect(),
+                    )
+                } else {
+                    (sig.return_type.clone(), sig.params.clone())
+                };
+                if arity_matches {
+                    let evidence_context = format!("function `{name}`'s invoke evidence");
+                    if evidence.len() != sig.requirements.len() {
+                        diagnostics.push(Diagnostic::error(
+                            codes::EVIDENCE_COUNT_MISMATCH,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "{evidence_context} carries {} entry(ies), but the callee declares {} capability requirement(s)",
+                                evidence.len(),
+                                sig.requirements.len()
+                            ),
+                        ));
+                    } else {
+                        for (entry, requirement) in evidence.iter().zip(sig.requirements.iter()) {
+                            let required_arguments: Vec<Ty> = requirement
+                                .arguments
+                                .iter()
+                                .map(|t| substitute(t, &subst))
+                                .collect();
+                            let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+                            if let Err(problem) = check_evidence(
+                                entry,
+                                requirement.protocol,
+                                &required_arguments,
+                                true,
+                                &function.requirements,
+                                agg,
+                                0,
+                                &mut budget,
+                            ) {
+                                diagnostics.push(Diagnostic::error(
+                                    problem.code(),
+                                    source,
+                                    Span::dummy(),
+                                    format!("{evidence_context} {}", problem.describe()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if param_tys.len() != args.len() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function expecting {} argument(s) with {}",
+                            param_tys.len(),
+                            args.len()
+                        ),
+                    ));
+                } else {
+                    for (param_ty, arg) in param_tys.iter().zip(args.iter()) {
+                        if let Some(arg_ty) = value_types.get(arg)
+                            && *arg_ty != *param_ty
+                        {
+                            diagnostics.push(Diagnostic::error(
+                                codes::OPERAND_TYPE_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}` invokes a function passing an argument of type `{}` where `{}` was expected",
+                                    crate::types::display_ty(arg_ty, interner),
+                                    crate::types::display_ty(param_ty, interner)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if !alloc_slots.contains(ok_slot) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SUCCESS_SLOT_UNALLOCATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's success slot %{} was never allocated with `alloc`",
+                            ok_slot.0
+                        ),
+                    ));
+                } else if let Some(slot_ty) = value_types.get(ok_slot)
+                    && *slot_ty != return_ty
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SUCCESS_TYPE_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's success slot %{} is declared `{}`, but the callee returns `{}`",
+                            ok_slot.0,
+                            crate::types::display_ty(slot_ty, interner),
+                            crate::types::display_ty(&return_ty, interner)
+                        ),
+                    ));
+                }
+                if !known_blocks.contains(ok_target) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_BRANCH_TARGET,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes to bb{}, which does not exist",
+                            ok_target.0
+                        ),
+                    ));
+                }
+                let raises_set: HashSet<ItemId> = sig.raises.iter().copied().collect();
+                let mut target_variants: HashSet<ItemId> = HashSet::new();
+                let mut has_duplicate_target = false;
+                for target in err_targets {
+                    if !target_variants.insert(target.variant) {
+                        has_duplicate_target = true;
+                    }
+                    match agg.variants.get(&target.variant) {
+                        None => diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_VARIANT_OR_CASE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invoke's failure target names unknown variant id {}",
+                                target.variant.0
+                            ),
+                        )),
+                        Some(layout) => {
+                            if !alloc_slots.contains(&target.slot) {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_SLOT_UNALLOCATED,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} was never allocated with `alloc`",
+                                        target.slot.0
+                                    ),
+                                ));
+                            } else if let Some(slot_ty) = value_types.get(&target.slot)
+                                && *slot_ty != Ty::Named(target.variant, layout.name)
+                            {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_TYPE_MISMATCH,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} is declared `{}`, but its own failure target names `{}`",
+                                        target.slot.0,
+                                        crate::types::display_ty(slot_ty, interner),
+                                        registry.qualified_name(target.variant, interner)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if !known_blocks.contains(&target.target) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_BRANCH_TARGET,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invokes to bb{}, which does not exist",
+                                target.target.0
+                            ),
+                        ));
+                    }
+                }
+                if has_duplicate_target || target_variants != raises_set {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_ERR_TARGET_COVERAGE_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's failure targets do not cover exactly the callee's declared `raises` set, with no duplicates"
+                        ),
+                    ));
+                }
+            }
+            Terminator::Raise { value } => {
+                require_value(*value, diagnostics);
+                let declared_variant = value_types.get(value).and_then(|ty| match ty {
+                    Ty::Named(v, _) => Some(*v),
+                    _ => None,
+                });
+                if !declared_variant.is_some_and(|v| function.raises.contains(&v)) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNDECLARED_RAISE,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` raises a value not in its own declared `raises` set"
+                        ),
+                    ));
+                }
+            }
         }
     }
 
@@ -1237,6 +1587,28 @@ fn verify_dominance(
             Terminator::Switch { scrutinee, .. } => {
                 check_use(*scrutinee, block.id, after_all, diagnostics);
             }
+            Terminator::Invoke {
+                args,
+                ok_slot,
+                err_targets,
+                ..
+            } => {
+                for arg in args {
+                    check_use(*arg, block.id, after_all, diagnostics);
+                }
+                // `ok_slot`/each failure target's `slot` are write
+                // destinations, exactly like `Instruction::Store`'s own
+                // `slot` -- the `alloc` that defined it must dominate
+                // this `Invoke`, or some path could reach it without
+                // ever allocating the slot it writes into.
+                check_use(*ok_slot, block.id, after_all, diagnostics);
+                for target in err_targets {
+                    check_use(target.slot, block.id, after_all, diagnostics);
+                }
+            }
+            Terminator::Raise { value } => {
+                check_use(*value, block.id, after_all, diagnostics);
+            }
             Terminator::Return(None) | Terminator::Branch(_) => {}
         }
     }
@@ -1309,6 +1681,16 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
                 ..
             } => vec![*then_block, *else_block],
             Terminator::Switch { cases, .. } => cases.clone(),
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                let mut targets = vec![*ok_target];
+                targets.extend(err_targets.iter().map(|t| t.target));
+                targets
+            }
+            Terminator::Raise { .. } => Vec::new(),
         }
     };
 
@@ -2228,6 +2610,17 @@ fn verify_value_kind(
                 ));
                 return;
             };
+            if !sig.raises.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::CALL_TO_FALLIBLE_FUNCTION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls a fallible function through an ordinary `call`; only `invoke` may call a function declaring `raises`",
+                        result.0
+                    ),
+                ));
+            }
             let call_context = format!(
                 "function `{function_name}`: %{}'s call type argument",
                 result.0
@@ -2929,7 +3322,20 @@ fn verify_payload_refinement(
                     incoming.entry(*target).or_default().push(fact);
                 }
             }
-            Terminator::Return(_) => {}
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                incoming.entry(*ok_target).or_default().push(HashSet::new());
+                for target in err_targets {
+                    incoming
+                        .entry(target.target)
+                        .or_default()
+                        .push(HashSet::new());
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
         }
     }
 
@@ -3022,6 +3428,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3435,6 +3842,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -3489,6 +3897,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -3601,6 +4010,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -3680,6 +4090,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3711,6 +4122,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3743,6 +4155,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3932,6 +4345,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(1),
@@ -4045,6 +4459,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4093,6 +4508,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4163,6 +4579,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4268,6 +4685,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4902,6 +5320,7 @@ mod tests {
                 ty: Ty::I64,
             }],
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: Vec::new(),
@@ -5319,6 +5738,7 @@ mod tests {
                 },
             ],
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -5832,6 +6252,7 @@ mod tests {
             requirements: vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -5860,6 +6281,7 @@ mod tests {
             requirements,
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -6281,6 +6703,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: result_ty,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions,
@@ -6455,6 +6878,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -6539,6 +6963,7 @@ mod tests {
             requirements,
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {

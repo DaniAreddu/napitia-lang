@@ -343,9 +343,62 @@ pub enum Expr {
         args: Vec<Type>,
         span: Span,
     },
+    /// `raise <expr>` (`rfcs/0010`). Always type `never`; `expr` must
+    /// resolve to one of the current function's own declared `raises`
+    /// variants (checked later, not here).
+    Raise {
+        operand: Box<Expr>,
+        span: Span,
+    },
+    /// `handle <expr> { success ... , failure ... }` (`rfcs/0010`).
+    Handle(Box<HandleExpr>),
     /// A malformed expression the parser recovered from. Carries no
     /// value; later stages must skip it rather than type-check it.
     Error {
+        span: Span,
+    },
+}
+
+/// `rfcs/0010`: consumes a fallible expression exhaustively.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandleExpr {
+    pub operand: Box<Expr>,
+    pub arms: Vec<HandleArm>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandleArm {
+    /// `success <pattern> => <body>` -- exactly one is required per
+    /// `handle`; `pattern` is checked later to be a bare bind or `_`.
+    Success {
+        pattern: Pattern,
+        body: MatchArmBody,
+        span: Span,
+    },
+    /// `failure <FailurePattern> => <body>`.
+    Failure {
+        pattern: FailurePattern,
+        body: MatchArmBody,
+        span: Span,
+    },
+}
+
+/// A `handle` failure arm's own pattern -- not an ordinary [`Pattern`]
+/// because it must be able to name *which* raised type a case belongs to
+/// (`Type.Case`), unlike an ordinary `match`, whose single scrutinee type
+/// already pins that down.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailurePattern {
+    /// `_` -- a final catch-all for every raised case not otherwise
+    /// named, binding no value (a raised value's type varies by which
+    /// case actually occurred, so there is nothing uniform to bind).
+    Wildcard { span: Span },
+    /// `ErrorType.Case` or `ErrorType.Case(pattern, ...)`.
+    Case {
+        error_type: Ident,
+        case: Ident,
+        args: Vec<Pattern>,
         span: Span,
     },
 }
@@ -379,11 +432,29 @@ impl Expr {
             | Expr::Continue { span }
             | Expr::RecordLiteral { span, .. }
             | Expr::TypeApply { span, .. }
+            | Expr::Raise { span, .. }
             | Expr::Error { span } => *span,
             Expr::Ident(ident) => ident.span,
             Expr::If(if_expr) => if_expr.span,
             Expr::Match(match_expr) => match_expr.span,
             Expr::Block(block) => block.span,
+            Expr::Handle(handle_expr) => handle_expr.span,
+        }
+    }
+}
+
+impl HandleArm {
+    pub fn span(&self) -> Span {
+        match self {
+            HandleArm::Success { span, .. } | HandleArm::Failure { span, .. } => *span,
+        }
+    }
+}
+
+impl FailurePattern {
+    pub fn span(&self) -> Span {
+        match self {
+            FailurePattern::Wildcard { span } | FailurePattern::Case { span, .. } => *span,
         }
     }
 }

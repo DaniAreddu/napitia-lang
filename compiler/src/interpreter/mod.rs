@@ -1667,4 +1667,38 @@ mod tests {
                      }";
         assert_eq!(run(text), Ok(Value::Int(-9)));
     }
+
+    // -- Fix 3: diverging operands under `?`/`handle` (`rfcs/0010`) -----
+
+    #[test]
+    fn postfix_try_with_a_diverging_argument_returns_through_the_argument_exactly_once() {
+        // `read` is never actually invoked -- the argument's own `return`
+        // ends `main` first, exactly once, before the fallible call (and
+        // therefore the postfix `?` after it) is ever reached.
+        let text = "variant FileError { Missing } \
+                     func read(path: str) -> str raises FileError { \
+                         if path == \"\" { raise FileError.Missing; } \
+                         return \"ok\"; \
+                     } \
+                     func main() -> i64 { \
+                         return read({ return 7 })?; \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn handle_with_a_diverging_argument_returns_through_the_argument_exactly_once() {
+        let text = "variant FileError { Missing } \
+                     func read(path: str) -> str raises FileError { \
+                         if path == \"\" { raise FileError.Missing; } \
+                         return \"ok\"; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read({ return 7 }) { \
+                             success v => 1, \
+                             failure FileError.Missing => 2, \
+                         }; \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
 }

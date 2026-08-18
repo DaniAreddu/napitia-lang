@@ -1,15 +1,22 @@
 # Spec 0005: Error and Effect Model
 
-- Status: Design direction only. Not implemented in Alpha 0.1.
+- Status: `raises`/`raise`/postfix `?`/`handle` implemented (Alpha
+  0.1.6) — see `rfcs/0010-typed-outcomes.md` for the accepted, concrete
+  design and current honest limitations. Capability `uses` effects
+  (Koka/OCaml-effects-style, distinct from `rfcs/0009`'s already-checked
+  capability `uses`), `panic` as a trackable effect, and the
+  ownership/region interaction below remain design direction only.
 
-Alpha 0.1's checked "failure modes" are limited to compiler diagnostics
-(lexical/syntax/name-resolution/type errors) and two runtime conditions the
-NIR interpreter detects directly: division by zero and invalid internal
-operations (`spec/0006-napitia-ir.md`). The `uses`/`raises` clauses parsed
-in `spec/0002-syntax.md` are not checked against any real effect/error
-model in this milestone — declaring either non-empty is itself a checked,
-reported error, rather than being silently accepted and ignored. This
-spec records the intended long-term model, using the
+Alpha 0.1.6 checks `raises`/`raise`/postfix `?`/`handle` against a real,
+nominal effect model (`rfcs/0010`): a function's own `raises` clause is a
+closed, explicit, per-function list, never inferred or propagated
+automatically; there is no value-level "outcome" type in addition to it
+— `raises` plus `?`/`handle` fully replace that need, resolving two of
+this spec's own previously-open research questions below. The NIR
+interpreter's own division-by-zero/malformed-instruction reporting
+(`spec/0006-napitia-ir.md`) remains a separate, lower layer, unrelated to
+`raises`. This spec's remaining sections record intended long-term
+direction beyond what `rfcs/0010` actually implements, using the
 provisional vocabulary from `rfcs/0004-language-independence.md`. An
 earlier version of this spec named `Result<T, E>` and `Option<T>`
 directly — those are Rust's own standard-library type names, not Napitia
@@ -17,11 +24,14 @@ concepts, and RFC 0004 corrects that.
 
 ## Implemented features
 
+- `raises`/`raise`/postfix `?`/`handle`, checked against a real, nominal
+  effect model with mandatory explicit handling at every fallible call
+  site and exhaustive, per-case `handle` coverage (`rfcs/0010`,
+  Alpha 0.1.6).
 - The NIR interpreter reports division-by-zero and malformed-instruction
   conditions as structured `InterpreterError` values rather than
-  panicking or invoking undefined behavior (`spec/0006`). This is the only
-  piece of the eventual error model that exists today, and it exists at
-  the interpreter layer, not the language-surface layer.
+  panicking or invoking undefined behavior (`spec/0006`) — a separate,
+  lower layer than `raises`, not itself a checked language-surface effect.
 
 ## Accepted design direction
 
@@ -91,15 +101,17 @@ statically (e.g. calling with the wrong argument count), it does, and no
 
 ## Unresolved research questions
 
-- Whether `uses`/`raises` are checked structurally (any function that
-  performs the effect/can produce the error must declare it, and it
-  propagates through callers automatically, Koka/OCaml-effects style) or
-  nominally (an explicit, closed-per-function list a function opts into).
-  This is the central open question `rfcs/0003` exists to resolve;
-  renaming the keywords did not resolve it.
-- Whether a value-level "outcome" type is needed *in addition to*
-  `raises`, for storing a not-yet-propagated failure as data, or whether
-  `raises` plus `?` fully replaces that need.
+- **Resolved by `rfcs/0010` (Alpha 0.1.6):** `raises` is checked
+  nominally — an explicit, closed-per-function list a function opts
+  into, never structurally inferred or auto-propagated. This resolves
+  the failure-error half of this question; the analogous question for
+  capability `uses` *effects* (as opposed to `rfcs/0009`'s already-solved
+  capability `uses` requirements) remains open.
+- **Resolved by `rfcs/0010` (Alpha 0.1.6):** no value-level "outcome"
+  type exists in addition to `raises` — `raises` plus `?`/`handle` fully
+  replace that need. A raised value cannot be stored, compared, or
+  passed around independently of the control-flow constructs that
+  produce and consume it (`rfcs/0010`'s own honest limitations).
 - Whether `panic` itself should be a trackable effect (so "this function
   can panic" is visible in its type) or remain untracked, matching most
   mainstream statically typed languages.

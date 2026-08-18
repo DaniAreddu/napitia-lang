@@ -40,25 +40,27 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.5
+## Current status: Alpha 0.1.6
 
-This milestone adds `protocol`/`extend`/`uses`: a capability system for
-expressing "this type supports this operation" without inheritance,
-implicit receivers, or runtime type discovery. `protocol Equal[T] { func
-equal(left: T, right: T) -> bool; }` declares an explicit contract;
-`extend Equal[i64] { ... }` supplies a concrete (or conditionally generic)
-implementation; `Equal[i64].equal(a, b)` is the only way to call one —
-there is no `Self`, no implicit receiver, and `==` never routes through a
-protocol implicitly. Every capability requirement is resolved once,
-entirely at compile time, into one piece of evidence (a concrete
-extension, or a forward of the caller's own identical requirement) —
-dictionary passing, the same technique behind Haskell typeclasses without
-runtime dispatch, but a custom Napitia design, not a copy of Rust traits,
-Java/Go interfaces, or Haskell typeclasses. An independent NIR verifier
-pass re-checks every protocol/extend declaration and every call's evidence
-against hand-built NIR, never trusting the type checker to have already
-gotten it right. It builds on Alpha 0.1.4's generics (`rfcs/0008`) and
-Alpha 0.1.3's module-qualified identity and import aliases (`rfcs/0007`).
+This milestone adds `raises`/`raise`/postfix `?`/`handle`: a custom,
+statically checked failure model, not a copy of Rust's `Result`,
+Java/Python/C++ exceptions, or Go's tuple-return convention. A function's
+raised-error set is part of its signature, exactly like its return type
+(`func read_config(path: str) -> str raises FileError { ... }`); `raise
+FileError.Missing` produces a failure and unconditionally diverges; `?`
+explicitly propagates a fallible call's failure to the enclosing
+function's own declared `raises` set; `handle <expr> { success v => ...,
+failure FileError.Missing => ... }` exhaustively consumes every raised
+case, at case granularity, across however many distinct raised types are
+in play. A fallible call left unhandled — not propagated, not consumed —
+is a compile-time diagnostic; there is no ambient exception channel and
+no implicit unwinding. `Terminator::Invoke`/`Terminator::Raise` give this
+an explicit two-destination NIR representation (success and failure are
+both just typed CFG edges), independently re-checked by the same NIR
+verifier pass every other construct already distrusts hand-built NIR for.
+It builds on Alpha 0.1.5's capability protocols (`rfcs/0009`), Alpha
+0.1.4's generics (`rfcs/0008`), and Alpha 0.1.3's module-qualified
+identity and import aliases (`rfcs/0007`).
 
 ### Implemented in this milestone
 
@@ -92,12 +94,12 @@ Alpha 0.1.3's module-qualified identity and import aliases (`rfcs/0007`).
   blocks, with a textual printer for debugging and a verifier pass that
   re-checks structural and type invariants before a module is ever
   interpreted. Record/variant construction, field/payload projection,
-  and `match` (lowered to a real decision tree over `switch`/`condbr`)
-  all have full NIR representation now; casts, `defer`, postfix `?`,
-  non-empty `uses`/`raises` clauses, and a value-carrying `break`
-  remain parsed-but-rejected, never silently accepted or faked.
-  Lowering the rest of a module is atomic: either every function
-  lowers, or the whole module fails with diagnostics.
+  `match` (lowered to a real decision tree over `switch`/`condbr`), and
+  `raise`/postfix `?`/`handle` (lowered to `Invoke`/`Raise`, see below)
+  all have full NIR representation now; casts, `defer`, and a
+  value-carrying `break` remain parsed-but-rejected, never silently
+  accepted or faked. Lowering the rest of a module is atomic: either
+  every function lowers, or the whole module fails with diagnostics.
 - A tree-walking interpreter over NIR, used to execute the supported
   language subset (including records, variants, and `match`) without a
   native backend.
@@ -126,6 +128,17 @@ Alpha 0.1.3's module-qualified identity and import aliases (`rfcs/0007`).
   vtable), exact-forwarding-only symbolic resolution, an entry-point
   restriction, and an independent NIR verifier pass covering every
   protocol/extend layout and every call's evidence — see below.
+- Typed outcomes (`raises`/`raise`/postfix `?`/`handle`): a function's
+  own canonical, deduplicated raised-error set as part of its signature;
+  exhaustive, per-case `handle` coverage (a concrete missing-`Type.Case`
+  witness on failure, not merely "non-exhaustive"); mandatory explicit
+  handling at every fallible call site (propagate or consume — never
+  silently ignored); an entry-point restriction mirroring capability
+  protocols'; and an independent NIR verifier pass covering every
+  `Invoke`/`Raise` the same way it already covers every other
+  construct — see `rfcs/0010-typed-outcomes.md` for the full design and
+  current honest limitations (there is no protocol/capability
+  integration for typed failure yet).
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -321,18 +334,21 @@ Field mutation, record/variant equality, pattern guards, or-patterns,
 record-destructuring/slice/range patterns, an inline `[T: Protocol]`
 bound spelling on a generic type parameter (the underlying capability
 requirement exists via `uses Protocol[T]` on the function — see above),
-protocol default methods/supertraits/first-class protocol values, checked
-`uses`/`raises` *effects* and errors (`spec/0005`, distinct from
-capability `uses`, which is fully checked), ownership/region enforcement
-(and the indirection that would lift the recursive-aggregate
-restriction), structured concurrency, remote packages/dependency
-declarations, wildcard/grouped imports, re-exports, package/module
-aliases (as opposed to the per-item import aliases that do exist — see
-above), incremental/cached compilation, an LLVM (or any native) backend,
-native-code generic specialization/monomorphization, garbage collection,
-and any domain-specific library (REST, ORM, tensors, GPU).
-Design direction for most of these exists in `rfcs/`;
-none of it is faked in the implementation.
+protocol default methods/supertraits/first-class protocol values, a
+protocol method declaring its own `raises` (typed failure has no
+protocol/capability integration yet — see `rfcs/0010`), generic error
+variants, partial `handle` (consuming only some raised effects and
+re-raising the rest), first-class effect/error values, stack traces or
+`panic`/`recover`, ownership/region enforcement (and the indirection that
+would lift the recursive-aggregate restriction), structured concurrency,
+remote packages/dependency declarations, wildcard/grouped imports,
+re-exports, package/module aliases (as opposed to the per-item import
+aliases that do exist — see above), incremental/cached compilation, an
+LLVM (or any native) backend, native-code generic
+specialization/monomorphization, garbage collection, and any
+domain-specific library (REST, ORM, tensors, GPU). Design direction for
+most of these exists in `rfcs/`; none of it is faked in the
+implementation.
 
 ## Building
 

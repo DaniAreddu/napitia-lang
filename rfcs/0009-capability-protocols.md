@@ -152,9 +152,16 @@ budget-exceeded comparison to plain "disjoint": doing so could let two
 extensions that might genuinely overlap both stay registered. A pair this
 checker cannot decide within budget is reported as `T0047`, and *both*
 extends involved are excluded from the solver — coherence can be claimed
-for neither. The result (and its diagnostic's exact wording, file, and
-span) is independent of declaration order — reversing which extend was
-written first produces byte-identical output.
+for neither. The *decision* (disjoint, overlapping, or budget-exceeded,
+and therefore the diagnostic code: `T0036`, `T0037`, or `T0047`) is
+independent of declaration order — reversing which of two extends was
+written first never changes which of those three outcomes is reached.
+The rendered diagnostic itself is not required to be byte-identical
+after such a reversal: by design, the primary span always belongs to
+the *second*-declared extend (see "Determinism" below), so reversing
+the source necessarily changes which extend that is, and with it the
+reported span/source excerpt — an honest consequence of the input
+itself changing, not an unresolved nondeterminism in the checker.
 
 Separately, every extend's own type parameter must be *determined* by its
 protocol head: `extend[T] Equal[i64] uses Other[T]` declares `T` with
@@ -343,12 +350,38 @@ than a flood of them, a hang, or a stack overflow.
 
 ## Determinism
 
-Every diagnostic this milestone adds — authority, overlap, missing/
-ambiguous capability, poisoned protocol calls, entry-point restriction,
-every new `V`-code — is independent of declaration order, import order,
-and which of two aliases a program happens to use: the same program,
-reversed in whichever of these ways applies, produces byte-identical
-diagnostics (same code, file, span, and message) or byte-identical NIR.
+Three separate, precise guarantees — worth stating separately, since they
+are not the same claim:
+
+- **Identical input always produces identical output.** Compiling the
+  exact same source twice (`repeated_compiles_produce_identical_nir_
+  output`-style tests) produces byte-identical diagnostics and
+  byte-identical NIR, always. Nothing in this milestone's solver, overlap
+  checker, or verifier depends on process state, hashing order, or
+  anything else that could make two runs of the same input disagree.
+- **Import/module discovery order does not influence semantic
+  resolution.** Which order a project's modules happen to be discovered
+  or imported in never changes *what a program means*: the same set of
+  declarations resolves to the same capability decisions, the same
+  accepted/rejected extends, and the same canonical NIR (item identity is
+  `ItemId`-based, never derived from source position or import order —
+  `rfcs/0007`), so permuting import order produces byte-identical NIR and
+  identical diagnostics for genuinely order-independent constructs (e.g.
+  which protocol a cross-module call resolves to).
+- **Reversing which of two conflicting declarations comes first is
+  order-independent *by outcome*, not by rendered text.** Overlap
+  checking (`T0036`/`T0037`/`T0047`) always reaches the same decision
+  regardless of which of two extends was written first — reversing them
+  never flips disjoint/overlap/budget-exceeded. It is not, and cannot
+  honestly be, byte-identical *text* after such a reversal: this
+  checker's own convention is that the primary diagnostic is always
+  reported against the *second*-declared extend, with the first labeled
+  as "declared here" — reversing the source changes which declaration is
+  second, and therefore which span/source excerpt is primary. Byte-
+  identical rendered output is not a meaningful guarantee here, because
+  the input itself changed; what is guaranteed, and tested, is that the
+  diagnostic *code* (and, for `T0047`, which extends get excluded) is the
+  same either way.
 
 ## Required examples
 

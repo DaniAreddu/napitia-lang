@@ -567,3 +567,30 @@ fn extending_a_primitive_from_a_module_that_owns_neither_it_nor_the_protocol_is_
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("T0035"));
 }
+
+#[test]
+fn a_raised_variant_and_a_fallible_function_imported_across_modules_run_end_to_end() {
+    // `ConfigError` and `read_config` are declared in `config.npt`;
+    // `main.npt` only imports and `handle`s them (`rfcs/0010`).
+    let dir = project("raises_two_file");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "-1");
+}

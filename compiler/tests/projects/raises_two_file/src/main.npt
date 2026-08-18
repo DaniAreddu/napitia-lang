@@ -1,0 +1,9 @@
+import config.ConfigError;
+import config.read_config;
+
+func main() -> i64 {
+    return handle read_config(false) {
+        success v => v,
+        failure ConfigError.Missing => -1,
+    };
+}

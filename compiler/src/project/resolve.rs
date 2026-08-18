@@ -206,15 +206,46 @@ fn resolve_one_import(
             declared_span: variant.span,
         });
     }
+    if let Some(protocol) = target_hir
+        .protocols
+        .iter()
+        .find(|p| p.name == declared_name)
+    {
+        if !protocol.public {
+            return Err(Box::new(private_item_diagnostic(
+                importing_source,
+                import.span,
+                item_name,
+                &dotted,
+                *target_source,
+                protocol.name_span,
+            )));
+        }
+        let methods = protocol.methods.iter().map(|m| (m.name, m.index)).collect();
+        return Ok(ImportedItem {
+            local_name,
+            kind: ImportedItemKind::Protocol {
+                item: protocol.id,
+                declared_name: protocol.name,
+                methods,
+            },
+            import_span: import.span,
+            local_name_span,
+            declared_source: *target_source,
+            declared_span: protocol.name_span,
+        });
+    }
     if let Some(other) = target_hir
         .other_items
         .iter()
         .find(|o| o.name == declared_name)
     {
+        // Only one `OtherItemKind` exists today; the message is written
+        // out in full (rather than built from a generic article + kind
+        // name) so it stays grammatically correct without needing an
+        // article table if a differently-named kind is ever added.
         let kind_text = match other.kind {
-            OtherItemKind::Protocol => "protocol",
-            OtherItemKind::Extend => "extend block",
-            OtherItemKind::Import => "import",
+            OtherItemKind::Import => "an import declaration",
         };
         return Err(Box::new(
             Diagnostic::error(
@@ -222,8 +253,7 @@ fn resolve_one_import(
                 importing_source,
                 import.span,
                 format!(
-                    "`{item_name}` in module `{dotted}` is {} `{kind_text}`, which cannot be imported in Alpha 0.1.2",
-                    if matches!(other.kind, OtherItemKind::Extend) { "an" } else { "a" }
+                    "`{item_name}` in module `{dotted}` is {kind_text} and cannot itself be imported"
                 ),
             )
             .with_primary_label("not an importable kind")
@@ -476,14 +506,50 @@ mod tests {
         assert_eq!(diags[0].code, "M0003");
     }
 
+    /// `rfcs/0009`: a protocol is a real, importable item, the same way
+    /// a function/record/variant already is -- superseding an earlier
+    /// Alpha 0.1.2-era test (of the same underlying scenario) that
+    /// asserted the opposite, back when `protocol` was still name-only
+    /// in HIR and any attempt to import one was rejected as M0005.
     #[test]
-    fn importing_a_protocol_is_m0005_not_silently_ignored() {
+    fn resolves_a_public_protocol_import() {
         let mut map = SourceMap::new();
         let mut interner = Interner::new();
         let (target_hir, target_source) = lowered_target(
             &mut map,
             &mut interner,
-            "protocol Drawable { func draw() -> i64; }",
+            "public protocol Drawable[T] { func draw(target: T) -> i64; }",
+        );
+        let importing_source = map.add_file("main.npt", "");
+        let mut module_paths = HashMap::new();
+        module_paths.insert("shapes".to_string(), ModuleId(0));
+        let mut lowered = HashMap::new();
+        lowered.insert(ModuleId(0), (target_hir, target_source));
+
+        let imports = vec![import_ref(&["shapes", "Drawable"], Span::dummy())];
+        let resolved = resolve_imports(
+            &imports,
+            importing_source,
+            &module_paths,
+            &lowered,
+            &mut interner,
+        )
+        .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            resolved[0].kind,
+            ImportedItemKind::Protocol { .. }
+        ));
+    }
+
+    #[test]
+    fn importing_a_private_protocol_is_m0006() {
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let (target_hir, target_source) = lowered_target(
+            &mut map,
+            &mut interner,
+            "protocol Drawable[T] { func draw(target: T) -> i64; }",
         );
         let importing_source = map.add_file("main.npt", "");
         let mut module_paths = HashMap::new();
@@ -501,6 +567,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
-        assert_eq!(diags[0].code, "M0005");
+        assert_eq!(diags[0].code, "M0006");
     }
 }

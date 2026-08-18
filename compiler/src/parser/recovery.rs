@@ -75,6 +75,32 @@ pub(super) fn synchronize_to_stmt(p: &mut Parser) {
     }
 }
 
+/// Advances past tokens until the next `func` keyword (a fresh member
+/// attempt), a block-closing `}` (left for the caller), or end of input.
+/// Called after a `protocol`/`extend` member fails to parse.
+///
+/// Deliberately never delegates to `synchronize_to_stmt`/`is_stmt_start`:
+/// those consider a general statement-start token (`value`, `mutable`,
+/// `if`, ...) itself a valid recovery point, correct inside an ordinary
+/// block, where such a token really does start the next statement. A
+/// `protocol`/`extend` body has no such statements -- it only ever
+/// contains `func` declarations -- so a malformed member beginning with
+/// one of those tokens is not a synchronization point at all here, and
+/// `synchronize_to_stmt` would return without advancing, leaving the
+/// caller's own "did this call make progress" check permanently false:
+/// an infinite loop that keeps re-attempting the same non-`func` token
+/// forever, its diagnostics list growing without bound.
+pub(super) fn synchronize_to_member_start(p: &mut Parser) {
+    loop {
+        match p.current() {
+            TokenKind::Eof | TokenKind::RBrace | TokenKind::Func => return,
+            _ => {
+                p.advance();
+            }
+        }
+    }
+}
+
 /// Advances past tokens until the next `,` (consumed) or a closing `}`
 /// (left for the caller). Called after one entry of a comma-separated,
 /// brace-delimited list (a record's fields, a variant's cases, a

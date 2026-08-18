@@ -1,0 +1,23 @@
+// INVALID: `extend[T] P[T, T]` and `extend[U] P[U, i64]` both cover
+// `P[i64, i64]` -- an incoherent overlap that must be rejected before
+// any call site even exists. Rejected as T0037 (Alpha 0.1.5,
+// rfcs/0009).
+protocol P[A, B] {
+    func test(left: A, right: B) -> bool;
+}
+
+extend[T] P[T, T] {
+    func test(left: T, right: T) -> bool {
+        return true
+    }
+}
+
+extend[U] P[U, i64] {
+    func test(left: U, right: i64) -> bool {
+        return false
+    }
+}
+
+func main() -> bool {
+    return true
+}

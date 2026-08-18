@@ -517,6 +517,8 @@ mod tests {
             records.push(r);
         }
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records,
             variants: Vec::new(),
@@ -592,6 +594,8 @@ mod tests {
             records.push(r);
         }
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records,
             variants: Vec::new(),
@@ -629,12 +633,16 @@ mod tests {
         field_types.insert(record_c.id, vec![ty_c]);
 
         let forward = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![record_a.clone(), record_b.clone(), record_c.clone()],
             variants: Vec::new(),
             other_items: Vec::new(),
         };
         let reversed = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![record_c, record_b, record_a],
             variants: Vec::new(),
@@ -671,6 +679,8 @@ mod tests {
         let mut payload_types = HashMap::new();
         payload_types.insert(variant_b.id, vec![vec![variant_ty]]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![record_a],
             variants: vec![variant_b],
@@ -805,6 +815,8 @@ mod tests {
         field_types.insert(node_record.id, vec![node_field_ty]);
         field_types.insert(box_record.id, vec![box_field_ty]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![node_record, box_record],
             variants: Vec::new(),
@@ -847,6 +859,8 @@ mod tests {
         let mut field_types = HashMap::new();
         field_types.insert(box_record.id, vec![box_field_ty]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![box_record],
             variants: Vec::new(),
@@ -897,6 +911,8 @@ mod tests {
         field_types.insert(outer_record.id, vec![outer_field_ty]);
         field_types.insert(box_record.id, vec![box_field_ty]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![outer_record, box_record],
             variants: Vec::new(),
@@ -933,6 +949,8 @@ mod tests {
         let mut field_types = HashMap::new();
         field_types.insert(node_record.id, vec![field_ty]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![node_record],
             variants: Vec::new(),
@@ -977,6 +995,8 @@ mod tests {
         let mut payload_types = HashMap::new();
         payload_types.insert(list_variant.id, vec![payload]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: Vec::new(),
             variants: vec![list_variant],
@@ -1042,6 +1062,8 @@ mod tests {
         field_types.insert(wrap_record.id, vec![wrap_field_ty]);
         field_types.insert(box_record.id, vec![box_field_ty]);
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![wrap_record, box_record],
             variants: Vec::new(),

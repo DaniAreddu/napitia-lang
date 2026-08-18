@@ -1,0 +1,29 @@
+// A conditional extension: `Box[T]` is `Equal` whenever `T` itself is
+// (Alpha 0.1.5, rfcs/0009). The `uses Equal[T]` requirement below is
+// resolved by forwarding the caller's own evidence, never derived
+// symbolically -- see rfcs/0009 for why this is an honest limitation.
+record Box[T] {
+    payload: T,
+}
+
+protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        return left == right
+    }
+}
+
+extend[T] Equal[Box[T]] uses Equal[T] {
+    func equal(left: Box[T], right: Box[T]) -> bool {
+        return Equal[T].equal(left.payload, right.payload)
+    }
+}
+
+func main() -> bool {
+    value a = Box[i64] { payload: 7 };
+    value b = Box[i64] { payload: 7 };
+    return Equal[Box[i64]].equal(a, b)
+}

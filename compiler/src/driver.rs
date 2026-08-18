@@ -18,7 +18,7 @@ use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
 use crate::syntax::ast;
 use crate::typeck;
-use crate::types::Ty;
+use crate::types::{Evidence, Ty};
 
 pub struct LexOutput {
     pub tokens: Vec<Token>,
@@ -56,6 +56,10 @@ pub struct CheckOutput {
     pub pattern_case: HashMap<hir::PatternId, (hir::ItemId, usize)>,
     /// See [`typeck::TypeckResult::call_type_args`].
     pub call_type_args: HashMap<hir::ExprId, Vec<Ty>>,
+    /// See [`typeck::TypeckResult::call_evidence`].
+    pub call_evidence: HashMap<hir::ExprId, Vec<Evidence>>,
+    /// See [`typeck::TypeckResult::protocol_call_evidence`].
+    pub protocol_call_evidence: HashMap<hir::ExprId, Evidence>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -72,6 +76,8 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         expr_types: typeck_result.expr_types,
         pattern_case: typeck_result.pattern_case,
         call_type_args: typeck_result.call_type_args,
+        call_evidence: typeck_result.call_evidence,
+        protocol_call_evidence: typeck_result.protocol_call_evidence,
         diagnostics,
     }
 }
@@ -106,6 +112,8 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.expr_types,
         &checked.pattern_case,
         &checked.call_type_args,
+        &checked.call_evidence,
+        &checked.protocol_call_evidence,
         interner,
         source,
     ) {

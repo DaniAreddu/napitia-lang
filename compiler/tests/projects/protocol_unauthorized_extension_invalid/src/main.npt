@@ -1,0 +1,14 @@
+import protocols.Equal;
+
+// INVALID: `i64` is a primitive, so only `protocols.npt` (Equal's own
+// declaring module) has authority to extend `Equal` for it -- this
+// module has neither. Rejected as T0035 (Alpha 0.1.5, rfcs/0009).
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        return left == right
+    }
+}
+
+func main() -> bool {
+    return Equal[i64].equal(1, 1)
+}

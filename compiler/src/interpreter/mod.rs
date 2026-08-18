@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
 use crate::symbol::Interner;
+use crate::types::Evidence;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -84,7 +85,7 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function `{name}`"))
             })?;
-        self.call_function(function, args)
+        self.call_function(function, args, Vec::new())
     }
 
     /// Calls the function identified by `item` with no arguments -- a
@@ -107,13 +108,22 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function {item:?}"))
             })?;
-        self.call_function(function, args)
+        self.call_function(function, args, Vec::new())
     }
 
+    /// `evidence` is this call's own resolved capability evidence
+    /// (`rfcs/0009`), one entry per `function.requirements`, in that
+    /// same order -- always fully concrete (`Evidence::Extension`) by
+    /// the time a frame actually runs: whichever call constructed this
+    /// vector already resolved any `Evidence::Forwarded` against *its
+    /// own* calling frame first (see `resolve_evidence`), so a running
+    /// frame's own evidence never itself needs further resolution, only
+    /// a lookup.
     fn call_function(
         &self,
         function: &Function,
         args: Vec<Value>,
+        evidence: Vec<Evidence>,
     ) -> Result<Value, InterpreterError> {
         // `Vec::zip` silently truncates to the shorter side: too few
         // arguments would leave the missing parameters unbound (an
@@ -129,6 +139,23 @@ impl<'a> Interpreter<'a> {
                 "function expects {} argument(s), found {}",
                 function.params.len(),
                 args.len()
+            )));
+        }
+        // Mirrors the argument-count check just above: the verifier
+        // checks NIR-to-NIR evidence shape (`Call`'s own evidence list
+        // length against its callee's declared requirements), but never
+        // a value-level call across this API boundary (`Interpreter::
+        // call`/`call_item`, called directly by the CLI/tests, never
+        // through a `Call` instruction at all). A requirement-bearing
+        // function invoked with the wrong number of evidence entries
+        // fails here, immediately and by its own diagnosis, rather than
+        // deferred until whichever `protocol.call` first tries to index
+        // past the end of an evidence vector too short for it.
+        if function.requirements.len() != evidence.len() {
+            return Err(InterpreterError::InvalidOperation(format!(
+                "function declares {} capability requirement(s) but was given {} evidence entries",
+                function.requirements.len(),
+                evidence.len()
             )));
         }
         let mut values: HashMap<ValueId, Value> = HashMap::new();
@@ -158,7 +185,7 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, kind, .. } => {
-                        let value = self.eval(kind, &values)?;
+                        let value = self.eval(kind, &values, &evidence)?;
                         values.insert(*result, value);
                     }
                     crate::nir::Instruction::Store { slot, value } => {
@@ -212,6 +239,7 @@ impl<'a> Interpreter<'a> {
         &self,
         kind: &ValueKind,
         values: &HashMap<ValueId, Value>,
+        current_evidence: &[Evidence],
     ) -> Result<Value, InterpreterError> {
         match kind {
             ValueKind::Alloc => Ok(Value::Unit),
@@ -277,7 +305,7 @@ impl<'a> Interpreter<'a> {
             // straight past `type_args` here without needing to look at
             // it at all, the same "generics erase at runtime" approach
             // ordinary type-erased generics use.
-            ValueKind::Call(item, _type_args, args) => {
+            ValueKind::Call(item, _type_args, args, call_evidence) => {
                 let arg_values = args
                     .iter()
                     .map(|id| get(values, id))
@@ -288,7 +316,57 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .find(|f| f.id == *item)
                     .ok_or_else(|| invalid("call to a function not present in this module"))?;
-                self.call_function(callee, arg_values)
+                let resolved_evidence = call_evidence
+                    .iter()
+                    .map(|e| resolve_evidence(current_evidence, e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.call_function(callee, arg_values, resolved_evidence)
+            }
+            // Dispatches through this specific call's own resolved
+            // evidence (`rfcs/0009`): a concrete extension is looked up
+            // by its `ItemId` and its own method table consulted by
+            // canonical index, never by re-resolving a name -- this is
+            // the one place a protocol call actually executes.
+            ValueKind::ProtocolCall {
+                protocol: _,
+                arguments: _,
+                method,
+                evidence,
+                args,
+            } => {
+                let arg_values = args
+                    .iter()
+                    .map(|id| get(values, id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let resolved = resolve_evidence(current_evidence, evidence)?;
+                let Evidence::Extension { extend, nested } = resolved else {
+                    return Err(invalid(
+                        "protocol call evidence did not resolve to a concrete extension",
+                    ));
+                };
+                let extend_layout = self
+                    .module
+                    .extends
+                    .iter()
+                    .find(|(id, _)| *id == extend)
+                    .map(|(_, layout)| layout)
+                    .ok_or_else(|| {
+                        invalid("protocol call evidence references an unknown extend")
+                    })?;
+                let method_item = extend_layout.methods.get(*method).ok_or_else(|| {
+                    invalid("protocol call method index out of range for its extend")
+                })?;
+                let callee = self
+                    .module
+                    .functions
+                    .iter()
+                    .find(|f| f.id == *method_item)
+                    .ok_or_else(|| {
+                        invalid(
+                            "protocol call's implementing function is not present in this module",
+                        )
+                    })?;
+                self.call_function(callee, arg_values, nested)
             }
             ValueKind::RecordCreate(item, _type_args, field_ids) => {
                 let fields = field_ids
@@ -362,6 +440,33 @@ fn get(values: &HashMap<ValueId, Value>, id: &ValueId) -> Result<Value, Interpre
 
 fn invalid(message: impl Into<String>) -> InterpreterError {
     InterpreterError::InvalidOperation(message.into())
+}
+
+/// Resolves one static [`Evidence`] entry (from a `Call`/`ProtocolCall`
+/// instruction) against the *currently executing* frame's own already-
+/// resolved evidence (`rfcs/0009`): `Evidence::Extension` is
+/// self-contained and passes through unchanged; `Evidence::Forwarded(k)`
+/// means "use whatever this frame's own `evidence[k]` already is" --
+/// exactly the frame-relative copy that lets a still-symbolic generic
+/// body forward its own requirement without the interpreter ever
+/// re-running any type/capability resolution. An out-of-range forwarded
+/// index is malformed NIR the verifier should already have rejected;
+/// the interpreter still reports it as a structured error rather than
+/// panicking.
+fn resolve_evidence(
+    current_evidence: &[Evidence],
+    entry: &Evidence,
+) -> Result<Evidence, InterpreterError> {
+    match entry {
+        Evidence::Extension { extend, nested } => Ok(Evidence::Extension {
+            extend: *extend,
+            nested: nested.clone(),
+        }),
+        Evidence::Forwarded(index) => current_evidence
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| invalid("forwarded capability evidence index out of range")),
+    }
 }
 
 fn kind_name(value: &Value) -> &'static str {
@@ -525,6 +630,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -787,6 +894,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -822,6 +931,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -848,10 +959,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: vec![
                     Param {
                         value: ValueId(0),
@@ -888,10 +1002,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: vec![Param {
                     value: ValueId(0),
                     ty: Ty::I64,
@@ -914,6 +1031,50 @@ mod tests {
         );
     }
 
+    /// Fix 5: `Interpreter::call`/`call_item` are a direct value-level
+    /// entry point into a function -- unlike a `Call` instruction, never
+    /// mediated by the verifier's own evidence-shape check. A
+    /// requirement-bearing function invoked this way with no evidence at
+    /// all must fail immediately, with its own diagnosis, rather than
+    /// deferred until whatever `protocol.call` inside its body first
+    /// tries to index past the end of an empty evidence vector.
+    #[test]
+    fn calling_a_requirement_bearing_function_with_no_evidence_is_an_immediate_error() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Function, Param, Terminator};
+        use crate::types::{CapabilityRequirement, Ty};
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                type_params: Vec::new(),
+                requirements: vec![CapabilityRequirement::new(ItemId(1), vec![Ty::I64])],
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: Ty::I64,
+                }],
+                return_type: Ty::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Some(ValueId(0))),
+                }],
+            }],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected an evidence-count error, got {outcome:?}"
+        );
+    }
+
     #[test]
     fn a_function_missing_its_entry_block_is_an_error_not_a_panic() {
         // `function.blocks.first()` would previously accept whichever
@@ -926,10 +1087,13 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::Unit,
                 blocks: vec![BasicBlock {
@@ -1072,10 +1236,13 @@ mod tests {
         let name = interner.intern("f");
         let variant = ItemId(1);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![
@@ -1120,10 +1287,13 @@ mod tests {
         let record_a = ItemId(1);
         let record_b = ItemId(2);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![Function {
                 id: ItemId(0),
                 name,
                 type_params: Vec::new(),
+                requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
                 blocks: vec![BasicBlock {

@@ -142,17 +142,22 @@ pub struct HirModule {
     pub functions: Vec<HirFunction>,
     pub records: Vec<HirRecord>,
     pub variants: Vec<HirVariant>,
-    /// `protocol`/`extend`/`import` items. Alpha 0.1 resolves and
-    /// duplicate-checks their names but does not lower their bodies
-    /// further (`spec/0003`): full support depends on generics and
-    /// protocol conformance checking, neither implemented yet.
+    /// Every `protocol` declaration (`rfcs/0009`), fully lowered:
+    /// explicit type parameters and method signatures.
+    pub protocols: Vec<HirProtocol>,
+    /// Every `extend` declaration (`rfcs/0009`), fully lowered. An
+    /// extend has no name of its own (never imported by name); coherence
+    /// across every module's extends is checked once, globally, over
+    /// the fully merged project (`typeck`).
+    pub extends: Vec<HirExtend>,
+    /// `import` items only, as of `rfcs/0009` -- kept only for the
+    /// "this local name is actually an import statement, not an
+    /// importable declaration" diagnostic in `project::resolve`.
     pub other_items: Vec<OtherItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtherItemKind {
-    Protocol,
-    Extend,
     Import,
 }
 
@@ -233,7 +238,12 @@ pub struct HirFunction {
     pub id: ItemId,
     pub name: Symbol,
     pub name_span: Span,
-    /// See [`HirRecord::type_params`].
+    /// This function's own generic parameters. For an ordinary
+    /// `func`/`record`/`variant`, see [`HirRecord::type_params`]. An
+    /// extend method (`rfcs/0009`) never declares its own: it is always
+    /// empty here, and the method instead shares the identity of its
+    /// owning [`HirExtend::type_params`] -- a method's body resolves `T`
+    /// to that same [`TypeParamId`], not a method-local one.
     pub type_params: Vec<HirTypeParam>,
     /// See [`HirRecord::source`].
     pub source: SourceId,
@@ -241,16 +251,111 @@ pub struct HirFunction {
     pub public: bool,
     pub params: Vec<HirParam>,
     pub return_type: Option<HirType>,
-    /// Effect/capability paths from a `uses` clause, preserved as-parsed.
-    /// Not semantically checked (`spec/0005`): the checker only reports
-    /// a function declaring a non-empty clause as using an unsupported
-    /// feature, rather than silently discarding it.
+    /// Bare dotted-path entries from a `uses` clause with no bracketed
+    /// type arguments -- `spec/0005`'s pre-existing, still-unchecked
+    /// effect declarations (`Database.Read`), untouched by `rfcs/0009`.
+    /// Preserved as-parsed; the checker only reports a function
+    /// declaring a non-empty clause as using an unsupported feature,
+    /// rather than silently discarding it.
     pub uses: Vec<Path>,
+    /// This function's own capability requirements (`rfcs/0009`): every
+    /// `uses` clause entry that *did* carry a bracketed type-argument
+    /// list, already resolved to a canonical protocol identity plus its
+    /// (possibly still-symbolic, in terms of this function's own type
+    /// parameters) type arguments, in declared order. Part of this
+    /// function's public signature -- never inferred from its body.
+    pub requirements: Vec<HirCapabilityRequirement>,
     /// Error names from a `raises` clause, preserved as-parsed. Not
     /// semantically checked (`spec/0005`), same as `uses`.
     pub raises: Vec<Ident>,
     pub body: HirBlock,
     pub span: Span,
+}
+
+/// One resolved `protocol` declaration (`rfcs/0009`): explicit type
+/// parameters plus its methods, each a signature only -- no body, no
+/// implicit receiver, no `Self`.
+#[derive(Debug, Clone)]
+pub struct HirProtocol {
+    pub id: ItemId,
+    pub name: Symbol,
+    pub name_span: Span,
+    /// At least one, always -- a protocol with none is rejected before
+    /// this is ever built (`rfcs/0009`).
+    pub type_params: Vec<HirTypeParam>,
+    pub methods: Vec<HirProtocolMethod>,
+    pub span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
+    /// See [`HirRecord::public`].
+    pub public: bool,
+}
+
+/// One `protocol` method signature. `index` is this method's
+/// declaration-order position within its own protocol -- its canonical
+/// identity everywhere downstream (a `protocol.call` instruction, an
+/// extend's own method table), never re-derived from `name` again once
+/// resolved here.
+#[derive(Debug, Clone)]
+pub struct HirProtocolMethod {
+    pub index: usize,
+    pub name: Symbol,
+    pub name_span: Span,
+    /// In the *protocol's own* type-parameter space -- an extend
+    /// implementing this method substitutes these with its own
+    /// `protocol_arguments` before comparing against what it actually
+    /// declared (`typeck`).
+    pub params: Vec<HirType>,
+    /// `None` means `unit`, exactly like [`HirFunction::return_type`].
+    pub return_type: Option<HirType>,
+    pub span: Span,
+}
+
+/// One capability requirement, still at HIR granularity: a resolved
+/// protocol identity plus its (possibly symbolic, in terms of the
+/// enclosing declaration's own type parameters) type arguments, exactly
+/// as written in a `uses` clause. `typeck` resolves `arguments` into
+/// concrete [`crate::types::Ty`]s and lifts this into a canonical
+/// [`crate::types::CapabilityRequirement`].
+#[derive(Debug, Clone)]
+pub struct HirCapabilityRequirement {
+    pub protocol: ItemId,
+    pub arguments: Vec<HirType>,
+    pub span: Span,
+}
+
+/// One resolved `extend` declaration (`rfcs/0009`): `extend Equal[i64]`
+/// (a concrete extension, `type_params` empty) or `extend[T]
+/// Equal[Box[T]] uses Equal[T]` (a conditional one). Has no name of its
+/// own -- never imported, never referenced by name; only by `ItemId`,
+/// from a resolved capability-evidence tree.
+#[derive(Debug, Clone)]
+pub struct HirExtend {
+    pub id: ItemId,
+    /// This extend's own explicit type parameters, from `extend[...]`
+    /// -- empty for a concrete extension. Never implicitly introduced
+    /// from an otherwise-unknown name in `protocol_arguments`.
+    pub type_params: Vec<HirTypeParam>,
+    pub protocol: ItemId,
+    /// `protocol`'s own type arguments at this extension's head
+    /// (`Equal[i64]`'s `[i64]`, `Equal[Box[T]]`'s `[Box[T]]`) -- in
+    /// terms of this extend's own `type_params`. Arity against the
+    /// protocol's own declared parameter count is validated by `typeck`,
+    /// the same way an ordinary aggregate type application's arity is.
+    pub protocol_arguments: Vec<HirType>,
+    pub protocol_ref_span: Span,
+    /// `uses Equal[T], ...` on the extend head itself, in source order.
+    pub requirements: Vec<HirCapabilityRequirement>,
+    /// This extend's own method bodies, in *source* order (not
+    /// necessarily the protocol's own declaration order -- `typeck`
+    /// matches each one to its protocol method by name). Each method's
+    /// own `type_params` is always empty; its body shares this extend's
+    /// own `type_params` scope (see [`HirFunction::type_params`]'s own
+    /// doc comment).
+    pub methods: Vec<HirFunction>,
+    pub span: Span,
+    /// See [`HirRecord::source`].
+    pub source: SourceId,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +559,27 @@ pub enum HirExpr {
         fields: Vec<HirFieldInit>,
         span: Span,
     },
+    /// A resolved reference to one protocol method, from `Protocol[Args]
+    /// .method` (`rfcs/0009`) -- mirrors [`HirExpr::CaseRef`]: valid HIR
+    /// on its own, but only ever a complete *value* as the callee of a
+    /// [`HirExpr::Call`] (`typeck` rejects a bare, uncalled one -- there
+    /// are no first-class/dynamic protocol methods in Alpha 0.1.5).
+    /// `method` is the resolved method's declaration-order index within
+    /// `protocol`, never re-derived from `name` again once resolved
+    /// here.
+    ProtocolMethodRef {
+        id: ExprId,
+        protocol: ItemId,
+        /// `Protocol`'s own type arguments as written at this call site
+        /// (`Equal[T]`'s `[T]`, `Equal[i64]`'s `[i64]`) -- always
+        /// present: unlike a generic function/case reference, a
+        /// protocol call's type arguments are never inferred (`rfcs/0009`
+        /// requires the explicit, fully-applied form at every call).
+        arguments: Vec<HirType>,
+        method: usize,
+        name: Symbol,
+        span: Span,
+    },
     /// A name that failed to resolve, or an expression the parser could
     /// not build. A diagnostic has already been recorded; later stages
     /// must skip this node rather than type-check it.
@@ -589,6 +715,7 @@ impl HirExpr {
             | HirExpr::Break { span, .. }
             | HirExpr::Continue { span, .. }
             | HirExpr::RecordLiteral { span, .. }
+            | HirExpr::ProtocolMethodRef { span, .. }
             | HirExpr::Error { span, .. } => *span,
             HirExpr::Block(block) => block.span,
         }
@@ -620,6 +747,7 @@ impl HirExpr {
             | HirExpr::Break { id, .. }
             | HirExpr::Continue { id, .. }
             | HirExpr::RecordLiteral { id, .. }
+            | HirExpr::ProtocolMethodRef { id, .. }
             | HirExpr::Error { id, .. } => *id,
             HirExpr::Block(block) => block.id,
         }

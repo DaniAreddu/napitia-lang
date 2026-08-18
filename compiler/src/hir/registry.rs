@@ -25,6 +25,12 @@ pub enum ItemKind {
     Function,
     Record,
     Variant,
+    Protocol,
+    /// An `extend` declaration (`rfcs/0009`) -- the only kind with no
+    /// user-declared name of its own (`ItemIdentity::name` is always
+    /// `None` for one); its own methods are each registered separately,
+    /// as ordinary `ItemKind::Function` entries.
+    Extend,
 }
 
 impl ItemKind {
@@ -33,6 +39,8 @@ impl ItemKind {
             ItemKind::Function => "function",
             ItemKind::Record => "record",
             ItemKind::Variant => "variant",
+            ItemKind::Protocol => "protocol",
+            ItemKind::Extend => "extend",
         }
     }
 }
@@ -48,7 +56,10 @@ pub struct ItemIdentity {
     /// never as a literal leading dot.
     pub module_path: String,
     /// The item's own declared name -- never a local import alias.
-    pub name: Symbol,
+    /// `None` only for an `extend` declaration (`rfcs/0009`), which has
+    /// no user-declared name of its own to carry; every other kind
+    /// always carries `Some`.
+    pub name: Option<Symbol>,
     pub kind: ItemKind,
     pub source: SourceId,
     pub span: Span,
@@ -76,15 +87,22 @@ impl ItemRegistry {
     /// resolves through the item's own registered declaration.
     pub fn qualified_name(&self, id: ItemId, interner: &Interner) -> String {
         match self.entries.get(&id) {
-            Some(identity) if identity.module_path.is_empty() => {
-                interner.resolve(identity.name).to_string()
-            }
             Some(identity) => {
-                format!(
-                    "{}.{}",
-                    identity.module_path,
-                    interner.resolve(identity.name)
-                )
+                // An anonymous `extend` (`rfcs/0009`) has no declared
+                // name of its own; `nir::printer::qualified_ref` already
+                // appends `#{id}` and every caller already prefixes a
+                // literal `@`, so the bare keyword here is enough to
+                // produce the documented `@extend#<id>` form without
+                // pretending the declaration has a user-given name.
+                let name = match identity.name {
+                    Some(name) => interner.resolve(name).to_string(),
+                    None => identity.kind.describe().to_string(),
+                };
+                if identity.module_path.is_empty() {
+                    name
+                } else {
+                    format!("{}.{}", identity.module_path, name)
+                }
             }
             // Never reached by a well-formed compilation (every item a
             // consumer could hold an `ItemId` for was registered by
@@ -109,7 +127,7 @@ pub fn build(hir: &HirModule, module_path_of: &HashMap<SourceId, String>) -> Ite
             f.id,
             ItemIdentity {
                 module_path: module_path_of.get(&f.source).cloned().unwrap_or_default(),
-                name: f.name,
+                name: Some(f.name),
                 kind: ItemKind::Function,
                 source: f.source,
                 span: f.name_span,
@@ -121,7 +139,7 @@ pub fn build(hir: &HirModule, module_path_of: &HashMap<SourceId, String>) -> Ite
             r.id,
             ItemIdentity {
                 module_path: module_path_of.get(&r.source).cloned().unwrap_or_default(),
-                name: r.name,
+                name: Some(r.name),
                 kind: ItemKind::Record,
                 source: r.source,
                 span: r.span,
@@ -133,12 +151,48 @@ pub fn build(hir: &HirModule, module_path_of: &HashMap<SourceId, String>) -> Ite
             v.id,
             ItemIdentity {
                 module_path: module_path_of.get(&v.source).cloned().unwrap_or_default(),
-                name: v.name,
+                name: Some(v.name),
                 kind: ItemKind::Variant,
                 source: v.source,
                 span: v.span,
             },
         );
+    }
+    for p in &hir.protocols {
+        registry.entries.insert(
+            p.id,
+            ItemIdentity {
+                module_path: module_path_of.get(&p.source).cloned().unwrap_or_default(),
+                name: Some(p.name),
+                kind: ItemKind::Protocol,
+                source: p.source,
+                span: p.name_span,
+            },
+        );
+    }
+    for e in &hir.extends {
+        registry.entries.insert(
+            e.id,
+            ItemIdentity {
+                module_path: module_path_of.get(&e.source).cloned().unwrap_or_default(),
+                name: None,
+                kind: ItemKind::Extend,
+                source: e.source,
+                span: e.span,
+            },
+        );
+        for m in &e.methods {
+            registry.entries.insert(
+                m.id,
+                ItemIdentity {
+                    module_path: module_path_of.get(&m.source).cloned().unwrap_or_default(),
+                    name: Some(m.name),
+                    kind: ItemKind::Function,
+                    source: m.source,
+                    span: m.name_span,
+                },
+            );
+        }
     }
     registry
 }
@@ -157,6 +211,8 @@ mod tests {
         let source = map.add_file("sales/user.npt", "");
         let name = interner.intern("User");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![HirRecord {
                 id: ItemId(0),
@@ -187,6 +243,8 @@ mod tests {
         let source = map.add_file("t.npt", "");
         let name = interner.intern("add");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![HirFunction {
                 id: ItemId(0),
                 name,
@@ -197,6 +255,7 @@ mod tests {
                 params: Vec::new(),
                 return_type: None,
                 uses: Vec::new(),
+                requirements: Vec::new(),
                 raises: Vec::new(),
                 body: crate::hir::HirBlock {
                     id: crate::hir::ExprId(0),
@@ -222,6 +281,8 @@ mod tests {
         let admin_source = map.add_file("admin/user.npt", "");
         let name = interner.intern("User");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: vec![
                 HirRecord {
@@ -273,6 +334,8 @@ mod tests {
         let name = interner.intern("Shape");
         let case_name = interner.intern("Circle");
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: Vec::new(),
             records: Vec::new(),
             variants: vec![HirVariant {

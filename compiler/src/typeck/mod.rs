@@ -21,8 +21,12 @@ use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::generics::GenericInstanceKey;
 use crate::types::{
-    Ty, TyVar, display_ty, is_integer, is_numeric, primitive_from_name, substitute,
+    CapabilityRequirement, Evidence, Ty, TyVar, display_ty, is_integer, is_numeric,
+    primitive_from_name, substitute,
 };
+
+mod capability;
+use capability::{ExtendInfo, ProtocolInfo};
 
 mod codes {
     pub const TYPE_MISMATCH: &str = "T0001";
@@ -52,6 +56,55 @@ mod codes {
     pub const CANNOT_INFER_TYPE_ARGUMENT: &str = "T0026";
     pub const UNSUPPORTED_ON_TYPE_PARAMETER: &str = "T0027";
     pub const GENERIC_INSTANCE_BUDGET_EXCEEDED: &str = "T0028";
+    pub const PROTOCOL_METHOD_NOT_A_VALUE: &str = "T0029";
+    pub const PROTOCOL_ARITY_MISMATCH: &str = "T0030";
+    pub const EXTENSION_MISSING_METHOD: &str = "T0031";
+    pub const EXTENSION_DUPLICATE_METHOD: &str = "T0032";
+    pub const EXTENSION_EXTRA_METHOD: &str = "T0033";
+    pub const EXTENSION_SIGNATURE_MISMATCH: &str = "T0034";
+    pub const UNAUTHORIZED_EXTENSION: &str = "T0035";
+    pub const DUPLICATE_EXTENSION: &str = "T0036";
+    pub const OVERLAPPING_EXTENSION: &str = "T0037";
+    pub const UNDECLARED_CAPABILITY_USE: &str = "T0038";
+    pub const MISSING_CAPABILITY: &str = "T0039";
+    pub const AMBIGUOUS_CAPABILITY: &str = "T0040";
+    pub const CYCLIC_CAPABILITY_REQUIREMENT: &str = "T0041";
+    pub const CAPABILITY_DEPTH_EXCEEDED: &str = "T0042";
+    pub const CAPABILITY_WORK_BUDGET_EXCEEDED: &str = "T0043";
+    /// A protocol-call expression names a protocol id, or a method
+    /// index within it, that this module never registered
+    /// (`rfcs/0009`). Never reachable through `hir::lower`'s own
+    /// resolution of ordinary source (which already rejects an unknown
+    /// protocol/method with its own `R0022`/`R0024`) -- this is defense
+    /// in depth against hand-built HIR that bypasses that stage
+    /// entirely, so such a program still gets a diagnostic instead of a
+    /// silently invented `Ty::Error` with nothing said about why.
+    pub const UNKNOWN_PROTOCOL_OR_METHOD: &str = "T0044";
+    /// The executable entry function (`rfcs/0009`) declares one or more
+    /// `uses` capability requirements. There is no caller for the entry
+    /// point (`napitia run` invokes it directly), so there is nowhere
+    /// for it to receive evidence from -- a requirement it declared
+    /// could only ever be satisfied by forwarding, and forwarding from
+    /// no caller at all is meaningless. A concrete protocol call inside
+    /// `main`'s own body remains legal without declaring `uses`: the
+    /// solver selects a concrete extension directly, needing no
+    /// forwarded evidence at all.
+    pub const ENTRY_MAIN_CAPABILITY_REQUIREMENT: &str = "T0045";
+    /// An `extend`'s own type parameter does not occur anywhere inside
+    /// its protocol's type arguments (`extend[T] Equal[i64] uses
+    /// Other[T]`) -- Alpha 0.1.5's capability resolution is exact-
+    /// forwarding-only (`rfcs/0009`): once a concrete requirement selects
+    /// this extend, every one of its own type parameters must already be
+    /// determined by that selection alone. A parameter this concrete head
+    /// never mentions has nothing to bind it to any concrete type, so
+    /// nothing could ever supply it, symbolically or otherwise.
+    pub const UNCONSTRAINED_EXTEND_PARAMETER: &str = "T0046";
+    /// Coherence checking between two extends of the same protocol could
+    /// not be decided within the shared depth/work budget
+    /// (`typeck::capability::heads_can_overlap`). Both extends involved
+    /// are excluded from the solver rather than risk asserting coherence
+    /// (or incoherence) this checker could not actually prove.
+    pub const OVERLAP_WORK_BUDGET_EXCEEDED: &str = "T0047";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -95,6 +148,11 @@ struct FunctionSig {
     /// may reference these via `Ty::Param`; a call site substitutes a
     /// concrete argument for each before unifying.
     type_params: Vec<TypeParamId>,
+    /// This function's own `uses` capability requirements (`rfcs/0009`),
+    /// in declared order, still in terms of its own `type_params` --
+    /// substituted the same way `params`/`ret` are at a call site, then
+    /// resolved into evidence for that specific call.
+    requirements: Vec<CapabilityRequirement>,
     span: Span,
     /// Where this function was declared -- a different file than the
     /// call site's, in every cross-module call. A diagnostic pointing at
@@ -141,6 +199,17 @@ pub struct TypeckResult {
     /// rather than re-inferring or re-resolving it independently. Empty
     /// for a non-generic call/construction.
     pub call_type_args: HashMap<ExprId, Vec<Ty>>,
+    /// For every call whose callee declares one or more capability
+    /// requirements (`rfcs/0009`), the resolved [`Evidence`] for each,
+    /// in the callee's own declared order -- keyed by the call
+    /// expression's own `ExprId`, the same way `call_type_args` is.
+    /// Empty for a call to a function/extend method with no
+    /// requirements.
+    pub call_evidence: HashMap<ExprId, Vec<Evidence>>,
+    /// For every explicit protocol-call expression
+    /// (`Equal[T].equal(..)`), the one resolved [`Evidence`] answering
+    /// it -- keyed by the call expression's own `ExprId`.
+    pub protocol_call_evidence: HashMap<ExprId, Evidence>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`], the same as
@@ -191,6 +260,7 @@ pub fn check_module_with_registry(
         locals: HashMap::new(),
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
+        current_requirements: Vec::new(),
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
@@ -198,18 +268,31 @@ pub fn check_module_with_registry(
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
         call_type_args: HashMap::new(),
+        call_evidence: HashMap::new(),
+        protocol_call_evidence: HashMap::new(),
         pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
         entry_main,
         generic_params: HashMap::new(),
         generic_instances: std::collections::HashSet::new(),
+        protocols: HashMap::new(),
+        extends: Vec::new(),
+        capability_cache: HashMap::new(),
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
+    checker.register_protocols(hir);
     checker.build_signatures(hir);
+    checker.register_extends(hir);
     for function in &hir.functions {
         checker.source = function.source;
         checker.check_function(function);
+    }
+    for extend in &hir.extends {
+        for method in &extend.methods {
+            checker.source = method.source;
+            checker.check_function(method);
+        }
     }
     checker.finalize_defaults();
 
@@ -246,6 +329,8 @@ pub fn check_module_with_registry(
         expr_types,
         pattern_case: checker.pattern_case,
         call_type_args,
+        call_evidence: checker.call_evidence,
+        protocol_call_evidence: checker.protocol_call_evidence,
     }
 }
 
@@ -288,6 +373,12 @@ struct Checker<'a> {
     locals: HashMap<LocalId, LocalInfo>,
     pending_defaults: Vec<(TyVar, Ty)>,
     current_return_type: Ty,
+    /// The currently-checked function/extend method's own capability
+    /// requirements (`rfcs/0009`), still possibly symbolic in terms of
+    /// its own type parameters -- how `resolve_requirement` decides a
+    /// call inside this body can *forward* one of these rather than
+    /// searching for a concrete extension.
+    current_requirements: Vec<CapabilityRequirement>,
     /// Every declared record's fields, resolved to `Ty` and in
     /// declaration order -- the layout NIR's `record.create`/
     /// `record.field` will follow.
@@ -314,6 +405,10 @@ struct Checker<'a> {
     pattern_case: HashMap<crate::hir::PatternId, (ItemId, usize)>,
     /// See [`TypeckResult::call_type_args`].
     call_type_args: HashMap<ExprId, Vec<Ty>>,
+    /// See [`TypeckResult::call_evidence`].
+    call_evidence: HashMap<ExprId, Vec<Evidence>>,
+    /// See [`TypeckResult::protocol_call_evidence`].
+    protocol_call_evidence: HashMap<ExprId, Evidence>,
     /// Starting work budget for each match's exhaustiveness analysis.
     /// Always `exhaustive::MAX_USEFULNESS_STEPS` in `check_module`; a
     /// smaller value is a controlled test seam for exercising
@@ -336,6 +431,34 @@ struct Checker<'a> {
     /// (`crate::limits::MAX_GENERIC_INSTANCES`), never an independent
     /// counter duplicated per call site.
     generic_instances: std::collections::HashSet<GenericInstanceKey>,
+    /// Every declared protocol's own type parameters and method
+    /// signatures (`rfcs/0009`), keyed by its canonical `ItemId` -- built
+    /// once, before any extend or function body is checked.
+    protocols: HashMap<ItemId, ProtocolInfo>,
+    /// Every extend declaration this compilation accepts as coherent and
+    /// authorized (`rfcs/0009`) -- one that failed authority/overlap/
+    /// completeness validation is diagnosed but excluded here, so the
+    /// capability solver below never compounds one error into another.
+    extends: Vec<ExtendInfo>,
+    /// Memoizes the capability solver's own concrete-requirement
+    /// resolution (`capability::resolve_concrete`) by canonical
+    /// [`CapabilityRequirement`] identity -- but *only* a successful
+    /// resolution, deliberately never a failure. Every failure the
+    /// solver can produce (missing/ambiguous capability, a cyclic
+    /// requirement, a depth- or work-budget overrun) is either
+    /// path-dependent (a requirement that overruns the budget through
+    /// one deep/wide recursive chain may still resolve cleanly when
+    /// reached directly, at depth zero, from a different call site) or
+    /// must still produce its own diagnostic at every call site that
+    /// hits it (a second, otherwise-unrelated call needing an already-
+    /// known-missing capability must not fail silently just because an
+    /// earlier call already reported it) -- caching either kind of
+    /// failure globally would either poison an independent later solve
+    /// or swallow a diagnostic a caller is entitled to. A successful
+    /// concrete resolution has neither problem: it depends only on
+    /// `requirement` and the fixed, already-registered `self.extends`,
+    /// never on the path or budget remaining at the point it was found.
+    capability_cache: HashMap<CapabilityRequirement, Evidence>,
 }
 
 #[derive(Clone)]
@@ -372,6 +495,8 @@ struct VariantInfo {
     /// This variant's own generic parameters, in declaration order.
     /// Empty for a non-generic variant.
     type_params: Vec<TypeParamId>,
+    /// See [`RecordInfo::source`].
+    source: SourceId,
 }
 
 impl<'a> Checker<'a> {
@@ -439,6 +564,7 @@ impl<'a> Checker<'a> {
                     name: v.name,
                     cases,
                     type_params: v.type_params.iter().map(|p| p.id).collect(),
+                    source: v.source,
                 },
             );
             self.variant_display.insert(
@@ -495,16 +621,52 @@ impl<'a> Checker<'a> {
                 .as_ref()
                 .map(|t| self.resolve_named_type(t))
                 .unwrap_or(Ty::Unit);
+            let requirements = self.resolve_requirements(&f.requirements);
             self.functions.insert(
                 f.id,
                 FunctionSig {
                     params,
                     ret,
                     type_params: f.type_params.iter().map(|p| p.id).collect(),
+                    requirements,
                     span: f.span,
                     source: f.source,
                 },
             );
+        }
+        // Every extend method is registered exactly like an ordinary
+        // function -- it shares its owning extend's own `type_params`
+        // (see `HirFunction::type_params`'s own doc comment) and
+        // `requirements` (already resolved into `HirFunction::requirements`
+        // by `hir::lower`), so `check_function` needs no extend-specific
+        // path at all.
+        for e in &hir.extends {
+            self.source = e.source;
+            let extend_type_params: Vec<TypeParamId> = e.type_params.iter().map(|p| p.id).collect();
+            for m in &e.methods {
+                let params = m
+                    .params
+                    .iter()
+                    .map(|p| self.resolve_named_type(&p.ty))
+                    .collect();
+                let ret = m
+                    .return_type
+                    .as_ref()
+                    .map(|t| self.resolve_named_type(t))
+                    .unwrap_or(Ty::Unit);
+                let requirements = self.resolve_requirements(&m.requirements);
+                self.functions.insert(
+                    m.id,
+                    FunctionSig {
+                        params,
+                        ret,
+                        type_params: extend_type_params.clone(),
+                        requirements,
+                        span: m.span,
+                        source: m.source,
+                    },
+                );
+            }
         }
     }
 
@@ -655,6 +817,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.current_return_type = sig.ret.clone();
+        self.current_requirements = sig.requirements.clone();
         if !f.uses.is_empty() || !f.raises.is_empty() {
             self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
         }
@@ -681,6 +844,27 @@ impl<'a> Checker<'a> {
                     format!("`main` must take no parameters, found {}", f.params.len()),
                 )
                 .with_primary_label("`napitia run` calls `main` with no arguments"),
+            );
+        }
+        // The entry point has no caller of its own (`napitia run`
+        // invokes it directly), so a `uses` requirement it declared
+        // could only ever be satisfied by forwarding -- and there is no
+        // enclosing frame to forward from. Rejected here, at check time,
+        // rather than discovered as a runtime dispatch failure the
+        // moment the interpreter tries to resolve `Evidence::Forwarded`
+        // against an entry frame that was never given any evidence at
+        // all (`rfcs/0009`). A concrete protocol call inside `main`'s
+        // own body is unaffected: it never needs `uses` in the first
+        // place, since the solver picks a concrete extension directly.
+        if is_entry_main && !sig.requirements.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ENTRY_MAIN_CAPABILITY_REQUIREMENT,
+                    self.source,
+                    f.name_span,
+                    "the executable entry function cannot declare capability requirements; it has no caller to receive evidence from",
+                )
+                .with_primary_label("entry function declares a `uses` requirement"),
             );
         }
         let body_ty = self.check_block(&f.body);
@@ -840,6 +1024,26 @@ impl<'a> Checker<'a> {
                         ),
                     )
                     .with_primary_label("function used as a value"),
+                );
+                Ty::Error
+            }
+            // There are no first-class/dynamic protocol methods in
+            // Alpha 0.1.5; only `Call` special-cases a
+            // `ProtocolMethodRef` callee directly (`rfcs/0009`), so
+            // reaching this arm bare means one was referenced without
+            // being called.
+            HirExpr::ProtocolMethodRef { name, span, .. } => {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROTOCOL_METHOD_NOT_A_VALUE,
+                        self.source,
+                        *span,
+                        format!(
+                            "`{text}` is a protocol method and must be called directly, not used as a value"
+                        ),
+                    )
+                    .with_primary_label("protocol method used as a value"),
                 );
                 Ty::Error
             }
@@ -1326,6 +1530,200 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Resolves every one of a callee's own capability `requirements`
+    /// (substituted via this specific call's own `subst`, then fully
+    /// resolved -- a callee's requirement can still be symbolic in terms
+    /// of what *this* call itself is generic over) against the
+    /// currently-checked declaration's own forwarding environment,
+    /// falling back to the concrete-extension solver. Returns `None`,
+    /// having already recorded a diagnostic, the moment any single
+    /// requirement fails -- never a partial evidence list, matching the
+    /// same all-or-nothing contract every other part of a call's own
+    /// success (`ok`) already follows.
+    fn resolve_call_evidence(
+        &mut self,
+        requirements: &[CapabilityRequirement],
+        subst: &HashMap<TypeParamId, Ty>,
+        span: Span,
+    ) -> Option<Vec<Evidence>> {
+        let own_requirements = self.current_requirements.clone();
+        let mut evidence = Vec::with_capacity(requirements.len());
+        for req in requirements {
+            let substituted = CapabilityRequirement::new(
+                req.protocol,
+                req.arguments
+                    .iter()
+                    .map(|t| deep_resolve(&self.ctx, &substitute(t, subst)))
+                    .collect(),
+            );
+            evidence.push(self.resolve_requirement(&substituted, &own_requirements, span)?);
+        }
+        Some(evidence)
+    }
+
+    /// An explicit protocol-call expression, `Protocol[Args].method(..)`
+    /// (`rfcs/0009`) -- the only protocol-call syntax in Alpha 0.1.5.
+    /// Checks the method's own parameter/return types (substituting
+    /// `Args` into the protocol's own declared signature), then resolves
+    /// exactly which extension answers this specific
+    /// `Protocol[Args]` requirement, recording the result for
+    /// `nir::lower` to attach to the corresponding NIR instruction.
+    ///
+    /// All-or-nothing, the same way an ordinary call already is: any
+    /// arity/type mismatch (protocol type arguments, method argument
+    /// count, or an individual argument's type) makes the whole call
+    /// `Ty::Error` and skips capability resolution entirely -- evidence
+    /// is only ever resolved, and only ever recorded into
+    /// `protocol_call_evidence`, for a call whose own signature already
+    /// checked out. A call that never gets that far leaves no evidence
+    /// behind for `nir::lower` to find, the same "no partial success"
+    /// contract every other checked construct in this module follows.
+    #[allow(clippy::too_many_arguments)]
+    fn check_protocol_call(
+        &mut self,
+        call_id: ExprId,
+        protocol: ItemId,
+        arguments: &[HirType],
+        method: usize,
+        name: Symbol,
+        ref_span: Span,
+        args: &[HirExpr],
+        span: Span,
+    ) -> Ty {
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
+        let any_arg_never = arg_tys.iter().any(|t| matches!(t, Ty::Never));
+        let never_or_error = |never: bool| if never { Ty::Never } else { Ty::Error };
+
+        let resolved_arguments: Vec<Ty> = arguments
+            .iter()
+            .map(|a| self.resolve_named_type(a))
+            .collect();
+        // An invalid protocol type argument (an unknown type name,
+        // already diagnosed by `resolve_named_type` itself) must not
+        // also cascade into a "missing capability"/"ambiguous capability"
+        // diagnostic about the `Ty::Error` it produced -- the same
+        // "one bad expression, one diagnostic" discipline every other
+        // construct in this checker already follows.
+        if resolved_arguments.iter().any(|t| matches!(t, Ty::Error)) {
+            return never_or_error(any_arg_never);
+        }
+        let Some(type_param_count) = self.protocols.get(&protocol).map(|p| p.type_params.len())
+        else {
+            // Never reachable through `hir::lower`'s own resolution of
+            // ordinary source (already rejected as R0022); only a
+            // hand-built HIR bypassing it reaches here.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_OR_METHOD,
+                    self.source,
+                    ref_span,
+                    "this protocol-call expression names a protocol this module never registered",
+                )
+                .with_primary_label("unknown protocol"),
+            );
+            return never_or_error(any_arg_never);
+        };
+        if resolved_arguments.len() != type_param_count {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::PROTOCOL_ARITY_MISMATCH,
+                    self.source,
+                    ref_span,
+                    format!(
+                        "this protocol requires {type_param_count} type argument(s), found {}",
+                        resolved_arguments.len()
+                    ),
+                )
+                .with_primary_label("wrong number of protocol type arguments"),
+            );
+            return never_or_error(any_arg_never);
+        }
+        let subst: HashMap<TypeParamId, Ty> = self
+            .protocols
+            .get(&protocol)
+            .map(|p| p.type_params.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(resolved_arguments.iter().cloned())
+            .collect();
+        let Some((expected_params, expected_ret)) = self
+            .protocols
+            .get(&protocol)
+            .and_then(|p| p.methods.get(method))
+            .map(|m| {
+                (
+                    m.params
+                        .iter()
+                        .map(|t| substitute(t, &subst))
+                        .collect::<Vec<_>>(),
+                    substitute(&m.ret, &subst),
+                )
+            })
+        else {
+            // Never reachable through `hir::lower`'s own resolution of
+            // ordinary source (already rejected as R0024); only a
+            // hand-built HIR with an out-of-range method index reaches
+            // here.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_OR_METHOD,
+                    self.source,
+                    ref_span,
+                    "this protocol-call expression names a method index its protocol does not declare",
+                )
+                .with_primary_label("unknown protocol method"),
+            );
+            return never_or_error(any_arg_never);
+        };
+
+        let text = format!("`{}`", self.interner.resolve(name));
+        let mut ok = true;
+        if expected_params.len() != args.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    self.source,
+                    span,
+                    format!(
+                        "{text} expects {} argument(s), found {}",
+                        expected_params.len(),
+                        args.len()
+                    ),
+                )
+                .with_primary_label("wrong number of arguments"),
+            );
+            ok = false;
+        } else {
+            for (arg_ty, param_ty) in arg_tys.iter().zip(expected_params.iter()) {
+                if !self.unify_report(
+                    param_ty,
+                    arg_ty,
+                    span,
+                    "argument type does not match the protocol method's declared parameter type",
+                ) {
+                    ok = false;
+                }
+            }
+        }
+        if !ok {
+            return never_or_error(any_arg_never);
+        }
+
+        let requirement = CapabilityRequirement::new(protocol, resolved_arguments);
+        let own_requirements = self.current_requirements.clone();
+        let Some(evidence) = self.resolve_requirement(&requirement, &own_requirements, ref_span)
+        else {
+            return never_or_error(any_arg_never);
+        };
+        self.protocol_call_evidence.insert(call_id, evidence);
+
+        if any_arg_never {
+            Ty::Never
+        } else {
+            expected_ret
+        }
+    }
+
     fn check_call(
         &mut self,
         call_id: ExprId,
@@ -1341,6 +1739,19 @@ impl<'a> Checker<'a> {
         } = callee
         {
             return self.check_variant_construct(call_id, *variant, *case, type_args, args, span);
+        }
+        if let HirExpr::ProtocolMethodRef {
+            protocol,
+            arguments,
+            method,
+            name,
+            span: ref_span,
+            ..
+        } = callee
+        {
+            return self.check_protocol_call(
+                call_id, *protocol, arguments, *method, *name, *ref_span, args, span,
+            );
         }
 
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
@@ -1447,6 +1858,14 @@ impl<'a> Checker<'a> {
                 self.call_type_args.insert(call_id, resolved_args);
             } else {
                 ok = false;
+            }
+        }
+        if ok && !sig.requirements.is_empty() {
+            match self.resolve_call_evidence(&sig.requirements, &subst, span) {
+                Some(evidence) => {
+                    self.call_evidence.insert(call_id, evidence);
+                }
+                None => ok = false,
             }
         }
         if !ok {
@@ -2650,6 +3069,33 @@ mod tests {
         check_module(&hir, id, &interner, EntryMain::ByName)
     }
 
+    /// Like `check_full`, but also returns the lowered `HirModule` --
+    /// needed by tests that must pick out one specific expression's own
+    /// `ExprId` (to inspect `expr_types`/`protocol_call_evidence`) rather
+    /// than only the module-wide diagnostics/evidence counts.
+    fn check_full_with_hir(text: &str) -> (crate::hir::HirModule, TypeckResult) {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        (hir, result)
+    }
+
     #[test]
     fn well_typed_function_has_no_diagnostics() {
         let diags = check("func add(left: i64, right: i64) -> i64 { return left + right }");
@@ -2987,6 +3433,7 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
+            current_requirements: Vec::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -2994,8 +3441,13 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             call_type_args: HashMap::new(),
+            call_evidence: HashMap::new(),
+            protocol_call_evidence: HashMap::new(),
             generic_params: HashMap::new(),
             generic_instances: std::collections::HashSet::new(),
+            protocols: HashMap::new(),
+            extends: Vec::new(),
+            capability_cache: HashMap::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -3037,6 +3489,7 @@ mod tests {
             locals: HashMap::new(),
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
+            current_requirements: Vec::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -3044,8 +3497,13 @@ mod tests {
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
             call_type_args: HashMap::new(),
+            call_evidence: HashMap::new(),
+            protocol_call_evidence: HashMap::new(),
             generic_params: HashMap::new(),
             generic_instances: std::collections::HashSet::new(),
+            protocols: HashMap::new(),
+            extends: Vec::new(),
+            capability_cache: HashMap::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }
@@ -3881,6 +4339,7 @@ mod tests {
                 span: Span::dummy(),
             }),
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: crate::hir::HirBlock {
                 id: crate::hir::ExprId(0),
@@ -3901,6 +4360,8 @@ mod tests {
             span: Span::dummy(),
         };
         let hir = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: vec![record],
             variants: vec![],
@@ -4387,6 +4848,7 @@ mod tests {
                 name,
                 cases: vec![(name, vec![Ty::Param(t, name)]), (name, vec![])],
                 type_params: vec![t],
+                source,
             },
         );
         let scrutinee = Ty::Applied(maybe, vec![Ty::Bool]);
@@ -4439,5 +4901,646 @@ mod tests {
             "expected a budget-exceeded diagnostic, got {:?}",
             checker.diagnostics
         );
+    }
+
+    // -- Capability protocols: coherence, protocol calls (`rfcs/0009`) --
+
+    fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics.iter().map(|d| d.code).collect()
+    }
+
+    use crate::hir::HirExpr;
+
+    /// Walks into a `return`/block tail looking for the first `Call`
+    /// expression -- every test in this module builds a `main` whose
+    /// entire body is `return Protocol[Args].method(..)`, so this always
+    /// finds that one call.
+    fn find_call(expr: &HirExpr) -> Option<&HirExpr> {
+        match expr {
+            HirExpr::Call { .. } => Some(expr),
+            HirExpr::Return { value: Some(v), .. } => find_call(v),
+            HirExpr::Block(b) => b.tail.as_deref().and_then(find_call),
+            _ => None,
+        }
+    }
+
+    /// The Fix 4 regression, exercised through the real pipeline:
+    /// extend[T] P[T, T] and extend[U] P[U, i64] both cover the concrete
+    /// instantiation P[i64, i64].
+    #[test]
+    fn generic_generic_overlap_at_a_shared_concrete_instantiation_is_rejected() {
+        let diags = check(
+            "protocol P[A, B] {
+                func test(left: A, right: B) -> bool;
+            }
+            extend[T] P[T, T] {
+                func test(left: T, right: T) -> bool {
+                    return true
+                }
+            }
+            extend[U] P[U, i64] {
+                func test(left: U, right: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0037"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_overlapping_concrete_heads_are_accepted() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[bool] {
+                func test(left: bool) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn exact_duplicate_extensions_are_rejected_as_duplicate_not_overlap() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0036"),
+            "unexpected diagnostics: {diags:?}"
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0037"),
+            "an exact duplicate should not also be reported as a general overlap: {diags:?}"
+        );
+    }
+
+    /// Fix 1 (0.1.5 follow-up): reversing which of two exact-duplicate
+    /// extensions is declared first still produces the same diagnostic
+    /// code either way -- the *rendered* diagnostic (which span is
+    /// primary vs. "first declared here") intentionally still follows
+    /// declaration order, since the primary span always belongs to the
+    /// second-declared extend; only the diagnostic code is asserted
+    /// identical here, never the span/message text, which honestly does
+    /// change when the source itself is reordered.
+    #[test]
+    fn reversed_exact_duplicate_declaration_order_still_detects_the_duplicate() {
+        let forward = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return false
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let reversed = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return false
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&forward).contains(&"T0036"),
+            "unexpected diagnostics: {forward:?}"
+        );
+        assert!(
+            codes_of(&reversed).contains(&"T0036"),
+            "unexpected diagnostics: {reversed:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_declaration_order_still_detects_the_overlap() {
+        let diags = check(
+            "protocol P[A, B] {
+                func test(left: A, right: B) -> bool;
+            }
+            extend[U] P[U, i64] {
+                func test(left: U, right: i64) -> bool {
+                    return true
+                }
+            }
+            extend[T] P[T, T] {
+                func test(left: T, right: T) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0037"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    /// Fix 7: the overlap diagnostic's own primary span/source must
+    /// belong to the second declared extension, never whichever extend
+    /// happened to be registered last overall.
+    #[test]
+    fn overlap_diagnostic_is_reported_at_the_second_extensions_own_span() {
+        let diags = check(
+            "protocol P[A] {
+                func test(left: A) -> bool;
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            extend P[i64] {
+                func test(left: i64) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let diag = diags
+            .iter()
+            .find(|d| d.code == "T0036")
+            .expect("expected a duplicate-extension diagnostic");
+        // The second extend block starts well after position 0; its own
+        // primary span must reflect that, not a stale span left over
+        // from whatever was registered last.
+        assert!(
+            diag.primary_span.start > 0,
+            "expected the second extension's own span, got {:?}",
+            diag.primary_span
+        );
+    }
+
+    // -- Fix 6: a failed protocol call is fully poisoned --
+
+    #[test]
+    fn protocol_call_arity_mismatch_poisons_the_expression_and_records_no_evidence() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1, 1)
+            }",
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expects")),
+            "expected an arity diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.protocol_call_evidence.is_empty(),
+            "a call that failed arity checking must not record evidence"
+        );
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(
+            result.expr_types.get(&call.id()),
+            Some(&Ty::Error),
+            "an arity-mismatched protocol call must resolve to Ty::Error"
+        );
+    }
+
+    #[test]
+    fn protocol_call_argument_type_mismatch_poisons_the_expression() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, true)
+            }",
+        );
+        assert!(
+            codes_of(&result.diagnostics).contains(&"T0001"),
+            "expected a type-mismatch diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.protocol_call_evidence.is_empty(),
+            "a call with a mismatched argument must not record evidence"
+        );
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(result.expr_types.get(&call.id()), Some(&Ty::Error));
+    }
+
+    #[test]
+    fn a_valid_protocol_call_records_exactly_one_evidence_entry() {
+        let (hir, result) = check_full_with_hir(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.protocol_call_evidence.len(), 1);
+        let main = hir.functions.last().expect("expected main");
+        let call = find_call(main.body.tail.as_deref().expect("expected a tail"))
+            .expect("expected a call expression");
+        assert_eq!(result.expr_types.get(&call.id()), Some(&Ty::Bool));
+    }
+
+    // -- Fix 9: the capability cache never poisons an independent solve --
+
+    #[test]
+    fn two_call_sites_needing_the_same_missing_capability_each_get_their_own_diagnostic() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let missing: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "T0039").collect();
+        assert_eq!(
+            missing.len(),
+            2,
+            "each call site needing the missing capability must get its own diagnostic, not just the first: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_for_a_missing_capability_do_not_depend_on_call_order() {
+        let forward = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let reversed = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let forward_messages: Vec<&str> = forward.iter().map(|d| d.message.as_str()).collect();
+        let reversed_messages: Vec<&str> = reversed.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(forward.len(), reversed.len());
+        assert_eq!(
+            forward_messages
+                .iter()
+                .collect::<std::collections::HashSet<_>>(),
+            reversed_messages
+                .iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "the same set of diagnostic messages must be produced regardless of declaration order"
+        );
+    }
+
+    #[test]
+    fn successful_evidence_is_reused_across_call_sites() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func a() -> bool {
+                return Equal[i64].equal(1, 1)
+            }
+            func b() -> bool {
+                return Equal[i64].equal(2, 2)
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A requirement chain deep enough to exceed `MAX_CAPABILITY_DEPTH`
+    /// must fail with its own budget diagnostic at the call site that
+    /// actually recurses that deep -- and must never poison a
+    /// completely independent, shallow resolution of the exact same
+    /// base requirement (`Equal0[i64]`, reached directly by `shallow()`
+    /// at depth zero) that the deep chain's own recursion also happens
+    /// to bottom out at. The chain is exactly `MAX_CAPABILITY_DEPTH + 1`
+    /// levels deep so its own recursion's depth-exceeded check fires
+    /// precisely at `Equal0[i64]` -- the same requirement `shallow()`
+    /// resolves directly -- rather than at some other node partway down
+    /// a longer chain, which would prove nothing about this specific
+    /// node ever being poisoned. Generated programmatically rather than
+    /// hand-written, the same way other pathologically deep fixtures in
+    /// this codebase are.
+    #[test]
+    fn a_depth_budget_failure_does_not_poison_an_independent_shallow_resolution() {
+        let depth = crate::limits::MAX_CAPABILITY_DEPTH + 1;
+        let mut source = String::new();
+        source.push_str("protocol Equal0[T] {\n    func equal(left: T, right: T) -> bool;\n}\n");
+        source.push_str(
+            "extend Equal0[i64] {\n    func equal(left: i64, right: i64) -> bool {\n        return left == right\n    }\n}\n",
+        );
+        for i in 1..=depth {
+            let prev = i - 1;
+            source.push_str(&format!(
+                "protocol Equal{i}[T] {{\n    func equal(left: T, right: T) -> bool;\n}}\n"
+            ));
+            source.push_str(&format!(
+                "extend[T] Equal{i}[T] uses Equal{prev}[T] {{\n    func equal(left: T, right: T) -> bool {{\n        return Equal{prev}[T].equal(left, right)\n    }}\n}}\n"
+            ));
+        }
+        source.push_str(&format!(
+            "func chain() -> bool {{\n    return Equal{depth}[i64].equal(1, 1)\n}}\n"
+        ));
+        source.push_str("func shallow() -> bool {\n    return Equal0[i64].equal(2, 2)\n}\n");
+        source.push_str("func main() -> i64 {\n    return 0\n}\n");
+
+        let diags = check(&source);
+        assert!(
+            diags.iter().any(|d| d.code == "T0042"),
+            "expected a depth-budget-exceeded diagnostic: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == "T0039"),
+            "the independent shallow resolution must not be poisoned into a missing-capability diagnostic: {diags:?}"
+        );
+    }
+
+    // -- Fix 5: the entry function cannot declare capability requirements --
+
+    #[test]
+    fn an_entry_main_declaring_a_uses_requirement_is_rejected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func main() -> bool
+            uses Equal[i64] {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "T0045"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_main_with_a_concrete_protocol_call_and_no_uses_clause_is_accepted() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_non_entry_function_declaring_a_uses_requirement_is_unaffected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func helper[T](left: T, right: T) -> bool
+            uses Equal[T] {
+                return Equal[T].equal(left, right)
+            }
+            func main() -> bool {
+                return helper[i64](1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Fix 3 (0.1.5 follow-up): exact-forwarding-only symbolic
+    //    semantics -- every extend type parameter must be determined by
+    //    its own protocol head (`rfcs/0009`) --------------------------
+
+    #[test]
+    fn an_extend_type_parameter_not_occurring_in_the_protocol_head_is_rejected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            protocol Other[U] {
+                func other(payload: U) -> bool;
+            }
+            extend[T] Equal[i64] uses Other[T] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_extend_type_parameter_occurring_nested_inside_a_generic_argument_is_accepted() {
+        let diags = check(
+            "record Box[T] { payload: T }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[T] Equal[Box[T]] uses Equal[T] {
+                func equal(left: Box[T], right: Box[T]) -> bool {
+                    return Equal[T].equal(left.payload, right.payload)
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_unconstrained_extend_parameters_each_get_their_own_diagnostic_in_declared_order() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[A, B] Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let t0046: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "T0046").collect();
+        assert_eq!(t0046.len(), 2, "unexpected diagnostics: {diags:?}");
+        assert!(t0046[0].primary_span.start < t0046[1].primary_span.start);
+    }
+
+    #[test]
+    fn every_extend_type_parameter_occurring_somewhere_in_a_multi_argument_head_is_accepted() {
+        let diags = check(
+            "record Pair[T, U] { left: T, right: U }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[T, U] Equal[Pair[T, U]] {
+                func equal(left: Pair[T, U], right: Pair[T, U]) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_still_symbolic_requirement_only_ever_resolves_by_forwarding() {
+        // `helper[T]`'s own call to `Equal[T].equal(..)` requires
+        // `Equal[T]`, still symbolic at this point in checking -- the
+        // solver's own entry point (`resolve_requirement`) only ever
+        // tries an exact structural match against `helper`'s own `uses`
+        // clause for a symbolic requirement (`Evidence::Forwarded`); it
+        // never falls through to concrete-extend search
+        // (`resolve_concrete`/`select_extension`, which only ever runs
+        // once a requirement is fully concrete), so this can never
+        // produce `Evidence::Extension` for a still-symbolic argument.
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func helper[T](left: T, right: T) -> bool uses Equal[T] {
+                return Equal[T].equal(left, right)
+            }
+            func main() -> bool {
+                return helper[i64](1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

@@ -67,13 +67,32 @@ pub struct FunctionDecl {
     pub type_params: Vec<Ident>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
-    /// Effect/capability paths from a `uses` clause. Parsed, not yet
-    /// checked (`spec/0005`).
-    pub uses: Vec<Path>,
+    /// A `uses` clause's own entries, in source order. Each entry is
+    /// either a bare dotted effect path with no bracketed arguments
+    /// (`Database.Read` -- `spec/0005`, parsed but never checked; out of
+    /// scope for `rfcs/0009`) or a single name with a bracketed
+    /// type-argument list (`Equal[T]` -- `rfcs/0009`'s capability
+    /// requirement, fully checked). Which of the two a given entry is
+    /// isn't decided here; `UsesClause::args` being non-empty is what
+    /// distinguishes them everywhere downstream.
+    pub uses: Vec<UsesClause>,
     /// Error names from a `raises` clause. Parsed, not yet checked
     /// (`spec/0005`).
     pub raises: Vec<Ident>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// One entry in a `uses` clause. `Database.Read` (a pre-existing,
+/// still-unchecked effect declaration, `spec/0005`) and `Equal[T]` (a
+/// `rfcs/0009` capability requirement) share this one production: the
+/// only grammatical difference is whether a bracketed type-argument list
+/// follows the (always single-segment, for a requirement) name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsesClause {
+    pub path: Path,
+    /// `[T]` in `Equal[T]` -- empty for a bare effect path.
+    pub args: Vec<Type>,
     pub span: Span,
 }
 
@@ -119,10 +138,19 @@ pub struct Case {
     pub span: Span,
 }
 
+/// `protocol Equal[T] { func equal(left: T, right: T) -> bool; }`
+/// (`rfcs/0009`). A capability protocol, not a Rust trait/Java
+/// interface/Go interface: it declares explicit type parameters, its
+/// methods are signatures only (no bodies, no default implementation),
+/// and there is no implicit receiver or `Self` -- every parameter is
+/// ordinary and explicit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProtocolDecl {
     pub public: bool,
     pub name: Ident,
+    /// `[T, U]` after the protocol name -- at least one, required
+    /// (`rfcs/0009`); a protocol with none is rejected.
+    pub type_params: Vec<Ident>,
     pub members: Vec<ProtocolMember>,
     pub span: Span,
 }
@@ -135,13 +163,22 @@ pub struct ProtocolMember {
     pub span: Span,
 }
 
-/// `extend Type [with Protocol] { ... }` — either a protocol
-/// implementation (`protocol` set) or inherent functions (`protocol`
-/// `None`).
+/// `extend Equal[i64] { ... }` or `extend[T] Equal[Box[T]] uses
+/// Equal[T] { ... }` (`rfcs/0009`) -- a concrete or conditional
+/// implementation of `protocol`'s type argument(s). `type_params` are
+/// only ever those explicitly declared in `extend[...]`; an unknown name
+/// appearing in `protocol`'s own argument list is never silently treated
+/// as an implicit parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtendDecl {
-    pub type_name: Ident,
-    pub protocol: Option<Path>,
+    pub type_params: Vec<Ident>,
+    /// The `Equal[i64]`/`Equal[Box[T]]` head: reuses `Type`'s own
+    /// name-plus-bracketed-arguments shape, since a protocol reference
+    /// here is syntactically identical to a type application.
+    pub protocol: Type,
+    /// `uses Equal[T], ...` between the head and `{` -- this extension's
+    /// own capability requirements, in source order.
+    pub uses: Vec<UsesClause>,
     pub functions: Vec<FunctionDecl>,
     pub span: Span,
 }

@@ -36,6 +36,64 @@ impl GenericInstanceKey {
     }
 }
 
+/// One capability requirement, canonically (`uses Equal[T]`,
+/// `rfcs/0009`): the exact declaring protocol's `ItemId` (never
+/// re-derived from a name, so a local import alias never creates a
+/// different requirement identity) plus its type arguments. Same
+/// identity contract as [`GenericInstanceKey`] -- nominal over the
+/// declaration, structural over the arguments -- kept as its own type
+/// rather than a type alias since a capability requirement and a generic
+/// instantiation are different concepts that only happen to share a
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityRequirement {
+    pub protocol: ItemId,
+    pub arguments: Vec<Ty>,
+}
+
+impl CapabilityRequirement {
+    pub fn new(protocol: ItemId, arguments: Vec<Ty>) -> Self {
+        CapabilityRequirement {
+            protocol,
+            arguments,
+        }
+    }
+}
+
+/// One resolved piece of capability evidence (`rfcs/0009`): how a single
+/// `uses` requirement, at one specific call site, is actually satisfied.
+/// Computed once, entirely at compile time, by `typeck`'s capability
+/// solver -- never re-derived, re-checked, or re-resolved by `nir::lower`,
+/// the verifier, or the interpreter, which only ever copy these values
+/// between call frames. This is dictionary-passing (the same technique
+/// implementing e.g. Haskell typeclasses without specialization), not a
+/// Rust vtable/trait object and not a C++ template instantiation: one
+/// piece of data describing *which* extension answers a requirement,
+/// passed alongside an ordinary call, with the callee's own body
+/// existing exactly once regardless of how many concrete types ever
+/// call it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Evidence {
+    /// A concrete `extend` declaration, selected once, entirely at
+    /// compile time, for this call site. `nested` is that same extend's
+    /// own `uses` requirements (if any -- e.g. a conditional `extend[T]
+    /// Equal[Box[T]] uses Equal[T]`), already resolved the same way: by
+    /// the time a concrete extend is selected, every type it was
+    /// selected for is already fully concrete too, so every leaf of
+    /// `nested` is itself always `Extension`, never `Forwarded`.
+    Extension {
+        extend: ItemId,
+        nested: Vec<Evidence>,
+    },
+    /// "Use whatever evidence the *currently executing* frame's own
+    /// requirement at this index already holds." How a still-symbolic
+    /// generic function or extend method forwards its own requirement to
+    /// a callee without ever needing to know the concrete type its own
+    /// caller will eventually supply -- resolved by the interpreter with
+    /// one frame-relative lookup, never by re-running any resolution.
+    Forwarded(usize),
+}
+
 /// Substitutes every occurrence of a type parameter in `subst` with its
 /// mapped concrete type, walking through `Ty::Applied`'s own argument
 /// list recursively (so a field/payload/parameter typed `Box[T]` becomes

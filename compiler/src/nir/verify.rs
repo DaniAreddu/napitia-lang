@@ -13,14 +13,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
-use crate::limits::MAX_GENERIC_DEPTH;
+use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::types::{Ty, is_integer, is_numeric, substitute};
+use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
-use super::{Function, Module, RecordLayout, VariantLayout};
+use super::{ExtendLayout, Function, Module, ProtocolLayout, RecordLayout, VariantLayout};
 
 mod codes {
     pub const DUPLICATE_FUNCTION_ID: &str = "V0001";
@@ -124,6 +124,117 @@ mod codes {
     /// depth for those, since this check runs first and rejects the
     /// type outright before they would ever need to).
     pub const GENERIC_DEPTH_EXCEEDED: &str = "V0035";
+    /// An `extend`'s own `protocol` field does not match any declared
+    /// protocol in this module (`rfcs/0009`).
+    pub const UNKNOWN_EXTEND_PROTOCOL: &str = "V0036";
+    /// An `extend`'s `protocol_arguments` count does not match its own
+    /// protocol's declared type-parameter count.
+    pub const EXTEND_PROTOCOL_ARITY_MISMATCH: &str = "V0037";
+    /// One capability requirement (an `extend`'s own `uses` clause, or an
+    /// ordinary function's own `uses` clause) names a protocol this
+    /// module never declared.
+    pub const UNKNOWN_REQUIREMENT_PROTOCOL: &str = "V0038";
+    /// One capability requirement (an `extend`'s own `uses` clause, or an
+    /// ordinary function's own `uses` clause) supplies a number of
+    /// arguments that does not match its own named protocol's declared
+    /// type-parameter count.
+    pub const REQUIREMENT_ARITY_MISMATCH: &str = "V0039";
+    /// An `extend`'s method table has a different length than its own
+    /// protocol's declared method list -- every protocol method must
+    /// have exactly one implementing function, never more or fewer.
+    pub const EXTEND_METHOD_COUNT_MISMATCH: &str = "V0040";
+    /// An `extend`'s method table references a function id this module
+    /// never declared.
+    pub const EXTEND_METHOD_UNKNOWN_FUNCTION: &str = "V0041";
+    /// An `extend`'s method table references a function whose own
+    /// `type_params` are not exactly its owning extend's own
+    /// `type_params`, in the same order -- every extend method's body is
+    /// lowered sharing its extend's own type-parameter scope (never a
+    /// separate generic scope of its own), so any mismatch here means
+    /// this function was never actually built as this extend's method.
+    pub const EXTEND_METHOD_TYPE_PARAM_MISMATCH: &str = "V0042";
+    /// An `extend`'s method function's own declared parameter/return
+    /// types do not match its protocol method's declared signature once
+    /// substituted with this extend's own `protocol_arguments`.
+    pub const EXTEND_METHOD_SIGNATURE_MISMATCH: &str = "V0043";
+    /// The same underlying function id answers two different method
+    /// slots in the same extend's own method table -- every protocol
+    /// method an extend implements must be a distinct function.
+    pub const DUPLICATE_EXTEND_METHOD_REFERENCE: &str = "V0044";
+    /// A protocol or extend reuses an id already used by another
+    /// protocol/extend in this module (`rfcs/0009`).
+    pub const DUPLICATE_PROTOCOL_ID: &str = "V0045";
+    pub const DUPLICATE_EXTEND_ID: &str = "V0046";
+    /// A `Call`'s evidence does not carry exactly as many entries as its
+    /// callee's own requirement count (`rfcs/0009`).
+    pub const EVIDENCE_COUNT_MISMATCH: &str = "V0047";
+    /// An `Evidence::Forwarded` index is out of range for the currently
+    /// verified function's own `requirements`.
+    pub const FORWARDED_INDEX_OUT_OF_RANGE: &str = "V0048";
+    /// An `Evidence::Forwarded` index is in range, but the requirement
+    /// it names is not exactly the capability actually required at this
+    /// call site -- forwarding only ever passes a requirement through
+    /// unchanged, never converts one into another.
+    pub const FORWARDED_REQUIREMENT_MISMATCH: &str = "V0049";
+    /// An `Evidence::Extension` names an extend id this module never
+    /// declared.
+    pub const UNKNOWN_EXTENSION_REFERENCE: &str = "V0050";
+    /// An `Evidence::Extension`'s own extend targets a different
+    /// protocol than the one actually required at this call site.
+    pub const EXTENSION_PROTOCOL_MISMATCH: &str = "V0051";
+    /// An `Evidence::Extension`'s own extend head cannot structurally
+    /// match the arguments actually required at this call site -- no
+    /// substitution of the extend's own type parameters makes its
+    /// declared `protocol_arguments` equal the required arguments.
+    pub const EXTENSION_HEAD_MISMATCH: &str = "V0052";
+    /// An `Evidence::Extension`'s own `nested` evidence has a different
+    /// length than its extend's own `requirements`.
+    pub const NESTED_EVIDENCE_COUNT_MISMATCH: &str = "V0053";
+    /// An `Evidence::Extension`'s own `nested` evidence contains a
+    /// `Forwarded` entry. By the time a concrete extend is selected,
+    /// every type it was selected for is already fully concrete, so
+    /// every leaf of `nested` must itself always be `Extension` --
+    /// `Forwarded` is only ever legal at the outermost evidence position
+    /// of a `Call`/`protocol.call`, never nested inside a resolved
+    /// extension.
+    pub const FORWARDED_INSIDE_NESTED_EVIDENCE: &str = "V0054";
+    /// Evidence nested deeper than `crate::limits::MAX_CAPABILITY_DEPTH`
+    /// -- bounds a hostilely deep hand-built evidence tree the same way
+    /// `GENERIC_DEPTH_EXCEEDED` bounds a hostilely deep type, so
+    /// recursive evidence validation can never overflow the native
+    /// stack. Reported once per malformed evidence root, never once per
+    /// nested node.
+    pub const EVIDENCE_DEPTH_EXCEEDED: &str = "V0055";
+    /// Evidence validation visited more nodes than
+    /// `crate::limits::MAX_CAPABILITY_RESOLUTION_STEPS` while checking
+    /// one evidence root -- bounds a hand-built evidence tree that stays
+    /// within the depth limit but branches wide enough at every level to
+    /// make exhaustive validation itself pathologically expensive.
+    pub const EVIDENCE_WORK_BUDGET_EXCEEDED: &str = "V0056";
+    /// A `protocol.call` instruction names a protocol id this module
+    /// never declared, or a `method` index out of range for that
+    /// protocol's declared method list.
+    pub const UNKNOWN_PROTOCOL_CALL_TARGET: &str = "V0057";
+    /// An extend's method function does not declare exactly its own
+    /// extend's `uses` requirements, in the same declared order.
+    /// `ProtocolCall` passes an extension's own `nested` evidence
+    /// straight to its implementing function as that function's own
+    /// evidence; a mismatch here would let otherwise-valid-looking NIR
+    /// pass every other extend/method check and still fail (or silently
+    /// misdispatch) only once actually interpreted.
+    pub const EXTEND_METHOD_REQUIREMENTS_MISMATCH: &str = "V0058";
+    /// An extend's own type parameter does not occur anywhere inside its
+    /// protocol's type arguments -- `rfcs/0009`'s exact-forwarding-only
+    /// requirement (`typeck`'s own `T0046`), re-derived independently
+    /// here since this verifier never trusts hand-built NIR to already
+    /// satisfy it.
+    pub const UNCONSTRAINED_EXTEND_PARAMETER: &str = "V0059";
+    /// An `Evidence::Extension` was selected for a requirement whose
+    /// arguments are still symbolic (contain a `Ty::Param`) -- Alpha
+    /// 0.1.5 permits only an exact `Evidence::Forwarded` match in that
+    /// situation; a concrete extend can only ever be legitimately
+    /// selected once every argument is fully concrete.
+    pub const EXTENSION_FOR_SYMBOLIC_REQUIREMENT: &str = "V0060";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -136,15 +247,24 @@ struct KnownFunction {
     type_params: Vec<TypeParamId>,
     params: Vec<Ty>,
     return_type: Ty,
+    /// This function's own capability requirements (`rfcs/0009`), in
+    /// declared order -- a `Call` targeting it must carry exactly this
+    /// many evidence entries, each independently checked against the
+    /// corresponding substituted requirement here.
+    requirements: Vec<CapabilityRequirement>,
 }
 
-/// Every declared record's/variant's layout, by `ItemId`, for validating
-/// aggregate operations against the module's own declared shape rather
-/// than trusting whatever `record.create`/`variant.create` happened to
+/// Every declared record's/variant's/protocol's/extend's layout, by
+/// `ItemId`, for validating an operation against the module's own
+/// declared shape rather than trusting whatever instruction happened to
 /// be built with.
 struct AggregateContext<'a> {
     records: HashMap<ItemId, &'a RecordLayout>,
     variants: HashMap<ItemId, &'a VariantLayout>,
+    protocols: HashMap<ItemId, &'a ProtocolLayout>,
+    /// Read by `check_evidence` to resolve an `Evidence::Extension`
+    /// against its own declared extend.
+    extends: HashMap<ItemId, &'a ExtendLayout>,
 }
 
 /// Verifies every function in `module`, collecting every diagnostic it
@@ -172,6 +292,8 @@ pub fn verify_module(
         Function,
         Record,
         Variant,
+        Protocol,
+        Extend,
     }
     let mut item_roles: HashMap<ItemId, ItemRole> = HashMap::new();
     let mut check_item_identity =
@@ -213,6 +335,7 @@ pub fn verify_module(
                 type_params: function.type_params.iter().map(|(id, _)| *id).collect(),
                 params: function.params.iter().map(|p| p.ty.clone()).collect(),
                 return_type: function.return_type.clone(),
+                requirements: function.requirements.clone(),
             },
         );
     }
@@ -247,10 +370,40 @@ pub fn verify_module(
         }
         check_item_identity(*id, ItemRole::Variant, &name, &mut diagnostics);
     }
+    let mut seen_protocol_ids = HashSet::new();
+    for (id, _protocol) in &module.protocols {
+        let name = registry.qualified_name(*id, interner);
+        if !seen_protocol_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_PROTOCOL_ID,
+                source,
+                Span::dummy(),
+                format!(
+                    "protocol `{name}` reuses an id already used by another protocol in this module"
+                ),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Protocol, &name, &mut diagnostics);
+    }
+    let mut seen_extend_ids = HashSet::new();
+    for (id, _extend) in &module.extends {
+        let name = format!("extend #{}", id.0);
+        if !seen_extend_ids.insert(*id) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_EXTEND_ID,
+                source,
+                Span::dummy(),
+                format!("{name} reuses an id already used by another extend in this module"),
+            ));
+        }
+        check_item_identity(*id, ItemRole::Extend, &name, &mut diagnostics);
+    }
 
     let agg = AggregateContext {
         records: module.records.iter().map(|(id, r)| (*id, r)).collect(),
         variants: module.variants.iter().map(|(id, v)| (*id, v)).collect(),
+        protocols: module.protocols.iter().map(|(id, p)| (*id, p)).collect(),
+        extends: module.extends.iter().map(|(id, e)| (*id, e)).collect(),
     };
 
     // Every record field's and every variant case payload's own
@@ -298,6 +451,273 @@ pub fn verify_module(
                     &payload_context,
                     &mut diagnostics,
                 );
+            }
+        }
+    }
+
+    // Every protocol's own type parameters must be pairwise distinct,
+    // and every method's declared parameter/return type must be a valid
+    // type root scoped to that protocol's own type parameters (`rfcs/0009`)
+    // -- exactly the same shape of check a record's fields or a variant's
+    // case payloads already get. A protocol's method list is never
+    // iterated in a way whose *checking* order matters (unlike its
+    // declaration order, which is load-bearing for `protocol.call`'s own
+    // `method` index and is preserved automatically by walking the `Vec`
+    // in place).
+    for (id, protocol) in &module.protocols {
+        let context = format!("protocol `{}`", registry.qualified_name(*id, interner));
+        check_no_duplicate_type_params(&protocol.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            protocol.type_params.iter().map(|(id, _)| *id).collect();
+        for method in &protocol.methods {
+            let method_context = format!("{context}'s method `{}`", interner.resolve(method.name));
+            for param in &method.params {
+                check_type_root(
+                    param,
+                    &agg,
+                    &own_params,
+                    source,
+                    interner,
+                    registry,
+                    &method_context,
+                    &mut diagnostics,
+                );
+            }
+            check_type_root(
+                &method.return_type,
+                &agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &method_context,
+                &mut diagnostics,
+            );
+        }
+    }
+
+    // Every `extend`'s own declared shape must independently hold
+    // (`rfcs/0009`): its `protocol` must actually exist, its own
+    // `protocol_arguments`/`requirements` must be well-formed types
+    // referencing that protocol (and any other) with the right arity,
+    // its method table must have exactly one entry per protocol method,
+    // and each entry must reference a real, distinct function actually
+    // built as this extend's own method (sharing its exact type-param
+    // scope) with a signature matching the protocol method it
+    // implements once substituted through this extend's own head.
+    for (id, extend) in &module.extends {
+        let context = format!("extend #{}", id.0);
+        check_no_duplicate_type_params(&extend.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            extend.type_params.iter().map(|(id, _)| *id).collect();
+
+        // Exact-forwarding-only symbolic semantics (`rfcs/0009`): an
+        // extend's own type parameter must be determined by its protocol
+        // head alone. `typeck` already rejects this for ordinary source
+        // (`T0046`); re-derived here independently since this verifier
+        // never trusts hand-built NIR to already satisfy it.
+        let mut occurring_params: HashSet<TypeParamId> = HashSet::new();
+        for ty in &extend.protocol_arguments {
+            collect_occurring_type_params(ty, &mut occurring_params, 0);
+        }
+        for (type_param_id, type_param_name) in &extend.type_params {
+            if !occurring_params.contains(type_param_id) {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNCONSTRAINED_EXTEND_PARAMETER,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s type parameter `{}` does not occur in the protocol arguments and cannot be determined by this extension's head",
+                        interner.resolve(*type_param_name)
+                    ),
+                ));
+            }
+        }
+
+        let arg_context = format!("{context}'s protocol argument");
+        for ty in &extend.protocol_arguments {
+            check_type_root(
+                ty,
+                &agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &arg_context,
+                &mut diagnostics,
+            );
+        }
+        for requirement in &extend.requirements {
+            let requirement_context = format!("{context}'s `uses` requirement");
+            for ty in &requirement.arguments {
+                check_type_root(
+                    ty,
+                    &agg,
+                    &own_params,
+                    source,
+                    interner,
+                    registry,
+                    &requirement_context,
+                    &mut diagnostics,
+                );
+            }
+            match agg.protocols.get(&requirement.protocol) {
+                None => diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_REQUIREMENT_PROTOCOL,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{requirement_context} names a protocol id {} that does not exist in this module",
+                        requirement.protocol.0
+                    ),
+                )),
+                Some(required_protocol)
+                    if required_protocol.type_params.len() != requirement.arguments.len() =>
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::REQUIREMENT_ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "{requirement_context} supplies {} argument(s) to `{}`, which declares {}",
+                            requirement.arguments.len(),
+                            registry.qualified_name(requirement.protocol, interner),
+                            required_protocol.type_params.len()
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let Some(protocol) = agg.protocols.get(&extend.protocol) else {
+            diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_EXTEND_PROTOCOL,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} names a protocol id {} that does not exist in this module",
+                    extend.protocol.0
+                ),
+            ));
+            continue;
+        };
+        if protocol.type_params.len() != extend.protocol_arguments.len() {
+            diagnostics.push(Diagnostic::error(
+                codes::EXTEND_PROTOCOL_ARITY_MISMATCH,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} supplies {} argument(s) to `{}`, which declares {}",
+                    extend.protocol_arguments.len(),
+                    registry.qualified_name(extend.protocol, interner),
+                    protocol.type_params.len()
+                ),
+            ));
+        }
+        if protocol.methods.len() != extend.methods.len() {
+            diagnostics.push(Diagnostic::error(
+                codes::EXTEND_METHOD_COUNT_MISMATCH,
+                source,
+                Span::dummy(),
+                format!(
+                    "{context} implements {} method(s), but `{}` declares {}",
+                    extend.methods.len(),
+                    registry.qualified_name(extend.protocol, interner),
+                    protocol.methods.len()
+                ),
+            ));
+        }
+        let subst: HashMap<TypeParamId, Ty> = protocol
+            .type_params
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(extend.protocol_arguments.iter().cloned())
+            .collect();
+        let extend_type_param_ids: Vec<TypeParamId> =
+            extend.type_params.iter().map(|(id, _)| *id).collect();
+        let mut seen_method_functions: HashSet<ItemId> = HashSet::new();
+        for (index, method_id) in extend.methods.iter().enumerate() {
+            if !seen_method_functions.insert(*method_id) {
+                diagnostics.push(Diagnostic::error(
+                    codes::DUPLICATE_EXTEND_METHOD_REFERENCE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context} uses the same function ({}) for two different method slots",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            let Some(implementing) = known_functions.get(method_id) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_UNKNOWN_FUNCTION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] references function id {}, which does not exist in this module",
+                        method_id.0
+                    ),
+                ));
+                continue;
+            };
+            if implementing.type_params != extend_type_param_ids {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_TYPE_PARAM_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not share its own extend's type-parameter scope",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            // `ProtocolCall` passes an extension's own `nested` evidence
+            // straight to its implementing function as that function's
+            // evidence (`interpreter::ValueKind::ProtocolCall`), and
+            // `Interpreter::call_function` validates that evidence
+            // against the callee's own declared `Function::requirements`
+            // -- so an implementing function's own requirements must be
+            // exactly its extend's own `requirements`, in the same
+            // declared order, or a well-formed extend could still fail
+            // at runtime (or worse, silently accept mismatched evidence)
+            // despite passing every other check above.
+            if implementing.requirements != extend.requirements {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not declare exactly its own extend's `uses` requirements, in the same order",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            let Some(protocol_method) = protocol.methods.get(index) else {
+                // Already reported above as EXTEND_METHOD_COUNT_MISMATCH;
+                // there is no protocol method at this index to check the
+                // signature against.
+                continue;
+            };
+            let expected_params: Vec<Ty> = protocol_method
+                .params
+                .iter()
+                .map(|t| substitute(t, &subst))
+                .collect();
+            let expected_return = substitute(&protocol_method.return_type, &subst);
+            if implementing.params != expected_params || implementing.return_type != expected_return
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_SIGNATURE_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not match `{}`'s method `{}` signature once substituted",
+                        registry.qualified_name(*method_id, interner),
+                        registry.qualified_name(extend.protocol, interner),
+                        interner.resolve(protocol_method.name)
+                    ),
+                ));
             }
         }
     }
@@ -381,6 +801,48 @@ fn verify_function(
             &fn_context,
             diagnostics,
         );
+    }
+    for requirement in &function.requirements {
+        let requirement_context = format!("{fn_context}'s `uses` requirement");
+        for ty in &requirement.arguments {
+            check_type_root(
+                ty,
+                agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &requirement_context,
+                diagnostics,
+            );
+        }
+        match agg.protocols.get(&requirement.protocol) {
+            None => diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_REQUIREMENT_PROTOCOL,
+                source,
+                Span::dummy(),
+                format!(
+                    "{requirement_context} names a protocol id {} that does not exist in this module",
+                    requirement.protocol.0
+                ),
+            )),
+            Some(required_protocol)
+                if required_protocol.type_params.len() != requirement.arguments.len() =>
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::REQUIREMENT_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{requirement_context} supplies {} argument(s) to `{}`, which declares {}",
+                        requirement.arguments.len(),
+                        registry.qualified_name(requirement.protocol, interner),
+                        required_protocol.type_params.len()
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
     }
 
     let known_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
@@ -487,6 +949,7 @@ fn verify_function(
                         known_functions,
                         agg,
                         &own_params,
+                        &function.requirements,
                         source,
                         &name,
                         interner,
@@ -802,11 +1265,12 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         | ValueKind::Le(a, b)
         | ValueKind::Gt(a, b)
         | ValueKind::Ge(a, b) => vec![*a, *b],
-        ValueKind::Call(_, _, args) => args.clone(),
+        ValueKind::Call(_, _, args, _) => args.clone(),
         ValueKind::RecordCreate(_, _, fields) => fields.clone(),
         ValueKind::RecordField { base, .. } => vec![*base],
         ValueKind::VariantCreate { payload, .. } => payload.clone(),
         ValueKind::VariantPayload { base, .. } => vec![*base],
+        ValueKind::ProtocolCall { args, .. } => args.clone(),
     }
 }
 
@@ -1212,6 +1676,50 @@ fn exceeds_generic_depth(ty: &Ty, depth: usize) -> bool {
     }
 }
 
+/// Collects every `TypeParamId` occurring anywhere inside `ty`, recursing
+/// through `Ty::Applied`'s own argument list -- used to independently
+/// re-derive whether an extend's own type parameter is actually
+/// determined by its protocol head (`rfcs/0009`'s exact-forwarding-only
+/// requirement; mirrors `typeck::capability`'s own
+/// `collect_occurring_type_params`, since this verifier never trusts
+/// hand-built NIR to already satisfy what `typeck` enforces for ordinary
+/// source). Depth-bounded the same way every other stage that walks a
+/// type application is.
+fn collect_occurring_type_params(ty: &Ty, out: &mut HashSet<TypeParamId>, depth: usize) {
+    if depth > MAX_GENERIC_DEPTH {
+        return;
+    }
+    match ty {
+        Ty::Param(id, _) => {
+            out.insert(*id);
+        }
+        Ty::Applied(_, args) => {
+            for arg in args {
+                collect_occurring_type_params(arg, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `ty` contains a symbolic `Ty::Param` anywhere, recursing
+/// through `Ty::Applied` -- used to reject `Evidence::Extension` against
+/// a still-symbolic required capability (`rfcs/0009`): Alpha 0.1.5
+/// permits only an exact `Evidence::Forwarded` match once any part of
+/// the required arguments is still symbolic, since a concrete extend's
+/// own head can never be legitimately selected for a type that is not
+/// yet concrete.
+fn contains_symbolic_param(ty: &Ty, depth: usize) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Param(..) => true,
+        Ty::Applied(_, args) => args.iter().any(|a| contains_symbolic_param(a, depth + 1)),
+        _ => false,
+    }
+}
+
 /// The single, shared check every type root `verify_module` inspects
 /// goes through -- a record field, a variant case payload, a function
 /// parameter or return type, an instruction's result type, or a
@@ -1266,6 +1774,253 @@ fn check_type_root(
     check_type_param_scope(ty, own_params, source, context, diagnostics);
 }
 
+/// Every distinct way one [`Evidence`] node can fail to actually satisfy
+/// the capability required of it (`rfcs/0009`) -- kept out of
+/// `check_evidence`'s own recursion as plain data, rather than pushed as
+/// a [`Diagnostic`] the instant it's found, so a nested failure produces
+/// exactly one diagnostic at the call site that owns the whole evidence
+/// tree, never one per nested level (`Diagnostic::error` is only ever
+/// constructed once, by `check_evidence`'s caller, from whichever
+/// variant this recursion bottoms out at).
+#[derive(Debug)]
+enum EvidenceProblem {
+    DepthExceeded,
+    WorkBudgetExceeded,
+    ForwardedNotAllowedHere,
+    ForwardedIndexOutOfRange,
+    ForwardedRequirementMismatch,
+    UnknownExtension(ItemId),
+    ExtensionProtocolMismatch,
+    ExtensionHeadMismatch,
+    NestedEvidenceCountMismatch { expected: usize, found: usize },
+    ExtensionForSymbolicRequirement,
+}
+
+impl EvidenceProblem {
+    fn code(&self) -> &'static str {
+        match self {
+            EvidenceProblem::DepthExceeded => codes::EVIDENCE_DEPTH_EXCEEDED,
+            EvidenceProblem::WorkBudgetExceeded => codes::EVIDENCE_WORK_BUDGET_EXCEEDED,
+            EvidenceProblem::ForwardedNotAllowedHere => codes::FORWARDED_INSIDE_NESTED_EVIDENCE,
+            EvidenceProblem::ForwardedIndexOutOfRange => codes::FORWARDED_INDEX_OUT_OF_RANGE,
+            EvidenceProblem::ForwardedRequirementMismatch => codes::FORWARDED_REQUIREMENT_MISMATCH,
+            EvidenceProblem::UnknownExtension(_) => codes::UNKNOWN_EXTENSION_REFERENCE,
+            EvidenceProblem::ExtensionProtocolMismatch => codes::EXTENSION_PROTOCOL_MISMATCH,
+            EvidenceProblem::ExtensionHeadMismatch => codes::EXTENSION_HEAD_MISMATCH,
+            EvidenceProblem::NestedEvidenceCountMismatch { .. } => {
+                codes::NESTED_EVIDENCE_COUNT_MISMATCH
+            }
+            EvidenceProblem::ExtensionForSymbolicRequirement => {
+                codes::EXTENSION_FOR_SYMBOLIC_REQUIREMENT
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            EvidenceProblem::DepthExceeded => format!(
+                "is nested deeper than the maximum capability depth of {MAX_CAPABILITY_DEPTH}"
+            ),
+            EvidenceProblem::WorkBudgetExceeded => {
+                "is too large to validate exhaustively".to_string()
+            }
+            EvidenceProblem::ForwardedNotAllowedHere => {
+                "forwards capability evidence from inside another extension's own nested \
+                 evidence, where only a concrete extension is ever legal"
+                    .to_string()
+            }
+            EvidenceProblem::ForwardedIndexOutOfRange => {
+                "forwards a capability evidence index that is out of range for the \
+                 enclosing function's own requirements"
+                    .to_string()
+            }
+            EvidenceProblem::ForwardedRequirementMismatch => {
+                "forwards a capability requirement that is not exactly the capability \
+                 actually required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::UnknownExtension(id) => format!(
+                "references extend id {}, which does not exist in this module",
+                id.0
+            ),
+            EvidenceProblem::ExtensionProtocolMismatch => {
+                "selects an extension for a different protocol than the one actually \
+                 required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::ExtensionHeadMismatch => {
+                "selects an extension whose own head cannot structurally match the \
+                 arguments actually required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::NestedEvidenceCountMismatch { expected, found } => format!(
+                "selects an extension carrying {found} nested evidence entries, but its own \
+                 extend declares {expected} requirement(s)"
+            ),
+            EvidenceProblem::ExtensionForSymbolicRequirement => {
+                "selects a concrete extension for a requirement that is still symbolic; only \
+                 an exact Forwarded match is legal until every argument is concrete"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One-directional structural match of an extend's own head
+/// (`protocol_arguments`, which may reference the extend's own type
+/// parameters) against the concrete/opaque arguments actually required
+/// at a call site (which never contain any of the extend's own type
+/// parameters, so they are never themselves bound -- only ever compared
+/// against). The first occurrence of a free extend type parameter binds
+/// it to whatever `target` subtree sits in that position; every later
+/// occurrence of the same parameter must match the exact same bound
+/// type. This is deliberately not the two-sided overlap unifier
+/// (`heads_can_overlap` in `typeck::capability`): only one side ever
+/// carries free variables here, so no occurs check or substitution
+/// chasing is needed, only a depth bound against a hostile hand-built
+/// type on either side.
+fn match_extend_head(
+    subst: &mut HashMap<TypeParamId, Ty>,
+    free: &HashSet<TypeParamId>,
+    pattern: &Ty,
+    target: &Ty,
+    depth: usize,
+) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return false;
+    }
+    match pattern {
+        Ty::Param(id, _) if free.contains(id) => match subst.get(id) {
+            Some(bound) => bound == target,
+            None => {
+                subst.insert(*id, target.clone());
+                true
+            }
+        },
+        Ty::Applied(item, args) => match target {
+            Ty::Applied(target_item, target_args)
+                if item == target_item && args.len() == target_args.len() =>
+            {
+                args.iter()
+                    .zip(target_args.iter())
+                    .all(|(a, t)| match_extend_head(subst, free, a, t, depth + 1))
+            }
+            _ => false,
+        },
+        other => other == target,
+    }
+}
+
+/// Checks one [`Evidence`] node (and, for an [`Evidence::Extension`],
+/// everything nested inside it) against the exact capability required of
+/// it at this position (`rfcs/0009`): a `protocol` identity plus already-
+/// substituted `arguments`. `allow_forwarded` is `false` for anything
+/// reached through an extension's own `nested` list -- by the time a
+/// concrete extend is selected, every type it was selected for is
+/// already fully concrete, so every leaf of `nested` is itself always
+/// `Extension`, never `Forwarded` (see [`Evidence::Extension`]'s own doc
+/// comment); it is `true` only at the outermost position a `Call`/
+/// `protocol.call` instruction's own evidence list ever occupies, where
+/// forwarding the *currently executing* function's own requirement
+/// through unchanged is exactly what generic capability forwarding is.
+/// `caller_requirements` is that enclosing function's own `requirements`,
+/// against which a `Forwarded` index and its exact compatibility are
+/// checked. `budget` is a shared work counter (not just a depth bound):
+/// a hand-built evidence tree that stays shallow but branches wide enough
+/// at every level could otherwise make exhaustive validation itself
+/// pathologically expensive, even though no *cycle* is possible (this is
+/// an owned tree, never a graph).
+#[allow(clippy::too_many_arguments)]
+fn check_evidence(
+    evidence: &Evidence,
+    required_protocol: ItemId,
+    required_arguments: &[Ty],
+    allow_forwarded: bool,
+    caller_requirements: &[CapabilityRequirement],
+    agg: &AggregateContext,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), EvidenceProblem> {
+    if depth > MAX_CAPABILITY_DEPTH {
+        return Err(EvidenceProblem::DepthExceeded);
+    }
+    if *budget == 0 {
+        return Err(EvidenceProblem::WorkBudgetExceeded);
+    }
+    *budget -= 1;
+
+    match evidence {
+        Evidence::Forwarded(index) => {
+            if !allow_forwarded {
+                return Err(EvidenceProblem::ForwardedNotAllowedHere);
+            }
+            let Some(forwarded) = caller_requirements.get(*index) else {
+                return Err(EvidenceProblem::ForwardedIndexOutOfRange);
+            };
+            if forwarded.protocol != required_protocol || forwarded.arguments != required_arguments
+            {
+                return Err(EvidenceProblem::ForwardedRequirementMismatch);
+            }
+            Ok(())
+        }
+        Evidence::Extension { extend, nested } => {
+            // Exact-forwarding-only symbolic semantics (`rfcs/0009`): a
+            // concrete extend can only ever have been legitimately
+            // selected once every part of the required capability is
+            // itself concrete -- a still-symbolic requirement can only
+            // resolve by forwarding an identical caller requirement
+            // unchanged, checked above. This must be checked before any
+            // other `Extension` check below, since a symbolic argument
+            // could otherwise coincidentally structurally "match" a
+            // hand-built extend head sharing the same raw `TypeParamId`.
+            if required_arguments
+                .iter()
+                .any(|t| contains_symbolic_param(t, 0))
+            {
+                return Err(EvidenceProblem::ExtensionForSymbolicRequirement);
+            }
+            let Some(layout) = agg.extends.get(extend) else {
+                return Err(EvidenceProblem::UnknownExtension(*extend));
+            };
+            if layout.protocol != required_protocol {
+                return Err(EvidenceProblem::ExtensionProtocolMismatch);
+            }
+            let free: HashSet<TypeParamId> = layout.type_params.iter().map(|(id, _)| *id).collect();
+            let mut subst: HashMap<TypeParamId, Ty> = HashMap::new();
+            let head_matches = layout.protocol_arguments.len() == required_arguments.len()
+                && layout
+                    .protocol_arguments
+                    .iter()
+                    .zip(required_arguments.iter())
+                    .all(|(p, t)| match_extend_head(&mut subst, &free, p, t, 0));
+            if !head_matches {
+                return Err(EvidenceProblem::ExtensionHeadMismatch);
+            }
+            if nested.len() != layout.requirements.len() {
+                return Err(EvidenceProblem::NestedEvidenceCountMismatch {
+                    expected: layout.requirements.len(),
+                    found: nested.len(),
+                });
+            }
+            for (n, r) in nested.iter().zip(layout.requirements.iter()) {
+                let sub_arguments: Vec<Ty> =
+                    r.arguments.iter().map(|t| substitute(t, &subst)).collect();
+                check_evidence(
+                    n,
+                    r.protocol,
+                    &sub_arguments,
+                    false,
+                    caller_requirements,
+                    agg,
+                    depth + 1,
+                    budget,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_value_kind(
     result: ValueId,
@@ -1276,6 +2031,7 @@ fn verify_value_kind(
     known_functions: &HashMap<ItemId, KnownFunction>,
     agg: &AggregateContext,
     own_params: &HashSet<TypeParamId>,
+    own_requirements: &[CapabilityRequirement],
     source: SourceId,
     function_name: &str,
     interner: &Interner,
@@ -1456,7 +2212,7 @@ fn verify_value_kind(
                 );
             }
         }
-        ValueKind::Call(callee, type_args, args) => {
+        ValueKind::Call(callee, type_args, args, evidence) => {
             for arg in args {
                 require_value(*arg, diagnostics);
             }
@@ -1488,18 +2244,13 @@ fn verify_value_kind(
                     diagnostics,
                 );
             }
-            let (return_ty, param_tys): (Ty, Vec<Ty>) = if type_args.len() == sig.type_params.len()
-            {
-                let subst: HashMap<TypeParamId, Ty> = sig
-                    .type_params
+            let arity_matches = type_args.len() == sig.type_params.len();
+            let subst: HashMap<TypeParamId, Ty> = if arity_matches {
+                sig.type_params
                     .iter()
                     .copied()
                     .zip(type_args.iter().cloned())
-                    .collect();
-                (
-                    substitute(&sig.return_type, &subst),
-                    sig.params.iter().map(|p| substitute(p, &subst)).collect(),
-                )
+                    .collect()
             } else {
                 diagnostics.push(Diagnostic::error(
                     codes::GENERIC_ARITY_MISMATCH,
@@ -1512,8 +2263,63 @@ fn verify_value_kind(
                         type_args.len()
                     ),
                 ));
+                HashMap::new()
+            };
+            let (return_ty, param_tys): (Ty, Vec<Ty>) = if arity_matches {
+                (
+                    substitute(&sig.return_type, &subst),
+                    sig.params.iter().map(|p| substitute(p, &subst)).collect(),
+                )
+            } else {
                 (sig.return_type.clone(), sig.params.clone())
             };
+            // Evidence is only checked once the call's own type
+            // arguments are known-good: an already-reported arity
+            // mismatch leaves `subst` empty, which would otherwise
+            // cascade into spurious evidence diagnostics unrelated to
+            // the actual problem.
+            if arity_matches {
+                let evidence_context =
+                    format!("function `{function_name}`: %{}'s call evidence", result.0);
+                if evidence.len() != sig.requirements.len() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::EVIDENCE_COUNT_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "{evidence_context} carries {} entry(ies), but the callee declares {} capability requirement(s)",
+                            evidence.len(),
+                            sig.requirements.len()
+                        ),
+                    ));
+                } else {
+                    for (entry, requirement) in evidence.iter().zip(sig.requirements.iter()) {
+                        let required_arguments: Vec<Ty> = requirement
+                            .arguments
+                            .iter()
+                            .map(|t| substitute(t, &subst))
+                            .collect();
+                        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+                        if let Err(problem) = check_evidence(
+                            entry,
+                            requirement.protocol,
+                            &required_arguments,
+                            true,
+                            own_requirements,
+                            agg,
+                            0,
+                            &mut budget,
+                        ) {
+                            diagnostics.push(Diagnostic::error(
+                                problem.code(),
+                                source,
+                                Span::dummy(),
+                                format!("{evidence_context} {}", problem.describe()),
+                            ));
+                        }
+                    }
+                }
+            }
             if return_ty != *result_ty {
                 operand_mismatch(
                     diagnostics,
@@ -1924,6 +2730,144 @@ fn verify_value_kind(
                 )),
             }
         }
+        ValueKind::ProtocolCall {
+            protocol,
+            arguments,
+            method,
+            evidence,
+            args,
+        } => {
+            for arg in args {
+                require_value(*arg, diagnostics);
+            }
+            let call_context = format!(
+                "function `{function_name}`: %{}'s protocol-call type argument",
+                result.0
+            );
+            for t in arguments {
+                check_type_root(
+                    t,
+                    agg,
+                    own_params,
+                    source,
+                    interner,
+                    registry,
+                    &call_context,
+                    diagnostics,
+                );
+            }
+            let Some(layout) = agg.protocols.get(protocol) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_CALL_TARGET,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls a protocol with id {}, which does not exist in this module",
+                        result.0, protocol.0
+                    ),
+                ));
+                return;
+            };
+            if layout.type_params.len() != arguments.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} supplies {} type argument(s) to `{}`, which declares {}",
+                        result.0,
+                        arguments.len(),
+                        registry.qualified_name(*protocol, interner),
+                        layout.type_params.len()
+                    ),
+                ));
+                return;
+            }
+            let Some(method_layout) = layout.methods.get(*method) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_CALL_TARGET,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls method index {method} of `{}`, which does not exist",
+                        result.0,
+                        registry.qualified_name(*protocol, interner)
+                    ),
+                ));
+                return;
+            };
+            let subst: HashMap<TypeParamId, Ty> = layout
+                .type_params
+                .iter()
+                .map(|(id, _)| *id)
+                .zip(arguments.iter().cloned())
+                .collect();
+            let expected_params: Vec<Ty> = method_layout
+                .params
+                .iter()
+                .map(|t| substitute(t, &subst))
+                .collect();
+            let expected_return = substitute(&method_layout.return_type, &subst);
+            if expected_return != *result_ty {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "calls a protocol method returning `{}` but is itself declared `{}`",
+                        ty_name(&expected_return),
+                        ty_name(result_ty)
+                    ),
+                );
+            }
+            if expected_params.len() != args.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` calls a protocol method expecting {} argument(s) with {}",
+                        expected_params.len(),
+                        args.len()
+                    ),
+                ));
+            } else {
+                for (param_ty, arg) in expected_params.iter().zip(args.iter()) {
+                    if let Some(arg_ty) = ty_of(*arg)
+                        && arg_ty != *param_ty
+                    {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "passes an argument of type `{}` where `{}` was expected",
+                                ty_name(&arg_ty),
+                                ty_name(param_ty)
+                            ),
+                        );
+                    }
+                }
+            }
+            let evidence_context = format!(
+                "function `{function_name}`: %{}'s protocol-call evidence",
+                result.0
+            );
+            let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+            if let Err(problem) = check_evidence(
+                evidence,
+                *protocol,
+                arguments,
+                true,
+                own_requirements,
+                agg,
+                0,
+                &mut budget,
+            ) {
+                diagnostics.push(Diagnostic::error(
+                    problem.code(),
+                    source,
+                    Span::dummy(),
+                    format!("{evidence_context} {}", problem.describe()),
+                ));
+            }
+        }
     }
 }
 
@@ -2063,7 +3007,7 @@ fn check_same_as_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nir::{BasicBlock, CaseLayout};
+    use crate::nir::{BasicBlock, CaseLayout, ProtocolMethodLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -2075,6 +3019,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -2100,6 +3045,8 @@ mod tests {
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![valid_function(ItemId(0), name)],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2119,6 +3066,8 @@ mod tests {
         let a = interner.intern("a");
         let b = interner.intern("b");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![valid_function(ItemId(0), a), valid_function(ItemId(0), b)],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2140,6 +3089,8 @@ mod tests {
             terminator: Terminator::Return(None),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2157,6 +3108,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.blocks.clear();
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2174,6 +3127,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.blocks[0].terminator = Terminator::Branch(BlockId(99));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2192,9 +3147,11 @@ mod tests {
         function.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(42), Vec::new(), Vec::new()),
+            kind: ValueKind::Call(ItemId(42), Vec::new(), Vec::new(), Vec::new()),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2213,6 +3170,8 @@ mod tests {
         // %99 is never defined anywhere in this function.
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(99)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2235,6 +3194,8 @@ mod tests {
             kind: ValueKind::Load(ValueId(0)),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2268,6 +3229,8 @@ mod tests {
         ];
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2289,6 +3252,8 @@ mod tests {
             else_block: BlockId(0),
         };
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2306,6 +3271,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Bool; // body still returns an i64
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2341,6 +3308,8 @@ mod tests {
         ];
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(2)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2358,6 +3327,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Var(crate::types::TyVar(0));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2375,6 +3346,8 @@ mod tests {
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Error;
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2395,10 +3368,12 @@ mod tests {
             result: ValueId(1),
             ty: Ty::I64,
             // `g` takes zero parameters; this call passes one.
-            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)], Vec::new()),
         });
         let callee = valid_function(ItemId(0), g_name);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -2420,6 +3395,8 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records,
             variants,
@@ -2455,6 +3432,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![BasicBlock {
@@ -2508,6 +3486,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2619,6 +3598,7 @@ mod tests {
             id,
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -2697,6 +3677,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
             blocks: vec![BasicBlock {
@@ -2727,6 +3708,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -2758,6 +3740,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
             blocks: vec![BasicBlock {
@@ -2946,6 +3929,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3058,6 +4042,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3105,6 +4090,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3174,6 +4160,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3278,6 +4265,7 @@ mod tests {
             id: ItemId(0),
             name,
             type_params: Vec::new(),
+            requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
             blocks: vec![
@@ -3564,9 +4552,11 @@ mod tests {
             result: ValueId(1),
             ty: Ty::I64,
             // `g` declares one type parameter; this call supplies none.
-            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), Vec::new(), vec![ValueId(0)], Vec::new()),
         });
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3605,10 +4595,12 @@ mod tests {
         caller.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(0), vec![Ty::I64], vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), vec![Ty::I64], vec![ValueId(0)], Vec::new()),
         });
         caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3832,6 +4824,8 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: vec![(record, record_layout)],
             variants: vec![(variant, variant_layout)],
@@ -3902,6 +4896,7 @@ mod tests {
             id,
             name,
             type_params: vec![(TypeParamId(0), t)],
+            requirements: Vec::new(),
             params: vec![crate::nir::Param {
                 value: ValueId(0),
                 ty: Ty::I64,
@@ -3923,7 +4918,7 @@ mod tests {
         caller.blocks[0].instructions.push(Instruction::Value {
             result: ValueId(1),
             ty: Ty::I64,
-            kind: ValueKind::Call(ItemId(0), vec![type_arg], vec![ValueId(0)]),
+            kind: ValueKind::Call(ItemId(0), vec![type_arg], vec![ValueId(0)], Vec::new()),
         });
         caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
         caller
@@ -3938,6 +4933,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Error);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3960,6 +4957,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Var(crate::types::TyVar(0)));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -3983,6 +4982,8 @@ mod tests {
         let unknown = ItemId(9999);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(unknown, vec![Ty::I64]));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -4018,6 +5019,8 @@ mod tests {
         };
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(pair, vec![Ty::I64]));
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: vec![(pair, pair_layout)],
             variants: Vec::new(),
@@ -4053,6 +5056,8 @@ mod tests {
         }
         let caller = caller_calling_g_with_type_arg(f_name, deep_ty);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: vec![(box_item, box_layout)],
             variants: Vec::new(),
@@ -4081,6 +5086,8 @@ mod tests {
         let callee = phantom_generic_callee(ItemId(0), g_name, t);
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Bool);
         let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![callee, caller],
             records: Vec::new(),
             variants: Vec::new(),
@@ -4179,5 +5186,1505 @@ mod tests {
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
         );
+    }
+
+    // -- Fix 3: protocol layout validation (`rfcs/0009`) -----------------
+
+    fn verify_module_with(
+        protocols: Vec<(ItemId, ProtocolLayout)>,
+        extends: Vec<(ItemId, ExtendLayout)>,
+        functions: Vec<Function>,
+        interner: &Interner,
+    ) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let module = Module {
+            protocols,
+            extends,
+            functions,
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        verify_module(&module, source, interner, &ItemRegistry::default())
+    }
+
+    /// A one-method `protocol Equal[T] { func equal(left: T, right: T)
+    /// -> bool; }` layout, for tests that mutate exactly one thing about
+    /// an otherwise-valid protocol declaration.
+    fn valid_equal_protocol(interner: &mut Interner) -> (ItemId, ProtocolLayout) {
+        let t = TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let equal = interner.intern("equal");
+        (
+            ItemId(0),
+            ProtocolLayout {
+                name: interner.intern("Equal"),
+                type_params: vec![(t, t_symbol)],
+                methods: vec![ProtocolMethodLayout {
+                    name: equal,
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn a_valid_protocol_layout_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (id, protocol) = valid_equal_protocol(&mut interner);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_protocol_declaring_the_same_type_parameter_twice_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let t = protocol.type_params[0];
+        protocol.type_params.push(t);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_protocol_method_using_a_foreign_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let foreign_symbol = interner.intern("U");
+        protocol.methods[0].params[0] = Ty::Param(TypeParamId(99), foreign_symbol);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_protocol_method_returning_an_error_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        protocol.methods[0].return_type = Ty::Error;
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
+    }
+
+    #[test]
+    fn a_protocol_method_parameter_naming_an_unknown_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let bogus = interner.intern("Bogus");
+        protocol.methods[0].params[0] = Ty::Named(ItemId(999), bogus);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_NAMED_TYPE));
+    }
+
+    #[test]
+    fn a_protocol_method_parameter_nested_deeper_than_the_generic_depth_limit_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let box_item = ItemId(50);
+        let t = protocol.type_params[0];
+        let mut deep = Ty::Param(t.0, t.1);
+        for _ in 0..(MAX_GENERIC_DEPTH + 2) {
+            deep = Ty::Applied(box_item, vec![deep]);
+        }
+        protocol.methods[0].params[0] = deep;
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED));
+    }
+
+    // -- Fix 3: extend layout validation (`rfcs/0009`) -------------------
+
+    /// `func equal_i64(left: i64, right: i64) -> bool { return left ==
+    /// right }`, the implementing function for `extend Equal[i64]`
+    /// below.
+    fn equal_i64_method(interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(1),
+            name: interner.intern("equal_i64"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                crate::nir::Param {
+                    value: ValueId(0),
+                    ty: Ty::I64,
+                },
+                crate::nir::Param {
+                    value: ValueId(1),
+                    ty: Ty::I64,
+                },
+            ],
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Eq(ValueId(0), ValueId(1)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        }
+    }
+
+    /// `extend Equal[i64] { func equal(left: i64, right: i64) -> bool
+    /// {..} }` -- a concrete extend of [`valid_equal_protocol`], for
+    /// tests that mutate exactly one thing about an otherwise-valid
+    /// extend declaration.
+    fn valid_equal_i64_extend() -> (ItemId, ExtendLayout) {
+        (
+            ItemId(10),
+            ExtendLayout {
+                protocol: ItemId(0),
+                type_params: Vec::new(),
+                protocol_arguments: vec![Ty::I64],
+                requirements: Vec::new(),
+                methods: vec![ItemId(1)],
+            },
+        )
+    }
+
+    #[test]
+    fn a_valid_extend_layout_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_extend_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.protocol = ItemId(999);
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            Vec::new(),
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_EXTEND_PROTOCOL));
+    }
+
+    #[test]
+    fn an_extend_supplying_the_wrong_number_of_protocol_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.protocol_arguments = vec![Ty::I64, Ty::I64];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_PROTOCOL_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_requirement_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_REQUIREMENT_PROTOCOL));
+    }
+
+    #[test]
+    fn an_extend_requirement_with_the_wrong_arity_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, Vec::new())];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::REQUIREMENT_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_with_the_wrong_method_table_length_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = Vec::new();
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_referencing_an_unknown_function_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = vec![ItemId(999)];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_UNKNOWN_FUNCTION));
+    }
+
+    #[test]
+    fn an_extend_method_function_not_sharing_its_extends_type_parameter_scope_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.type_params = vec![(TypeParamId(77), interner.intern("U"))];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_TYPE_PARAM_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_a_signature_not_matching_its_protocol_method_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        // Declares `(i64, i64) -> i64` where the protocol (substituted
+        // for `Equal[i64]`) requires `(i64, i64) -> bool`.
+        method.return_type = Ty::I64;
+        method.blocks[0].instructions[0] = Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::I64,
+            kind: ValueKind::Add(ValueId(0), ValueId(1)),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_SIGNATURE_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_using_the_same_function_for_two_method_slots_is_rejected() {
+        let mut interner = Interner::new();
+        let t = TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let protocol_id = ItemId(0);
+        let protocol = ProtocolLayout {
+            name: interner.intern("Equal"),
+            type_params: vec![(t, t_symbol)],
+            methods: vec![
+                ProtocolMethodLayout {
+                    name: interner.intern("equal"),
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                },
+                ProtocolMethodLayout {
+                    name: interner.intern("not_equal"),
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                },
+            ],
+        };
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.methods = vec![ItemId(1), ItemId(1)];
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_EXTEND_METHOD_REFERENCE));
+    }
+
+    // -- Fix 2 (0.1.5 follow-up): an extend method's own `requirements`
+    //    must be exactly its owning extend's `requirements`, in order --
+
+    #[test]
+    fn an_extend_method_with_a_different_requirement_count_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_the_same_count_but_a_different_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_the_same_protocol_but_different_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::Bool])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_requirements_in_a_different_order_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let other_protocol_id = ItemId(21);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![
+            CapabilityRequirement::new(protocol_id, vec![Ty::I64]),
+            CapabilityRequirement::new(other_protocol_id, vec![Ty::Bool]),
+        ];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![
+            CapabilityRequirement::new(other_protocol_id, vec![Ty::Bool]),
+            CapabilityRequirement::new(protocol_id, vec![Ty::I64]),
+        ];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_exactly_matching_requirements_is_accepted() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH),
+            "{diagnostics:?}"
+        );
+    }
+
+    // -- Fix 3 (0.1.5 follow-up): exact-forwarding-only symbolic
+    //    semantics, independently re-checked in NIR (`rfcs/0009`) -------
+
+    #[test]
+    fn an_extend_with_an_unconstrained_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(40);
+        let t_symbol = interner.intern("T");
+        let extend_id = ItemId(10);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol)],
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn two_unconstrained_extend_parameters_each_get_their_own_named_diagnostic_in_order() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(40);
+        let u = TypeParamId(41);
+        let t_symbol = interner.intern("T");
+        let u_symbol = interner.intern("U");
+        let extend_id = ItemId(10);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol), (u, u_symbol)],
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        let v0059: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code == codes::UNCONSTRAINED_EXTEND_PARAMETER)
+            .collect();
+        assert_eq!(v0059.len(), 2, "{diagnostics:?}");
+        assert!(v0059[0].message.contains("`T`"), "{}", v0059[0].message);
+        assert!(v0059[1].message.contains("`U`"), "{}", v0059[1].message);
+    }
+
+    #[test]
+    fn an_extend_type_parameter_occurring_in_a_nested_application_is_accepted() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(41);
+        let t_symbol = interner.intern("T");
+        let box_item = ItemId(51);
+        let extend_id = ItemId(11);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol)],
+            protocol_arguments: vec![Ty::Applied(box_item, vec![Ty::Param(t, t_symbol)])],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(!codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn every_extend_type_parameter_occurring_in_a_multi_argument_protocol_head_is_accepted() {
+        let mut interner = Interner::new();
+        let a = TypeParamId(0);
+        let b = TypeParamId(1);
+        let a_symbol = interner.intern("A");
+        let b_symbol = interner.intern("B");
+        let protocol_id = ItemId(0);
+        let protocol = ProtocolLayout {
+            name: interner.intern("P"),
+            type_params: vec![(a, a_symbol), (b, b_symbol)],
+            methods: vec![ProtocolMethodLayout {
+                name: interner.intern("test"),
+                params: vec![Ty::Param(a, a_symbol), Ty::Param(b, b_symbol)],
+                return_type: Ty::Bool,
+            }],
+        };
+        let t = TypeParamId(42);
+        let u = TypeParamId(43);
+        let t_symbol = interner.intern("T");
+        let u_symbol = interner.intern("U");
+        let extend_id = ItemId(12);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol), (u, u_symbol)],
+            protocol_arguments: vec![Ty::Param(t, t_symbol), Ty::Param(u, u_symbol)],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(!codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_for_a_still_symbolic_requirement_is_rejected() {
+        let extend_id = ItemId(1);
+        let protocol_id = ItemId(0);
+        let t = TypeParamId(0);
+        let t_symbol = Symbol(0);
+        let layout = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Param(t, t_symbol)],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(extend_id, &layout);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        let evidence = Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        };
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::Param(t, t_symbol)],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(
+            result,
+            Err(EvidenceProblem::ExtensionForSymbolicRequirement)
+        ));
+    }
+
+    #[test]
+    fn the_equivalent_exact_forwarded_evidence_for_a_symbolic_requirement_is_accepted() {
+        let protocol_id = ItemId(0);
+        let t = TypeParamId(0);
+        let t_symbol = Symbol(0);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends: HashMap::new(),
+        };
+        let caller_requirements = vec![CapabilityRequirement::new(
+            protocol_id,
+            vec![Ty::Param(t, t_symbol)],
+        )];
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &Evidence::Forwarded(0),
+            protocol_id,
+            &[Ty::Param(t, t_symbol)],
+            true,
+            &caller_requirements,
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // -- Fix 3: ordinary `Call` evidence validation (`rfcs/0009`) -------
+
+    /// `func g() -> bool uses Equal[i64] { return true }` -- a callee
+    /// declaring one capability requirement, for tests that call it with
+    /// exactly one evidence entry and mutate that entry.
+    fn callee_requiring_equal_i64(interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(2),
+            name: interner.intern("g"),
+            type_params: Vec::new(),
+            requirements: vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Const(Const::Bool(true)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    /// `func f() -> bool uses Equal[i64] { return g() }`, calling
+    /// [`callee_requiring_equal_i64`] with whatever `evidence` a test
+    /// wants to check, and declaring its own requirement so a
+    /// `Forwarded(0)` test has something valid to forward.
+    fn caller_forwarding_to_callee(
+        interner: &mut Interner,
+        requirements: Vec<CapabilityRequirement>,
+        evidence: Vec<Evidence>,
+    ) -> Function {
+        Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements,
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Call(ItemId(2), Vec::new(), Vec::new(), evidence),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn forwarding_the_callers_own_matching_requirement_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            vec![Evidence::Forwarded(0)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn dispatching_through_a_valid_concrete_extension_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_call_with_the_wrong_number_of_evidence_entries_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            Vec::new(),
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EVIDENCE_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn a_forwarded_index_out_of_range_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            vec![Evidence::Forwarded(5)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_INDEX_OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn a_forwarded_requirement_not_matching_the_call_site_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // The caller's own requirement at index 0 is `Equal[bool]`, not
+        // the `Equal[i64]` the callee actually requires.
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::Bool])],
+            vec![Evidence::Forwarded(0)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_REQUIREMENT_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_referencing_an_unknown_extend_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: ItemId(999),
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_EXTENSION_REFERENCE));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_for_the_wrong_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // A second, unrelated protocol with the same shape as `Equal`,
+        // so the extend below is a completely valid extension -- just
+        // not of the protocol the callee actually requires.
+        let ord_t = TypeParamId(1);
+        let ord_t_symbol = interner.intern("U");
+        let ord_protocol_id = ItemId(20);
+        let ord_protocol = ProtocolLayout {
+            name: interner.intern("Ord"),
+            type_params: vec![(ord_t, ord_t_symbol)],
+            methods: vec![ProtocolMethodLayout {
+                name: interner.intern("less"),
+                params: vec![
+                    Ty::Param(ord_t, ord_t_symbol),
+                    Ty::Param(ord_t, ord_t_symbol),
+                ],
+                return_type: Ty::Bool,
+            }],
+        };
+        let ord_extend_id = ItemId(11);
+        let ord_extend = ExtendLayout {
+            protocol: ord_protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: ord_extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol), (ord_protocol_id, ord_protocol)],
+            vec![(ord_extend_id, ord_extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_PROTOCOL_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_whose_head_does_not_match_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // Targets the right protocol, but for `bool`, not the `i64` the
+        // callee actually requires.
+        let mismatched_extend_id = ItemId(12);
+        let mismatched_extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Bool],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: mismatched_extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(mismatched_extend_id, mismatched_extend)],
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_HEAD_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_with_the_wrong_number_of_nested_entries_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        // A conditional extend requiring one capability of its own --
+        // the evidence below supplies zero nested entries for it.
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::NESTED_EVIDENCE_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn a_forwarded_entry_nested_inside_an_extension_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])],
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: vec![Evidence::Forwarded(0)],
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_INSIDE_NESTED_EVIDENCE));
+    }
+
+    // -- `check_evidence`/`match_extend_head` unit tests: depth/work
+    //    budgets on a hostile hand-built evidence tree, exercised
+    //    directly rather than through `verify_module` since building an
+    //    equally deep *valid* chain of distinct extends would obscure
+    //    what each test is actually bounding.
+
+    #[test]
+    fn evidence_nested_deeper_than_the_capability_depth_limit_is_rejected() {
+        // A chain of `Extension { extend: SAME_ID, nested: [...] }`,
+        // self-referentially "requiring itself" at every level -- purely
+        // structural (no real solver would ever produce this), built
+        // only to exercise `check_evidence`'s own recursion depth bound
+        // directly, independent of `verify_module`'s plumbing.
+        let extend_id = ItemId(1);
+        let protocol_id = ItemId(0);
+        let layout = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])],
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(extend_id, &layout);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        let mut evidence = Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        };
+        for _ in 0..(MAX_CAPABILITY_DEPTH + 2) {
+            evidence = Evidence::Extension {
+                extend: extend_id,
+                nested: vec![evidence],
+            };
+        }
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::I64],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(result, Err(EvidenceProblem::DepthExceeded)));
+    }
+
+    #[test]
+    fn evidence_exceeding_the_work_budget_is_rejected_without_a_diagnostic_per_node() {
+        let protocol_id = ItemId(0);
+        // Two extends sharing one shape: `branch` requires `WIDTH`
+        // copies of itself (so a structurally valid tree stays exactly
+        // `WIDTH`-ary at every internal node), `leaf` requires nothing
+        // (a valid terminal, so the tree can actually bottom out without
+        // needing to recurse forever to stay well-formed).
+        const WIDTH: usize = 4;
+        let branch_id = ItemId(1);
+        let leaf_id = ItemId(2);
+        let branch = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64]); WIDTH],
+            methods: Vec::new(),
+        };
+        let leaf = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(branch_id, &branch);
+        extends.insert(leaf_id, &leaf);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        // Shallow (well within the depth limit) but wide enough at every
+        // level to blow well past a small work budget: `WIDTH^levels`
+        // leaves alone is already far more than `budget` below, while
+        // `levels` itself stays nowhere near `MAX_CAPABILITY_DEPTH`.
+        fn build(branch_id: ItemId, leaf_id: ItemId, levels: usize) -> Evidence {
+            if levels == 0 {
+                return Evidence::Extension {
+                    extend: leaf_id,
+                    nested: Vec::new(),
+                };
+            }
+            Evidence::Extension {
+                extend: branch_id,
+                nested: (0..WIDTH)
+                    .map(|_| build(branch_id, leaf_id, levels - 1))
+                    .collect(),
+            }
+        }
+        let evidence = build(branch_id, leaf_id, 10);
+        let mut budget = 50;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::I64],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(result, Err(EvidenceProblem::WorkBudgetExceeded)));
+    }
+
+    // -- Fix 3: `protocol.call` validation (`rfcs/0009`) -----------------
+
+    /// `func f() -> <result_ty> { return <protocol>[<arguments>].method[<method>](1, 1, ..) }`
+    /// with `arg_count` integer-literal arguments, for tests that mutate
+    /// exactly one thing about an otherwise-valid `protocol.call`.
+    #[allow(clippy::too_many_arguments)]
+    fn caller_with_protocol_call(
+        interner: &mut Interner,
+        protocol: ItemId,
+        arguments: Vec<Ty>,
+        method: usize,
+        evidence: Evidence,
+        result_ty: Ty,
+        arg_count: usize,
+    ) -> Function {
+        let mut instructions: Vec<Instruction> = (0..arg_count)
+            .map(|i| Instruction::Value {
+                result: ValueId(i as u32),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            })
+            .collect();
+        let call_result = ValueId(arg_count as u32);
+        instructions.push(Instruction::Value {
+            result: call_result,
+            ty: result_ty.clone(),
+            kind: ValueKind::ProtocolCall {
+                protocol,
+                arguments,
+                method,
+                evidence,
+                args: (0..arg_count).map(|i| ValueId(i as u32)).collect(),
+            },
+        });
+        Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: result_ty,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(call_result)),
+            }],
+        }
+    }
+
+    fn valid_evidence_for_equal_i64(extend_id: ItemId) -> Evidence {
+        Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_valid_protocol_call_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_protocol_call_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            ItemId(999),
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            Vec::new(),
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_PROTOCOL_CALL_TARGET));
+    }
+
+    #[test]
+    fn a_protocol_call_with_the_wrong_number_of_type_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64, Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_with_an_out_of_range_method_index_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            5,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_PROTOCOL_CALL_TARGET));
+    }
+
+    #[test]
+    fn a_protocol_call_with_the_wrong_number_of_value_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            3,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_declared_with_the_wrong_result_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        // `Equal[i64].equal(..)` actually returns `bool`, not `i64`.
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::I64,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_passing_an_argument_of_the_wrong_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        // `Equal[i64].equal(left: i64, right: i64)` expects two `i64`s;
+        // this call passes a `bool` as its first argument instead.
+        let caller = Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::Bool,
+                        kind: ValueKind::ProtocolCall {
+                            protocol: protocol_id,
+                            arguments: vec![Ty::I64],
+                            method: 0,
+                            evidence: valid_evidence_for_equal_i64(extend_id),
+                            args: vec![ValueId(0), ValueId(1)],
+                        },
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_whose_evidence_cannot_satisfy_the_exact_requirement_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // Targets the right protocol, but for `bool`, not the `i64` this
+        // call site actually requires.
+        let mismatched_extend_id = ItemId(12);
+        let mismatched_extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Bool],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(mismatched_extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(mismatched_extend_id, mismatched_extend)],
+            vec![caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_HEAD_MISMATCH));
+    }
+
+    // -- Fix 1 (0.1.5 follow-up): every Function::requirements entry is
+    //    independently validated ---------------------------------------
+
+    fn function_with_requirement(
+        interner: &mut Interner,
+        type_params: Vec<(TypeParamId, Symbol)>,
+        requirements: Vec<CapabilityRequirement>,
+    ) -> Function {
+        Function {
+            id: ItemId(20),
+            name: interner.intern("f"),
+            type_params,
+            requirements,
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Const(Const::Bool(true)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_function_requirement_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])],
+        );
+        let diagnostics = verify_module_with(Vec::new(), Vec::new(), vec![function], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_REQUIREMENT_PROTOCOL));
+    }
+
+    #[test]
+    fn a_function_requirement_with_the_wrong_arity_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, Vec::new())],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::REQUIREMENT_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_function_requirement_with_an_error_type_argument_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, vec![Ty::Error])],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
+    }
+
+    #[test]
+    fn a_function_requirement_with_an_unresolved_type_variable_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Var(crate::types::TyVar(0))],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNRESOLVED_TYPE_VARIABLE));
+    }
+
+    #[test]
+    fn a_function_requirement_using_a_foreign_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let foreign = interner.intern("U");
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Param(TypeParamId(999), foreign)],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_function_requirement_nested_past_the_generic_depth_limit_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let box_item = ItemId(50);
+        let mut deep = Ty::I64;
+        for _ in 0..(MAX_GENERIC_DEPTH + 2) {
+            deep = Ty::Applied(box_item, vec![deep]);
+        }
+        let function = function_with_requirement(
+            &mut interner,
+            Vec::new(),
+            vec![CapabilityRequirement::new(protocol_id, vec![deep])],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED));
+    }
+
+    #[test]
+    fn a_valid_symbolic_function_requirement_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(30);
+        let t_symbol = interner.intern("T");
+        let function = function_with_requirement(
+            &mut interner,
+            vec![(t, t_symbol)],
+            vec![CapabilityRequirement::new(
+                protocol_id,
+                vec![Ty::Param(t, t_symbol)],
+            )],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![function],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

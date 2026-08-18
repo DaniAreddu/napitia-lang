@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use super::{
-    BasicBlock, CaseLayout, Const, Function, Module, Param, RecordLayout, Terminator, ValueId,
-    ValueKind, VariantLayout,
+    BasicBlock, CaseLayout, Const, ExtendLayout, Function, Module, Param, ProtocolLayout,
+    ProtocolMethodLayout, RecordLayout, Terminator, ValueId, ValueKind, VariantLayout,
 };
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
@@ -32,7 +32,7 @@ use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
-use crate::types::{Ty, is_numeric, primitive_from_name};
+use crate::types::{CapabilityRequirement, Evidence, Ty, is_numeric, primitive_from_name};
 
 use super::block::BlockId;
 
@@ -60,12 +60,15 @@ type LowerResult<T> = Result<T, Box<Diagnostic>>;
 /// successfully and the whole `Module` is returned, or one or more
 /// failed and the *only* thing returned is their diagnostics -- there is
 /// no way to get back a `Module` with some functions missing.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
     pattern_case: &HashMap<PatternId, (ItemId, usize)>,
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
+    call_evidence: &HashMap<ExprId, Vec<Evidence>>,
+    protocol_call_evidence: &HashMap<ExprId, Evidence>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -132,6 +135,7 @@ pub fn lower_module(
     }
 
     let mut function_sigs = HashMap::new();
+    let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -145,6 +149,128 @@ pub fn lower_module(
             .unwrap_or(Ty::Unit);
         let type_params = f.type_params.iter().map(|p| p.id).collect();
         function_sigs.insert(f.id, (type_params, params, ret));
+        function_requirements.insert(
+            f.id,
+            f.requirements
+                .iter()
+                .map(|r| resolve_requirement(interner, r))
+                .collect(),
+        );
+    }
+
+    // Every declared protocol's layout, in declaration order -- built
+    // once, up front, since an extend's own method table (below) needs
+    // to look a protocol's method names up by index.
+    let mut protocols: Vec<(ItemId, ProtocolLayout)> = Vec::with_capacity(hir.protocols.len());
+    for p in &hir.protocols {
+        let methods = p
+            .methods
+            .iter()
+            .map(|m| ProtocolMethodLayout {
+                name: m.name,
+                params: m
+                    .params
+                    .iter()
+                    .map(|t| resolve_named_type(interner, t))
+                    .collect(),
+                return_type: m
+                    .return_type
+                    .as_ref()
+                    .map(|t| resolve_named_type(interner, t))
+                    .unwrap_or(Ty::Unit),
+            })
+            .collect();
+        protocols.push((
+            p.id,
+            ProtocolLayout {
+                name: p.name,
+                type_params: p.type_params.iter().map(|tp| (tp.id, tp.name)).collect(),
+                methods,
+            },
+        ));
+    }
+
+    // Every accepted extend's layout, in declaration order. `nir::lower`
+    // trusts that every extend it sees here already passed `typeck`'s
+    // authority/overlap/completeness validation (this module's own
+    // "input already passed type-checking" contract, see its own module
+    // doc) -- an unauthorized or incomplete extend never reaches here at
+    // all in the ordinary pipeline. Each extend method is registered
+    // exactly like an ordinary function (sharing the extend's own
+    // `type_params`/`requirements`) and lowered the same way, below.
+    let mut extends: Vec<(ItemId, ExtendLayout)> = Vec::with_capacity(hir.extends.len());
+    let mut function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>> =
+        HashMap::new();
+    for e in &hir.extends {
+        let extend_type_params: Vec<crate::hir::TypeParamId> =
+            e.type_params.iter().map(|p| p.id).collect();
+        let extend_named_type_params: Vec<(crate::hir::TypeParamId, Symbol)> =
+            e.type_params.iter().map(|p| (p.id, p.name)).collect();
+        for m in &e.methods {
+            function_named_type_params.insert(m.id, extend_named_type_params.clone());
+        }
+        let protocol_arguments: Vec<Ty> = e
+            .protocol_arguments
+            .iter()
+            .map(|t| resolve_named_type(interner, t))
+            .collect();
+        let requirements: Vec<CapabilityRequirement> = e
+            .requirements
+            .iter()
+            .map(|r| resolve_requirement(interner, r))
+            .collect();
+        let proto_method_names: Vec<Symbol> = protocols
+            .iter()
+            .find(|(id, _)| *id == e.protocol)
+            .map(|(_, layout)| layout.methods.iter().map(|m| m.name).collect())
+            .unwrap_or_default();
+        let mut methods_by_index: Vec<Option<ItemId>> = vec![None; proto_method_names.len()];
+        for m in &e.methods {
+            function_sigs.insert(
+                m.id,
+                (
+                    extend_type_params.clone(),
+                    m.params
+                        .iter()
+                        .map(|p| resolve_named_type(interner, &p.ty))
+                        .collect(),
+                    m.return_type
+                        .as_ref()
+                        .map(|t| resolve_named_type(interner, t))
+                        .unwrap_or(Ty::Unit),
+                ),
+            );
+            function_requirements.insert(m.id, requirements.clone());
+            if let Some(index) = proto_method_names.iter().position(|n| *n == m.name) {
+                methods_by_index[index] = Some(m.id);
+            }
+        }
+        let mut methods = Vec::with_capacity(methods_by_index.len());
+        for (index, method_id) in methods_by_index.into_iter().enumerate() {
+            match method_id {
+                Some(id) => methods.push(id),
+                None => {
+                    return Err(vec![Diagnostic::error(
+                        codes::INTERNAL_INVARIANT_VIOLATED,
+                        source,
+                        e.span,
+                        format!(
+                            "extend for protocol method index {index} has no implementing function; typeck should have already rejected this incomplete extend"
+                        ),
+                    )]);
+                }
+            }
+        }
+        extends.push((
+            e.id,
+            ExtendLayout {
+                protocol: e.protocol,
+                type_params: extend_named_type_params,
+                protocol_arguments,
+                requirements,
+                methods,
+            },
+        ));
     }
 
     let mut lowering = Lowering {
@@ -152,11 +278,15 @@ pub fn lower_module(
         expr_types,
         pattern_case,
         call_type_args,
+        call_evidence,
+        protocol_call_evidence,
         interner,
         source,
         records: record_layouts,
         variants: variant_layouts,
         function_sigs,
+        function_requirements,
+        function_named_type_params,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -164,6 +294,14 @@ pub fn lower_module(
         match lowering.lower_function(f) {
             Ok(nir_fn) => functions.push(nir_fn),
             Err(diag) => diagnostics.push(*diag),
+        }
+    }
+    for e in &hir.extends {
+        for m in &e.methods {
+            match lowering.lower_function(m) {
+                Ok(nir_fn) => functions.push(nir_fn),
+                Err(diag) => diagnostics.push(*diag),
+            }
         }
     }
 
@@ -204,6 +342,8 @@ pub fn lower_module(
         functions,
         records,
         variants,
+        protocols,
+        extends,
     })
 }
 
@@ -214,11 +354,15 @@ enum ItemKind {
     Record,
     Variant,
     Function,
+    Protocol,
+    Extend,
 }
 
 impl ItemKind {
     fn describe(self) -> &'static str {
         match self {
+            ItemKind::Protocol => "protocol",
+            ItemKind::Extend => "extend",
             ItemKind::Record => "record",
             ItemKind::Variant => "variant",
             ItemKind::Function => "function",
@@ -279,6 +423,28 @@ fn validate_item_identities(
     for f in &hir.functions {
         check(f.id, ItemKind::Function, f.name, f.name_span);
     }
+    for p in &hir.protocols {
+        check(p.id, ItemKind::Protocol, p.name, p.name_span);
+    }
+    for e in &hir.extends {
+        // An extend has no name of its own; its own protocol's name is
+        // used only for this diagnostic's own text, never as this
+        // extend's identity. An extend whose protocol reference never
+        // resolved (`hir::lower` already reported that separately) has
+        // no name to borrow here, so its own id-collision check is
+        // skipped rather than fabricating one.
+        if let Some(protocol_name) = hir
+            .protocols
+            .iter()
+            .find(|p| p.id == e.protocol)
+            .map(|p| p.name)
+        {
+            check(e.id, ItemKind::Extend, protocol_name, e.span);
+        }
+        for m in &e.methods {
+            check(m.id, ItemKind::Function, m.name, m.name_span);
+        }
+    }
     diagnostics
 }
 
@@ -336,6 +502,26 @@ fn resolve_named_type_at_depth(interner: &Interner, ty: &crate::hir::HirType, de
     }
 }
 
+/// Converts one HIR-level capability requirement (`rfcs/0009`) into its
+/// canonical form, the same "read back what typeck already resolved,
+/// never re-validate" discipline `resolve_named_type` follows -- typeck
+/// already rejected an unknown protocol or wrong arity; this module
+/// never runs at all for a program that didn't already pass that check
+/// (`nir::lower`'s own module doc).
+fn resolve_requirement(
+    interner: &Interner,
+    requirement: &crate::hir::HirCapabilityRequirement,
+) -> crate::types::CapabilityRequirement {
+    crate::types::CapabilityRequirement::new(
+        requirement.protocol,
+        requirement
+            .arguments
+            .iter()
+            .map(|a| resolve_named_type(interner, a))
+            .collect(),
+    )
+}
+
 struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
@@ -346,6 +532,13 @@ struct Lowering<'a> {
     /// "typeck already decided, lowering only reads it back" discipline
     /// `expr_types`/`local_types` already follow.
     call_type_args: &'a HashMap<ExprId, Vec<Ty>>,
+    /// Every call's own resolved capability evidence (`rfcs/0009`), one
+    /// entry per requirement the callee declares, in that same order --
+    /// read back here, never re-resolved (mirrors `call_type_args`).
+    call_evidence: &'a HashMap<ExprId, Vec<Evidence>>,
+    /// Every explicit protocol-call expression's own resolved evidence,
+    /// keyed by that call's own `ExprId` (`rfcs/0009`).
+    protocol_call_evidence: &'a HashMap<ExprId, Evidence>,
     interner: &'a Interner,
     source: SourceId,
     records: HashMap<ItemId, RecordLayout>,
@@ -355,6 +548,16 @@ struct Lowering<'a> {
     /// first element via `Ty::Param`; a call site substitutes its own
     /// `call_type_args` for them (`rfcs/0008`).
     function_sigs: HashMap<ItemId, (Vec<crate::hir::TypeParamId>, Vec<Ty>, Ty)>,
+    /// Every function/extend method's own capability requirements
+    /// (`rfcs/0009`), in declared order -- a `Call` targeting one of
+    /// these carries exactly this many evidence entries.
+    function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>>,
+    /// An extend method's own *displayed* generic parameters -- always
+    /// its owning extend's own `type_params` (never empty the way its
+    /// own `HirFunction::type_params` is), keyed by the method's own
+    /// `ItemId`. Absent (falls back to `f.type_params` directly) for an
+    /// ordinary function, which owns its parameters itself.
+    function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>>,
 }
 
 #[derive(Copy, Clone)]
@@ -570,10 +773,26 @@ impl<'a> Lowering<'a> {
             ))
         })?;
 
+        // An extend method's own `f.type_params` is always empty (see
+        // `HirFunction::type_params`'s own doc comment): its real
+        // generic parameters are its *owning extend's* own, looked up
+        // here by name rather than assumed empty, so a conditional
+        // extend's NIR function still carries its own `[T]` correctly.
+        let type_params = self
+            .function_named_type_params
+            .get(&f.id)
+            .cloned()
+            .unwrap_or_else(|| f.type_params.iter().map(|p| (p.id, p.name)).collect());
+        let requirements = self
+            .function_requirements
+            .get(&f.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(Function {
             id: f.id,
             name: f.name,
-            type_params: f.type_params.iter().map(|p| (p.id, p.name)).collect(),
+            type_params,
+            requirements,
             params,
             return_type,
             blocks,
@@ -812,6 +1031,17 @@ impl<'a> Lowering<'a> {
             // independently-drifting implementation here.
             HirExpr::CaseRef { variant, case, .. } => {
                 self.lower_variant_construct(fb, *variant, *case, &[], expr)
+            }
+            // There are no first-class/dynamic protocol methods in
+            // Alpha 0.1.5 (`rfcs/0009`); typeck already rejects a bare
+            // (uncalled) reference outright before lowering ever runs
+            // in the normal pipeline.
+            HirExpr::ProtocolMethodRef { name, span, .. } => {
+                let text = self.interner.resolve(*name);
+                Err(self.unsupported(
+                    *span,
+                    &format!("using protocol method `{text}` as a first-class value"),
+                ))
             }
             HirExpr::Unary { op, operand, .. } => self.lower_unary(fb, *op, operand),
             HirExpr::Binary {
@@ -1133,6 +1363,15 @@ impl<'a> Lowering<'a> {
         if let HirExpr::CaseRef { variant, case, .. } = callee {
             return self.lower_variant_construct(fb, *variant, *case, args, call_expr);
         }
+        if let HirExpr::ProtocolMethodRef {
+            protocol,
+            arguments,
+            method,
+            ..
+        } = callee
+        {
+            return self.lower_protocol_call(fb, *protocol, arguments, *method, args, call_expr);
+        }
 
         let HirExpr::Function { item, .. } = callee else {
             // typeck already rejects a call whose callee doesn't
@@ -1180,9 +1419,57 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
+        let requirements = self
+            .function_requirements
+            .get(item)
+            .cloned()
+            .unwrap_or_default();
+        let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(call_expr),
-            ValueKind::Call(*item, type_args, arg_values),
+            ValueKind::Call(*item, type_args, arg_values, evidence),
+        )))
+    }
+
+    /// Lowers an explicit protocol-call expression,
+    /// `Protocol[Args].method(..)` (`rfcs/0009`) -- `typeck` already
+    /// resolved exactly which extension (or forwarded requirement)
+    /// answers this specific call (`protocol_call_evidence`); lowering
+    /// only ever reads that back, never re-resolves it.
+    fn lower_protocol_call(
+        &mut self,
+        fb: &mut FnBuilder,
+        protocol: ItemId,
+        arguments: &[crate::hir::HirType],
+        method: usize,
+        args: &[HirExpr],
+        call_expr: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
+        let resolved_arguments: Vec<Ty> = arguments
+            .iter()
+            .map(|a| self.resolve_named_type(a))
+            .collect();
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            match self.lower_expr(fb, arg)? {
+                LoweredExpr::Value(v) => arg_values.push(v),
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            }
+        }
+        let Some(evidence) = self.protocol_call_evidence.get(&call_expr.id()).cloned() else {
+            return Err(self.internal_error(
+                "protocol call has no recorded call-site evidence from typeck's capability solver",
+            ));
+        };
+        Ok(LoweredExpr::Value(fb.push_value(
+            self.expr_ty(call_expr),
+            ValueKind::ProtocolCall {
+                protocol,
+                arguments: resolved_arguments,
+                method,
+                evidence,
+                args: arg_values,
+            },
         )))
     }
 
@@ -2093,6 +2380,33 @@ impl<'a> Lowering<'a> {
             ))),
         }
     }
+
+    /// Reads `expr_id`'s already-resolved capability evidence back from
+    /// typeck's `call_evidence` (`rfcs/0009`), never re-resolved here --
+    /// mirrors `resolve_call_type_args` exactly: absent metadata for a
+    /// callee with no requirements is a valid empty list; anything else
+    /// missing or wrong-arity is a structured internal-lowering error,
+    /// never a silent default or a truncating zip.
+    fn resolve_call_evidence(
+        &self,
+        expr_id: ExprId,
+        requirements: &[CapabilityRequirement],
+        what: &str,
+    ) -> LowerResult<Vec<Evidence>> {
+        match self.call_evidence.get(&expr_id) {
+            None if requirements.is_empty() => Ok(Vec::new()),
+            None => Err(self.internal_error(&format!(
+                "{what} declares {} capability requirement(s) but has no recorded call-site evidence",
+                requirements.len()
+            ))),
+            Some(evidence) if evidence.len() == requirements.len() => Ok(evidence.clone()),
+            Some(evidence) => Err(self.internal_error(&format!(
+                "{what} declares {} capability requirement(s) but has {} recorded call-site evidence entries",
+                requirements.len(),
+                evidence.len()
+            ))),
+        }
+    }
 }
 
 /// One pattern slot in a decision-tree matrix row: either a real
@@ -2192,6 +2506,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -2227,6 +2543,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -2261,6 +2579,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -2986,6 +3306,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         )
@@ -3037,6 +3359,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         );
@@ -3099,6 +3423,7 @@ mod tests {
             params: vec![],
             return_type: None,
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(0),
@@ -3162,6 +3487,7 @@ mod tests {
             params: vec![],
             return_type: None,
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(100),
@@ -3193,6 +3519,8 @@ mod tests {
         let case_name = interner.intern("Empty");
         let unknown_variant = ItemId(0);
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function_with_tail(
                 ItemId(1),
                 f,
@@ -3212,6 +3540,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3235,6 +3565,8 @@ mod tests {
         // Case index 7 does not exist -- the variant declares no cases
         // at all.
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function_with_tail(
                 ItemId(1),
                 f,
@@ -3254,6 +3586,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3293,6 +3627,8 @@ mod tests {
             }],
         };
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function_with_tail(
                 ItemId(1),
                 f,
@@ -3313,6 +3649,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -3330,6 +3668,8 @@ mod tests {
         let a = interner.intern("A");
         let b = interner.intern("B");
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![],
             records: vec![
                 minimal_record(ItemId(0), a, source),
@@ -3344,6 +3684,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3368,6 +3710,8 @@ mod tests {
         let a = interner.intern("A");
         let b = interner.intern("B");
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![],
             records: vec![],
             variants: vec![
@@ -3382,6 +3726,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3406,6 +3752,8 @@ mod tests {
         let f = interner.intern("f");
         let g = interner.intern("g");
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![
                 minimal_function(ItemId(0), f, source),
                 minimal_function(ItemId(0), g, source),
@@ -3420,6 +3768,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3444,6 +3794,8 @@ mod tests {
         let a = interner.intern("A");
         let b = interner.intern("B");
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![],
             records: vec![minimal_record(ItemId(0), a, source)],
             variants: vec![minimal_variant(ItemId(0), b, source)],
@@ -3455,6 +3807,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3481,6 +3835,8 @@ mod tests {
         let a = interner.intern("A");
         let f = interner.intern("f");
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![minimal_function(ItemId(0), f, source)],
             records: vec![minimal_record(ItemId(0), a, source)],
             variants: vec![],
@@ -3492,6 +3848,8 @@ mod tests {
             &local_types,
             &expr_types,
             &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &interner,
             source,
@@ -3522,6 +3880,8 @@ mod tests {
         let d = interner.intern("D");
         // Two independent collisions: records 0/0, then variants 1/1.
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![],
             records: vec![
                 minimal_record(ItemId(0), a, source),
@@ -3540,6 +3900,8 @@ mod tests {
                 &local_types,
                 &expr_types,
                 &pattern_case,
+                &HashMap::new(),
+                &HashMap::new(),
                 &HashMap::new(),
                 &interner,
                 source,
@@ -3589,6 +3951,10 @@ mod tests {
             variants,
             function_sigs: HashMap::new(),
             call_type_args: Box::leak(Box::new(HashMap::new())),
+            call_evidence: Box::leak(Box::new(HashMap::new())),
+            protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
+            function_requirements: HashMap::new(),
+            function_named_type_params: HashMap::new(),
         }
     }
 
@@ -3618,6 +3984,10 @@ mod tests {
             variants,
             function_sigs,
             call_type_args,
+            call_evidence: Box::leak(Box::new(HashMap::new())),
+            protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
+            function_requirements: HashMap::new(),
+            function_named_type_params: HashMap::new(),
         }
     }
 
@@ -4395,6 +4765,7 @@ mod tests {
             }],
             return_type: Some(i64_name),
             uses: vec![],
+            requirements: Vec::new(),
             raises: vec![],
             body: HirBlock {
                 id: ExprId(3),
@@ -4405,6 +4776,8 @@ mod tests {
             span: Span::dummy(),
         };
         let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
             functions: vec![function],
             records: vec![],
             variants: vec![variant],
@@ -4423,6 +4796,8 @@ mod tests {
             &expr_types,
             &pattern_case,
             &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             source,
         );
@@ -4569,6 +4944,8 @@ mod tests {
             &result.expr_types,
             &result.pattern_case,
             &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
             &interner,
             id,
         );
@@ -4635,7 +5012,7 @@ mod tests {
             .flat_map(|b| &b.instructions)
             .find_map(|i| {
                 if let Instruction::Value {
-                    kind: ValueKind::Call(_, type_args, _),
+                    kind: ValueKind::Call(_, type_args, _, _),
                     ..
                 } = i
                 {

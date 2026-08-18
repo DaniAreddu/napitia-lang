@@ -1,7 +1,7 @@
 //! NIR instructions.
 
 use crate::hir::ItemId;
-use crate::types::Ty;
+use crate::types::{Evidence, Ty};
 
 /// Identifies a value produced within one function: a parameter
 /// (numbered first), an `alloc` (identifying the resulting storage slot
@@ -54,8 +54,11 @@ pub enum ValueKind {
     /// (`rfcs/0008`) -- empty for a non-generic call. The callee itself
     /// is looked up once by `FunctionRef` regardless: one parametric NIR
     /// function body is shared by every call, never cloned per
-    /// instantiation.
-    Call(FunctionRef, Vec<Ty>, Vec<ValueId>),
+    /// instantiation. `evidence` is this call's own resolved capability
+    /// evidence (`rfcs/0009`), one entry per requirement the callee
+    /// itself declares (`Function::requirements`), in that same
+    /// declared order -- empty when the callee declares none.
+    Call(FunctionRef, Vec<Ty>, Vec<ValueId>, Vec<Evidence>),
     /// Constructs a record value. `fields` is already in **declaration
     /// order** (never construction-site/source order) -- reordering
     /// happens once, at the point of construction, so every later
@@ -94,6 +97,28 @@ pub enum ValueKind {
         variant: ItemId,
         case: usize,
         index: usize,
+    },
+    /// An explicit protocol-call expression, `Protocol[Args].method(..)`
+    /// (`rfcs/0009`), fully resolved at compile time: `protocol`/`method`
+    /// are the canonical protocol identity and its method's
+    /// declaration-order index (never re-derived from a name at run
+    /// time), and `evidence` is exactly how this specific call answers
+    /// that protocol's requirement -- a concrete extension
+    /// (`Evidence::Extension`) or a forward to the current frame's own
+    /// evidence (`Evidence::Forwarded`), resolved once by `typeck`'s
+    /// capability solver. Dispatch is a pure lookup through `evidence`,
+    /// never a name re-resolution.
+    ProtocolCall {
+        protocol: ItemId,
+        /// `protocol`'s own type arguments at this specific call site
+        /// (`Equal[i64]`'s `[i64]`), so the verifier can substitute them
+        /// into the protocol's own declared method signature and check
+        /// this instruction's operands/result against it, exactly like
+        /// `Call`'s own `type_args` lets it check an ordinary call.
+        arguments: Vec<Ty>,
+        method: usize,
+        evidence: Evidence,
+        args: Vec<ValueId>,
     },
 }
 

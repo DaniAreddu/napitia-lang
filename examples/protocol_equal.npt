@@ -1,0 +1,17 @@
+// A concrete capability protocol and its extension for `i64`
+// (Alpha 0.1.5, rfcs/0009). `Equal[T].equal(..)` is an explicit,
+// compile-time-resolved call -- there is no implicit receiver, no
+// `Self`, and no operator sugar routing `==` through a protocol.
+protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        return left == right
+    }
+}
+
+func main() -> bool {
+    return Equal[i64].equal(21, 21)
+}

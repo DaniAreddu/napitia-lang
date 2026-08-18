@@ -221,6 +221,18 @@ mod codes {
     /// pass every other extend/method check and still fail (or silently
     /// misdispatch) only once actually interpreted.
     pub const EXTEND_METHOD_REQUIREMENTS_MISMATCH: &str = "V0058";
+    /// An extend's own type parameter does not occur anywhere inside its
+    /// protocol's type arguments -- `rfcs/0009`'s exact-forwarding-only
+    /// requirement (`typeck`'s own `T0046`), re-derived independently
+    /// here since this verifier never trusts hand-built NIR to already
+    /// satisfy it.
+    pub const UNCONSTRAINED_EXTEND_PARAMETER: &str = "V0059";
+    /// An `Evidence::Extension` was selected for a requirement whose
+    /// arguments are still symbolic (contain a `Ty::Param`) -- Alpha
+    /// 0.1.5 permits only an exact `Evidence::Forwarded` match in that
+    /// situation; a concrete extend can only ever be legitimately
+    /// selected once every argument is fully concrete.
+    pub const EXTENSION_FOR_SYMBOLIC_REQUIREMENT: &str = "V0060";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -496,6 +508,28 @@ pub fn verify_module(
         check_no_duplicate_type_params(&extend.type_params, source, &context, &mut diagnostics);
         let own_params: HashSet<TypeParamId> =
             extend.type_params.iter().map(|(id, _)| *id).collect();
+
+        // Exact-forwarding-only symbolic semantics (`rfcs/0009`): an
+        // extend's own type parameter must be determined by its protocol
+        // head alone. `typeck` already rejects this for ordinary source
+        // (`T0046`); re-derived here independently since this verifier
+        // never trusts hand-built NIR to already satisfy it.
+        let mut occurring_params: HashSet<TypeParamId> = HashSet::new();
+        for ty in &extend.protocol_arguments {
+            collect_occurring_type_params(ty, &mut occurring_params, 0);
+        }
+        for (type_param_id, _) in &extend.type_params {
+            if !occurring_params.contains(type_param_id) {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNCONSTRAINED_EXTEND_PARAMETER,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s type parameter does not occur in the protocol's own type arguments and cannot be determined by this extension's head"
+                    ),
+                ));
+            }
+        }
 
         let arg_context = format!("{context}'s protocol argument");
         for ty in &extend.protocol_arguments {
@@ -1639,6 +1673,50 @@ fn exceeds_generic_depth(ty: &Ty, depth: usize) -> bool {
     }
 }
 
+/// Collects every `TypeParamId` occurring anywhere inside `ty`, recursing
+/// through `Ty::Applied`'s own argument list -- used to independently
+/// re-derive whether an extend's own type parameter is actually
+/// determined by its protocol head (`rfcs/0009`'s exact-forwarding-only
+/// requirement; mirrors `typeck::capability`'s own
+/// `collect_occurring_type_params`, since this verifier never trusts
+/// hand-built NIR to already satisfy what `typeck` enforces for ordinary
+/// source). Depth-bounded the same way every other stage that walks a
+/// type application is.
+fn collect_occurring_type_params(ty: &Ty, out: &mut HashSet<TypeParamId>, depth: usize) {
+    if depth > MAX_GENERIC_DEPTH {
+        return;
+    }
+    match ty {
+        Ty::Param(id, _) => {
+            out.insert(*id);
+        }
+        Ty::Applied(_, args) => {
+            for arg in args {
+                collect_occurring_type_params(arg, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `ty` contains a symbolic `Ty::Param` anywhere, recursing
+/// through `Ty::Applied` -- used to reject `Evidence::Extension` against
+/// a still-symbolic required capability (`rfcs/0009`): Alpha 0.1.5
+/// permits only an exact `Evidence::Forwarded` match once any part of
+/// the required arguments is still symbolic, since a concrete extend's
+/// own head can never be legitimately selected for a type that is not
+/// yet concrete.
+fn contains_symbolic_param(ty: &Ty, depth: usize) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Param(..) => true,
+        Ty::Applied(_, args) => args.iter().any(|a| contains_symbolic_param(a, depth + 1)),
+        _ => false,
+    }
+}
+
 /// The single, shared check every type root `verify_module` inspects
 /// goes through -- a record field, a variant case payload, a function
 /// parameter or return type, an instruction's result type, or a
@@ -1712,6 +1790,7 @@ enum EvidenceProblem {
     ExtensionProtocolMismatch,
     ExtensionHeadMismatch,
     NestedEvidenceCountMismatch { expected: usize, found: usize },
+    ExtensionForSymbolicRequirement,
 }
 
 impl EvidenceProblem {
@@ -1727,6 +1806,9 @@ impl EvidenceProblem {
             EvidenceProblem::ExtensionHeadMismatch => codes::EXTENSION_HEAD_MISMATCH,
             EvidenceProblem::NestedEvidenceCountMismatch { .. } => {
                 codes::NESTED_EVIDENCE_COUNT_MISMATCH
+            }
+            EvidenceProblem::ExtensionForSymbolicRequirement => {
+                codes::EXTENSION_FOR_SYMBOLIC_REQUIREMENT
             }
         }
     }
@@ -1772,6 +1854,11 @@ impl EvidenceProblem {
                 "selects an extension carrying {found} nested evidence entries, but its own \
                  extend declares {expected} requirement(s)"
             ),
+            EvidenceProblem::ExtensionForSymbolicRequirement => {
+                "selects a concrete extension for a requirement that is still symbolic; only \
+                 an exact Forwarded match is legal until every argument is concrete"
+                    .to_string()
+            }
         }
     }
 }
@@ -1874,6 +1961,21 @@ fn check_evidence(
             Ok(())
         }
         Evidence::Extension { extend, nested } => {
+            // Exact-forwarding-only symbolic semantics (`rfcs/0009`): a
+            // concrete extend can only ever have been legitimately
+            // selected once every part of the required capability is
+            // itself concrete -- a still-symbolic requirement can only
+            // resolve by forwarding an identical caller requirement
+            // unchanged, checked above. This must be checked before any
+            // other `Extension` check below, since a symbolic argument
+            // could otherwise coincidentally structurally "match" a
+            // hand-built extend head sharing the same raw `TypeParamId`.
+            if required_arguments
+                .iter()
+                .any(|t| contains_symbolic_param(t, 0))
+            {
+                return Err(EvidenceProblem::ExtensionForSymbolicRequirement);
+            }
             let Some(layout) = agg.extends.get(extend) else {
                 return Err(EvidenceProblem::UnknownExtension(*extend));
             };
@@ -5520,6 +5622,166 @@ mod tests {
             !codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH),
             "{diagnostics:?}"
         );
+    }
+
+    // -- Fix 3 (0.1.5 follow-up): exact-forwarding-only symbolic
+    //    semantics, independently re-checked in NIR (`rfcs/0009`) -------
+
+    #[test]
+    fn an_extend_with_an_unconstrained_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(40);
+        let t_symbol = interner.intern("T");
+        let extend_id = ItemId(10);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol)],
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn an_extend_type_parameter_occurring_in_a_nested_application_is_accepted() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(41);
+        let t_symbol = interner.intern("T");
+        let box_item = ItemId(51);
+        let extend_id = ItemId(11);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol)],
+            protocol_arguments: vec![Ty::Applied(box_item, vec![Ty::Param(t, t_symbol)])],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(!codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn every_extend_type_parameter_occurring_in_a_multi_argument_protocol_head_is_accepted() {
+        let mut interner = Interner::new();
+        let a = TypeParamId(0);
+        let b = TypeParamId(1);
+        let a_symbol = interner.intern("A");
+        let b_symbol = interner.intern("B");
+        let protocol_id = ItemId(0);
+        let protocol = ProtocolLayout {
+            name: interner.intern("P"),
+            type_params: vec![(a, a_symbol), (b, b_symbol)],
+            methods: vec![ProtocolMethodLayout {
+                name: interner.intern("test"),
+                params: vec![Ty::Param(a, a_symbol), Ty::Param(b, b_symbol)],
+                return_type: Ty::Bool,
+            }],
+        };
+        let t = TypeParamId(42);
+        let u = TypeParamId(43);
+        let t_symbol = interner.intern("T");
+        let u_symbol = interner.intern("U");
+        let extend_id = ItemId(12);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol), (u, u_symbol)],
+            protocol_arguments: vec![Ty::Param(t, t_symbol), Ty::Param(u, u_symbol)],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            Vec::new(),
+            &interner,
+        );
+        assert!(!codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_for_a_still_symbolic_requirement_is_rejected() {
+        let extend_id = ItemId(1);
+        let protocol_id = ItemId(0);
+        let t = TypeParamId(0);
+        let t_symbol = Symbol(0);
+        let layout = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Param(t, t_symbol)],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(extend_id, &layout);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        let evidence = Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        };
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::Param(t, t_symbol)],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(
+            result,
+            Err(EvidenceProblem::ExtensionForSymbolicRequirement)
+        ));
+    }
+
+    #[test]
+    fn the_equivalent_exact_forwarded_evidence_for_a_symbolic_requirement_is_accepted() {
+        let protocol_id = ItemId(0);
+        let t = TypeParamId(0);
+        let t_symbol = Symbol(0);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends: HashMap::new(),
+        };
+        let caller_requirements = vec![CapabilityRequirement::new(
+            protocol_id,
+            vec![Ty::Param(t, t_symbol)],
+        )];
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &Evidence::Forwarded(0),
+            protocol_id,
+            &[Ty::Param(t, t_symbol)],
+            true,
+            &caller_requirements,
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     // -- Fix 3: ordinary `Call` evidence validation (`rfcs/0009`) -------

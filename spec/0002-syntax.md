@@ -73,17 +73,22 @@ FunctionDecl = [ "public" ] "func" IDENT "(" [ ParamList ] ")"
 ParamList    = Param { "," Param } [ "," ] ;
 Param        = IDENT ":" Type ;
 
-UsesClause   = "uses" EffectPath { "," EffectPath } ;
+UsesClause   = "uses" UsesEntry { "," UsesEntry } ;
+UsesEntry    = EffectPath [ "[" Type { "," Type } [ "," ] "]" ] ;
 RaisesClause = "raises" IDENT { "," IDENT } ;
 EffectPath   = IDENT { "." IDENT } ;
 ```
 
-A function with no `-> Type` has return type `unit`. `uses`/`raises` are
-parsed and preserved on the function's AST/HIR node in this milestone,
-but declaring either non-empty is a checked, reported error (see
-`spec/0005`, `rfcs/0003-extensible-effects.md`): the type checker does
-not yet implement effect/error checking, so it rejects any use of these
-clauses outright rather than silently accepting and ignoring them.
+A function with no `-> Type` has return type `unit`. A `UsesEntry`
+carrying a bracketed type-argument list (`Equal[T]`) is a capability
+requirement (`rfcs/0009`), fully implemented as of Alpha 0.1.5 — see
+"Protocols and capabilities", below. A bare `UsesEntry` with no type
+arguments (`Database.Read`) is instead `spec/0005`'s pre-existing effect
+declaration, which remains unimplemented: declaring one is still a
+checked, reported error (`rfcs/0003-extensible-effects.md`), exactly as
+before this milestone. `raises` likewise remains parsed and preserved but
+rejected if non-empty — this milestone changes nothing about error
+checking.
 
 ### Records, variants, and protocols
 
@@ -96,27 +101,39 @@ VariantDecl  = [ "public" ] "variant" IDENT "{" [ CaseList ] "}" ;
 CaseList     = Case { "," Case } [ "," ] ;
 Case         = IDENT [ "(" Type { "," Type } ")" ] ;
 
-ProtocolDecl = [ "public" ] "protocol" IDENT "{" { ProtocolMember } "}" ;
+ProtocolDecl   = [ "public" ] "protocol" IDENT TypeParamList
+                 "{" { ProtocolMember } "}" ;
 ProtocolMember = "func" IDENT "(" [ ParamList ] ")" [ "->" Type ] ";" ;
 
-ExtendDecl = "extend" IDENT [ "with" Path ] "{" { FunctionDecl } "}" ;
+ExtendDecl = "extend" [ TypeParamList ] Type [ UsesClause ]
+             "{" { FunctionDecl } "}" ;
 ```
 
 `record` is a product type (fields); `variant` is a sum type (a closed set
 of cases, optionally carrying payload types). `protocol` declares a
-behavioral contract as a set of function signatures with no bodies.
-`extend` attaches function bodies to a type, either as a protocol
-implementation (`extend Point with Printable { ... }`) or as inherent
-functions with no protocol (`extend Point { ... }`).
+capability contract (`rfcs/0009`): a name, one or more explicit type
+parameters, and a set of method signatures with no bodies — there is no
+implicit receiver or `Self`; every method parameter is ordinary and
+explicit. `extend` attaches one implementation of a protocol to a
+specific (possibly still-generic) instantiation of it: `Type` after
+`extend`'s own optional `[T, ...]` type-parameter list is the protocol
+name applied to its own type arguments (`Equal[i64]`, or `Equal[Box[T]]`
+using the extend's own `T`), and the optional `UsesClause` declares this
+extension's own capability requirements (see "Functions", above, for the
+same clause on a function). Every function inside an `extend`'s body
+implements exactly one of its protocol's declared methods — the body is
+that one implementation, not an independent set of inherent functions
+with no protocol (there is no `extend` with no protocol at all).
 
 All four are parsed, name-resolved, and duplicate-checked against a
-module-level item in HIR. As of Alpha 0.1.1, `record`/`variant` are
-fully implemented end to end (construction, field access, variant
-constructors, pattern matching — see below and `spec/0003`); `protocol`/
-`extend` remain name/kind-only in HIR (field lists, case payloads are
-preserved for `record`/`variant`, but protocol member signatures and
-extend bodies are not) — protocol conformance checking is still
-accepted direction, not implemented.
+module-level item in HIR. `record`/`variant` are fully implemented end
+to end since Alpha 0.1.1 (construction, field access, variant
+constructors, pattern matching — see below and `spec/0003`).
+`protocol`/`extend` are fully implemented as of Alpha 0.1.5
+(`rfcs/0009`): declaration, authority/coherence checking, capability
+resolution (`uses`), and an explicit `Protocol[Args].method(...)` call
+expression — see "Protocol calls", below, and `spec/0003`/
+`spec/0006`/`rfcs/0009` for the full semantic model.
 
 A named `record`/`variant` type is nominal (two declarations are
 distinct types even with identical fields, compared by declaration
@@ -179,6 +196,25 @@ than an ordinary field access. The qualifier may be omitted
 (`Found(user)`) when the case name is unambiguous across every declared
 variant in the module; if two variants both declare a case with that
 name, the unqualified form is a checked, reported ambiguity error.
+
+#### Protocol calls (Alpha 0.1.5)
+
+```napitia
+Equal[i64].equal(21, 21)
+```
+
+A protocol method is invoked by qualifying the protocol's name with its
+own bracketed type arguments, then a `.` and the method call — again
+`PostfixExpr`'s existing `FieldAccess` followed by `Call`, this time on a
+type-application base rather than a bare identifier. This is the *only*
+call syntax for a protocol method: there is no implicit receiver
+(`a.equal(b)` never resolves to a protocol call) and no operator sugar
+routing `==`/`<`/etc. through one. Naming a protocol method without
+calling it (`Equal.equal`, or `Equal[i64].equal` with no argument list) is
+a checked, reported error, not a first-class function value. See
+`rfcs/0009-capability-protocols.md` for the full semantic model
+(authority, coherence, capability resolution) and `spec/0003`/`spec/0006`
+for the type-system and NIR-level detail.
 
 ### Types
 

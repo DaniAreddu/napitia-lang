@@ -1273,6 +1273,93 @@ fn verify_function(
                 for arg in args {
                     require_value(*arg, diagnostics);
                 }
+                // Every check in this block is about this `Invoke`'s own
+                // structure -- its argument values, its slots, its branch
+                // targets -- and never depends on the callee's own
+                // registered signature. An unknown callee must not short-
+                // circuit any of it: only the signature-dependent checks
+                // further down (type/arity/evidence matching, and the
+                // `raises`-coverage comparison, which genuinely cannot be
+                // performed without a signature to compare against) are
+                // skipped when the callee itself is unresolvable.
+                if !alloc_slots.contains(ok_slot) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SUCCESS_SLOT_UNALLOCATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's success slot %{} was never allocated with `alloc`",
+                            ok_slot.0
+                        ),
+                    ));
+                }
+                if !known_blocks.contains(ok_target) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_BRANCH_TARGET,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes to bb{}, which does not exist",
+                            ok_target.0
+                        ),
+                    ));
+                }
+                let mut target_variants: HashSet<ItemId> = HashSet::new();
+                let mut has_duplicate_target = false;
+                for target in err_targets {
+                    if !target_variants.insert(target.variant) {
+                        has_duplicate_target = true;
+                    }
+                    match agg.variants.get(&target.variant) {
+                        None => diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_VARIANT_OR_CASE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invoke's failure target names unknown variant id {}",
+                                target.variant.0
+                            ),
+                        )),
+                        Some(layout) => {
+                            if !alloc_slots.contains(&target.slot) {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_SLOT_UNALLOCATED,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} was never allocated with `alloc`",
+                                        target.slot.0
+                                    ),
+                                ));
+                            } else if let Some(slot_ty) = value_types.get(&target.slot)
+                                && *slot_ty != Ty::Named(target.variant, layout.name)
+                            {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_TYPE_MISMATCH,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} is declared `{}`, but its own failure target names `{}`",
+                                        target.slot.0,
+                                        crate::types::display_ty(slot_ty, interner),
+                                        registry.qualified_name(target.variant, interner)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if !known_blocks.contains(&target.target) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_BRANCH_TARGET,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invokes to bb{}, which does not exist",
+                                target.target.0
+                            ),
+                        ));
+                    }
+                }
                 let Some(sig) = known_functions.get(callee) else {
                     diagnostics.push(Diagnostic::error(
                         codes::UNKNOWN_FUNCTION_REF,
@@ -1407,17 +1494,14 @@ fn verify_function(
                         }
                     }
                 }
-                if !alloc_slots.contains(ok_slot) {
-                    diagnostics.push(Diagnostic::error(
-                        codes::INVOKE_SUCCESS_SLOT_UNALLOCATED,
-                        source,
-                        Span::dummy(),
-                        format!(
-                            "function `{name}` invoke's success slot %{} was never allocated with `alloc`",
-                            ok_slot.0
-                        ),
-                    ));
-                } else if let Some(slot_ty) = value_types.get(ok_slot)
+                // The allocation checks for `ok_slot`/each err target's
+                // slot, and the branch-target validity checks, already
+                // ran above (callee-independent); only the type match
+                // against the callee's own resolved return type, and the
+                // coverage comparison against its own resolved `raises`
+                // set, need the signature and belong here.
+                if alloc_slots.contains(ok_slot)
+                    && let Some(slot_ty) = value_types.get(ok_slot)
                     && *slot_ty != return_ty
                 {
                     diagnostics.push(Diagnostic::error(
@@ -1432,74 +1516,7 @@ fn verify_function(
                         ),
                     ));
                 }
-                if !known_blocks.contains(ok_target) {
-                    diagnostics.push(Diagnostic::error(
-                        codes::UNKNOWN_BRANCH_TARGET,
-                        source,
-                        Span::dummy(),
-                        format!(
-                            "function `{name}` invokes to bb{}, which does not exist",
-                            ok_target.0
-                        ),
-                    ));
-                }
                 let raises_set: HashSet<ItemId> = sig.raises.iter().copied().collect();
-                let mut target_variants: HashSet<ItemId> = HashSet::new();
-                let mut has_duplicate_target = false;
-                for target in err_targets {
-                    if !target_variants.insert(target.variant) {
-                        has_duplicate_target = true;
-                    }
-                    match agg.variants.get(&target.variant) {
-                        None => diagnostics.push(Diagnostic::error(
-                            codes::UNKNOWN_VARIANT_OR_CASE,
-                            source,
-                            Span::dummy(),
-                            format!(
-                                "function `{name}` invoke's failure target names unknown variant id {}",
-                                target.variant.0
-                            ),
-                        )),
-                        Some(layout) => {
-                            if !alloc_slots.contains(&target.slot) {
-                                diagnostics.push(Diagnostic::error(
-                                    codes::INVOKE_FAILURE_SLOT_UNALLOCATED,
-                                    source,
-                                    Span::dummy(),
-                                    format!(
-                                        "function `{name}` invoke's failure slot %{} was never allocated with `alloc`",
-                                        target.slot.0
-                                    ),
-                                ));
-                            } else if let Some(slot_ty) = value_types.get(&target.slot)
-                                && *slot_ty != Ty::Named(target.variant, layout.name)
-                            {
-                                diagnostics.push(Diagnostic::error(
-                                    codes::INVOKE_FAILURE_TYPE_MISMATCH,
-                                    source,
-                                    Span::dummy(),
-                                    format!(
-                                        "function `{name}` invoke's failure slot %{} is declared `{}`, but its own failure target names `{}`",
-                                        target.slot.0,
-                                        crate::types::display_ty(slot_ty, interner),
-                                        registry.qualified_name(target.variant, interner)
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    if !known_blocks.contains(&target.target) {
-                        diagnostics.push(Diagnostic::error(
-                            codes::UNKNOWN_BRANCH_TARGET,
-                            source,
-                            Span::dummy(),
-                            format!(
-                                "function `{name}` invokes to bb{}, which does not exist",
-                                target.target.0
-                            ),
-                        ));
-                    }
-                }
                 if has_duplicate_target || target_variants != raises_set {
                     diagnostics.push(Diagnostic::error(
                         codes::INVOKE_ERR_TARGET_COVERAGE_MISMATCH,
@@ -7517,6 +7534,70 @@ mod tests {
         assert!(
             codes_of(&diagnostics).contains(&codes::INVOKE_OF_INFALLIBLE_FUNCTION),
             "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_of_an_unknown_callee_still_validates_its_own_slots_and_targets() {
+        // An unknown callee means there is no signature to check
+        // type/arity/evidence against -- but the `Invoke`'s own
+        // structure (its argument values, its success/failure slots,
+        // its branch targets) is independent of the callee entirely,
+        // and must still be validated rather than short-circuited by
+        // the callee lookup failing.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, _shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(999), // does not exist in this module
+            type_args: Vec::new(),
+            args: vec![ValueId(77)], // never defined anywhere
+            evidence: Vec::new(),
+            ok_slot: ValueId(2),   // never allocated
+            ok_target: BlockId(9), // does not exist
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(3),    // never allocated
+                target: BlockId(10), // does not exist
+            }],
+        };
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, _shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        let codes = codes_of(&diagnostics);
+        assert!(
+            codes.contains(&codes::UNKNOWN_FUNCTION_REF),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::UNKNOWN_VALUE),
+            "an unknown callee must not skip argument value validation: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::INVOKE_SUCCESS_SLOT_UNALLOCATED),
+            "an unknown callee must not skip success slot allocation validation: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::INVOKE_FAILURE_SLOT_UNALLOCATED),
+            "an unknown callee must not skip failure slot allocation validation: {diagnostics:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == codes::UNKNOWN_BRANCH_TARGET)
+                .count(),
+            2,
+            "an unknown callee must not skip either branch target's validation: {diagnostics:?}"
         );
     }
 

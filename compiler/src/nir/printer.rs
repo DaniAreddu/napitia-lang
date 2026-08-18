@@ -239,6 +239,27 @@ fn requirements_suffix(
     format!("\nuses {}", parts.join(", "))
 }
 
+/// A function's own declared raised-effect set (`rfcs/0010`), as
+/// `\nraises [@a#1, @b#2]` -- omitted entirely (the one, documented
+/// stable representation of an empty set, mirroring `requirements_suffix`'s
+/// own convention for an empty `uses`) when the function is infallible.
+/// Printed sorted by qualified name rather than in whatever order
+/// `Function.raises` itself happens to store them: two declarations with
+/// the same semantic effect set (however their own source spelled or
+/// ordered it) must always print identically here, and this printer
+/// never trusts an upstream representation to already be canonical.
+fn raises_suffix(raises: &[ItemId], interner: &Interner, registry: &ItemRegistry) -> String {
+    if raises.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = raises
+        .iter()
+        .map(|r| format!("@{}", qualified_ref(*r, registry, interner)))
+        .collect();
+    parts.sort();
+    format!("\nraises [{}]", parts.join(", "))
+}
+
 fn format_evidence(evidence: &Evidence, interner: &Interner, registry: &ItemRegistry) -> String {
     match evidence {
         Evidence::Forwarded(index) => format!("forwarded[{index}]"),
@@ -289,11 +310,12 @@ fn print_function(
         .join(", ");
     let _ = writeln!(
         out,
-        "func @{}{}({params}) -> {}{} {{",
+        "func @{}{}({params}) -> {}{}{} {{",
         qualified_ref(function.id, registry, interner),
         declared_type_params_suffix(&function.type_params, interner),
         format_ty(&function.return_type, interner, registry),
-        requirements_suffix(&function.requirements, interner, registry)
+        requirements_suffix(&function.requirements, interner, registry),
+        raises_suffix(&function.raises, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
     // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
@@ -664,6 +686,75 @@ mod tests {
         assert!(text.contains("bb0:\n"));
         assert!(text.contains("add.i64"));
         assert!(text.contains("ret"));
+    }
+
+    // -- Fix 4: complete raised-effect signatures (`rfcs/0010`) ---------
+
+    #[test]
+    fn an_infallible_functions_signature_prints_no_raises_suffix_at_all() {
+        // The one, documented stable representation of an empty raised-
+        // effect set: omitted entirely, mirroring `uses`'s own
+        // convention for an empty capability requirement list.
+        let text = print("func f() -> i64 { return 1 }");
+        assert!(text.starts_with("func @f#0() -> i64 {\n"));
+        assert!(!text.contains("raises"));
+    }
+
+    #[test]
+    fn a_functions_signature_prints_its_single_raised_effect() {
+        let text = print(
+            "variant FileError { Missing } \
+             func f() -> i64 raises FileError { raise FileError.Missing }",
+        );
+        assert!(
+            text.contains("raises [@FileError#0]"),
+            "expected a raises suffix naming FileError, got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_functions_signature_prints_every_raised_effect() {
+        let text = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises FileError, NetworkError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        assert!(
+            text.contains("raises [@FileError#0, @NetworkError#1]"),
+            "expected a raises suffix naming both effects in canonical order, got: {text}"
+        );
+    }
+
+    #[test]
+    fn raised_effects_print_in_the_same_canonical_order_regardless_of_raises_clause_order() {
+        // Same variant declarations, in the same order (so both compile
+        // to the same underlying ids) -- only the `raises` clause's own
+        // entry order is reversed.
+        let forward = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises FileError, NetworkError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        let reversed = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises NetworkError, FileError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        let forward_suffix = forward.lines().find(|l| l.starts_with("raises")).unwrap();
+        let reversed_suffix = reversed.lines().find(|l| l.starts_with("raises")).unwrap();
+        assert_eq!(
+            forward_suffix, reversed_suffix,
+            "the same semantic effect set must print identically regardless of the raises clause's own entry order"
+        );
     }
 
     #[test]

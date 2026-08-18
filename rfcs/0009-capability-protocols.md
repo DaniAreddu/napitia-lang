@@ -143,12 +143,32 @@ a sound, deterministic, bidirectional structural unifier over each
 extend's own head (`typeck::capability::heads_can_overlap`): each side's
 own type parameters form a disjoint free-variable set, substitutions chase
 transitively through both sides, an occurs check rejects a self-
-referential match, and the whole search is bounded by an explicit
-depth/work budget so a hostile or accidentally-recursive pair of
-declarations fails with a diagnostic rather than hanging or overflowing
-the stack. The result (and its diagnostic's exact wording, file, and span)
-is independent of declaration order — reversing which extend was written
-first produces byte-identical output.
+referential match, and the whole search is bounded by a real depth
+*and* work-step budget, each independently enforced — not merely a depth
+check, since a shallow but wide pair of heads could otherwise still make
+this pathologically expensive. `heads_can_overlap` returns a tri-state
+outcome (disjoint, overlap, or budget-exceeded), never collapsing a
+budget-exceeded comparison to plain "disjoint": doing so could let two
+extensions that might genuinely overlap both stay registered. A pair this
+checker cannot decide within budget is reported as `T0047`, and *both*
+extends involved are excluded from the solver — coherence can be claimed
+for neither. The result (and its diagnostic's exact wording, file, and
+span) is independent of declaration order — reversing which extend was
+written first produces byte-identical output.
+
+Separately, every extend's own type parameter must be *determined* by its
+protocol head: `extend[T] Equal[i64] uses Other[T]` declares `T` with
+nothing that could ever bind it, since `T` never occurs anywhere in
+`Equal[i64]`'s own arguments. This is exact-forwarding-only's own
+declaration-time counterpart (see "Capability resolution" below) —
+rejected as `T0046`, one diagnostic per unconstrained parameter, in
+declared order, excluding the whole extend from the solver. A parameter
+occurring anywhere inside a nested application (`Equal[Box[T]]`) is fully
+determined and accepted; this is a purely structural occurrence check
+(`typeck::capability::collect_occurring_type_params`), not a fresh
+unification. `nir::verify` independently re-derives the same check as
+`V0059`, since it never trusts hand-built NIR to already satisfy what
+`typeck` enforces for ordinary source.
 
 ## Capability resolution: exact forwarding only
 
@@ -177,7 +197,15 @@ requirement:
   call `Equal[T].equal(...)` (forwarding its own requirement), but cannot
   call, say, `Ord[T].compare(...)` unless it *also* declares `uses
   Ord[T]` — nothing infers a stronger or different capability from a
-  weaker one.
+  weaker one. Consequently `Evidence::Extension` is never legal for a
+  still-symbolic requirement (one whose arguments still contain a
+  `Ty::Param`): a concrete extend can only ever have been legitimately
+  selected once every argument is fully concrete. `nir::verify`
+  independently enforces this as `V0060`, checked before attempting any
+  structural match against the candidate extension's own head — a
+  hand-built NIR reusing the same raw `TypeParamId` on both sides could
+  otherwise coincidentally "match" a hostile `Extension` entry against a
+  symbolic requirement.
 
 This is dispatched at runtime with one frame-relative lookup
 (`interpreter::resolve_evidence`) — the interpreter never re-runs any part
@@ -263,11 +291,27 @@ back, `typeck`) already got this right:
   method's parameter/return type is a valid root (no `Ty::Error`,
   unresolved `Ty::Var`, unknown nominal identity, wrong arity, or
   excessive generic depth).
+- **Function requirements**: every ordinary function's own `uses`
+  requirements get exactly the same independent validation an extend's
+  own requirements do — referenced protocol exists with correct arity,
+  and every argument is a valid root scoped to the function's own type
+  parameters. This is not merely re-checking what `typeck` already
+  accepted: it is the same defense-in-depth this verifier applies to
+  every other declaration kind.
 - **Extend layouts**: the named protocol and every `uses` requirement's
   protocol actually exist, with correct arity; every declared type is a
-  valid root scoped to the extend's own type parameters; the method table
-  has exactly one entry per protocol method, referencing a real, distinct
-  function that shares its owning extend's exact type-parameter scope and
+  valid root scoped to the extend's own type parameters (and every one of
+  the extend's own type parameters must occur somewhere inside its
+  protocol arguments — `V0059`, `nir::verify`'s own re-derivation of
+  `T0046`); the method table has exactly one entry per protocol method,
+  referencing a real, distinct function that shares its owning extend's
+  exact type-parameter scope, declares *exactly* its owning extend's own
+  `requirements` in the same declared order (`V0058` — `ProtocolCall`
+  passes an extension's own `nested` evidence straight to its implementing
+  function as that function's evidence, and `Interpreter::call_function`
+  validates that evidence against the callee's own declared
+  `Function::requirements`, so a mismatch here could otherwise pass every
+  other check yet still misdispatch, or fail, only once interpreted), and
   whose signature matches the protocol method once substituted through
   the extend's own head.
 - **`Call` evidence**: entry count matches the callee's own requirement
@@ -289,7 +333,7 @@ back, `typeck`) already got this right:
   against exactly the protocol/arguments this specific call site
   requires.
 
-Every failure class gets its own stable `V`-code (`V0036`-`V0057`, see
+Every failure class gets its own stable `V`-code (`V0036`-`V0060`, see
 below), never reused for an unrelated shape of failure. Recursive
 evidence validation is bounded by the same depth/work budget the solver
 itself uses, and produces exactly one diagnostic per malformed evidence
@@ -350,6 +394,10 @@ T0044  a protocol-call expression names an unknown protocol/method in
        hand-built HIR (defensive; typeck's own parser/resolver paths
        never produce this for ordinary source)
 T0045  the executable entry function declares a uses requirement
+T0046  an extend's own type parameter does not occur in its protocol
+       arguments and cannot be determined by its own head
+T0047  overlap checking between two extends could not be decided within
+       the shared depth/work budget; both are excluded from the solver
 
 V0036  an extend names a protocol id that does not exist
 V0037  an extend's protocol-argument count does not match its protocol
@@ -374,6 +422,12 @@ V0054  a Forwarded entry appears inside another extension's own nested
 V0055  evidence nested past the capability depth limit
 V0056  evidence validation exceeded its work-step budget
 V0057  a protocol.call names an unknown protocol or method index
+V0058  an extend method's own requirements do not exactly match its
+       owning extend's requirements, in the same declared order
+V0059  an extend's own type parameter does not occur in its protocol
+       arguments (nir::verify's own re-derivation of T0046)
+V0060  Evidence::Extension was selected for a still-symbolic requirement;
+       only an exact Evidence::Forwarded match is legal in that case
 ```
 
 ## Honest limitations
@@ -393,11 +447,12 @@ V0057  a protocol.call names an unknown protocol or method index
   protocol-typed value, and no way to store or compare an `Evidence` from
   user code.
 - Coherence checking is sound but not maximally permissive: it rejects
-  every case it cannot prove non-overlapping within its depth/work
-  budget, which means a pathologically deep pair of generic extend heads
-  can be rejected as unprovable rather than accepted, even if no genuine
-  runtime overlap would ever occur. This mirrors `rfcs/0008`'s own generic
-  instantiation/depth budgets, not a new kind of imprecision.
+  (`T0047`) every case it cannot prove non-overlapping within its real
+  depth *and* work-step budget, which means a pathologically deep or wide
+  pair of generic extend heads can be excluded as unprovable rather than
+  accepted, even if no genuine runtime overlap would ever occur. This
+  mirrors `rfcs/0008`'s own generic instantiation/depth budgets, not a new
+  kind of imprecision.
 - Type-argument inference from a *bare* integer/float literal argument
   still does not resolve through a generic capability-requiring function,
   for the same pre-existing reason `rfcs/0008` documents for ordinary

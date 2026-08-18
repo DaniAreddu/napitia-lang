@@ -209,6 +209,10 @@ mod codes {
     /// within the depth limit but branches wide enough at every level to
     /// make exhaustive validation itself pathologically expensive.
     pub const EVIDENCE_WORK_BUDGET_EXCEEDED: &str = "V0056";
+    /// A `protocol.call` instruction names a protocol id this module
+    /// never declared, or a `method` index out of range for that
+    /// protocol's declared method list.
+    pub const UNKNOWN_PROTOCOL_CALL_TARGET: &str = "V0057";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -2550,12 +2554,144 @@ fn verify_value_kind(
                 )),
             }
         }
-        // TODO(rfcs/0009): protocol/method/evidence validation for
-        // protocol.call is not yet implemented (tracked as a follow-up
-        // commit) -- operands are still checked generically by this
-        // function's own caller via `operands_of`, but this specific
-        // instruction kind has no independent semantic check here yet.
-        ValueKind::ProtocolCall { .. } => {}
+        ValueKind::ProtocolCall {
+            protocol,
+            arguments,
+            method,
+            evidence,
+            args,
+        } => {
+            for arg in args {
+                require_value(*arg, diagnostics);
+            }
+            let call_context = format!(
+                "function `{function_name}`: %{}'s protocol-call type argument",
+                result.0
+            );
+            for t in arguments {
+                check_type_root(
+                    t,
+                    agg,
+                    own_params,
+                    source,
+                    interner,
+                    registry,
+                    &call_context,
+                    diagnostics,
+                );
+            }
+            let Some(layout) = agg.protocols.get(protocol) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_CALL_TARGET,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls a protocol with id {}, which does not exist in this module",
+                        result.0, protocol.0
+                    ),
+                ));
+                return;
+            };
+            if layout.type_params.len() != arguments.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::GENERIC_ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} supplies {} type argument(s) to `{}`, which declares {}",
+                        result.0,
+                        arguments.len(),
+                        registry.qualified_name(*protocol, interner),
+                        layout.type_params.len()
+                    ),
+                ));
+                return;
+            }
+            let Some(method_layout) = layout.methods.get(*method) else {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNKNOWN_PROTOCOL_CALL_TARGET,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls method index {method} of `{}`, which does not exist",
+                        result.0,
+                        registry.qualified_name(*protocol, interner)
+                    ),
+                ));
+                return;
+            };
+            let subst: HashMap<TypeParamId, Ty> = layout
+                .type_params
+                .iter()
+                .map(|(id, _)| *id)
+                .zip(arguments.iter().cloned())
+                .collect();
+            let expected_params: Vec<Ty> = method_layout
+                .params
+                .iter()
+                .map(|t| substitute(t, &subst))
+                .collect();
+            let expected_return = substitute(&method_layout.return_type, &subst);
+            if expected_return != *result_ty {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "calls a protocol method returning `{}` but is itself declared `{}`",
+                        ty_name(&expected_return),
+                        ty_name(result_ty)
+                    ),
+                );
+            }
+            if expected_params.len() != args.len() {
+                diagnostics.push(Diagnostic::error(
+                    codes::ARITY_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` calls a protocol method expecting {} argument(s) with {}",
+                        expected_params.len(),
+                        args.len()
+                    ),
+                ));
+            } else {
+                for (param_ty, arg) in expected_params.iter().zip(args.iter()) {
+                    if let Some(arg_ty) = ty_of(*arg)
+                        && arg_ty != *param_ty
+                    {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "passes an argument of type `{}` where `{}` was expected",
+                                ty_name(&arg_ty),
+                                ty_name(param_ty)
+                            ),
+                        );
+                    }
+                }
+            }
+            let evidence_context = format!(
+                "function `{function_name}`: %{}'s protocol-call evidence",
+                result.0
+            );
+            let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+            if let Err(problem) = check_evidence(
+                evidence,
+                *protocol,
+                arguments,
+                true,
+                own_requirements,
+                agg,
+                0,
+                &mut budget,
+            ) {
+                diagnostics.push(Diagnostic::error(
+                    problem.code(),
+                    source,
+                    Span::dummy(),
+                    format!("{evidence_context} {}", problem.describe()),
+                ));
+            }
+        }
     }
 }
 
@@ -5637,5 +5773,237 @@ mod tests {
             &mut budget,
         );
         assert!(matches!(result, Err(EvidenceProblem::WorkBudgetExceeded)));
+    }
+
+    // -- Fix 3: `protocol.call` validation (`rfcs/0009`) -----------------
+
+    /// `func f() -> <result_ty> { return <protocol>[<arguments>].method[<method>](1, 1, ..) }`
+    /// with `arg_count` integer-literal arguments, for tests that mutate
+    /// exactly one thing about an otherwise-valid `protocol.call`.
+    #[allow(clippy::too_many_arguments)]
+    fn caller_with_protocol_call(
+        interner: &mut Interner,
+        protocol: ItemId,
+        arguments: Vec<Ty>,
+        method: usize,
+        evidence: Evidence,
+        result_ty: Ty,
+        arg_count: usize,
+    ) -> Function {
+        let mut instructions: Vec<Instruction> = (0..arg_count)
+            .map(|i| Instruction::Value {
+                result: ValueId(i as u32),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            })
+            .collect();
+        let call_result = ValueId(arg_count as u32);
+        instructions.push(Instruction::Value {
+            result: call_result,
+            ty: result_ty.clone(),
+            kind: ValueKind::ProtocolCall {
+                protocol,
+                arguments,
+                method,
+                evidence,
+                args: (0..arg_count).map(|i| ValueId(i as u32)).collect(),
+            },
+        });
+        Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: result_ty,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(call_result)),
+            }],
+        }
+    }
+
+    fn valid_evidence_for_equal_i64(extend_id: ItemId) -> Evidence {
+        Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_valid_protocol_call_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_protocol_call_naming_an_unknown_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            ItemId(999),
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            Vec::new(),
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_PROTOCOL_CALL_TARGET));
+    }
+
+    #[test]
+    fn a_protocol_call_with_the_wrong_number_of_type_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64, Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_with_an_out_of_range_method_index_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            5,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_PROTOCOL_CALL_TARGET));
+    }
+
+    #[test]
+    fn a_protocol_call_with_the_wrong_number_of_value_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::Bool,
+            3,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::ARITY_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_declared_with_the_wrong_result_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        // `Equal[i64].equal(..)` actually returns `bool`, not `i64`.
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(extend_id),
+            Ty::I64,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
+    }
+
+    #[test]
+    fn a_protocol_call_whose_evidence_cannot_satisfy_the_exact_requirement_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // Targets the right protocol, but for `bool`, not the `i64` this
+        // call site actually requires.
+        let mismatched_extend_id = ItemId(12);
+        let mismatched_extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Bool],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let caller = caller_with_protocol_call(
+            &mut interner,
+            protocol_id,
+            vec![Ty::I64],
+            0,
+            valid_evidence_for_equal_i64(mismatched_extend_id),
+            Ty::Bool,
+            2,
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(mismatched_extend_id, mismatched_extend)],
+            vec![caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_HEAD_MISMATCH));
     }
 }

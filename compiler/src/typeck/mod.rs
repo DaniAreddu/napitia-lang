@@ -2527,6 +2527,19 @@ impl<'a> Checker<'a> {
             return Ty::Error;
         };
         let success_ty = self.check_call_at(*id, callee, args, *call_span, true);
+        // A call is strict in its arguments (`check_call_at`'s own doc):
+        // if one of them diverges, the call itself is never actually
+        // reached, so there is nothing here for `?` to ever propagate --
+        // distinct from the callee's own declared return type genuinely
+        // being `never` (which still really raises), so this checks the
+        // *arguments* specifically, re-derived from `expr_types` rather
+        // than re-evaluating any of them a second time.
+        if args
+            .iter()
+            .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)))
+        {
+            return Ty::Never;
+        }
         let raises = self.callee_raises(callee);
         if raises.is_empty() {
             self.diagnostics.push(
@@ -2589,6 +2602,19 @@ impl<'a> Checker<'a> {
             return Ty::Error;
         };
         let success_ty = self.check_call_at(*id, callee, args, *call_span, true);
+        // A call is strict in its arguments (`check_call_at`'s own
+        // doc): if one of them diverges, the call itself is never
+        // actually reached, and neither is any `handle` arm -- mirrors
+        // `check_match`'s own diverging-scrutinee rule. Every arm's
+        // pattern/body is still checked below for its own independent
+        // diagnostics, but none of them may be joined into the result,
+        // analyzed for coverage, or flagged unreachable relative to each
+        // other (that would blame the wrong arm for what is really the
+        // operand's own unreachability). Re-derived from `expr_types`
+        // rather than re-evaluating any argument a second time.
+        let operand_diverges = args
+            .iter()
+            .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)));
         let raises = self.callee_raises(callee);
         if raises.is_empty() {
             self.diagnostics.push(
@@ -2655,7 +2681,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     let body_ty = self.check_arm_body(&arm.body);
-                    if success_count == 1 {
+                    if success_count == 1 && !operand_diverges {
                         arm_result = Some(match arm_result {
                             None => body_ty,
                             Some(acc) => self.join_diverging_branches(
@@ -2668,8 +2694,9 @@ impl<'a> Checker<'a> {
                     }
                 }
                 HirHandleArmKind::Failure(HirFailurePattern::Wildcard { .. }) => {
-                    let reachable = !wildcard_seen && !required.is_subset(&covered);
-                    if !reachable {
+                    let reachable =
+                        !operand_diverges && !wildcard_seen && !required.is_subset(&covered);
+                    if !reachable && !operand_diverges {
                         self.diagnostics.push(
                             Diagnostic::error(
                                 codes::UNREACHABLE_HANDLE_ARM,
@@ -2724,8 +2751,10 @@ impl<'a> Checker<'a> {
                         }
                     };
                     if let Some((variant, case)) = key {
-                        let reachable = !wildcard_seen && !covered.contains(&(variant, case));
-                        if !reachable {
+                        let reachable = !operand_diverges
+                            && !wildcard_seen
+                            && !covered.contains(&(variant, case));
+                        if !reachable && !operand_diverges {
                             self.diagnostics.push(
                                 Diagnostic::error(
                                     codes::UNREACHABLE_HANDLE_ARM,
@@ -2800,6 +2829,16 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // The operand call never actually happens (a diverging argument
+        // already ended this path) -- every arm above was still checked
+        // for its own independent diagnostics, but none of them are
+        // reachable, so neither coverage requirement below is
+        // meaningful: mirrors `check_match`'s own diverging-scrutinee
+        // rule of skipping exhaustiveness analysis entirely once
+        // divergence is already known.
+        if operand_diverges {
+            return Ty::Never;
+        }
         if success_count == 0 {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -6105,6 +6144,124 @@ mod tests {
                 return handle load(\"x\") {
                     success v => v,
                     failure FileError.Missing => \"default\"
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A diverging *argument* to the fallible call under `?` means the
+    /// call itself is never actually reached -- `?` must not require
+    /// this function to have declared the callee's own `raises` types,
+    /// since nothing here could ever actually propagate one.
+    #[test]
+    fn postfix_try_with_a_diverging_argument_is_never_and_needs_no_propagation_declared() {
+        let diags = check(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return read({ return 7 })?
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The whole `?` expression's own checked type is `never` when its
+    /// argument diverges, exactly like an ordinary diverging call.
+    #[test]
+    fn postfix_try_with_a_diverging_argument_has_expression_type_never() {
+        let (hir, result) = check_full_with_hir(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 raises FileError {
+                return read({ return 7 })?
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        let HirExpr::Return { value, .. } = hir.functions[1].body.tail.as_deref().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let try_expr = value.as_deref().unwrap();
+        assert_eq!(result.expr_types.get(&try_expr.id()), Some(&Ty::Never));
+    }
+
+    /// A diverging argument under `handle` means the operand call is
+    /// never reached: no missing-`success`/non-exhaustive-handler
+    /// diagnostic, and mismatched arm result types must not be joined
+    /// into a false "handle arms must have the same type" diagnostic.
+    #[test]
+    fn handle_with_a_diverging_argument_needs_no_success_arm_or_exhaustive_coverage() {
+        let diags = check(
+            "variant FileError { Missing, PermissionDenied }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    failure FileError.Missing => \"a string\",
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The whole `handle` expression's own checked type is `never` when
+    /// its operand's argument diverges, exactly like a diverging `match`
+    /// scrutinee.
+    #[test]
+    fn handle_with_a_diverging_argument_has_expression_type_never() {
+        let (hir, result) = check_full_with_hir(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    success v => 1,
+                    failure FileError.Missing => 2,
+                }
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        let HirExpr::Return { value, .. } = hir.functions[1].body.tail.as_deref().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let handle_expr = value.as_deref().unwrap();
+        assert_eq!(result.expr_types.get(&handle_expr.id()), Some(&Ty::Never));
+    }
+
+    /// Mismatched arm result types must not be joined -- and so must not
+    /// produce a "handle arms must have the same type" diagnostic --
+    /// when the operand's own argument diverges first, since none of
+    /// the arms are ever actually reachable.
+    #[test]
+    fn handle_with_a_diverging_argument_does_not_report_mismatched_arm_types() {
+        let diags = check(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    success v => \"a string, not an i64\",
+                    failure FileError.Missing => 2,
                 }
             }",
         );

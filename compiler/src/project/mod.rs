@@ -1613,6 +1613,17 @@ mod tests {
             .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
         let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
         assert_eq!(result, Ok(crate::interpreter::Value::Bool(true)));
+
+        // Neither alias may influence the canonical printed identity of
+        // the protocol, the extend, or its method: there is exactly one
+        // `extend` declaration and one `equal` method declaration,
+        // regardless of how many local names resolve to it (each is
+        // referenced twice in the NIR text below: once at its own
+        // declaration, once from the call site / method table).
+        let text = crate::nir::print_module(&compiled.nir, &interner, &compiled.registry);
+        assert!(!text.contains("<item #"), "{text}");
+        assert_eq!(text.matches("extend @").count(), 1, "{text}");
+        assert_eq!(text.matches("equal#").count(), 2, "{text}");
     }
 
     /// Reverse import order (`Point` before `Equal` instead of after)
@@ -1696,6 +1707,10 @@ mod tests {
         assert_eq!(
             forward_text, reversed_text,
             "import order must never change printed NIR"
+        );
+        assert!(
+            !forward_text.contains("<item #"),
+            "the extend and its method must resolve a real registered identity: {forward_text}"
         );
 
         let forward_result =

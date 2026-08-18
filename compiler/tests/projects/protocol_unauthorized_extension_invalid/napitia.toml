@@ -1,0 +1,7 @@
+[package]
+name = "protocol_unauthorized_extension_invalid"
+version = "0.1.0"
+
+[project]
+source-root = "src"
+entry = "main.npt"

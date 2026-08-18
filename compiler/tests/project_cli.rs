@@ -528,3 +528,42 @@ fn two_same_named_generic_records_from_different_modules_remain_distinct() {
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "42");
 }
+
+#[test]
+fn a_protocol_imported_across_modules_compiles_and_runs_end_to_end() {
+    // `Equal[i64]` and its extension are declared in `protocols.npt`;
+    // `main.npt` only imports and calls it (Alpha 0.1.5, rfcs/0009).
+    let dir = project("protocol_cross_module");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "true");
+}
+
+#[test]
+fn extending_a_primitive_from_a_module_that_owns_neither_it_nor_the_protocol_is_unauthorized() {
+    // `i64` is a primitive, so only the protocol's own declaring module
+    // (`protocols.npt`) has authority to extend `Equal` for it -- this
+    // project's `main.npt` has neither, and is rejected as T0035
+    // (Alpha 0.1.5, rfcs/0009).
+    let dir = project("protocol_unauthorized_extension_invalid");
+    let output = napitia(&["check", &dir]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("T0035"));
+}

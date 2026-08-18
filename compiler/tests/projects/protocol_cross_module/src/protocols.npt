@@ -1,0 +1,9 @@
+public protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        return left == right
+    }
+}

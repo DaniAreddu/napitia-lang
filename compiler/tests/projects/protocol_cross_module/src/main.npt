@@ -1,0 +1,5 @@
+import protocols.Equal;
+
+func main() -> bool {
+    return Equal[i64].equal(9, 9)
+}

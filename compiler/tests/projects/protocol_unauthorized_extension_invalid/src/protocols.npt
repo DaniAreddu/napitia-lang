@@ -1,0 +1,3 @@
+public protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}

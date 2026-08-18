@@ -335,10 +335,13 @@ record-destructuring/slice/range patterns, an inline `[T: Protocol]`
 bound spelling on a generic type parameter (the underlying capability
 requirement exists via `uses Protocol[T]` on the function — see above),
 protocol default methods/supertraits/first-class protocol values, a
-protocol method declaring its own `raises` (typed failure has no
-protocol/capability integration yet — see `rfcs/0010`), generic error
-variants, partial `handle` (consuming only some raised effects and
-re-raising the rest), first-class effect/error values, stack traces or
+protocol method (or its own implementing `extend` method, rejected the
+same way) declaring `raises` (typed failure has no protocol/capability
+integration yet — see `rfcs/0010`), generic error variants (explicitly
+diagnosed, not merely unspellable — a `raises` entry naming a generic
+variant is rejected), partial `handle` (consuming only some raised
+effects and re-raising the rest), first-class effect/error values, stack
+traces or
 `panic`/`recover`, ownership/region enforcement (and the indirection that
 would lift the recursive-aggregate restriction), structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,

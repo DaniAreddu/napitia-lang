@@ -1,6 +1,6 @@
 # RFC 0010: Typed Outcomes and Explicit Failure Flow (Alpha 0.1.6)
 
-- Status: Accepted, implementing in Alpha 0.1.6
+- Status: Accepted, implemented in Alpha 0.1.6
 
 ## Summary
 
@@ -107,13 +107,18 @@ representation (`EffectSet`) is a deduplicated, order-independent set of
 own real source span, preserving meaningful source order in the rendered
 message.
 
-Generic error variants (`raises Box[T]`) are out of scope: since the
-grammar has no syntax for a type-argumented `raises` entry, this is
-rejected as an ordinary "expected `,` or `{`" parse recovery, not a
-dedicated semantic diagnostic — consistent with how this project already
-treats a grammatically-absent construct (see `rfcs/0008`'s own treatment
-of `<T>` angle-bracket syntax: rejected by having no grammar for it,
-not by a special-cased checker).
+Generic error variants are out of scope, enforced two different ways
+depending on how a program tries to spell one. Explicit type arguments
+(`raises Box[T]`) can never even parse as a `raises` entry at all --
+the grammar has no bracketed type-argument position here, so this is an
+ordinary "expected `,` or `{`" parse recovery, not a dedicated semantic
+diagnostic (consistent with how this project already treats a
+grammatically-absent construct; see `rfcs/0008`'s own treatment of
+`<T>` angle-bracket syntax). A *bare* reference to a generic
+declaration (`raises Failure`, where `variant Failure[T] { .. }`) does
+parse -- the grammar alone cannot tell a generic variant's name apart
+from a non-generic one -- so this is explicitly diagnosed instead,
+against each candidate's own declared type-parameter count (`R0030`).
 
 A private variant may not appear in a *public* function's `raises`
 clause (mirroring the existing private-type-leak check for return/
@@ -151,7 +156,12 @@ enclosing function's own declared `raises` set (checked against the
 canonical `EffectSet`, not by name). `?` is never an identity operation:
 it always lowers to an explicit two-target dispatch (see "NIR"), never a
 no-op wrapping/unwrapping of some intermediate value — there is no
-`Result`-shaped value for it to unwrap in the first place.
+`Result`-shaped value for it to unwrap in the first place. When one of
+the call's own *arguments* diverges (not the callee itself), the call is
+never actually reached at all -- `expr?`'s own checked type is `never`
+immediately, with no propagation requirement, mirroring how a call is
+already strict in its arguments everywhere else in this project
+(`rfcs/0008`).
 
 ## Mandatory explicit handling
 
@@ -185,14 +195,22 @@ is rejected before exhaustiveness is even considered. A duplicate or
 already-fully-covered `failure` arm is unreachable and rejected the same
 way an unreachable `match` arm already is (`T0018`'s own precedent).
 Missing coverage is reported with a concrete witness (which
-`Type.Case` combination is unhandled), not merely "non-exhaustive."
-`success`/`failure` arm bodies join through the same never-aware type-join
-rules an ordinary `match`'s arms already do; a `handle` every one of whose
-reachable arms diverges has type `never`. A raised value produced
-*inside* a `handle` arm's own body (by a nested fallible call) is not
-implicitly caught by the enclosing `handle` — it needs its own `?` or
-nested `handle`, exactly like an ordinary nested nested `match`/`if` would
-never implicitly catch a `return` from one of its own sibling branches.
+`Type.Case` combination is unhandled, sorted by each candidate's own
+stable qualified name so the witness never depends on the unrelated
+order the raised variants happen to be declared in), not merely
+"non-exhaustive." `success`/`failure` arm bodies join through the same
+never-aware type-join rules an ordinary `match`'s arms already do; a
+`handle` every one of whose reachable arms diverges has type `never`. A
+raised value produced *inside* a `handle` arm's own body (by a nested
+fallible call) is not implicitly caught by the enclosing `handle` — it
+needs its own `?` or nested `handle`, exactly like an ordinary nested
+`match`/`if` would never implicitly catch a `return` from one of its own
+sibling branches. Exactly like `?`, when one of the operand call's own
+arguments diverges, the whole `handle` is `never` immediately -- every
+arm's own pattern/body is still checked for its own independent
+diagnostics (mirroring `match`'s own diverging-scrutinee rule), but none
+of them are joined, required to cover every case, or flagged unreachable
+relative to each other, since none of them are actually reachable.
 
 ## Protocol and capability interaction
 
@@ -205,9 +223,14 @@ A protocol method's own signature declaring `raises`, an implementing
 extend method narrowing it, and a `protocol.call` site's effects being
 checked against the protocol's own declared set rather than a specific
 implementation's are all deliberately **not** part of this milestone --
-see "Honest limitations" below. `postfix ?`/`raise`/`handle` are only
-ever checked and lowered against a direct call to a named ordinary
-function in Alpha 0.1.6.
+see "Honest limitations" below. Since a protocol method has no
+raised-effect signature at all, an extend method implementing one is
+actively rejected if it declares its own `raises` (`R0031`), not merely
+left unsupported -- an infallible protocol method could otherwise be
+satisfied by a fallible implementation, and `protocol.call`'s own
+single-destination `ValueKind` would have nowhere for a raised value to
+go. `postfix ?`/`raise`/`handle` are only ever checked and lowered
+against a direct call to a named ordinary function in Alpha 0.1.6.
 
 ## NIR
 
@@ -215,8 +238,15 @@ Fits into the existing slot-based CFG rather than introducing a second
 value representation:
 
 - Every `Function` carries its own resolved `raises: Vec<ItemId>` (the
-  canonical effect set, deduplicated, in a fixed deterministic order —
-  declaration order, never a `HashMap`'s).
+  canonical effect set, deduplicated, sorted by each variant's own
+  stable declared name — never raw `ItemId` order, which is only ever
+  assigned in whatever order declarations/imports happened to be
+  discovered in, nor a `HashMap`'s own iteration order). Reversing a
+  function's own `raises` clause entry order changes nothing about the
+  resulting NIR, including the specific `err_targets` order an `Invoke`
+  targeting it is built with (`nir::lower::canonical_raises`) — this is
+  what actually keeps two semantically identical programs' NIR byte-
+  identical under such reordering, not just their printed signatures.
 - `Terminator::Invoke { callee, type_args, args, evidence, ok_slot,
   ok_target, err_targets }` replaces `Call` as a *terminator* (not an
   ordinary value-producing instruction) for any call to a fallible
@@ -252,8 +282,25 @@ value representation:
   lowered exactly once, in a block shared by every case it covers,
   mirroring how `match`'s own wildcard arm reuses one target across
   several `Switch` cases.
-- A fully-diverging `raise`/`handle` allocates no result slot, mirroring
-  `if`/`match`'s own existing discipline for a fully-diverging join.
+- A `handle` every one of whose reachable arms diverges allocates no
+  result slot, mirroring `if`/`match`'s own existing discipline for a
+  fully-diverging join. A diverging *operand* (one of `?`/`handle`'s own
+  fallible call's arguments, not its arms) skips building any `Invoke`
+  at all -- the call itself is never reached, mirroring `check_call_at`'s
+  own "a call is strict in its arguments" rule (`rfcs/0008`) rather than
+  fabricating an unreachable `Invoke` nothing would ever execute.
+- `lower_call`/`lower_invoke` never fabricate a callee's own metadata: a
+  missing signature/capability-requirement/raised-effect entry (only
+  reachable through hand-built HIR referencing a function this module
+  never itself resolved one for) fails lowering atomically with a
+  structured diagnostic, through the same shared lookup both share, never
+  silently defaulting to an empty/`Ty::Error` stand-in.
+- The textual printer shows a function's own complete `raises [@a#1,
+  @b#2]` suffix (omitted entirely, its own one documented stable
+  representation, when infallible) alongside its existing `uses` suffix
+  -- sorted by qualified name, independent of `Function.raises`'s own
+  (already canonical, see above) stored order, so the printer never
+  needs to trust it either.
 - Lowering the whole module remains atomic: either every function lowers
   or the whole module fails with diagnostics, never a partially-lowered
   result.
@@ -262,18 +309,37 @@ value representation:
 
 Independently re-checks, exactly as skeptically as every other construct
 this verifier already distrusts hand-built NIR for: a function's own
-`raises` list references only real, distinct variant `ItemId`s; an
+`raises` list references only real, distinct, non-generic variant
+`ItemId`s (a generic one is rejected the same way `hir::lower`/`typeck`
+already reject it for ordinary source, never merely trusted); an
 ordinary `Call` never targets a fallible function; an `Invoke` never
-targets an infallible one; `Invoke`'s success/failure slots are
-allocated and correctly typed, its `err_targets` cover exactly the
-callee's own declared `raises` set with no duplicate or unknown variant,
-its evidence/type-argument/argument checks reuse exactly the same checks
+targets an infallible one; an extend's own method table never references
+a fallible function either, since a protocol method has no raised-effect
+signature to narrow; `Invoke`'s success/failure slots are allocated and
+correctly typed, its `err_targets` cover exactly the callee's own
+declared `raises` set with no duplicate or unknown variant, its
+evidence/type-argument/argument checks reuse exactly the same checks
 `Call` already has, and every branch target exists; `Raise`'s own value
 is one of the current function's own declared `raises` types; every
-`Invoke`/`Raise` respects slot dominance and terminator-only placement
-(no instruction ever follows one in the same block). One diagnostic per
-malformed root, never one per nested level, bounded by the same
-generic-depth budget every other recursive check already shares.
+`Invoke`/`Raise` respects terminator-only placement (no instruction ever
+follows one in the same block).
+
+Beyond dominance (already required of every slot, and insufficient on
+its own here): a `Load` of `ok_slot` or an `err_targets` entry's own
+`slot` must be *definitely initialized* -- reached only through the one
+`Invoke` edge that actually writes it, not merely reachable from some
+block the writing edge's own `alloc` happens to dominate. This
+generalizes the same single-hop "guaranteed by every incoming edge" fact
+propagation `match`'s own case-refinement check already uses for
+`variant.payload`, applied to `Invoke`'s own conditional writes instead
+of a `Switch`'s own case identity -- a block reachable through more than
+one of `Invoke`'s own edges (e.g. an `err_target` sharing its target
+block with `ok_target`) can never assume either slot it wasn't the one
+actually written on the edge taken to reach it.
+
+One diagnostic per malformed root, never one per nested level, bounded
+by the same generic-depth budget every other recursive check already
+shares.
 
 ## Interpreter
 
@@ -309,24 +375,37 @@ already establishes).
 
 ## Complexity limits
 
-Effect-set resolution, handler exhaustiveness, and NIR verifier recursion
-each reuse this project's existing depth/work-budget discipline
-(`crate::limits`) rather than introducing an unbounded new one; exceeding
-a budget is always its own diagnostic, never a hang, a panic, or a
-silently-truncated result.
+A `raises` clause is a flat list and a `handle`'s own required/covered
+case sets are bounded by the total case count across the operand's own
+raised effects -- neither is a nested/recursive structure that could grow
+combinatorially the way a generic type application can, so neither needs
+(or has) its own depth/work-budget counter. Where an `Invoke`'s own
+type-argument/parameter types or capability evidence genuinely do
+recurse (exactly like an ordinary `Call`'s already do), they reuse this
+project's *existing* depth/work-budget discipline (`crate::limits`'s
+`MAX_GENERIC_DEPTH`/`MAX_CAPABILITY_DEPTH`/
+`MAX_CAPABILITY_RESOLUTION_STEPS`) rather than introducing a second,
+parallel one specific to typed outcomes; exceeding a budget is always its
+own diagnostic, never a hang, a panic, or a silently-truncated result.
 
 ## Honest limitations
 
 - A protocol method's own signature cannot declare `raises`, and
   `postfix ?`/`raise`/`handle` are only checked/lowered against a direct
   call to a named ordinary function -- there is no protocol/capability
-  integration for typed failure in this milestone at all. `uses` and
-  `raises` remain independent concepts everywhere they can currently
-  coexist (an ordinary function may declare either, both, or neither),
-  but a protocol method cannot yet be one of the places that coexistence
-  is expressed.
-- Generic error variants do not exist; every `raises` entry names a
-  concrete, non-generic variant.
+  integration for typed failure in this milestone at all. Since a
+  protocol method has no raised-effect signature to narrow, an `extend`
+  method implementing one is rejected the same way if *it* declares
+  `raises` (`R0031`): every protocol implementation must be infallible
+  too, not just every protocol declaration. `uses` and `raises` remain
+  independent concepts everywhere they can currently coexist (an
+  ordinary function may declare either, both, or neither), but neither a
+  protocol method nor its own implementation can yet be one of the
+  places that coexistence is expressed.
+- Generic error variants are explicitly diagnosed, not merely
+  unspellable: a `raises` entry naming a variant that declares one or
+  more type parameters is rejected (`R0030`); every accepted `raises`
+  entry names a concrete, non-generic variant.
 - A `failure` arm's payload positions may only bind or discard — no
   nested literal/variant matching on a raised value's own payload.
 - Partial handling (consuming only some of an operand's raised effects

@@ -600,8 +600,8 @@ mod tests {
             &typeck_result.expr_types,
             &typeck_result.pattern_case,
             &typeck_result.call_type_args,
-            &HashMap::new(),
-            &HashMap::new(),
+            &typeck_result.call_evidence,
+            &typeck_result.protocol_call_evidence,
             &interner,
             id,
         )
@@ -724,6 +724,102 @@ mod tests {
                           value b = Box[i64] { payload: identity[i64](1) }; \
                           return b.payload \
                       }";
+        assert_eq!(print(source), print(source));
+    }
+
+    // -- Fix 8: canonical registry covers protocols, extends, and their
+    //    methods, so valid NIR never falls back to `<item #...>` -------
+
+    #[test]
+    fn protocol_and_extend_and_method_never_print_a_placeholder_identity() {
+        let text = print(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(!text.contains("<item #"), "{text}");
+    }
+
+    #[test]
+    fn an_anonymous_extend_prints_its_deterministic_keyword_identity() {
+        let text = print(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        // The extend itself has no user-declared name (`rfcs/0009`), so
+        // its canonical identity is the bare keyword plus its own
+        // `ItemId` -- never a placeholder and never a borrowed method
+        // or protocol name.
+        assert!(text.contains("extend @extend#"), "{text}");
+    }
+
+    #[test]
+    fn repeated_method_names_across_different_extends_stay_distinct() {
+        let text = print(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            extend Equal[bool] {
+                func equal(left: bool, right: bool) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        // Both extends' methods happen to share a declared name
+        // (`equal`); the printer must still show two distinct
+        // `name#id` identities, one per extend's own method `ItemId`,
+        // each referenced consistently between its `func` declaration
+        // and its extend's method-table entry.
+        let ids: std::collections::HashSet<&str> = text
+            .split("equal#")
+            .skip(1)
+            .map(|rest| {
+                rest.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "expected two distinct method ids: {text}");
+    }
+
+    #[test]
+    fn protocol_and_extend_nir_printing_is_deterministic() {
+        let source = "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }";
         assert_eq!(print(source), print(source));
     }
 }

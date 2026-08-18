@@ -565,6 +565,49 @@ fn format_terminator(term: &Terminator, interner: &Interner, registry: &ItemRegi
                 qualified_ref(*variant, registry, interner)
             )
         }
+        Terminator::Invoke {
+            callee,
+            type_args,
+            args,
+            evidence,
+            ok_slot,
+            ok_target,
+            err_targets,
+        } => {
+            let args = args
+                .iter()
+                .map(|v| format!("%{}", v.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Sorted by `variant`'s own qualified name, not by
+            // declaration order -- so two `err_targets` lists holding the
+            // same edges in a different order (a nondeterminism source
+            // an unordered set-of-effects representation could otherwise
+            // introduce upstream) always print identically here, keeping
+            // this text usable as golden output (module doc comment).
+            let mut err_targets: Vec<String> = err_targets
+                .iter()
+                .map(|t| {
+                    format!(
+                        "@{} -> %{}, bb{}",
+                        qualified_ref(t.variant, registry, interner),
+                        t.slot.0,
+                        t.target.0
+                    )
+                })
+                .collect();
+            err_targets.sort();
+            format!(
+                "invoke @{}{}({args}){} -> %{}, bb{} else {{{}}}",
+                qualified_ref(*callee, registry, interner),
+                type_args_suffix(type_args, interner, registry),
+                evidence_list_suffix(evidence, interner, registry),
+                ok_slot.0,
+                ok_target.0,
+                err_targets.join("; ")
+            )
+        }
+        Terminator::Raise { value } => format!("raise %{}", value.0),
     }
 }
 

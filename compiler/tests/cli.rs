@@ -733,3 +733,33 @@ fn raises_non_exhaustive_handler_example_is_t0053() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("error[T0053]"));
 }
+
+/// A `raises` entry naming a generic variant is rejected at the
+/// frontend (R0030), at every stage, with no leaked internal (`Ixxxx`/
+/// `Vxxxx`) diagnostic and no panic (generic error variants are
+/// explicitly out of scope, `rfcs/0010`).
+#[test]
+fn raises_generic_variant_example_is_r0030_at_every_stage_with_no_leaked_internal_diagnostic() {
+    let path = example("raises_generic_variant_invalid.npt");
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should fail with exit code 1"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error[R0030]"),
+            "`{cmd}` should report R0030: {err}"
+        );
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{cmd}` leaked an internal diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+}

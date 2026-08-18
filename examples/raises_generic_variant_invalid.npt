@@ -1,0 +1,11 @@
+variant Failure[T] {
+    Value(T),
+}
+
+func fail() -> i64 raises Failure {
+    raise Failure[i64].Value(42);
+}
+
+func main() -> i64 {
+    return 0;
+}

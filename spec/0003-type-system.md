@@ -1,9 +1,10 @@
 # Spec 0003: Type System
 
-- Status: Partially implemented (Alpha 0.1.4) — primitive types, local
+- Status: Partially implemented (Alpha 0.1.5) — primitive types, local
   inference, nominal record/variant aggregates with pattern matching
-  (Alpha 0.1.1), and unconstrained generic type parameters on
-  functions/records/variants (Alpha 0.1.4, `rfcs/0008`).
+  (Alpha 0.1.1), unconstrained generic type parameters on
+  functions/records/variants (Alpha 0.1.4, `rfcs/0008`), and capability
+  protocols (Alpha 0.1.5, `rfcs/0009`).
 
 ## Implemented features
 
@@ -163,9 +164,64 @@ inference, without introducing a separate compile-time-only numeric type.
   exceeds a shared depth budget.
 
 See `rfcs/0008-canonical-generics.md` for the complete design, the
-diagnostic codes, and the current honest limitations (no protocol/trait
-bounds yet, so every type parameter is unconstrained; no native-code
-specialization).
+diagnostic codes, and the current honest limitations (no native-code
+specialization). A generic type parameter itself still has no inline
+bound syntax (there is no `[T: Comparable]`) — as of Alpha 0.1.5, the
+closest equivalent is a capability requirement on the *function*
+(`uses Comparable[T]`, see "Protocols and capabilities", below), checked
+independently of unification rather than as a constraint attached to `T`
+itself.
+
+### Protocols and capabilities (Alpha 0.1.5)
+
+- **Explicit, no `Self`**: a `protocol` declares its own type parameters
+  explicitly (`protocol Equal[T] { func equal(left: T, right: T) -> bool;
+  }`); there is no implicit receiver and no `Self` type anywhere in this
+  design. A method is invoked only via an explicit
+  `Protocol[Args].method(...)` expression — never `a.equal(b)`, and never
+  through operator sugar (`==` keeps its own pre-existing built-in
+  meaning for primitives, entirely independent of any user-declared
+  `Equal`-shaped protocol).
+- **Canonical requirement identity**: `CapabilityRequirement { protocol:
+  ItemId, arguments: Vec<Ty> }` identifies a `uses` requirement the same
+  way `GenericInstanceKey` identifies a generic instantiation (`rfcs/0008`)
+  — nominal on the declaring protocol's `ItemId` (never re-derived from a
+  name, so an import alias never changes identity), structural on its
+  arguments.
+- **Evidence, not a vtable**: every requirement resolves to exactly one
+  `Evidence` value, computed once at compile time by a dedicated
+  capability solver (`typeck::capability`) — `Evidence::Extension` (a
+  concrete `extend`, plus its own nested requirements resolved the same
+  way) or `Evidence::Forwarded(index)` (reuse the *currently executing*
+  function's own requirement at that index unchanged). This is dictionary
+  passing, not a runtime vtable/trait-object mechanism and not template
+  instantiation: one canonical extend implementation exists regardless of
+  how many call sites resolve to it, and no runtime type inspection is
+  involved.
+- **Authority and coherence**: an `extend` is only legal in the module
+  that owns its protocol or the outermost nominal aggregate of the
+  protocol's first type argument (a primitive first argument requires the
+  protocol's own module); two extends that could both match the same
+  concrete instantiation are rejected as an overlap, checked by a sound
+  bidirectional structural unifier over each extend's own head, entirely
+  independent of any call site.
+- **Exact forwarding only**: a still-generic function's own `uses`
+  requirement can only be satisfied by forwarding an identical caller
+  requirement, or by a concrete extension once every type involved is
+  fully concrete — never by deriving, weakening, or combining a
+  requirement symbolically. `T0039`/`T0040` report a missing/ambiguous
+  capability; `T0041`/`T0042`/`T0043` bound cyclic/too-deep/too-expensive
+  resolution.
+- **Entry-point restriction**: the executable entry function cannot
+  declare a `uses` requirement (`T0045`) — it has no caller to receive
+  evidence from. A concrete protocol call inside its own body remains
+  legal without any `uses` clause.
+
+See `rfcs/0009-capability-protocols.md` for the complete design
+(including the syntax, the full diagnostic list, and honest limitations
+such as no supertraits/default methods and no first-class protocol
+values) and `spec/0006-napitia-ir.md` for the NIR-level representation of
+protocols, extends, and evidence.
 
 ### `match` and pattern matching (Alpha 0.1.1)
 
@@ -275,16 +331,16 @@ The internal type representation is deliberately structured so the
 following can be added without a redesign of the checker's core
 unification algorithm:
 
-- **Protocol/trait bounds on a generic type parameter**
-  (`func max[T: Comparable](a: T, b: T) -> T`). Alpha 0.1.4 implements
-  unconstrained generics only (`rfcs/0008`) — a type parameter is opaque
-  and rigid, with no operation beyond passing/returning/binding/
-  construction proven safe for it; bounds are what would let a
-  constrained `T` prove it supports a specific operation (equality,
-  ordering, ...) without the whole-program symbolic body check needing
-  to reject it outright.
-- **Protocols**: as constraints on type variables during unification, not
-  as a runtime vtable mechanism at this layer.
+- **Inline bound syntax on a generic type parameter**
+  (`func max[T: Comparable](a: T, b: T) -> T`). Alpha 0.1.5 implements the
+  underlying capability requirement this bullet was originally describing
+  — `func max[T](a: T, b: T) -> T uses Comparable[T]`
+  (`rfcs/0009`) — as a `uses` clause on the *function*, checked by a
+  dedicated capability solver independent of unification, rather than as
+  a constraint attached to `T` itself. Only the `[T: Comparable]` inline-
+  bound *spelling* remains unimplemented; a type parameter with no
+  matching `uses` requirement is still opaque and rigid exactly as
+  `rfcs/0008` describes.
 - **A standard-library `Maybe[T]` absence type**: the language itself
   can express `variant Maybe[T] { Some(T), None }` directly as of
   Alpha 0.1.4 (`rfcs/0008`); what remains future work is bundling one in
@@ -307,8 +363,10 @@ special-cased or faked to look implemented.
 
 ## Unresolved research questions
 
-- Whether protocol bounds should support associated types/const generics
-  from the start, or be added later without breaking existing bounds.
+- Whether an inline `[T: Protocol]` bound spelling should ever be added
+  alongside `uses Protocol[T]` (`rfcs/0009`), and if so whether it should
+  support associated types/const generics from the start or be added
+  later without breaking existing capability requirements.
 - Whether integer literal defaulting to `i64` is the right default, versus
   requiring an explicit type in more contexts.
 - How much Hindley-Milner-style binding-local polymorphism (if any)

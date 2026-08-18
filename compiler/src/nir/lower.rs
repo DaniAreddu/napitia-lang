@@ -74,6 +74,41 @@ pub fn lower_module(
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
+    lower_module_with_paths(
+        hir,
+        local_types,
+        expr_types,
+        pattern_case,
+        call_type_args,
+        call_evidence,
+        protocol_call_evidence,
+        interner,
+        source,
+        &HashMap::new(),
+    )
+}
+
+/// Like [`lower_module`], but for a caller (single-file compilation has
+/// no project-level module path at all, so it goes through
+/// `lower_module`'s own empty-map wrapper instead) that can supply each
+/// declaring module's own dotted path -- read back by
+/// [`canonical_raises`] so two variants sharing a bare name from
+/// *different* modules still canonicalize to a stable, module-
+/// qualified order rather than an ambiguous tie (`rfcs/0007`,
+/// `rfcs/0010`).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_module_with_paths(
+    hir: &HirModule,
+    local_types: &HashMap<LocalId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    call_type_args: &HashMap<ExprId, Vec<Ty>>,
+    call_evidence: &HashMap<ExprId, Vec<Evidence>>,
+    protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    interner: &Interner,
+    source: SourceId,
+    module_path_of: &HashMap<SourceId, String>,
+) -> Result<Module, Vec<Diagnostic>> {
     // Every module-level item's ItemId must be globally unique across
     // records, variants, and functions alike -- not just unique within
     // its own kind. hir::lower's own name resolution already keeps this
@@ -111,8 +146,10 @@ pub fn lower_module(
         );
     }
     let mut variant_layouts: HashMap<ItemId, VariantLayout> = HashMap::new();
+    let mut variant_source: HashMap<ItemId, SourceId> = HashMap::new();
     let mut variant_order: Vec<ItemId> = Vec::new();
     for v in &hir.variants {
+        variant_source.insert(v.id, v.source);
         let cases = v
             .cases
             .iter()
@@ -159,14 +196,18 @@ pub fn lower_module(
                 .map(|r| resolve_requirement(interner, r))
                 .collect(),
         );
-        function_raises.insert(
-            f.id,
-            canonical_raises(
-                f.raises.iter().map(|r| r.variant).collect(),
-                &variant_layouts,
-                interner,
-            ),
-        );
+        let raises = match canonical_raises(
+            f.raises.iter().map(|r| r.variant).collect(),
+            &variant_layouts,
+            &variant_source,
+            module_path_of,
+            interner,
+            source,
+        ) {
+            Ok(raises) => raises,
+            Err(diagnostic) => return Err(vec![*diagnostic]),
+        };
+        function_raises.insert(f.id, raises);
     }
 
     // Every declared protocol's layout, in declaration order -- built
@@ -252,14 +293,18 @@ pub fn lower_module(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
-            function_raises.insert(
-                m.id,
-                canonical_raises(
-                    m.raises.iter().map(|r| r.variant).collect(),
-                    &variant_layouts,
-                    interner,
-                ),
-            );
+            let method_raises = match canonical_raises(
+                m.raises.iter().map(|r| r.variant).collect(),
+                &variant_layouts,
+                &variant_source,
+                module_path_of,
+                interner,
+                source,
+            ) {
+                Ok(raises) => raises,
+                Err(diagnostic) => return Err(vec![*diagnostic]),
+            };
+            function_raises.insert(m.id, method_raises);
             if let Some(index) = proto_method_names.iter().position(|n| *n == m.name) {
                 methods_by_index[index] = Some(m.id);
             }
@@ -301,8 +346,10 @@ pub fn lower_module(
         protocol_call_evidence,
         interner,
         source,
+        module_path_of,
         records: record_layouts,
         variants: variant_layouts,
+        variant_source,
         function_sigs,
         function_requirements,
         function_raises,
@@ -543,34 +590,66 @@ fn resolve_requirement(
 }
 
 /// Canonicalizes a function's own raised-effect set (`rfcs/0010`) by
-/// each variant's own declared name -- never by raw `ItemId`, which is
-/// only ever assigned in whatever order declarations/imports happened
-/// to be discovered in, and can differ across two otherwise-identical
+/// each variant's own *stable qualified identity* -- its declaring
+/// module's own dotted path (`""` for single-file compilation, which
+/// has no project-level module path at all, `rfcs/0007`) paired with
+/// its own declared name -- never by raw `ItemId`, which is only ever
+/// assigned in whatever order declarations/imports happened to be
+/// discovered in, and can differ across two otherwise-identical
 /// compilations that merely reorder those without changing what the
-/// program means. `Function.raises`'s own stored order is what
-/// `lower_invoke` iterates to build each `Invoke`'s own `err_targets`,
-/// so this is what actually keeps two semantically identical programs'
-/// NIR (block/value numbering, not just the printed signature) byte-
-/// identical under such reordering -- HIR's own `raises` stays in
-/// source declaration order throughout (needed for its own diagnostics'
-/// span-accurate reporting); only this NIR-facing copy is canonicalized.
-/// A tie (two variants sharing a bare name, only reachable through an
-/// aliased cross-module import naming both in one `raises` clause)
-/// falls back to `ItemId` purely as a last-resort, still-deterministic
-/// tiebreaker, never as the primary key.
+/// program means. Two variants sharing a bare name from *different*
+/// modules are still correctly distinguished (their own module paths
+/// differ); the only way an actual tie could survive is two items
+/// genuinely sharing both a module and a name, which duplicate-
+/// declaration checking already rejects independently -- `sort_by_key`
+/// is stable, so even that unreachable case would just preserve the
+/// (already-deterministic, source-declaration-order) input order rather
+/// than fall back to `ItemId`. `Function.raises`'s own stored order is
+/// what `lower_invoke` iterates to build each `Invoke`'s own
+/// `err_targets`, so this is what actually keeps two semantically
+/// identical programs' NIR (block/value numbering, not just the printed
+/// signature) byte-identical under such reordering -- HIR's own
+/// `raises` stays in source declaration order throughout (needed for
+/// its own diagnostics' span-accurate reporting); only this NIR-facing
+/// copy is canonicalized.
+///
+/// Every entry here was already resolved to a real declared variant by
+/// `hir::lower`'s own `resolve_raises`, so a missing `variant_layouts`
+/// entry is unreachable for any HIR it produced -- but this is a public
+/// entry point (`lower_module`) a direct caller can invoke with
+/// hand-built HIR bypassing that guarantee, so it fails atomically with
+/// a structured diagnostic rather than silently sorting an unresolvable
+/// entry as if it belonged first (or last).
 fn canonical_raises(
     mut raises: Vec<ItemId>,
     variant_layouts: &HashMap<ItemId, VariantLayout>,
+    variant_source: &HashMap<ItemId, SourceId>,
+    module_path_of: &HashMap<SourceId, String>,
     interner: &Interner,
-) -> Vec<ItemId> {
-    raises.sort_by_key(|item| {
-        let name = variant_layouts
+    source: SourceId,
+) -> LowerResult<Vec<ItemId>> {
+    let mut key_of: HashMap<ItemId, (String, String)> = HashMap::with_capacity(raises.len());
+    for item in &raises {
+        let Some(layout) = variant_layouts.get(item) else {
+            return Err(Box::new(Diagnostic::error(
+                codes::INTERNAL_INVARIANT_VIOLATED,
+                source,
+                Span::dummy(),
+                format!(
+                    "a function's own `raises` names id {item:?}, which does not resolve to any declared variant"
+                ),
+            )));
+        };
+        let module_path = variant_source
             .get(item)
-            .map(|layout| interner.resolve(layout.name).to_string())
+            .and_then(|src| module_path_of.get(src))
+            .cloned()
             .unwrap_or_default();
-        (name, item.0)
-    });
-    raises
+        let name = interner.resolve(layout.name).to_string();
+        key_of.insert(*item, (module_path, name));
+    }
+    raises.sort_by(|a, b| key_of[a].cmp(&key_of[b]));
+    Ok(raises)
 }
 
 struct Lowering<'a> {
@@ -592,8 +671,18 @@ struct Lowering<'a> {
     protocol_call_evidence: &'a HashMap<ExprId, Evidence>,
     interner: &'a Interner,
     source: SourceId,
+    /// Every declaring module's own dotted path, by `SourceId` -- empty
+    /// for single-file compilation, which has no project-level module
+    /// path at all (`rfcs/0007`). Read back by `canonical_raises` so two
+    /// variants sharing a bare name from different modules still
+    /// canonicalize to a stable order (`rfcs/0010`).
+    module_path_of: &'a HashMap<SourceId, String>,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
+    /// Every declared variant's own declaring `SourceId`, by `ItemId` --
+    /// read back by `canonical_raises` (together with `module_path_of`)
+    /// to resolve each raised variant's own stable qualified identity.
+    variant_source: HashMap<ItemId, SourceId>,
     /// `(this function's own generic parameters, its param types, its
     /// return type)`. The parameter/return types may reference the
     /// first element via `Ty::Param`; a call site substitutes its own
@@ -847,6 +936,14 @@ impl<'a> Lowering<'a> {
             .get(&f.id)
             .cloned()
             .unwrap_or_default();
+        let raises = canonical_raises(
+            f.raises.iter().map(|r| r.variant).collect(),
+            &self.variants,
+            &self.variant_source,
+            self.module_path_of,
+            self.interner,
+            self.source,
+        )?;
         Ok(Function {
             id: f.id,
             name: f.name,
@@ -854,11 +951,7 @@ impl<'a> Lowering<'a> {
             requirements,
             params,
             return_type,
-            raises: canonical_raises(
-                f.raises.iter().map(|r| r.variant).collect(),
-                &self.variants,
-                self.interner,
-            ),
+            raises,
             blocks,
         })
     }
@@ -4154,6 +4247,109 @@ mod tests {
         assert!(diagnostics.iter().any(|d| d.code == "I0002"));
     }
 
+    /// Two variants named `Err`, one declared in module `a` and one in
+    /// module `b`, raised by the same function -- `canonical_raises`
+    /// must order them by their *declaring module's own path*, never by
+    /// declaration order (of either the `variants` list or the
+    /// function's own `raises` clause) and never by raw `ItemId`. Run
+    /// with the module-list order and the `raises`-clause order each
+    /// reversed relative to the other, both must produce the identical
+    /// canonical order.
+    fn assert_err_variants_canonicalize_by_module_path(
+        variants_in_b_then_a_order: bool,
+        raises_in_b_then_a_order: bool,
+    ) {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let source_b = map.add_file("b.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let item_b = ItemId(1);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+        let variant_b = minimal_variant(item_b, err_name, source_b);
+        let variants = if variants_in_b_then_a_order {
+            vec![variant_b, variant_a]
+        } else {
+            vec![variant_a, variant_b]
+        };
+        let mut module_path_of = HashMap::new();
+        module_path_of.insert(source_a, "a".to_string());
+        module_path_of.insert(source_b, "b".to_string());
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let entry_b = crate::hir::HirRaisesEntry {
+            variant: item_b,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(2),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = if raises_in_b_then_a_order {
+            vec![entry_b, entry_a]
+        } else {
+            vec![entry_a, entry_b]
+        };
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants,
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &module_path_of,
+        )
+        .expect("lowering with two distinct-module, same-name variants should succeed");
+        let f = result
+            .functions
+            .iter()
+            .find(|f| f.id == ItemId(2))
+            .expect("lowered function must be present");
+        assert_eq!(
+            f.raises,
+            vec![item_a, item_b],
+            "module `a`'s variant must sort before module `b`'s regardless of declaration order"
+        );
+    }
+
+    #[test]
+    fn canonical_raises_orders_by_module_path_with_b_declared_before_a() {
+        assert_err_variants_canonicalize_by_module_path(true, true);
+    }
+
+    #[test]
+    fn canonical_raises_orders_by_module_path_with_a_declared_before_b() {
+        assert_err_variants_canonicalize_by_module_path(false, false);
+    }
+
     #[test]
     fn duplicate_record_id_fails_lowering_atomically_not_a_panic() {
         let mut interner = Interner::new();
@@ -4441,8 +4637,10 @@ mod tests {
             pattern_case,
             interner,
             source,
+            module_path_of: Box::leak(Box::new(HashMap::new())),
             records,
             variants,
+            variant_source: HashMap::new(),
             function_sigs: HashMap::new(),
             call_type_args: Box::leak(Box::new(HashMap::new())),
             call_evidence: Box::leak(Box::new(HashMap::new())),
@@ -4475,8 +4673,10 @@ mod tests {
             pattern_case,
             interner,
             source,
+            module_path_of: Box::leak(Box::new(HashMap::new())),
             records,
             variants,
+            variant_source: HashMap::new(),
             function_sigs,
             call_type_args,
             call_evidence: Box::leak(Box::new(HashMap::new())),

@@ -1,6 +1,6 @@
 # Spec 0006: Napitia IR (NIR)
 
-- Status: Partially implemented (Alpha 0.1.3)
+- Status: Partially implemented (Alpha 0.1.5)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -178,6 +178,57 @@ above, and an import alias never appears here either. See
 canonical generic-instance-key design, and the verifier rules described
 below.
 
+### Protocols and capabilities (Alpha 0.1.5)
+
+A `Module` carries every declared protocol's and extend's own layout,
+each keyed by its own `ItemId`, in declaration order:
+
+```text
+protocol @Equal#4[T] {
+    method[0] equal(T, T) -> bool;
+}
+
+extend @extend#7 for @Equal#4[i64] {
+    method[0] = @equal_i64#8;
+}
+
+func @f#9(%0: i64, %1: i64) -> bool {
+bb0:
+    %2 = protocol.call @Equal#4[i64].method[0](%0, %1) evidence [@extend#7]
+    ret %2
+}
+```
+
+`ProtocolLayout` is a name, its own type parameters, and its methods in
+declaration order (a `protocol.call`'s own `method` index refers into this
+same order, never a name). `ExtendLayout` is the protocol it implements,
+its own type parameters, its own concrete/symbolic arguments at that
+protocol (`protocol_arguments`), its own `uses` requirements, and a method
+table (`Vec<ItemId>`) mapping each protocol method's index to the real
+NIR function implementing it — every extend method is lowered as an
+ordinary `Function` sharing its own extend's exact type-parameter/
+requirement scope (`rfcs/0009`), never a separate generic scope of its
+own, and registered in the canonical `ItemRegistry` (`rfcs/0007`) like any
+other function; an extend itself has no user-declared name, so its own
+canonical identity is the bare `extend` keyword plus its `ItemId`
+(`@extend#7` above), never the registry's `<item #...>` placeholder and
+never borrowed from its protocol or first method.
+
+Capability evidence (`crate::types::Evidence`) appears in exactly two
+places: a `Call`'s own evidence list (one entry per callee requirement)
+and a `protocol.call`'s single evidence value (satisfying the protocol
+requirement the call itself names). `Evidence::Extension { extend,
+nested }` prints as `@<extend>`, with `nested` printed the same way,
+recursively, when non-empty; `Evidence::Forwarded(k)` prints as
+`forwarded[k]`. Both are resolved once, entirely at compile time, by
+`typeck`'s capability solver — the interpreter only ever copies an
+already-resolved `Evidence` between call frames (one frame-relative
+lookup for `Forwarded`), never re-running any part of resolution. See
+`rfcs/0009-capability-protocols.md` for the complete semantic model
+(authority, coherence, exact-forwarding-only resolution, the entry-point
+restriction) and `spec/0003-type-system.md` for the type-system-level
+detail.
+
 ### Lowering from HIR
 
 HIR control-flow constructs (`if`/`else`, `while`, `loop`, `break`,
@@ -298,8 +349,26 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   these checks recurses through nested `Ty::Applied` arguments and is
   bounded by the same generic-depth limit every other stage that walks a
   type application shares.
+- **Protocols and extends** (Alpha 0.1.5, `rfcs/0009`): every protocol's
+  own type parameters and method parameter/return types, and every
+  extend's referenced protocol/`uses` requirements/protocol-argument
+  types/method table (correct length, each entry a real, distinct
+  function sharing its owning extend's exact type-parameter scope with a
+  signature matching its protocol method once substituted), are
+  independently re-checked the same way records/variants/generics are.
+- **Capability evidence** (Alpha 0.1.5, `rfcs/0009`): a `Call`'s evidence
+  count is checked against its callee's own requirement count, and a
+  `protocol.call`'s protocol/method index/argument and result types are
+  checked against its own substituted signature; every evidence entry —
+  `Forwarded` (in range, exactly compatible with what is required) or
+  `Extension` (a real extend targeting the right protocol, whose own head
+  structurally matches, with the right nested-entry count and no
+  `Forwarded` anywhere inside `nested`) — is checked recursively, bounded
+  by the same capability depth/work budget the solver itself uses, with
+  exactly one diagnostic per malformed evidence root, never one per
+  nested node.
 
-It reports structured diagnostics (`V0001`–`V0034` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0057` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

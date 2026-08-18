@@ -20,13 +20,15 @@
 use std::collections::HashMap;
 
 use super::{
-    BasicBlock, CaseLayout, Const, ExtendLayout, Function, Module, Param, ProtocolLayout,
-    ProtocolMethodLayout, RecordLayout, Terminator, ValueId, ValueKind, VariantLayout,
+    BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
+    ProtocolLayout, ProtocolMethodLayout, RecordLayout, Terminator, ValueId, ValueKind,
+    VariantLayout,
 };
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
-    HirModule, HirPattern, HirStmt, ItemId, LocalId, PatternId,
+    ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFieldInit, HirFunction, HirHandleArm,
+    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, ItemId,
+    LocalId, PatternId,
 };
 use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
@@ -136,6 +138,7 @@ pub fn lower_module(
 
     let mut function_sigs = HashMap::new();
     let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
+    let mut function_raises: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -156,6 +159,7 @@ pub fn lower_module(
                 .map(|r| resolve_requirement(interner, r))
                 .collect(),
         );
+        function_raises.insert(f.id, f.raises.iter().map(|r| r.variant).collect());
     }
 
     // Every declared protocol's layout, in declaration order -- built
@@ -241,6 +245,7 @@ pub fn lower_module(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
+            function_raises.insert(m.id, m.raises.iter().map(|r| r.variant).collect());
             if let Some(index) = proto_method_names.iter().position(|n| *n == m.name) {
                 methods_by_index[index] = Some(m.id);
             }
@@ -286,6 +291,7 @@ pub fn lower_module(
         variants: variant_layouts,
         function_sigs,
         function_requirements,
+        function_raises,
         function_named_type_params,
     };
     let mut functions = Vec::new();
@@ -552,6 +558,14 @@ struct Lowering<'a> {
     /// (`rfcs/0009`), in declared order -- a `Call` targeting one of
     /// these carries exactly this many evidence entries.
     function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>>,
+    /// Every function/extend method's own declared raised-error set
+    /// (`rfcs/0010`), canonical and in a fixed order -- read back by
+    /// `lower_invoke` to decide postfix `?`/`handle`'s own `Invoke`
+    /// failure edges, one per entry here, without re-deriving it from
+    /// whichever `Function` this callee eventually lowers to (which may
+    /// not even exist yet, since lowering order is not the same as
+    /// declaration order for extend methods).
+    function_raises: HashMap<ItemId, Vec<ItemId>>,
     /// An extend method's own *displayed* generic parameters -- always
     /// its owning extend's own `type_params` (never empty the way its
     /// own `HirFunction::type_params` is), keyed by the method's own
@@ -795,6 +809,7 @@ impl<'a> Lowering<'a> {
             requirements,
             params,
             return_type,
+            raises: f.raises.iter().map(|r| r.variant).collect(),
             blocks,
         })
     }
@@ -1065,16 +1080,12 @@ impl<'a> Lowering<'a> {
             // unpropagated inner value would let either "succeed" while
             // lying about what it does.
             HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
-            // `rfcs/0010`: real Invoke/Raise-based lowering for these
-            // three lands in a follow-up commit within this same
-            // milestone -- `typeck` already stops every one of them
-            // before NIR lowering runs in the normal pipeline; this is
-            // defense in depth against a direct caller bypassing that
-            // gate, exactly like every other not-yet-lowered construct
-            // in this match.
-            HirExpr::Try { span, .. } => Err(self.unsupported(*span, "postfix `?`")),
-            HirExpr::Raise { span, .. } => Err(self.unsupported(*span, "`raise`")),
-            HirExpr::Handle { span, .. } => Err(self.unsupported(*span, "`handle`")),
+            HirExpr::Try { expr: inner, .. } => self.lower_try(fb, inner),
+            HirExpr::Raise { operand, .. } => self.lower_raise(fb, operand),
+            HirExpr::Handle { operand, arms, .. } => {
+                let result_ty = self.expr_ty(expr);
+                self.lower_handle(fb, operand, arms, result_ty)
+            }
             HirExpr::If {
                 condition,
                 then_branch,
@@ -1438,6 +1449,380 @@ impl<'a> Lowering<'a> {
             self.expr_ty(call_expr),
             ValueKind::Call(*item, type_args, arg_values, evidence),
         )))
+    }
+
+    /// Shared setup for postfix `?`/`handle` (`rfcs/0010`): both require
+    /// their own operand to structurally be a direct call to a fallible
+    /// function (`typeck`'s own `check_try`/`check_handle` already
+    /// enforce this before a well-typed program ever reaches lowering).
+    /// Lowers the callee's own arguments exactly like an ordinary call,
+    /// then terminates the current block with `Terminator::Invoke`.
+    ///
+    /// Returns `None` (never emitting an `Invoke` at all) when the
+    /// operand itself was not actually a fallible call -- either because
+    /// evaluating it (for its own independent side effects/divergence,
+    /// still required even though the result is never used as a value)
+    /// diverged, or because a direct caller bypassed `typeck` with
+    /// malformed HIR; the caller must propagate `LoweredExpr::Diverged`
+    /// in the former case exactly as if this were any other diverging
+    /// subexpression.
+    ///
+    /// On success, returns the callee's own return type, the slot/block
+    /// its success edge stores into and continues at, one
+    /// `(variant, slot, block)` triple per effect the callee declares in
+    /// `raises` (in that same canonical order), and -- only when
+    /// `merge_result_ty` was given -- an extra slot/block allocated on
+    /// this same still-open block for the caller's own use (`handle`'s
+    /// own result slot/merge block, which must dominate every arm the
+    /// same way `lower_match`'s own result slot does; allocating it here,
+    /// before the `Invoke` that is about to terminate this block, is the
+    /// only way to still append to it -- the caller is responsible for
+    /// actually lowering each failure block's own body before the
+    /// enclosing function is finished.
+    #[allow(clippy::type_complexity)]
+    fn lower_invoke(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        context: &str,
+        merge_result_ty: Option<&Ty>,
+    ) -> LowerResult<
+        Option<(
+            Ty,
+            ValueId,
+            BlockId,
+            Vec<(ItemId, ValueId, BlockId)>,
+            Option<(ValueId, BlockId)>,
+        )>,
+    > {
+        let HirExpr::Call { callee, args, .. } = operand else {
+            if matches!(self.lower_expr(fb, operand)?, LoweredExpr::Diverged) {
+                return Ok(None);
+            }
+            return Err(self.internal_error(&format!(
+                "{context}'s operand is not a direct call to a fallible function"
+            )));
+        };
+        let HirExpr::Function { item, .. } = &**callee else {
+            if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
+                return Ok(None);
+            }
+            for arg in args {
+                if matches!(self.lower_expr(fb, arg)?, LoweredExpr::Diverged) {
+                    return Ok(None);
+                }
+            }
+            return Err(self.internal_error(&format!(
+                "{context}'s operand does not call a named function"
+            )));
+        };
+        let (type_params, param_tys, ret_ty) = self
+            .function_sigs
+            .get(item)
+            .cloned()
+            .unwrap_or_else(|| (Vec::new(), Vec::new(), Ty::Error));
+        let type_args = self.resolve_call_type_args(operand.id(), &type_params, context)?;
+        let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
+        let mut arg_values = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let hint = param_tys
+                .get(i)
+                .map(|t| crate::types::substitute(t, &subst))
+                .unwrap_or(Ty::Error);
+            match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => arg_values.push(v),
+                LoweredExpr::Diverged => return Ok(None),
+            }
+        }
+        let requirements = self
+            .function_requirements
+            .get(item)
+            .cloned()
+            .unwrap_or_default();
+        let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
+        let raises = self.function_raises.get(item).cloned().unwrap_or_default();
+
+        // Allocated here, before the `Invoke` below terminates this
+        // block -- not by the caller afterward, when it would already be
+        // too late to append anything to it.
+        let merge = merge_result_ty.map(|ty| (fb.alloc_slot(ty.clone()), fb.new_block()));
+
+        let ok_slot = fb.alloc_slot(ret_ty.clone());
+        let ok_target = fb.new_block();
+        let mut err_targets = Vec::with_capacity(raises.len());
+        let mut err_blocks = Vec::with_capacity(raises.len());
+        for variant in &raises {
+            let Some(layout) = self.variants.get(variant) else {
+                return Err(self.internal_error(&format!(
+                    "{context}'s callee declares raising unknown variant id {variant:?}"
+                )));
+            };
+            let err_slot = fb.alloc_slot(Ty::Named(*variant, layout.name));
+            let dispatch_block = fb.new_block();
+            err_targets.push(InvokeErrTarget {
+                variant: *variant,
+                slot: err_slot,
+                target: dispatch_block,
+            });
+            err_blocks.push((*variant, err_slot, dispatch_block));
+        }
+
+        fb.terminate(Terminator::Invoke {
+            callee: *item,
+            type_args,
+            args: arg_values,
+            evidence,
+            ok_slot,
+            ok_target,
+            err_targets,
+        });
+        Ok(Some((ret_ty, ok_slot, ok_target, err_blocks, merge)))
+    }
+
+    /// Postfix `?` (`rfcs/0010`). On the callee's success edge, simply
+    /// loads and forwards the success value; on each failure edge,
+    /// forwards the exact same raised value onward unchanged via this
+    /// function's own `Terminator::Raise` -- `typeck`'s own
+    /// `PROPAGATION_NOT_DECLARED` check already proved every one of
+    /// those effects is also a member of this function's own `raises`.
+    fn lower_try(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+        let Some((ret_ty, ok_slot, ok_target, err_blocks, _)) =
+            self.lower_invoke(fb, operand, "postfix `?`", None)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+        for (variant, err_slot, dispatch_block) in err_blocks {
+            let Some(layout) = self.variants.get(&variant) else {
+                return Err(self.internal_error("postfix `?` propagates an unknown variant"));
+            };
+            let name = layout.name;
+            fb.switch_to(dispatch_block);
+            let loaded = fb.push_value(Ty::Named(variant, name), ValueKind::Load(err_slot));
+            fb.terminate(Terminator::Raise { value: loaded });
+        }
+        fb.switch_to(ok_target);
+        Ok(LoweredExpr::Value(
+            fb.push_value(ret_ty, ValueKind::Load(ok_slot)),
+        ))
+    }
+
+    /// `raise <operand>` (`rfcs/0010`). Always diverges, exactly like
+    /// `return`/`break`: `operand` is evaluated exactly once, then the
+    /// current block ends with `Terminator::Raise` instead of falling
+    /// through to anything else.
+    fn lower_raise(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+        let value = match self.lower_expr(fb, operand)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        fb.terminate(Terminator::Raise { value });
+        Ok(LoweredExpr::Diverged)
+    }
+
+    /// `handle <operand> { ... }` (`rfcs/0010`). The callee's success
+    /// edge binds `success`'s pattern and lowers its body; each failure
+    /// edge is switched on its own variant's case, dispatching to
+    /// whichever `failure` arm's body `typeck`'s own exhaustiveness check
+    /// already proved covers it (a `Case` arm covers exactly the one
+    /// case it names; a single trailing wildcard covers everything no
+    /// `Case` arm already claimed, across every raised type at once) --
+    /// every arm body is lowered exactly once, in a block shared by
+    /// every case it covers, mirroring how an ordinary `match`'s own
+    /// wildcard/binding arm reuses one target across several
+    /// `Terminator::Switch` cases.
+    fn lower_handle(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        arms: &[HirHandleArm],
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
+        // No result slot/merge block at all when every reachable arm
+        // diverges (`typeck` already proved this) -- mirrors
+        // `lower_match`'s own `Ty::Never` short-circuit. Requested from
+        // `lower_invoke` itself (rather than allocated here afterward),
+        // since by the time it returns, the block it would need to
+        // allocate into is already terminated by the `Invoke`.
+        let merge_result_ty = (result_ty != Ty::Never).then_some(&result_ty);
+        let Some((ok_ty, ok_slot, ok_target, err_blocks, merge)) =
+            self.lower_invoke(fb, operand, "`handle`", merge_result_ty)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+
+        // For every (variant, case-index) pair any raised effect
+        // declares, which arm (by index into `arms`) actually covers it:
+        // the first `Case` arm naming it, or else the single trailing
+        // wildcard. Only ever consulted for pairs `typeck` already
+        // proved are covered by exactly one of these.
+        let mut case_arm: HashMap<(ItemId, usize), usize> = HashMap::new();
+        let mut wildcard_arm: Option<usize> = None;
+        for (i, arm) in arms.iter().enumerate() {
+            match &arm.kind {
+                HirHandleArmKind::Failure(HirFailurePattern::Case {
+                    variant: Some(v),
+                    case: Some(c),
+                    ..
+                }) => {
+                    case_arm.entry((*v, *c)).or_insert(i);
+                }
+                HirHandleArmKind::Failure(HirFailurePattern::Wildcard { .. })
+                    if wildcard_arm.is_none() =>
+                {
+                    wildcard_arm = Some(i);
+                }
+                _ => {}
+            }
+        }
+
+        // Each failure arm's own block, built (and immediately lowered)
+        // the first time any case reaches it -- a later case reaching
+        // the very same arm just reuses the block already recorded here.
+        let mut arm_blocks: HashMap<usize, BlockId> = HashMap::new();
+
+        for (variant, err_slot, dispatch_block) in err_blocks {
+            let Some(layout) = self.variants.get(&variant) else {
+                return Err(self.internal_error("`handle` dispatches an unknown raised variant"));
+            };
+            let variant_name = layout.name;
+            // Cloned out from under `layout` up front, so the borrow
+            // doesn't linger into the loop below (which needs `&mut
+            // self` to bind patterns and lower each arm's body).
+            let case_payload_tys: Vec<Vec<Ty>> =
+                layout.cases.iter().map(|c| c.payload.clone()).collect();
+            let num_cases = case_payload_tys.len();
+            fb.switch_to(dispatch_block);
+            let loaded = fb.push_value(Ty::Named(variant, variant_name), ValueKind::Load(err_slot));
+
+            let mut case_targets = Vec::with_capacity(num_cases);
+            for (case_index, payload_tys) in case_payload_tys.iter().enumerate() {
+                let Some(&arm_index) = case_arm
+                    .get(&(variant, case_index))
+                    .or(wildcard_arm.as_ref())
+                else {
+                    return Err(self.internal_error(&format!(
+                        "`handle` has no covering arm for case {case_index} of a raised variant; typeck should have already rejected this as non-exhaustive"
+                    )));
+                };
+                if let Some(&block) = arm_blocks.get(&arm_index) {
+                    case_targets.push(block);
+                    continue;
+                }
+                let block = fb.new_block();
+                arm_blocks.insert(arm_index, block);
+                case_targets.push(block);
+
+                fb.switch_to(block);
+                let HirHandleArmKind::Failure(pattern) = &arms[arm_index].kind else {
+                    return Err(self.internal_error(
+                        "`handle`'s failure dispatch resolved to a non-failure arm",
+                    ));
+                };
+                if let HirFailurePattern::Case { args: payload, .. } = pattern {
+                    if payload.len() != payload_tys.len() {
+                        return Err(self.internal_error(&format!(
+                            "failure pattern for case {case_index} of a raised variant has {} sub-pattern(s), expected {}",
+                            payload.len(),
+                            payload_tys.len()
+                        )));
+                    }
+                    for (i, (pat, ty)) in payload.iter().zip(payload_tys.iter()).enumerate() {
+                        let v = fb.push_value(
+                            ty.clone(),
+                            ValueKind::VariantPayload {
+                                base: loaded,
+                                variant,
+                                case: case_index,
+                                index: i,
+                            },
+                        );
+                        self.bind_arm_pattern(fb, pat, v)?;
+                    }
+                }
+                self.lower_arm_body(fb, &arms[arm_index].body, merge)?;
+                fb.switch_to(dispatch_block);
+            }
+            fb.terminate(Terminator::Switch {
+                scrutinee: loaded,
+                variant,
+                cases: case_targets,
+            });
+        }
+
+        fb.switch_to(ok_target);
+        let ok_value = fb.push_value(ok_ty, ValueKind::Load(ok_slot));
+        let Some(success_arm) = arms
+            .iter()
+            .find(|a| matches!(a.kind, HirHandleArmKind::Success(_)))
+        else {
+            return Err(self.internal_error(
+                "`handle` has no success arm; typeck should have already rejected this",
+            ));
+        };
+        let HirHandleArmKind::Success(pattern) = &success_arm.kind else {
+            unreachable!("just matched Success above");
+        };
+        self.bind_arm_pattern(fb, pattern, ok_value)?;
+        self.lower_arm_body(fb, &success_arm.body, merge)?;
+
+        match merge {
+            Some((slot, after)) => {
+                fb.switch_to(after);
+                Ok(LoweredExpr::Value(
+                    fb.push_value(result_ty, ValueKind::Load(slot)),
+                ))
+            }
+            None => Ok(LoweredExpr::Diverged),
+        }
+    }
+
+    /// Binds a `success`/failure-payload pattern -- always a bare `Bind`
+    /// or `Wildcard` once resolved (`typeck` rejects anything else) -- to
+    /// an already-computed value.
+    fn bind_arm_pattern(
+        &mut self,
+        fb: &mut FnBuilder,
+        pattern: &HirPattern,
+        value: ValueId,
+    ) -> LowerResult<()> {
+        match pattern {
+            HirPattern::Bind { local, .. } => {
+                fb.local_bindings
+                    .insert(*local, LocalBinding::Direct(value));
+                Ok(())
+            }
+            HirPattern::Wildcard { .. } => Ok(()),
+            other => Err(self.internal_error(&format!(
+                "a `handle` arm's pattern other than a bare bind or wildcard reached lowering: {other:?}"
+            ))),
+        }
+    }
+
+    /// Lowers one `handle` arm's body, storing its value into `merge`'s
+    /// slot and branching to its block -- exactly `lower_decision`'s own
+    /// tail behavior for an ordinary `match` arm. Does nothing further
+    /// when the body diverged on its own (it already terminated its
+    /// block itself).
+    fn lower_arm_body(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        let result = match body {
+            HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
+            HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+        };
+        if let LoweredExpr::Value(v) = result
+            && let Some((slot, after)) = merge
+        {
+            fb.push_store(slot, v);
+            fb.terminate(Terminator::Branch(after));
+        }
+        Ok(())
     }
 
     /// Lowers an explicit protocol-call expression,
@@ -3963,6 +4348,7 @@ mod tests {
             call_evidence: Box::leak(Box::new(HashMap::new())),
             protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
             function_requirements: HashMap::new(),
+            function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
         }
     }
@@ -3996,6 +4382,7 @@ mod tests {
             call_evidence: Box::leak(Box::new(HashMap::new())),
             protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
             function_requirements: HashMap::new(),
+            function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
         }
     }
@@ -4840,8 +5227,15 @@ mod tests {
     }
 
     #[test]
-    fn postfix_try_fails_lowering_instead_of_forwarding_the_inner_value() {
-        assert_fails_with_i0001("func f(x: i64) -> i64 { return x? }", "?");
+    fn postfix_try_on_a_non_call_operand_fails_lowering_instead_of_forwarding_the_inner_value() {
+        // typeck's own TRY_ON_INFALLIBLE already rejects `?` on anything
+        // but a direct call to a fallible function; a caller that lowers
+        // past that gate anyway must not have `?` silently become a
+        // no-op forwarding `x` unchanged.
+        assert_fails_with_i0002(
+            "func f(x: i64) -> i64 { return x? }",
+            "not a direct call to a fallible function",
+        );
     }
 
     #[test]

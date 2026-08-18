@@ -213,6 +213,14 @@ mod codes {
     /// never declared, or a `method` index out of range for that
     /// protocol's declared method list.
     pub const UNKNOWN_PROTOCOL_CALL_TARGET: &str = "V0057";
+    /// An extend's method function does not declare exactly its own
+    /// extend's `uses` requirements, in the same declared order.
+    /// `ProtocolCall` passes an extension's own `nested` evidence
+    /// straight to its implementing function as that function's own
+    /// evidence; a mismatch here would let otherwise-valid-looking NIR
+    /// pass every other extend/method check and still fail (or silently
+    /// misdispatch) only once actually interpreted.
+    pub const EXTEND_METHOD_REQUIREMENTS_MISMATCH: &str = "V0058";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -623,6 +631,27 @@ pub fn verify_module(
                     Span::dummy(),
                     format!(
                         "{context}'s method[{index}] ({}) does not share its own extend's type-parameter scope",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            // `ProtocolCall` passes an extension's own `nested` evidence
+            // straight to its implementing function as that function's
+            // evidence (`interpreter::ValueKind::ProtocolCall`), and
+            // `Interpreter::call_function` validates that evidence
+            // against the callee's own declared `Function::requirements`
+            // -- so an implementing function's own requirements must be
+            // exactly its extend's own `requirements`, in the same
+            // declared order, or a well-formed extend could still fail
+            // at runtime (or worse, silently accept mismatched evidence)
+            // despite passing every other check above.
+            if implementing.requirements != extend.requirements {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) does not declare exactly its own extend's `uses` requirements, in the same order",
                         registry.qualified_name(*method_id, interner)
                     ),
                 ));
@@ -5394,6 +5423,103 @@ mod tests {
             &interner,
         );
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_EXTEND_METHOD_REFERENCE));
+    }
+
+    // -- Fix 2 (0.1.5 follow-up): an extend method's own `requirements`
+    //    must be exactly its owning extend's `requirements`, in order --
+
+    #[test]
+    fn an_extend_method_with_a_different_requirement_count_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_the_same_count_but_a_different_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(ItemId(999), vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_the_same_protocol_but_different_arguments_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::Bool])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_requirements_in_a_different_order_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let other_protocol_id = ItemId(21);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![
+            CapabilityRequirement::new(protocol_id, vec![Ty::I64]),
+            CapabilityRequirement::new(other_protocol_id, vec![Ty::Bool]),
+        ];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![
+            CapabilityRequirement::new(other_protocol_id, vec![Ty::Bool]),
+            CapabilityRequirement::new(protocol_id, vec![Ty::I64]),
+        ];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH));
+    }
+
+    #[test]
+    fn an_extend_method_with_exactly_matching_requirements_is_accepted() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let mut method = equal_i64_method(&mut interner);
+        method.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_REQUIREMENTS_MISMATCH),
+            "{diagnostics:?}"
+        );
     }
 
     // -- Fix 3: ordinary `Call` evidence validation (`rfcs/0009`) -------

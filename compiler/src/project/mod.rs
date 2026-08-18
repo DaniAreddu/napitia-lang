@@ -185,6 +185,15 @@ pub fn compile_project(
         merged.functions.extend(module_hir.functions);
         merged.records.extend(module_hir.records);
         merged.variants.extend(module_hir.variants);
+        // Every protocol declared anywhere in the project, and every
+        // extend anywhere in the project -- coherence (authority,
+        // overlap) and requirement resolution are project-wide concerns
+        // (`rfcs/0009`), not scoped to one module, so `typeck` must see
+        // every one of them merged together the same deterministic,
+        // dependency-first order every other item kind already is,
+        // never a HashMap's.
+        merged.protocols.extend(module_hir.protocols);
+        merged.extends.extend(module_hir.extends);
         merged.other_items.extend(module_hir.other_items);
     }
     let entry_source = entry_source.expect("the entry module is always among loaded.modules");
@@ -1461,5 +1470,239 @@ mod tests {
             diags[0].message,
             "`Shared` is a case of variants `Figure`, `Second`, not `Target`"
         );
+    }
+
+    // -- Fix 1 / Fix 2: cross-module protocols, extends, and calls --
+
+    /// Protocol declared in one module, extend declared in a *different*
+    /// module (authorized through the aggregate it extends, not the
+    /// protocol itself), call made from the entry module -- every stage
+    /// (load, import resolution, HIR merge, typeck, NIR, verifier,
+    /// interpreter) must see the whole picture, not just the module it
+    /// happened to be declared in.
+    #[test]
+    fn cross_module_protocol_and_extend_compile_and_run() {
+        let project = TempProject::new("cross_module_protocol");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n",
+        );
+        project.write(
+            "src/shapes.npt",
+            "import protocols.Equal;\n\
+             public record Point { public x: i64 }\n\
+             extend Equal[Point] {\n    func equal(left: Point, right: Point) -> bool {\n        return left.x == right.x\n    }\n}\n",
+        );
+        project.write(
+            "src/main.npt",
+            "import protocols.Equal;\n\
+             import shapes.Point;\n\
+             func main() -> bool {\n    \
+                 value a = Point { x: 1 };\n    \
+                 value b = Point { x: 1 };\n    \
+                 return Equal[Point].equal(a, b)\n\
+             }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Bool(true)));
+    }
+
+    #[test]
+    fn cross_module_protocol_call_through_an_import_alias_resolves() {
+        let project = TempProject::new("cross_module_alias");
+        project.write("napitia.toml", MANIFEST);
+        // The extend lives in protocols.npt, the protocol's own module --
+        // a primitive first type argument (i64) has no declaring module
+        // of its own to lend authority, so only the protocol-owning
+        // module may extend it (`rfcs/0009`).
+        project.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n\
+             extend Equal[i64] {\n    func equal(left: i64, right: i64) -> bool {\n        return left == right\n    }\n}\n",
+        );
+        project.write(
+            "src/main.npt",
+            "import protocols.Equal as Eq;\n\
+             func main() -> bool {\n    return Eq[i64].equal(1, 1)\n}\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Bool(true)));
+    }
+
+    #[test]
+    fn importing_a_private_protocol_across_modules_is_rejected() {
+        let project = TempProject::new("private_protocol");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/protocols.npt",
+            "protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n",
+        );
+        project.write(
+            "src/main.npt",
+            "import protocols.Equal;\n\
+             func main() -> i64 { return 0 }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0006");
+    }
+
+    #[test]
+    fn calling_an_unknown_method_on_an_imported_protocol_is_r0024() {
+        let project = TempProject::new("unknown_imported_method");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n",
+        );
+        project.write(
+            "src/main.npt",
+            "import protocols.Equal;\n\
+             func main() -> bool { return Equal[i64].nope(1, 1) }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.code == "R0024"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_aliases_of_the_same_imported_protocol_do_not_create_duplicate_identities() {
+        // Two different local names for the *same* imported protocol
+        // (Equal, and Eq) are not a collision at all (that only applies
+        // to two imports introducing the *same* local name) -- the real
+        // requirement is that calling through either alias resolves to
+        // the exact same canonical protocol identity, never two
+        // independent ones that could (for instance) falsely overlap
+        // with each other or double-count as two separate extends.
+        let project = TempProject::new("two_protocol_aliases");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n\
+             extend Equal[i64] {\n    func equal(left: i64, right: i64) -> bool {\n        return left == right\n    }\n}\n",
+        );
+        project.write(
+            "src/main.npt",
+            "import protocols.Equal;\n\
+             import protocols.Equal as Eq;\n\
+             func main() -> bool {\n    return Equal[i64].equal(1, 1) == Eq[i64].equal(1, 1)\n}\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let result = Interpreter::new(&compiled.nir).run_item(compiled.entry_item);
+        assert_eq!(result, Ok(crate::interpreter::Value::Bool(true)));
+    }
+
+    /// Reverse import order (`Point` before `Equal` instead of after)
+    /// must produce byte-identical NIR and an identical run result --
+    /// resolution must never depend on declaration/import order.
+    #[test]
+    fn reverse_import_order_produces_identical_nir_and_result() {
+        let forward = TempProject::new("import_order_forward");
+        forward.write("napitia.toml", MANIFEST);
+        forward.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n",
+        );
+        forward.write(
+            "src/shapes.npt",
+            "import protocols.Equal;\n\
+             public record Point { public x: i64 }\n\
+             extend Equal[Point] {\n    func equal(left: Point, right: Point) -> bool {\n        return left.x == right.x\n    }\n}\n",
+        );
+        forward.write(
+            "src/main.npt",
+            "import protocols.Equal;\n\
+             import shapes.Point;\n\
+             func main() -> bool {\n    \
+                 value a = Point { x: 3 };\n    \
+                 value b = Point { x: 3 };\n    \
+                 return Equal[Point].equal(a, b)\n\
+             }\n",
+        );
+
+        let reversed = TempProject::new("import_order_reversed");
+        reversed.write("napitia.toml", MANIFEST);
+        reversed.write(
+            "src/protocols.npt",
+            "public protocol Equal[T] {\n    func equal(left: T, right: T) -> bool;\n}\n",
+        );
+        reversed.write(
+            "src/shapes.npt",
+            "import protocols.Equal;\n\
+             public record Point { public x: i64 }\n\
+             extend Equal[Point] {\n    func equal(left: Point, right: Point) -> bool {\n        return left.x == right.x\n    }\n}\n",
+        );
+        reversed.write(
+            "src/main.npt",
+            "import shapes.Point;\n\
+             import protocols.Equal;\n\
+             func main() -> bool {\n    \
+                 value a = Point { x: 3 };\n    \
+                 value b = Point { x: 3 };\n    \
+                 return Equal[Point].equal(a, b)\n\
+             }\n",
+        );
+
+        let mut forward_map = SourceMap::new();
+        let mut forward_interner = Interner::new();
+        let forward_compiled = compile_project(
+            &forward.manifest_path(),
+            &mut forward_map,
+            &mut forward_interner,
+        )
+        .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+        let mut reversed_map = SourceMap::new();
+        let mut reversed_interner = Interner::new();
+        let reversed_compiled = compile_project(
+            &reversed.manifest_path(),
+            &mut reversed_map,
+            &mut reversed_interner,
+        )
+        .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+
+        let forward_text = crate::nir::print_module(
+            &forward_compiled.nir,
+            &forward_interner,
+            &forward_compiled.registry,
+        );
+        let reversed_text = crate::nir::print_module(
+            &reversed_compiled.nir,
+            &reversed_interner,
+            &reversed_compiled.registry,
+        );
+        assert_eq!(
+            forward_text, reversed_text,
+            "import order must never change printed NIR"
+        );
+
+        let forward_result =
+            Interpreter::new(&forward_compiled.nir).run_item(forward_compiled.entry_item);
+        let reversed_result =
+            Interpreter::new(&reversed_compiled.nir).run_item(reversed_compiled.entry_item);
+        assert_eq!(forward_result, reversed_result);
+        assert_eq!(forward_result, Ok(crate::interpreter::Value::Bool(true)));
     }
 }

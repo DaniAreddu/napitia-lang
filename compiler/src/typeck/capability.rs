@@ -480,8 +480,17 @@ impl<'a> Checker<'a> {
                             "this extension can match the same concrete requirement as another extension; there is no specialization in Alpha 0.1.5",
                         )
                     };
+                    // `y.source`/`y.span`, never `self.source`: by the
+                    // time this runs (after every extend in `accepted`
+                    // has already been registered), `self.source` is
+                    // whichever extend's own registration happened to
+                    // run last -- unrelated to either `x` or `y` -- so
+                    // using it here would silently render this
+                    // diagnostic against the wrong file whenever that
+                    // last-registered extend differs from `y`'s own
+                    // module (`rfcs/0009`).
                     self.diagnostics.push(
-                        Diagnostic::error(code, self.source, y.span, message)
+                        Diagnostic::error(code, y.source, y.span, message)
                             .with_primary_label("overlapping extension")
                             .with_label_in(x.source, x.span, "first extension declared here"),
                     );
@@ -788,14 +797,22 @@ fn match_one(
     }
 }
 
-/// Whether two extend heads (each with its own free type parameters)
-/// *could* ever match the same concrete requirement -- a symmetric
-/// structural unification where either side's own parameter may bind to
-/// anything the other side offers at that position. Conservative by
-/// design: this is a "could these ever collide" check, not an attempt to
-/// enumerate every concrete program that would actually call both, which
-/// is exactly how coherence checking must work to be sound (`rfcs/0009`
-/// has no specialization to fall back on if it guessed wrong).
+/// Whether two extend heads (each with its own free type parameters,
+/// disjoint from the other's -- `TypeParamId`s are never shared across
+/// declarations) *could* ever match the same concrete requirement: a
+/// real, sound structural unification, not a "bind once and then compare
+/// by equality" approximation. Conservative by design -- this is a
+/// "could these ever collide" check, not an attempt to enumerate every
+/// concrete program that would actually call both, which is exactly how
+/// coherence checking must work to be sound (`rfcs/0009` has no
+/// specialization to fall back on if it guessed wrong).
+///
+/// Since every `TypeParamId` is globally unique (`rfcs/0008`), both
+/// sides' own free parameters can share one substitution map with no
+/// risk of collision -- there is no need for two separate namespaces or
+/// a rename pass first. `unify_head_args` is the same one-directional
+/// matcher `match_extend_head` uses for a concrete requirement, seen
+/// from the general case where *both* sides may still be symbolic.
 fn heads_can_overlap(
     a_args: &[Ty],
     a_params: &std::collections::HashSet<TypeParamId>,
@@ -805,56 +822,271 @@ fn heads_can_overlap(
     if a_args.len() != b_args.len() {
         return false;
     }
-    let mut a_subst = HashMap::new();
-    let mut b_subst = HashMap::new();
+    let free: std::collections::HashSet<TypeParamId> = a_params.union(b_params).copied().collect();
+    let mut subst = HashMap::new();
     a_args
         .iter()
         .zip(b_args.iter())
-        .all(|(a, b)| unify_heads(a, b, a_params, b_params, &mut a_subst, &mut b_subst, 0))
+        .all(|(a, b)| unify_head_args(&mut subst, &free, a, b, 0))
 }
 
-fn unify_heads(
+/// Follows `ty` through `subst`'s own chain of bindings until it reaches
+/// either a concrete (non-`Ty::Param`) type or a still-unbound free
+/// variable -- the same one-hop-at-a-time resolution
+/// `typeck::context::TypeContext::resolve` performs for ordinary
+/// inference variables, applied here to this unifier's own map instead.
+/// Bounded by the map's own size (a real substitution chain can never be
+/// longer than the number of variables it binds) so a malformed chain
+/// degrades to returning the last-seen type rather than looping forever.
+fn resolve_head(subst: &HashMap<TypeParamId, Ty>, ty: &Ty) -> Ty {
+    let mut current = ty.clone();
+    for _ in 0..=subst.len() {
+        let Ty::Param(id, _) = &current else {
+            return current;
+        };
+        match subst.get(id) {
+            Some(next) => current = next.clone(),
+            None => return current,
+        }
+    }
+    current
+}
+
+/// Whether `var` occurs anywhere inside `ty` (after resolving through
+/// `subst`) -- checked before every new binding, so this unifier can
+/// never construct an infinite/self-referential substitution the way a
+/// naive "just insert the binding" approach could (`extend[T] P[T]`
+/// unified against a hypothetical `extend[U] P[Box[U]]` `U`-side
+/// re-entry). Depth-bounded by [`MAX_GENERIC_DEPTH`]; past the bound,
+/// conservatively treated as occurring (rejects the unification rather
+/// than risk an unbounded walk).
+fn occurs_in_head(
+    subst: &HashMap<TypeParamId, Ty>,
+    var: TypeParamId,
+    ty: &Ty,
+    free: &std::collections::HashSet<TypeParamId>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match resolve_head(subst, ty) {
+        Ty::Param(id, _) if free.contains(&id) => id == var,
+        Ty::Applied(_, args) => args
+            .iter()
+            .any(|a| occurs_in_head(subst, var, a, free, depth + 1)),
+        _ => false,
+    }
+}
+
+/// The real unifier: resolves both sides through `subst` first, then
+/// either binds a still-free variable (occurs-checked) or requires the
+/// same nominal head with recursively-unifiable arguments. `subst` is
+/// shared and mutated across every argument position `heads_can_overlap`
+/// unifies, so a variable bound at one position is correctly chased at
+/// every later position that mentions it again -- the transitive
+/// chasing the previous, unsound implementation never did.
+fn unify_head_args(
+    subst: &mut HashMap<TypeParamId, Ty>,
+    free: &std::collections::HashSet<TypeParamId>,
     a: &Ty,
     b: &Ty,
-    a_params: &std::collections::HashSet<TypeParamId>,
-    b_params: &std::collections::HashSet<TypeParamId>,
-    a_subst: &mut HashMap<TypeParamId, Ty>,
-    b_subst: &mut HashMap<TypeParamId, Ty>,
     depth: usize,
 ) -> bool {
     if depth > MAX_GENERIC_DEPTH {
         return false;
     }
-    if let Ty::Param(id, _) = a
-        && a_params.contains(id)
-    {
-        return match a_subst.get(id) {
-            Some(existing) => existing == b,
-            None => {
-                a_subst.insert(*id, b.clone());
-                true
+    let ra = resolve_head(subst, a);
+    let rb = resolve_head(subst, b);
+    match (&ra, &rb) {
+        (Ty::Param(ia, _), Ty::Param(ib, _)) if free.contains(ia) && free.contains(ib) => {
+            if ia == ib {
+                return true;
             }
-        };
-    }
-    if let Ty::Param(id, _) = b
-        && b_params.contains(id)
-    {
-        return match b_subst.get(id) {
-            Some(existing) => existing == a,
-            None => {
-                b_subst.insert(*id, a.clone());
-                true
-            }
-        };
-    }
-    match (a, b) {
-        (Ty::Applied(ia, aargs), Ty::Applied(ib, bargs)) => {
-            ia == ib
-                && aargs.len() == bargs.len()
-                && aargs.iter().zip(bargs.iter()).all(|(x, y)| {
-                    unify_heads(x, y, a_params, b_params, a_subst, b_subst, depth + 1)
-                })
+            subst.insert(*ia, rb);
+            true
         }
-        _ => a == b,
+        (Ty::Param(ia, _), _) if free.contains(ia) => {
+            if occurs_in_head(subst, *ia, &rb, free, depth + 1) {
+                return false;
+            }
+            subst.insert(*ia, rb);
+            true
+        }
+        (_, Ty::Param(ib, _)) if free.contains(ib) => {
+            if occurs_in_head(subst, *ib, &ra, free, depth + 1) {
+                return false;
+            }
+            subst.insert(*ib, ra);
+            true
+        }
+        (Ty::Applied(pa, aargs), Ty::Applied(pb, bargs)) => {
+            pa == pb
+                && aargs.len() == bargs.len()
+                && aargs
+                    .iter()
+                    .zip(bargs.iter())
+                    .all(|(x, y)| unify_head_args(subst, free, x, y, depth + 1))
+        }
+        _ => ra == rb,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::symbol::Symbol;
+    use std::collections::HashSet;
+
+    fn param(id: u32) -> Ty {
+        Ty::Param(TypeParamId(id), Symbol(0))
+    }
+
+    fn boxed(item: u32, args: Vec<Ty>) -> Ty {
+        Ty::Applied(ItemId(item), args)
+    }
+
+    fn params(ids: &[u32]) -> HashSet<TypeParamId> {
+        ids.iter().map(|i| TypeParamId(*i)).collect()
+    }
+
+    /// The Fix 4 regression: `extend[T] P[T, T]` and `extend[U] P[U,
+    /// i64]` both cover the concrete instantiation `P[i64, i64]`, but
+    /// the previous "bind once, then compare by direct equality"
+    /// implementation missed it -- binding `T := U` at position 0, then
+    /// requiring `U == i64` (a literal term, not a chased resolution) at
+    /// position 1, which is never true even though `U` itself could
+    /// still become `i64`.
+    #[test]
+    fn detects_the_transitive_overlap_regression() {
+        let a_args = vec![param(0), param(0)]; // P[T, T]
+        let b_args = vec![param(1), Ty::I64]; // P[U, i64]
+        assert!(heads_can_overlap(
+            &a_args,
+            &params(&[0]),
+            &b_args,
+            &params(&[1])
+        ));
+    }
+
+    #[test]
+    fn reversed_argument_order_still_detects_the_same_overlap() {
+        let a_args = vec![Ty::I64, param(1)]; // P[i64, U]
+        let b_args = vec![param(0), param(0)]; // P[T, T]
+        assert!(heads_can_overlap(
+            &a_args,
+            &params(&[1]),
+            &b_args,
+            &params(&[0])
+        ));
+    }
+
+    #[test]
+    fn a_fully_generic_head_overlaps_with_every_other_head() {
+        let a_args = vec![param(0), param(0)]; // P[T, T]
+        let b_args = vec![param(1), param(2)]; // P[U, V] (fully free)
+        assert!(heads_can_overlap(
+            &a_args,
+            &params(&[0]),
+            &b_args,
+            &params(&[1, 2])
+        ));
+    }
+
+    #[test]
+    fn nested_applications_overlap_when_their_arguments_can_unify() {
+        // Q[Box[T]] vs Q[Box[i64]] -- overlap at T = i64.
+        let a_args = vec![boxed(100, vec![param(0)])];
+        let b_args = vec![boxed(100, vec![Ty::I64])];
+        assert!(heads_can_overlap(
+            &a_args,
+            &params(&[0]),
+            &b_args,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn different_nominal_heads_never_overlap() {
+        // Q[Box[T]] vs Q[Wrapper[T]] -- same argument shape, different
+        // declaration identity, can never be the same concrete type.
+        let a_args = vec![boxed(100, vec![param(0)])];
+        let b_args = vec![boxed(101, vec![param(1)])];
+        assert!(!heads_can_overlap(
+            &a_args,
+            &params(&[0]),
+            &b_args,
+            &params(&[1])
+        ));
+    }
+
+    #[test]
+    fn concrete_heads_with_different_arguments_never_overlap() {
+        let a_args = vec![Ty::I64, Ty::I64];
+        let b_args = vec![Ty::Bool, Ty::Bool];
+        assert!(!heads_can_overlap(
+            &a_args,
+            &HashSet::new(),
+            &b_args,
+            &HashSet::new()
+        ));
+    }
+
+    /// `R[T, Box[T]]` vs `R[Box[U], U]` would require `T = Box[U]` and
+    /// simultaneously `U = Box[T]` -- an infinite type. The occurs check
+    /// must reject this, not loop forever trying to satisfy it.
+    #[test]
+    fn occurs_check_rejects_a_self_referential_unification() {
+        let a_args = vec![param(0), boxed(100, vec![param(0)])]; // R[T, Box[T]]
+        let b_args = vec![boxed(100, vec![param(1)]), param(1)]; // R[Box[U], U]
+        assert!(!heads_can_overlap(
+            &a_args,
+            &params(&[0]),
+            &b_args,
+            &params(&[1])
+        ));
+    }
+
+    #[test]
+    fn exact_duplicate_concrete_heads_overlap() {
+        let a_args = vec![Ty::I64];
+        let b_args = vec![Ty::I64];
+        assert!(heads_can_overlap(
+            &a_args,
+            &HashSet::new(),
+            &b_args,
+            &HashSet::new()
+        ));
+    }
+
+    /// A pathologically deep, but still finite, pair of matching nested
+    /// applications must resolve (or fail) without overflowing the
+    /// native stack -- bounded by `MAX_GENERIC_DEPTH`, the same as every
+    /// other stage that walks a nested type application.
+    #[test]
+    fn deeply_nested_matching_heads_do_not_overflow_the_stack() {
+        let depth = MAX_GENERIC_DEPTH + 50;
+        let mut a = param(0);
+        let mut b = Ty::I64;
+        for _ in 0..depth {
+            a = boxed(100, vec![a]);
+            b = boxed(100, vec![b]);
+        }
+        // Not asserting the outcome itself -- only that this returns at
+        // all rather than hanging or crashing.
+        let _ = heads_can_overlap(&[a], &params(&[0]), &[b], &HashSet::new());
+    }
+
+    #[test]
+    fn deeply_nested_non_matching_heads_do_not_overflow_the_stack() {
+        let depth = MAX_GENERIC_DEPTH + 50;
+        let mut a = Ty::I64;
+        let mut b = Ty::Bool;
+        for _ in 0..depth {
+            a = boxed(100, vec![a]);
+            b = boxed(100, vec![b]);
+        }
+        let result = heads_can_overlap(&[a], &HashSet::new(), &[b], &HashSet::new());
+        assert!(!result, "different leaves at every depth can never overlap");
     }
 }

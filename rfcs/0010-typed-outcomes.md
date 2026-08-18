@@ -31,7 +31,7 @@ func load(path: str) -> str raises FileError {
 
 func main() -> str {
     return handle read_config("config.npt") {
-        success value => value,
+        success text => text,
         failure FileError.Missing => "default",
         failure FileError.PermissionDenied => "denied"
     }
@@ -196,21 +196,18 @@ never implicitly catch a `return` from one of its own sibling branches.
 
 ## Protocol and capability interaction
 
-A protocol method's own signature may declare a `raises` clause exactly
-like an ordinary function's. An implementing extend method may raise the
-protocol-declared set or any subset of it (narrowing is always sound;
-widening is not) — introducing an effect the protocol method never
-declared is rejected the same way an incompatible ordinary signature
-already is (`rfcs/0009`'s own `EXTENSION_SIGNATURE_MISMATCH`
-precedent). A `protocol.call` through resolved capability evidence is
-checked against the *protocol's own* declared effect set (the
-call site's own visible contract), never the specific implementation's
-possibly-narrower one — exactly how it already only ever sees the
-protocol's own declared ordinary signature, never an implementation
-detail. `uses` (capability requirements) and `raises` (typed failure)
-remain fully independent concepts: a function may declare either, both,
-or neither, and `?`/`handle` compose with capability-forwarding exactly
-as they compose with an ordinary call.
+`uses` (capability requirements) and `raises` (typed failure) are fully
+independent concepts: an ordinary function may declare either, both, or
+neither, and `?`/`handle` compose with capability-forwarding exactly as
+they compose with an ordinary call to a fallible function.
+
+A protocol method's own signature declaring `raises`, an implementing
+extend method narrowing it, and a `protocol.call` site's effects being
+checked against the protocol's own declared set rather than a specific
+implementation's are all deliberately **not** part of this milestone --
+see "Honest limitations" below. `postfix ?`/`raise`/`handle` are only
+ever checked and lowered against a direct call to a named ordinary
+function in Alpha 0.1.6.
 
 ## NIR
 
@@ -220,32 +217,41 @@ value representation:
 - Every `Function` carries its own resolved `raises: Vec<ItemId>` (the
   canonical effect set, deduplicated, in a fixed deterministic order —
   declaration order, never a `HashMap`'s).
-- `Terminator::Invoke { callee, type_args, args, evidence, success, ok_slot,
-  ok_target, err_target }` replaces `Call` as a *terminator* (not an
+- `Terminator::Invoke { callee, type_args, args, evidence, ok_slot,
+  ok_target, err_targets }` replaces `Call` as a *terminator* (not an
   ordinary value-producing instruction) for any call to a fallible
-  function: the success value is stored into `ok_slot` on the `ok_target`
-  edge; the raised value (with its own nominal variant identity) is
-  transferred to `err_target` for that edge's own consumer to read. An
-  ordinary, already-existing `ValueKind::Call` remains exactly what it
-  always was — reachable only for a callee whose own `raises` is empty;
-  a fallible callee reached through it is rejected by the verifier, never
+  function: the success value is stored into `ok_slot` on the
+  `ok_target` edge; a raised value (already an ordinary variant value,
+  built the same way any other `variant.create` is) is stored into
+  whichever `err_targets` entry's own `variant` matches it, and control
+  continues at that entry's own `target` block — exactly one entry per
+  effect the callee's own `raises` declares. An ordinary,
+  already-existing `ValueKind::Call` remains exactly what it always
+  was — reachable only for a callee whose own `raises` is empty; a
+  fallible callee reached through it is rejected by the verifier, never
   silently accepted.
-- `Terminator::Raise { variant, case, args, source_ty }` is the terminator
-  a `raise` expression's own block ends with — no successor edge at all
-  (it always transfers control to whatever `err_target` the *caller's*
-  own `Invoke` names, resolved by the interpreter's own call-frame
-  return path, exactly like `Terminator::Return` already resolves to
-  wherever the caller's own call site continues).
-- `?` lowers to an `Invoke` whose `err_target` is a fresh block that
-  itself ends in `Terminator::Raise` re-raising the exact received value
-  — explicit forwarding, never a no-op.
-- `handle` lowers to an `Invoke` whose `err_target` is a dispatch block:
-  a `switch`-shaped decision over the raised value's own nominal
-  variant/case (reusing the existing `Terminator::Switch` shape per
-  raised type, chained across however many distinct raised types are in
-  play), each case extracting its own payload via the existing
-  `variant.payload` instruction and joining into the handler's own shared
-  result slot exactly like `match`'s arms already do.
+- `Terminator::Raise { value }` is the terminator a `raise` expression's
+  own block ends with — no successor edge at all (it always transfers
+  control to whatever `Invoke` in the *caller's* own frame is waiting on
+  it, resolved by the interpreter's own call-frame return path, exactly
+  like `Terminator::Return` already resolves to wherever the caller's
+  own call site continues). `value` is already a complete variant value
+  (built by `variant.create` for a direct `raise`, or simply the value
+  already loaded from an `Invoke`'s own failure slot when `?` forwards
+  one unchanged) — there is no separate variant/case/payload field here.
+- `?` lowers to an `Invoke` whose every failure target is a fresh block
+  that loads its own slot and ends in `Terminator::Raise` re-raising the
+  exact received value — explicit forwarding, never a no-op.
+- `handle` lowers to an `Invoke` whose every failure target is a
+  dispatch block: a `switch`-shaped decision over the raised value's own
+  nominal variant/case (reusing the existing `Terminator::Switch` shape
+  per raised type), each case extracting its own payload via the
+  existing `variant.payload` instruction and joining into the handler's
+  own shared result slot exactly like `match`'s arms already do — a
+  `failure` arm covering more than one case (a trailing wildcard) is
+  lowered exactly once, in a block shared by every case it covers,
+  mirroring how `match`'s own wildcard arm reuses one target across
+  several `Switch` cases.
 - A fully-diverging `raise`/`handle` allocates no result slot, mirroring
   `if`/`match`'s own existing discipline for a fully-diverging join.
 - Lowering the whole module remains atomic: either every function lowers
@@ -258,29 +264,35 @@ Independently re-checks, exactly as skeptically as every other construct
 this verifier already distrusts hand-built NIR for: a function's own
 `raises` list references only real, distinct variant `ItemId`s; an
 ordinary `Call` never targets a fallible function; an `Invoke` never
-targets an infallible one; `Invoke`'s success/failure targets exist, its
-success slot's declared type matches the callee's own return type, and
+targets an infallible one; `Invoke`'s success/failure slots are
+allocated and correctly typed, its `err_targets` cover exactly the
+callee's own declared `raises` set with no duplicate or unknown variant,
 its evidence/type-argument/argument checks reuse exactly the same checks
-`Call` already has; `Raise`'s own variant/case reference a real
-declaration and the current function's own `raises` set, with argument
-types matching that case's declared payload; every `Invoke`/`Raise`
-respects slot dominance and terminator-only placement (no instruction
-ever follows one in the same block). One diagnostic per malformed
-root, never one per nested level, bounded by the same generic-depth
-budget every other recursive check already shares.
+`Call` already has, and every branch target exists; `Raise`'s own value
+is one of the current function's own declared `raises` types; every
+`Invoke`/`Raise` respects slot dominance and terminator-only placement
+(no instruction ever follows one in the same block). One diagnostic per
+malformed root, never one per nested level, bounded by the same
+generic-depth budget every other recursive check already shares.
 
 ## Interpreter
 
-A call's outcome is one of two explicit variants — conceptually
-`Returned(Value)` or `Raised(variant, case, payload)` — never a Rust
-panic/unwind. `Invoke` dispatches on this outcome directly: `Returned`
-continues at `ok_target` with the value stored in `ok_slot`; `Raised`
-continues at `err_target` with the raised identity available to whatever
-`switch`-shaped dispatch (from `handle`) or re-raise (from `?`) that
-target contains. `Terminator::Raise` itself simply *produces* `Raised`
-and returns it up to whichever frame's own `Invoke` is waiting — call
-arity, evidence count, and effect metadata are all validated the same
-way an ordinary call's already are, before the callee's body ever runs.
+A call's outcome is one of two explicit variants, internal to the
+interpreter — conceptually `Returned(Value)` or `Raised(Value)` (the
+raised value already carrying its own nominal variant identity) — never
+a Rust panic/unwind. `Invoke` dispatches on this outcome directly:
+`Returned` continues at `ok_target` with the value stored in `ok_slot`;
+`Raised` looks up the matching `err_targets` entry by the raised value's
+own variant identity, stores it into that entry's own slot, and
+continues at that entry's own target block. `Terminator::Raise` itself
+simply *produces* `Raised` and returns it up to whichever frame's own
+`Invoke` is waiting — call arity, evidence count, and effect metadata
+are all validated the same way an ordinary call's already are, before
+the callee's body ever runs. The public interpreter API is unaffected:
+a well-typed `main` can never legally raise, so a `Raised` outcome
+reaching the top level (only reachable through malformed hand-built
+NIR) is reported as a structured error rather than surfaced as if it
+were an ordinary return value.
 
 ## Diagnostics
 
@@ -305,6 +317,14 @@ silently-truncated result.
 
 ## Honest limitations
 
+- A protocol method's own signature cannot declare `raises`, and
+  `postfix ?`/`raise`/`handle` are only checked/lowered against a direct
+  call to a named ordinary function -- there is no protocol/capability
+  integration for typed failure in this milestone at all. `uses` and
+  `raises` remain independent concepts everywhere they can currently
+  coexist (an ordinary function may declare either, both, or neither),
+  but a protocol method cannot yet be one of the places that coexistence
+  is expressed.
 - Generic error variants do not exist; every `raises` entry names a
   concrete, non-generic variant.
 - A `failure` arm's payload positions may only bind or discard — no

@@ -13,10 +13,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
-use crate::limits::MAX_GENERIC_DEPTH;
+use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::types::{CapabilityRequirement, Ty, is_integer, is_numeric, substitute};
+use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
@@ -160,11 +160,55 @@ mod codes {
     /// method an extend implements must be a distinct function.
     pub const DUPLICATE_EXTEND_METHOD_REFERENCE: &str = "V0044";
     /// A protocol or extend reuses an id already used by another
-    /// protocol/extend in this module (`rfcs/0009`). Independent
-    /// evidence/signature verification for `Call`/`protocol.call`
-    /// (V0047 and up) lands in a follow-up commit.
+    /// protocol/extend in this module (`rfcs/0009`).
     pub const DUPLICATE_PROTOCOL_ID: &str = "V0045";
     pub const DUPLICATE_EXTEND_ID: &str = "V0046";
+    /// A `Call`'s evidence does not carry exactly as many entries as its
+    /// callee's own requirement count (`rfcs/0009`).
+    pub const EVIDENCE_COUNT_MISMATCH: &str = "V0047";
+    /// An `Evidence::Forwarded` index is out of range for the currently
+    /// verified function's own `requirements`.
+    pub const FORWARDED_INDEX_OUT_OF_RANGE: &str = "V0048";
+    /// An `Evidence::Forwarded` index is in range, but the requirement
+    /// it names is not exactly the capability actually required at this
+    /// call site -- forwarding only ever passes a requirement through
+    /// unchanged, never converts one into another.
+    pub const FORWARDED_REQUIREMENT_MISMATCH: &str = "V0049";
+    /// An `Evidence::Extension` names an extend id this module never
+    /// declared.
+    pub const UNKNOWN_EXTENSION_REFERENCE: &str = "V0050";
+    /// An `Evidence::Extension`'s own extend targets a different
+    /// protocol than the one actually required at this call site.
+    pub const EXTENSION_PROTOCOL_MISMATCH: &str = "V0051";
+    /// An `Evidence::Extension`'s own extend head cannot structurally
+    /// match the arguments actually required at this call site -- no
+    /// substitution of the extend's own type parameters makes its
+    /// declared `protocol_arguments` equal the required arguments.
+    pub const EXTENSION_HEAD_MISMATCH: &str = "V0052";
+    /// An `Evidence::Extension`'s own `nested` evidence has a different
+    /// length than its extend's own `requirements`.
+    pub const NESTED_EVIDENCE_COUNT_MISMATCH: &str = "V0053";
+    /// An `Evidence::Extension`'s own `nested` evidence contains a
+    /// `Forwarded` entry. By the time a concrete extend is selected,
+    /// every type it was selected for is already fully concrete, so
+    /// every leaf of `nested` must itself always be `Extension` --
+    /// `Forwarded` is only ever legal at the outermost evidence position
+    /// of a `Call`/`protocol.call`, never nested inside a resolved
+    /// extension.
+    pub const FORWARDED_INSIDE_NESTED_EVIDENCE: &str = "V0054";
+    /// Evidence nested deeper than `crate::limits::MAX_CAPABILITY_DEPTH`
+    /// -- bounds a hostilely deep hand-built evidence tree the same way
+    /// `GENERIC_DEPTH_EXCEEDED` bounds a hostilely deep type, so
+    /// recursive evidence validation can never overflow the native
+    /// stack. Reported once per malformed evidence root, never once per
+    /// nested node.
+    pub const EVIDENCE_DEPTH_EXCEEDED: &str = "V0055";
+    /// Evidence validation visited more nodes than
+    /// `crate::limits::MAX_CAPABILITY_RESOLUTION_STEPS` while checking
+    /// one evidence root -- bounds a hand-built evidence tree that stays
+    /// within the depth limit but branches wide enough at every level to
+    /// make exhaustive validation itself pathologically expensive.
+    pub const EVIDENCE_WORK_BUDGET_EXCEEDED: &str = "V0056";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -179,11 +223,8 @@ struct KnownFunction {
     return_type: Ty,
     /// This function's own capability requirements (`rfcs/0009`), in
     /// declared order -- a `Call` targeting it must carry exactly this
-    /// many evidence entries. Not yet read: independent `Call`/
-    /// `protocol.call` evidence verification (arity/forwarded-index/
-    /// extend-identity/depth-budget checks) is a tracked follow-up, not
-    /// implemented in this commit.
-    #[allow(dead_code)]
+    /// many evidence entries, each independently checked against the
+    /// corresponding substituted requirement here.
     requirements: Vec<CapabilityRequirement>,
 }
 
@@ -195,10 +236,8 @@ struct AggregateContext<'a> {
     records: HashMap<ItemId, &'a RecordLayout>,
     variants: HashMap<ItemId, &'a VariantLayout>,
     protocols: HashMap<ItemId, &'a ProtocolLayout>,
-    /// Not yet read outside registration -- reserved for the follow-up
-    /// `Call`/`protocol.call` evidence verification that resolves an
-    /// `Evidence::Extension` against its own declared extend.
-    #[allow(dead_code)]
+    /// Read by `check_evidence` to resolve an `Evidence::Extension`
+    /// against its own declared extend.
     extends: HashMap<ItemId, &'a ExtendLayout>,
 }
 
@@ -798,6 +837,7 @@ fn verify_function(
                         known_functions,
                         agg,
                         &own_params,
+                        &function.requirements,
                         source,
                         &name,
                         interner,
@@ -1578,6 +1618,229 @@ fn check_type_root(
     check_type_param_scope(ty, own_params, source, context, diagnostics);
 }
 
+/// Every distinct way one [`Evidence`] node can fail to actually satisfy
+/// the capability required of it (`rfcs/0009`) -- kept out of
+/// `check_evidence`'s own recursion as plain data, rather than pushed as
+/// a [`Diagnostic`] the instant it's found, so a nested failure produces
+/// exactly one diagnostic at the call site that owns the whole evidence
+/// tree, never one per nested level (`Diagnostic::error` is only ever
+/// constructed once, by `check_evidence`'s caller, from whichever
+/// variant this recursion bottoms out at).
+#[derive(Debug)]
+enum EvidenceProblem {
+    DepthExceeded,
+    WorkBudgetExceeded,
+    ForwardedNotAllowedHere,
+    ForwardedIndexOutOfRange,
+    ForwardedRequirementMismatch,
+    UnknownExtension(ItemId),
+    ExtensionProtocolMismatch,
+    ExtensionHeadMismatch,
+    NestedEvidenceCountMismatch { expected: usize, found: usize },
+}
+
+impl EvidenceProblem {
+    fn code(&self) -> &'static str {
+        match self {
+            EvidenceProblem::DepthExceeded => codes::EVIDENCE_DEPTH_EXCEEDED,
+            EvidenceProblem::WorkBudgetExceeded => codes::EVIDENCE_WORK_BUDGET_EXCEEDED,
+            EvidenceProblem::ForwardedNotAllowedHere => codes::FORWARDED_INSIDE_NESTED_EVIDENCE,
+            EvidenceProblem::ForwardedIndexOutOfRange => codes::FORWARDED_INDEX_OUT_OF_RANGE,
+            EvidenceProblem::ForwardedRequirementMismatch => codes::FORWARDED_REQUIREMENT_MISMATCH,
+            EvidenceProblem::UnknownExtension(_) => codes::UNKNOWN_EXTENSION_REFERENCE,
+            EvidenceProblem::ExtensionProtocolMismatch => codes::EXTENSION_PROTOCOL_MISMATCH,
+            EvidenceProblem::ExtensionHeadMismatch => codes::EXTENSION_HEAD_MISMATCH,
+            EvidenceProblem::NestedEvidenceCountMismatch { .. } => {
+                codes::NESTED_EVIDENCE_COUNT_MISMATCH
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            EvidenceProblem::DepthExceeded => format!(
+                "is nested deeper than the maximum capability depth of {MAX_CAPABILITY_DEPTH}"
+            ),
+            EvidenceProblem::WorkBudgetExceeded => {
+                "is too large to validate exhaustively".to_string()
+            }
+            EvidenceProblem::ForwardedNotAllowedHere => {
+                "forwards capability evidence from inside another extension's own nested \
+                 evidence, where only a concrete extension is ever legal"
+                    .to_string()
+            }
+            EvidenceProblem::ForwardedIndexOutOfRange => {
+                "forwards a capability evidence index that is out of range for the \
+                 enclosing function's own requirements"
+                    .to_string()
+            }
+            EvidenceProblem::ForwardedRequirementMismatch => {
+                "forwards a capability requirement that is not exactly the capability \
+                 actually required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::UnknownExtension(id) => format!(
+                "references extend id {}, which does not exist in this module",
+                id.0
+            ),
+            EvidenceProblem::ExtensionProtocolMismatch => {
+                "selects an extension for a different protocol than the one actually \
+                 required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::ExtensionHeadMismatch => {
+                "selects an extension whose own head cannot structurally match the \
+                 arguments actually required at this call site"
+                    .to_string()
+            }
+            EvidenceProblem::NestedEvidenceCountMismatch { expected, found } => format!(
+                "selects an extension carrying {found} nested evidence entries, but its own \
+                 extend declares {expected} requirement(s)"
+            ),
+        }
+    }
+}
+
+/// One-directional structural match of an extend's own head
+/// (`protocol_arguments`, which may reference the extend's own type
+/// parameters) against the concrete/opaque arguments actually required
+/// at a call site (which never contain any of the extend's own type
+/// parameters, so they are never themselves bound -- only ever compared
+/// against). The first occurrence of a free extend type parameter binds
+/// it to whatever `target` subtree sits in that position; every later
+/// occurrence of the same parameter must match the exact same bound
+/// type. This is deliberately not the two-sided overlap unifier
+/// (`heads_can_overlap` in `typeck::capability`): only one side ever
+/// carries free variables here, so no occurs check or substitution
+/// chasing is needed, only a depth bound against a hostile hand-built
+/// type on either side.
+fn match_extend_head(
+    subst: &mut HashMap<TypeParamId, Ty>,
+    free: &HashSet<TypeParamId>,
+    pattern: &Ty,
+    target: &Ty,
+    depth: usize,
+) -> bool {
+    if depth > MAX_GENERIC_DEPTH {
+        return false;
+    }
+    match pattern {
+        Ty::Param(id, _) if free.contains(id) => match subst.get(id) {
+            Some(bound) => bound == target,
+            None => {
+                subst.insert(*id, target.clone());
+                true
+            }
+        },
+        Ty::Applied(item, args) => match target {
+            Ty::Applied(target_item, target_args)
+                if item == target_item && args.len() == target_args.len() =>
+            {
+                args.iter()
+                    .zip(target_args.iter())
+                    .all(|(a, t)| match_extend_head(subst, free, a, t, depth + 1))
+            }
+            _ => false,
+        },
+        other => other == target,
+    }
+}
+
+/// Checks one [`Evidence`] node (and, for an [`Evidence::Extension`],
+/// everything nested inside it) against the exact capability required of
+/// it at this position (`rfcs/0009`): a `protocol` identity plus already-
+/// substituted `arguments`. `allow_forwarded` is `false` for anything
+/// reached through an extension's own `nested` list -- by the time a
+/// concrete extend is selected, every type it was selected for is
+/// already fully concrete, so every leaf of `nested` is itself always
+/// `Extension`, never `Forwarded` (see [`Evidence::Extension`]'s own doc
+/// comment); it is `true` only at the outermost position a `Call`/
+/// `protocol.call` instruction's own evidence list ever occupies, where
+/// forwarding the *currently executing* function's own requirement
+/// through unchanged is exactly what generic capability forwarding is.
+/// `caller_requirements` is that enclosing function's own `requirements`,
+/// against which a `Forwarded` index and its exact compatibility are
+/// checked. `budget` is a shared work counter (not just a depth bound):
+/// a hand-built evidence tree that stays shallow but branches wide enough
+/// at every level could otherwise make exhaustive validation itself
+/// pathologically expensive, even though no *cycle* is possible (this is
+/// an owned tree, never a graph).
+#[allow(clippy::too_many_arguments)]
+fn check_evidence(
+    evidence: &Evidence,
+    required_protocol: ItemId,
+    required_arguments: &[Ty],
+    allow_forwarded: bool,
+    caller_requirements: &[CapabilityRequirement],
+    agg: &AggregateContext,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), EvidenceProblem> {
+    if depth > MAX_CAPABILITY_DEPTH {
+        return Err(EvidenceProblem::DepthExceeded);
+    }
+    if *budget == 0 {
+        return Err(EvidenceProblem::WorkBudgetExceeded);
+    }
+    *budget -= 1;
+
+    match evidence {
+        Evidence::Forwarded(index) => {
+            if !allow_forwarded {
+                return Err(EvidenceProblem::ForwardedNotAllowedHere);
+            }
+            let Some(forwarded) = caller_requirements.get(*index) else {
+                return Err(EvidenceProblem::ForwardedIndexOutOfRange);
+            };
+            if forwarded.protocol != required_protocol || forwarded.arguments != required_arguments
+            {
+                return Err(EvidenceProblem::ForwardedRequirementMismatch);
+            }
+            Ok(())
+        }
+        Evidence::Extension { extend, nested } => {
+            let Some(layout) = agg.extends.get(extend) else {
+                return Err(EvidenceProblem::UnknownExtension(*extend));
+            };
+            if layout.protocol != required_protocol {
+                return Err(EvidenceProblem::ExtensionProtocolMismatch);
+            }
+            let free: HashSet<TypeParamId> = layout.type_params.iter().map(|(id, _)| *id).collect();
+            let mut subst: HashMap<TypeParamId, Ty> = HashMap::new();
+            let head_matches = layout.protocol_arguments.len() == required_arguments.len()
+                && layout
+                    .protocol_arguments
+                    .iter()
+                    .zip(required_arguments.iter())
+                    .all(|(p, t)| match_extend_head(&mut subst, &free, p, t, 0));
+            if !head_matches {
+                return Err(EvidenceProblem::ExtensionHeadMismatch);
+            }
+            if nested.len() != layout.requirements.len() {
+                return Err(EvidenceProblem::NestedEvidenceCountMismatch {
+                    expected: layout.requirements.len(),
+                    found: nested.len(),
+                });
+            }
+            for (n, r) in nested.iter().zip(layout.requirements.iter()) {
+                let sub_arguments: Vec<Ty> =
+                    r.arguments.iter().map(|t| substitute(t, &subst)).collect();
+                check_evidence(
+                    n,
+                    r.protocol,
+                    &sub_arguments,
+                    false,
+                    caller_requirements,
+                    agg,
+                    depth + 1,
+                    budget,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_value_kind(
     result: ValueId,
@@ -1588,6 +1851,7 @@ fn verify_value_kind(
     known_functions: &HashMap<ItemId, KnownFunction>,
     agg: &AggregateContext,
     own_params: &HashSet<TypeParamId>,
+    own_requirements: &[CapabilityRequirement],
     source: SourceId,
     function_name: &str,
     interner: &Interner,
@@ -1768,10 +2032,7 @@ fn verify_value_kind(
                 );
             }
         }
-        // TODO(rfcs/0009): `_evidence` is not yet independently verified
-        // here (evidence arity/type/forwarded-index/cycle checks land in
-        // a follow-up commit) -- tracked, not silently forgotten.
-        ValueKind::Call(callee, type_args, args, _evidence) => {
+        ValueKind::Call(callee, type_args, args, evidence) => {
             for arg in args {
                 require_value(*arg, diagnostics);
             }
@@ -1803,18 +2064,13 @@ fn verify_value_kind(
                     diagnostics,
                 );
             }
-            let (return_ty, param_tys): (Ty, Vec<Ty>) = if type_args.len() == sig.type_params.len()
-            {
-                let subst: HashMap<TypeParamId, Ty> = sig
-                    .type_params
+            let arity_matches = type_args.len() == sig.type_params.len();
+            let subst: HashMap<TypeParamId, Ty> = if arity_matches {
+                sig.type_params
                     .iter()
                     .copied()
                     .zip(type_args.iter().cloned())
-                    .collect();
-                (
-                    substitute(&sig.return_type, &subst),
-                    sig.params.iter().map(|p| substitute(p, &subst)).collect(),
-                )
+                    .collect()
             } else {
                 diagnostics.push(Diagnostic::error(
                     codes::GENERIC_ARITY_MISMATCH,
@@ -1827,8 +2083,63 @@ fn verify_value_kind(
                         type_args.len()
                     ),
                 ));
+                HashMap::new()
+            };
+            let (return_ty, param_tys): (Ty, Vec<Ty>) = if arity_matches {
+                (
+                    substitute(&sig.return_type, &subst),
+                    sig.params.iter().map(|p| substitute(p, &subst)).collect(),
+                )
+            } else {
                 (sig.return_type.clone(), sig.params.clone())
             };
+            // Evidence is only checked once the call's own type
+            // arguments are known-good: an already-reported arity
+            // mismatch leaves `subst` empty, which would otherwise
+            // cascade into spurious evidence diagnostics unrelated to
+            // the actual problem.
+            if arity_matches {
+                let evidence_context =
+                    format!("function `{function_name}`: %{}'s call evidence", result.0);
+                if evidence.len() != sig.requirements.len() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::EVIDENCE_COUNT_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "{evidence_context} carries {} entry(ies), but the callee declares {} capability requirement(s)",
+                            evidence.len(),
+                            sig.requirements.len()
+                        ),
+                    ));
+                } else {
+                    for (entry, requirement) in evidence.iter().zip(sig.requirements.iter()) {
+                        let required_arguments: Vec<Ty> = requirement
+                            .arguments
+                            .iter()
+                            .map(|t| substitute(t, &subst))
+                            .collect();
+                        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+                        if let Err(problem) = check_evidence(
+                            entry,
+                            requirement.protocol,
+                            &required_arguments,
+                            true,
+                            own_requirements,
+                            agg,
+                            0,
+                            &mut budget,
+                        ) {
+                            diagnostics.push(Diagnostic::error(
+                                problem.code(),
+                                source,
+                                Span::dummy(),
+                                format!("{evidence_context} {}", problem.describe()),
+                            ));
+                        }
+                    }
+                }
+            }
             if return_ty != *result_ty {
                 operand_mismatch(
                     diagnostics,
@@ -4905,5 +5216,426 @@ mod tests {
             &interner,
         );
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_EXTEND_METHOD_REFERENCE));
+    }
+
+    // -- Fix 3: ordinary `Call` evidence validation (`rfcs/0009`) -------
+
+    /// `func g() -> bool uses Equal[i64] { return true }` -- a callee
+    /// declaring one capability requirement, for tests that call it with
+    /// exactly one evidence entry and mutate that entry.
+    fn callee_requiring_equal_i64(interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(2),
+            name: interner.intern("g"),
+            type_params: Vec::new(),
+            requirements: vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Const(Const::Bool(true)),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    /// `func f() -> bool uses Equal[i64] { return g() }`, calling
+    /// [`callee_requiring_equal_i64`] with whatever `evidence` a test
+    /// wants to check, and declaring its own requirement so a
+    /// `Forwarded(0)` test has something valid to forward.
+    fn caller_forwarding_to_callee(
+        interner: &mut Interner,
+        requirements: Vec<CapabilityRequirement>,
+        evidence: Vec<Evidence>,
+    ) -> Function {
+        Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements,
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Call(ItemId(2), Vec::new(), Vec::new(), evidence),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn forwarding_the_callers_own_matching_requirement_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            vec![Evidence::Forwarded(0)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn dispatching_through_a_valid_concrete_extension_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_call_with_the_wrong_number_of_evidence_entries_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            Vec::new(),
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EVIDENCE_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn a_forwarded_index_out_of_range_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
+            vec![Evidence::Forwarded(5)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_INDEX_OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn a_forwarded_requirement_not_matching_the_call_site_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // The caller's own requirement at index 0 is `Equal[bool]`, not
+        // the `Equal[i64]` the callee actually requires.
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(ItemId(0), vec![Ty::Bool])],
+            vec![Evidence::Forwarded(0)],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_REQUIREMENT_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_referencing_an_unknown_extend_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: ItemId(999),
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            Vec::new(),
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_EXTENSION_REFERENCE));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_for_the_wrong_protocol_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // A second, unrelated protocol with the same shape as `Equal`,
+        // so the extend below is a completely valid extension -- just
+        // not of the protocol the callee actually requires.
+        let ord_t = TypeParamId(1);
+        let ord_t_symbol = interner.intern("U");
+        let ord_protocol_id = ItemId(20);
+        let ord_protocol = ProtocolLayout {
+            name: interner.intern("Ord"),
+            type_params: vec![(ord_t, ord_t_symbol)],
+            methods: vec![ProtocolMethodLayout {
+                name: interner.intern("less"),
+                params: vec![
+                    Ty::Param(ord_t, ord_t_symbol),
+                    Ty::Param(ord_t, ord_t_symbol),
+                ],
+                return_type: Ty::Bool,
+            }],
+        };
+        let ord_extend_id = ItemId(11);
+        let ord_extend = ExtendLayout {
+            protocol: ord_protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: ord_extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol), (ord_protocol_id, ord_protocol)],
+            vec![(ord_extend_id, ord_extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_PROTOCOL_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_selecting_an_extension_whose_head_does_not_match_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        // Targets the right protocol, but for `bool`, not the `i64` the
+        // callee actually requires.
+        let mismatched_extend_id = ItemId(12);
+        let mismatched_extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::Bool],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: mismatched_extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(mismatched_extend_id, mismatched_extend)],
+            vec![callee_requiring_equal_i64(&mut interner), caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTENSION_HEAD_MISMATCH));
+    }
+
+    #[test]
+    fn evidence_with_the_wrong_number_of_nested_entries_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        // A conditional extend requiring one capability of its own --
+        // the evidence below supplies zero nested entries for it.
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            Vec::new(),
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: Vec::new(),
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::NESTED_EVIDENCE_COUNT_MISMATCH));
+    }
+
+    #[test]
+    fn a_forwarded_entry_nested_inside_an_extension_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, mut extend) = valid_equal_i64_extend();
+        extend.requirements = vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])];
+        let method = equal_i64_method(&mut interner);
+        let caller = caller_forwarding_to_callee(
+            &mut interner,
+            vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])],
+            vec![Evidence::Extension {
+                extend: extend_id,
+                nested: vec![Evidence::Forwarded(0)],
+            }],
+        );
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![callee_requiring_equal_i64(&mut interner), method, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::FORWARDED_INSIDE_NESTED_EVIDENCE));
+    }
+
+    // -- `check_evidence`/`match_extend_head` unit tests: depth/work
+    //    budgets on a hostile hand-built evidence tree, exercised
+    //    directly rather than through `verify_module` since building an
+    //    equally deep *valid* chain of distinct extends would obscure
+    //    what each test is actually bounding.
+
+    #[test]
+    fn evidence_nested_deeper_than_the_capability_depth_limit_is_rejected() {
+        // A chain of `Extension { extend: SAME_ID, nested: [...] }`,
+        // self-referentially "requiring itself" at every level -- purely
+        // structural (no real solver would ever produce this), built
+        // only to exercise `check_evidence`'s own recursion depth bound
+        // directly, independent of `verify_module`'s plumbing.
+        let extend_id = ItemId(1);
+        let protocol_id = ItemId(0);
+        let layout = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64])],
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(extend_id, &layout);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        let mut evidence = Evidence::Extension {
+            extend: extend_id,
+            nested: Vec::new(),
+        };
+        for _ in 0..(MAX_CAPABILITY_DEPTH + 2) {
+            evidence = Evidence::Extension {
+                extend: extend_id,
+                nested: vec![evidence],
+            };
+        }
+        let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::I64],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(result, Err(EvidenceProblem::DepthExceeded)));
+    }
+
+    #[test]
+    fn evidence_exceeding_the_work_budget_is_rejected_without_a_diagnostic_per_node() {
+        let protocol_id = ItemId(0);
+        // Two extends sharing one shape: `branch` requires `WIDTH`
+        // copies of itself (so a structurally valid tree stays exactly
+        // `WIDTH`-ary at every internal node), `leaf` requires nothing
+        // (a valid terminal, so the tree can actually bottom out without
+        // needing to recurse forever to stay well-formed).
+        const WIDTH: usize = 4;
+        let branch_id = ItemId(1);
+        let leaf_id = ItemId(2);
+        let branch = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: vec![CapabilityRequirement::new(protocol_id, vec![Ty::I64]); WIDTH],
+            methods: Vec::new(),
+        };
+        let leaf = ExtendLayout {
+            protocol: protocol_id,
+            type_params: Vec::new(),
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: Vec::new(),
+        };
+        let mut extends = HashMap::new();
+        extends.insert(branch_id, &branch);
+        extends.insert(leaf_id, &leaf);
+        let agg = AggregateContext {
+            records: HashMap::new(),
+            variants: HashMap::new(),
+            protocols: HashMap::new(),
+            extends,
+        };
+        // Shallow (well within the depth limit) but wide enough at every
+        // level to blow well past a small work budget: `WIDTH^levels`
+        // leaves alone is already far more than `budget` below, while
+        // `levels` itself stays nowhere near `MAX_CAPABILITY_DEPTH`.
+        fn build(branch_id: ItemId, leaf_id: ItemId, levels: usize) -> Evidence {
+            if levels == 0 {
+                return Evidence::Extension {
+                    extend: leaf_id,
+                    nested: Vec::new(),
+                };
+            }
+            Evidence::Extension {
+                extend: branch_id,
+                nested: (0..WIDTH)
+                    .map(|_| build(branch_id, leaf_id, levels - 1))
+                    .collect(),
+            }
+        }
+        let evidence = build(branch_id, leaf_id, 10);
+        let mut budget = 50;
+        let result = check_evidence(
+            &evidence,
+            protocol_id,
+            &[Ty::I64],
+            true,
+            &[],
+            &agg,
+            0,
+            &mut budget,
+        );
+        assert!(matches!(result, Err(EvidenceProblem::WorkBudgetExceeded)));
     }
 }

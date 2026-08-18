@@ -1355,12 +1355,15 @@ impl<'a> Lowering<'a> {
         // infallible protocol method, and `protocol.call` -- an ordinary
         // value instruction with only one destination -- would have
         // nowhere for a raised value to go.
-        if !f.raises.is_empty() {
+        if let Some((first, rest)) = f.raises.split_first() {
+            let raises_span = rest
+                .iter()
+                .fold(first.span, |acc, entry| acc.join(entry.span));
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::EXTEND_METHOD_OWN_RAISES_CLAUSE,
                     self.source,
-                    f.span,
+                    raises_span,
                     "an extend method may not declare its own `raises` clause; protocol methods have no raised-effect signature yet",
                 )
                 .with_primary_label("unexpected `raises` clause"),
@@ -2758,18 +2761,51 @@ mod tests {
 
     #[test]
     fn an_extend_method_declaring_its_own_raises_clause_is_a_diagnostic() {
-        let (hir, diags) = lower(
-            "variant Failure { Broken }\n\
+        let text = "variant Failure { Broken }\n\
              protocol Operation[T] { func run(input: T) -> i64; }\n\
              extend Operation[i64] { func run(input: i64) -> i64 raises Failure { return 0 } }\n\
-             func main() -> i64 { return 0 }",
-        );
+             func main() -> i64 { return 0 }";
+        let (hir, diags) = lower(text);
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "R0031");
         // Diagnosed, never resolved into raised-effect metadata -- the
         // method still lowers, but with no raises at all, not a partial
         // or fake one.
         assert!(hir.extends[0].methods[0].raises.is_empty());
+        // The primary span must point at the raised-type list itself
+        // (`Failure`, in `raises Failure`), never the whole extend
+        // method -- narrower than the method's own span, and exactly
+        // covering the one raised name here.
+        let raises_clause = "raises Failure";
+        let clause_start = text.find(raises_clause).unwrap() as u32;
+        let expected_start = clause_start + "raises ".len() as u32;
+        let expected_end = expected_start + "Failure".len() as u32;
+        assert_eq!(
+            diags[0].primary_span,
+            Span::new(expected_start, expected_end),
+            "R0031 must point at the raised-type list, not the whole method"
+        );
+    }
+
+    #[test]
+    fn an_extend_method_raises_clause_span_covers_every_entry_not_just_the_first() {
+        let text = "variant Failure { Broken }\n\
+             variant Other { Broken }\n\
+             protocol Operation[T] { func run(input: T) -> i64; }\n\
+             extend Operation[i64] { func run(input: i64) -> i64 raises Failure, Other { return 0 } }\n\
+             func main() -> i64 { return 0 }";
+        let (_, diags) = lower(text);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0031");
+        let raises_clause = "raises Failure, Other";
+        let clause_start = text.find(raises_clause).unwrap() as u32;
+        let expected_start = clause_start + "raises ".len() as u32;
+        let expected_end = expected_start + "Failure, Other".len() as u32;
+        assert_eq!(
+            diags[0].primary_span,
+            Span::new(expected_start, expected_end),
+            "R0031's span must span from the first raised entry through the last"
+        );
     }
 
     #[test]

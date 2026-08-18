@@ -295,6 +295,17 @@ mod codes {
     /// for ordinary source, but this verifier never trusts hand-built
     /// NIR to already satisfy it.
     pub const EXTEND_METHOD_MUST_BE_INFALLIBLE: &str = "V0072";
+    /// A `Load` reads a slot some `Terminator::Invoke` in this same
+    /// function writes on one of its own edges (`ok_slot`, or one of its
+    /// `err_targets`' own `slot`), from a block the CFG does not prove is
+    /// reached *only* through that one edge -- dominance from the slot's
+    /// own `alloc` (already required) proves the slot exists before this
+    /// point, but never that the specific edge which actually writes it
+    /// is the one that was taken to get here. Mirrors
+    /// `PAYLOAD_OUTSIDE_REFINEMENT`'s own single-hop "every incoming edge
+    /// must agree" model, applied to Invoke's own conditional writes
+    /// instead of a `Switch`'s own case refinement.
+    pub const INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0073";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -3306,15 +3317,28 @@ fn verify_value_kind(
     }
 }
 
-/// A `variant.payload` instruction is only legal in a block reached
-/// through the matching case's own `Terminator::Switch` edge -- this
-/// re-derives that from the CFG itself (which block is a direct switch
-/// target for which `(scrutinee, variant, case)`), independent of how
-/// lowering happened to build it.
-/// A single guaranteed fact: the value `.0` is known to be case `.2` of
-/// variant `.1`.
-type RefinementFact = (ValueId, ItemId, usize);
+/// A single guaranteed fact about how a block was reached: either that
+/// a `Switch` scrutinee is known to hold a specific case of a specific
+/// variant, or that a specific `Terminator::Invoke`'s own conditionally-
+/// written slot (`ok_slot`, or one of its `err_targets`' own `slot`) is
+/// known initialized -- both are the same shape of question ("is this
+/// block reached *only* through the one edge that proves X"), so both
+/// share the one fact-propagation mechanism below.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RefinementFact {
+    CaseOf(ValueId, ItemId, usize),
+    SlotInitialized(ValueId),
+}
 
+/// A `variant.payload` instruction is only legal in a block reached
+/// through the matching case's own `Terminator::Switch` edge, and a
+/// `load` of a slot some `Terminator::Invoke` writes conditionally is
+/// only legal in a block reached through the one edge that actually
+/// writes it -- this re-derives both from the CFG itself, independent
+/// of how lowering happened to build it. Dominance (checked separately,
+/// `verify_dominance`) only proves a slot's own `alloc` precedes a use,
+/// never that the specific edge which actually writes it is the one
+/// that was taken to reach that use; this is what actually proves that.
 fn verify_payload_refinement(
     function: &Function,
     agg: &AggregateContext,
@@ -3323,16 +3347,36 @@ fn verify_payload_refinement(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let _ = agg;
+    // Every `ValueId` some `Terminator::Invoke` in this function writes
+    // conditionally on one of its own edges -- a `Load` of any other
+    // slot is an ordinary mutable binding (always written unconditionally
+    // immediately after its own `alloc`, `rfcs/0002`) and never needs
+    // this check at all.
+    let mut invoke_guarded_slots: HashSet<ValueId> = HashSet::new();
+    for block in &function.blocks {
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            invoke_guarded_slots.insert(*ok_slot);
+            for target in err_targets {
+                invoke_guarded_slots.insert(target.slot);
+            }
+        }
+    }
+
     // Every incoming edge into each block, tracked as its own
     // independent fact-set: empty for a plain branch/condbr edge
-    // (which guarantees no case refinement at all), or a single
-    // `(scrutinee, variant, case)` fact for a switch-case edge. Two
-    // edges into the same block -- even two cases of the same switch,
-    // or two different switches -- are kept as separate list entries:
-    // a target block reachable through more than one case of the same
-    // switch is genuinely reachable via either case, so nothing about
-    // that specific case can be assumed from having reached the block
-    // at all.
+    // (which guarantees no case refinement or slot initialization at
+    // all), or a single fact for a switch-case or Invoke ok/err edge.
+    // Two edges into the same block -- even two cases of the same
+    // switch, or two different switches -- are kept as separate list
+    // entries: a target block reachable through more than one case of
+    // the same switch is genuinely reachable via either case, so
+    // nothing about that specific case can be assumed from having
+    // reached the block at all.
     let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
     for block in &function.blocks {
         match &block.terminator {
@@ -3360,34 +3404,36 @@ fn verify_payload_refinement(
             } => {
                 for (case_index, target) in cases.iter().enumerate() {
                     let mut fact = HashSet::new();
-                    fact.insert((*scrutinee, *variant, case_index));
+                    fact.insert(RefinementFact::CaseOf(*scrutinee, *variant, case_index));
                     incoming.entry(*target).or_default().push(fact);
                 }
             }
             Terminator::Invoke {
+                ok_slot,
                 ok_target,
                 err_targets,
                 ..
             } => {
-                incoming.entry(*ok_target).or_default().push(HashSet::new());
+                let mut ok_fact = HashSet::new();
+                ok_fact.insert(RefinementFact::SlotInitialized(*ok_slot));
+                incoming.entry(*ok_target).or_default().push(ok_fact);
                 for target in err_targets {
-                    incoming
-                        .entry(target.target)
-                        .or_default()
-                        .push(HashSet::new());
+                    let mut fact = HashSet::new();
+                    fact.insert(RefinementFact::SlotInitialized(target.slot));
+                    incoming.entry(target.target).or_default().push(fact);
                 }
             }
             Terminator::Return(_) | Terminator::Raise { .. } => {}
         }
     }
 
-    // A payload extraction is only sound when the SAME fact is
-    // guaranteed by EVERY incoming edge -- intersection, never union.
-    // A block with no recorded incoming edges at all (the entry block,
-    // or an otherwise-unreachable block) guarantees nothing, matching
-    // an empty intersection's identity (the universal set) only in the
-    // abstract; concretely there is no edge to ever have proven a case
-    // refinement on, so nothing is ever allowed there.
+    // A payload extraction/guarded slot load is only sound when the
+    // SAME fact is guaranteed by EVERY incoming edge -- intersection,
+    // never union. A block with no recorded incoming edges at all (the
+    // entry block, or an otherwise-unreachable block) guarantees
+    // nothing, matching an empty intersection's identity (the universal
+    // set) only in the abstract; concretely there is no edge to ever
+    // have proven a fact on, so nothing is ever allowed there.
     let guaranteed = |block_id: BlockId| -> HashSet<RefinementFact> {
         let Some(edges) = incoming.get(&block_id) else {
             return HashSet::new();
@@ -3406,27 +3452,44 @@ fn verify_payload_refinement(
     for block in &function.blocks {
         let allowed = guaranteed(block.id);
         for instruction in &block.instructions {
-            if let Instruction::Value {
-                kind:
-                    ValueKind::VariantPayload {
-                        base,
-                        variant,
-                        case,
-                        ..
-                    },
-                ..
-            } = instruction
-                && !allowed.contains(&(*base, *variant, *case))
-            {
-                diagnostics.push(Diagnostic::error(
-                    codes::PAYLOAD_OUTSIDE_REFINEMENT,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
-                        block.id.0
-                    ),
-                ));
+            match instruction {
+                Instruction::Value {
+                    kind:
+                        ValueKind::VariantPayload {
+                            base,
+                            variant,
+                            case,
+                            ..
+                        },
+                    ..
+                } if !allowed.contains(&RefinementFact::CaseOf(*base, *variant, *case)) => {
+                    diagnostics.push(Diagnostic::error(
+                        codes::PAYLOAD_OUTSIDE_REFINEMENT,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
+                            block.id.0
+                        ),
+                    ));
+                }
+                Instruction::Value {
+                    kind: ValueKind::Load(slot),
+                    ..
+                } if invoke_guarded_slots.contains(slot)
+                    && !allowed.contains(&RefinementFact::SlotInitialized(*slot)) =>
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{function_name}` loads %{} in bb{}, which is not definitely reached only through the Invoke edge that writes it",
+                            slot.0, block.id.0
+                        ),
+                    ));
+                }
+                _ => {}
             }
         }
     }
@@ -7495,6 +7558,89 @@ mod tests {
         let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(
             diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Fix 7: Invoke slot definite initialization (`rfcs/0010`) -------
+
+    #[test]
+    fn a_success_slot_loaded_from_a_block_also_reached_through_a_failure_edge_is_rejected() {
+        // `ok_target` and the (single) failure target are the *same*
+        // block, which loads `ok_slot` -- but the failure edge never
+        // writes `ok_slot` at all, only its own `err_slot`. Dominance
+        // alone (the alloc precedes the Invoke) would wrongly accept
+        // this; only proving the load's own block is reached *solely*
+        // through the writing edge catches it.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+        callee.blocks[0].instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Named(shape_id, shape_name),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        }];
+        callee.blocks[0].terminator = Terminator::Raise { value: ValueId(0) };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            // Both edges land on bb1 -- the failure edge never wrote
+            // %0 (`ok_slot`), only %1 (its own failure slot).
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(1),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
             "unexpected diagnostics: {diagnostics:?}"
         );
     }

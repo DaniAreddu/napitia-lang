@@ -12,7 +12,7 @@ pub mod lower;
 pub mod printer;
 pub mod verify;
 
-pub use block::{BasicBlock, BlockId, Terminator};
+pub use block::{BasicBlock, BlockId, InvokeErrTarget, Terminator};
 pub use instruction::{Const, FunctionRef, Instruction, ValueId, ValueKind};
 pub use lower::lower_module;
 pub use printer::print_module;
@@ -132,6 +132,12 @@ pub struct Function {
     pub requirements: Vec<CapabilityRequirement>,
     pub params: Vec<Param>,
     pub return_type: Ty,
+    /// This function's own declared raised-error set (`rfcs/0010`),
+    /// canonical (deduplicated `ItemId`s) and in a fixed, deterministic
+    /// order -- empty means this function is infallible, and may only
+    /// ever be invoked through an ordinary `ValueKind::Call`, never a
+    /// `Terminator::Invoke`.
+    pub raises: Vec<ItemId>,
     pub blocks: Vec<BasicBlock>,
 }
 

@@ -221,11 +221,13 @@ fn resolve_one_import(
                 protocol.name_span,
             )));
         }
+        let methods = protocol.methods.iter().map(|m| (m.name, m.index)).collect();
         return Ok(ImportedItem {
             local_name,
             kind: ImportedItemKind::Protocol {
                 item: protocol.id,
                 declared_name: protocol.name,
+                methods,
             },
             import_span: import.span,
             local_name_span,

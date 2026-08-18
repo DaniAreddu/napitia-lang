@@ -134,6 +134,14 @@ pub enum ImportedItemKind {
         item: ItemId,
         /// See `Record::declared_name`.
         declared_name: Symbol,
+        /// `(method name, declaration-order index)`, in declaration
+        /// order -- the canonical method table an imported protocol's
+        /// own `Protocol[Args].method(..)` calls resolve against, the
+        /// same way a local protocol's is populated in
+        /// `Lowering::protocol_methods` (`rfcs/0009`). Without this, an
+        /// importing module could see that the protocol exists but
+        /// never resolve any of its methods to a canonical index.
+        methods: Vec<(Symbol, usize)>,
     },
 }
 
@@ -333,9 +341,12 @@ impl<'a> Lowering<'a> {
                 ImportedItemKind::Protocol {
                     item,
                     declared_name,
+                    methods,
                 } => {
                     self.protocol_names
                         .insert(imported.local_name, (item, declared_name));
+                    let method_indices: HashMap<Symbol, usize> = methods.into_iter().collect();
+                    self.protocol_methods.insert(item, method_indices);
                 }
             }
         }

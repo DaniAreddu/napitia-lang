@@ -288,6 +288,13 @@ mod codes {
     /// rejects this for ordinary source, but this verifier never trusts
     /// hand-built NIR to already satisfy it.
     pub const GENERIC_RAISES_TYPE: &str = "V0071";
+    /// An extend's method function's own `raises` is non-empty. A
+    /// protocol method has no `raises` of its own yet (`rfcs/0010`'s own
+    /// honest limitation), so every implementing method must be
+    /// infallible too -- `hir::lower`/`typeck` both already reject this
+    /// for ordinary source, but this verifier never trusts hand-built
+    /// NIR to already satisfy it.
+    pub const EXTEND_METHOD_MUST_BE_INFALLIBLE: &str = "V0072";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -748,6 +755,24 @@ pub fn verify_module(
                     Span::dummy(),
                     format!(
                         "{context}'s method[{index}] ({}) does not declare exactly its own extend's `uses` requirements, in the same order",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
+            // A protocol method has no `raises` of its own yet
+            // (`rfcs/0010`'s own honest limitation) -- an implementing
+            // method whose own `raises` is non-empty could otherwise
+            // satisfy an apparently infallible protocol method, and
+            // `ProtocolCall` (an ordinary value instruction with only
+            // one destination) would have nowhere for a raised value to
+            // go.
+            if !implementing.raises.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_MUST_BE_INFALLIBLE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) declares `raises`, but its protocol method has no raised-effect signature to narrow",
                         registry.qualified_name(*method_id, interner)
                     ),
                 ));
@@ -5798,6 +5823,30 @@ mod tests {
             &interner,
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_extend_method_declaring_raises_is_rejected() {
+        // hir::lower/typeck both already reject this for ordinary source
+        // (R0031/T0034); this verifier never trusts hand-built NIR to
+        // already satisfy it -- a fallible implementation could
+        // otherwise satisfy an apparently infallible protocol method.
+        // (`ItemId(20)` need not itself be a declared variant for this
+        // specific check -- it may also trigger the independent
+        // UNKNOWN_RAISES_TYPE check, which does not interfere with the
+        // assertion below.)
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.raises = vec![ItemId(20)];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_MUST_BE_INFALLIBLE));
     }
 
     #[test]

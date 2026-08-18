@@ -5530,4 +5530,61 @@ mod tests {
             "a bare generic unit case must not silently default to an empty type argument list"
         );
     }
+
+    // -- Fix 3: diverging operands under `?`/`handle` (`rfcs/0010`) -----
+
+    #[test]
+    fn postfix_try_with_a_diverging_argument_lowers_with_no_invoke() {
+        let module = lower(
+            "variant FileError { Missing }
+             func read(path: str) -> str raises FileError {
+                 if path == \"\" { raise FileError.Missing }
+                 return \"ok\"
+             }
+             func f() -> i64 {
+                 return read({ return 7 })?
+             }",
+        );
+        let f = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        assert!(
+            f.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Terminator::Invoke { .. })),
+            "a diverging argument means the fallible call is never reached, so no Invoke should ever be built: {:?}",
+            f.blocks
+        );
+    }
+
+    #[test]
+    fn handle_with_a_diverging_argument_lowers_with_no_invoke() {
+        let module = lower(
+            "variant FileError { Missing }
+             func read(path: str) -> str raises FileError {
+                 if path == \"\" { raise FileError.Missing }
+                 return \"ok\"
+             }
+             func f() -> i64 {
+                 return handle read({ return 7 }) {
+                     success v => 1,
+                     failure FileError.Missing => 2,
+                 }
+             }",
+        );
+        let f = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        assert!(
+            f.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Terminator::Invoke { .. })),
+            "a diverging argument means the fallible call is never reached, so no Invoke should ever be built: {:?}",
+            f.blocks
+        );
+    }
 }

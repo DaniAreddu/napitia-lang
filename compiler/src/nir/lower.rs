@@ -1463,11 +1463,7 @@ impl<'a> Lowering<'a> {
             }
             return Err(self.internal_error("call target does not resolve to a function"));
         };
-        let (type_params, param_tys, _ret_ty) = self
-            .function_sigs
-            .get(item)
-            .cloned()
-            .unwrap_or_else(|| (Vec::new(), Vec::new(), Ty::Error));
+        let (type_params, param_tys, _ret_ty) = self.lookup_function_sig(*item, "a call")?;
         // Resolved once by `typeck` (inferred or explicit) and read back
         // here, never re-inferred -- the same "typeck already decided"
         // discipline every other type in this module already follows
@@ -1488,11 +1484,7 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        let requirements = self
-            .function_requirements
-            .get(item)
-            .cloned()
-            .unwrap_or_default();
+        let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(call_expr),
@@ -1565,16 +1557,22 @@ impl<'a> Lowering<'a> {
                 "{context}'s operand does not call a named function"
             )));
         };
-        let (type_params, param_tys, ret_ty) = self
-            .function_sigs
-            .get(item)
-            .cloned()
-            .unwrap_or_else(|| (Vec::new(), Vec::new(), Ty::Error));
+        let (type_params, param_tys, ret_ty) = self.lookup_function_sig(*item, context)?;
         let type_args = self.resolve_call_type_args(operand.id(), &type_params, context)?;
         let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
+        // Unlike an ordinary `Call` (which reads its own already-
+        // substituted result type back from `expr_types`, since typeck
+        // recorded the whole call expression's type there), `Invoke`
+        // builds its own `ok_slot` type directly from the callee's own
+        // declared (still-symbolic, for a generic callee) signature --
+        // so it must substitute this itself, or a generic fallible
+        // callee's success slot would keep a dangling `Ty::Param` no
+        // concrete value ever actually has, corrupting every downstream
+        // instruction that reads it (`rfcs/0008`).
+        let ret_ty = crate::types::substitute(&ret_ty, &subst);
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -1586,13 +1584,9 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(None),
             }
         }
-        let requirements = self
-            .function_requirements
-            .get(item)
-            .cloned()
-            .unwrap_or_default();
+        let requirements = self.lookup_function_requirements(*item, context)?;
         let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
-        let raises = self.function_raises.get(item).cloned().unwrap_or_default();
+        let raises = self.lookup_function_raises(*item, context)?;
 
         // Allocated here, before the `Invoke` below terminates this
         // block -- not by the caller afterward, when it would already be
@@ -2781,6 +2775,63 @@ impl<'a> Lowering<'a> {
             Span::dummy(),
             message.to_string(),
         ))
+    }
+
+    /// Reads a callee's own already-resolved signature -- shared by
+    /// `lower_call` and `lower_invoke` so the two can never drift into
+    /// different fallback behavior for the same missing-metadata case.
+    /// Every function/extend method this module's own upfront pass in
+    /// `lower_module` actually processed always has an entry here, even
+    /// one declaring no type parameters (an empty `Vec`, a legitimate,
+    /// already-`Some` value, never confused with a missing entry) --
+    /// a missing entry can only mean `item` names a function this
+    /// module never itself resolved a signature for at all (a direct
+    /// caller's hand-built HIR referencing a nonexistent/foreign
+    /// function), which must fail atomically with a structured
+    /// diagnostic rather than silently fabricating an empty signature
+    /// returning `Ty::Error`.
+    #[allow(clippy::type_complexity)]
+    fn lookup_function_sig(
+        &self,
+        item: ItemId,
+        context: &str,
+    ) -> LowerResult<(Vec<crate::hir::TypeParamId>, Vec<Ty>, Ty)> {
+        self.function_sigs.get(&item).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "{context} targets a function this module never resolved a signature for"
+            ))
+        })
+    }
+
+    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
+    /// missing-vs-legitimately-empty distinction, for a callee's own
+    /// capability requirements (`rfcs/0009`).
+    fn lookup_function_requirements(
+        &self,
+        item: ItemId,
+        context: &str,
+    ) -> LowerResult<Vec<CapabilityRequirement>> {
+        self.function_requirements
+            .get(&item)
+            .cloned()
+            .ok_or_else(|| {
+                self.internal_error(&format!(
+                    "{context} targets a function this module never resolved capability requirements for"
+                ))
+            })
+    }
+
+    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
+    /// missing-vs-legitimately-empty distinction, for a callee's own
+    /// declared raised-effect set (`rfcs/0010`). Only `lower_invoke`
+    /// needs this: an ordinary `Call`'s own callee is never fallible, so
+    /// `lower_call` never looks its `raises` up at all.
+    fn lookup_function_raises(&self, item: ItemId, context: &str) -> LowerResult<Vec<ItemId>> {
+        self.function_raises.get(&item).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "{context} targets a function this module never resolved a raised-effect set for"
+            ))
+        })
     }
 
     /// Reads `expr_id`'s already-resolved type arguments back from
@@ -4729,6 +4780,15 @@ mod tests {
             function_sigs,
             &call_type_args,
         );
+        // A genuinely infallible, requirement-free callee still needs
+        // its own (empty) entry registered -- lower_call/lower_invoke's
+        // shared lookup helpers never fabricate one for a missing entry
+        // (Fix 6), so this test declares it explicitly rather than
+        // relying on the test harness's own otherwise-empty default map.
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        lowering.function_raises.insert(callee_item, Vec::new());
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),
@@ -4748,6 +4808,234 @@ mod tests {
             result.is_ok(),
             "a non-generic call must lower cleanly with no recorded type arguments: {result:?}"
         );
+    }
+
+    // -- Fix 6: no fake metadata fallbacks in lower_call/lower_invoke ---
+
+    #[test]
+    fn a_call_to_a_function_with_no_registered_signature_fails_lowering_atomically() {
+        // `function_sigs` never has an entry for `callee_item` at all --
+        // must fail with a structured diagnostic, never silently
+        // fabricate a zero-argument, `Ty::Error`-returning signature.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &call_type_args,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee.clone()),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a call with no registered signature")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn a_call_to_a_function_missing_capability_requirement_metadata_fails_lowering_atomically() {
+        // `function_sigs` has a real entry, but `function_requirements`
+        // was never populated for it at all -- distinct from genuinely
+        // declaring an empty requirement list (`Some(vec![])`), and must
+        // fail rather than silently treat "missing" the same as "none".
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            function_sigs,
+            &call_type_args,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee.clone()),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!(
+                "expected lowering to fail for a call whose callee has no registered capability requirements"
+            )
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn an_invoke_of_a_function_missing_raised_effect_metadata_fails_lowering_atomically() {
+        // `function_sigs`/`function_requirements` both have real
+        // (empty) entries, but `function_raises` was never populated at
+        // all -- must fail rather than silently treat this callee as
+        // infallible.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            function_sigs,
+            &call_type_args,
+        );
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let operand = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);
+        let Err(diagnostic) = result else {
+            panic!(
+                "expected lowering to fail for an invoke whose callee has no registered raises metadata"
+            )
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn a_valid_fallible_generic_call_lowers_through_invoke_with_no_diagnostics() {
+        // A generic callee declaring a real (non-empty) raises set, all
+        // three metadata maps genuinely populated -- the positive
+        // counterpart to the three failing cases above, confirming the
+        // strict lookups don't reject a legitimately well-formed invoke.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let error_item = ItemId(1);
+        let t = crate::hir::TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(
+            callee_item,
+            (
+                vec![t],
+                vec![Ty::Param(t, t_symbol)],
+                Ty::Param(t, t_symbol),
+            ),
+        );
+        let mut variants = HashMap::new();
+        let error_name = interner.intern("Failure");
+        let case_name = interner.intern("Broken");
+        variants.insert(
+            error_item,
+            VariantLayout {
+                name: error_name,
+                type_params: Vec::new(),
+                cases: vec![CaseLayout {
+                    name: case_name,
+                    payload: Vec::new(),
+                }],
+            },
+        );
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_expr_id = ExprId(1);
+        let mut call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        call_type_args.insert(call_expr_id, vec![Ty::I64]);
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+            function_sigs,
+            &call_type_args,
+        );
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        lowering
+            .function_raises
+            .insert(callee_item, vec![error_item]);
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let operand = HirExpr::Call {
+            id: call_expr_id,
+            callee: Box::new(callee),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);
+        let Ok(Some((ret_ty, _, _, err_blocks, _))) = result else {
+            panic!("expected a valid fallible generic invoke to lower successfully: {result:?}")
+        };
+        assert_eq!(ret_ty, Ty::I64);
+        assert_eq!(err_blocks.len(), 1);
+        assert_eq!(err_blocks[0].0, error_item);
     }
 
     #[test]

@@ -282,6 +282,12 @@ mod codes {
     /// `raises` set -- a function may only ever raise an effect it
     /// actually declares (`rfcs/0010`).
     pub const UNDECLARED_RAISE: &str = "V0070";
+    /// A function's own `raises` names a variant declaring one or more
+    /// type parameters. Generic error variants are explicitly out of
+    /// scope (`rfcs/0010`); `hir::lower`'s own `resolve_raises` already
+    /// rejects this for ordinary source, but this verifier never trusts
+    /// hand-built NIR to already satisfy it.
+    pub const GENERIC_RAISES_TYPE: &str = "V0071";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -907,8 +913,8 @@ fn verify_function(
     // already satisfy them.
     let mut seen_raises: HashSet<ItemId> = HashSet::new();
     for raised in &function.raises {
-        if !agg.variants.contains_key(raised) {
-            diagnostics.push(Diagnostic::error(
+        match agg.variants.get(raised) {
+            None => diagnostics.push(Diagnostic::error(
                 codes::UNKNOWN_RAISES_TYPE,
                 source,
                 Span::dummy(),
@@ -916,7 +922,18 @@ fn verify_function(
                     "{fn_context}'s `raises` names id {}, which is not a variant declared in this module",
                     raised.0
                 ),
-            ));
+            )),
+            Some(layout) if !layout.type_params.is_empty() => diagnostics.push(Diagnostic::error(
+                codes::GENERIC_RAISES_TYPE,
+                source,
+                Span::dummy(),
+                format!(
+                    "{fn_context}'s `raises` names `{}`, which declares {} type parameter(s); generic error variants are not supported",
+                    registry.qualified_name(*raised, interner),
+                    layout.type_params.len()
+                ),
+            )),
+            Some(_) => {}
         }
         if !seen_raises.insert(*raised) {
             diagnostics.push(Diagnostic::error(
@@ -7280,6 +7297,41 @@ mod tests {
         );
         assert!(
             codes_of(&diagnostics).contains(&codes::UNDECLARED_RAISE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_declaring_raises_of_a_generic_variant_is_rejected() {
+        // `hir::lower`'s own `resolve_raises` already rejects this for
+        // ordinary source (R0030); this verifier never trusts hand-built
+        // NIR to already satisfy it.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let failure_name = interner.intern("Failure");
+        let t = interner.intern("T");
+        let value_name = interner.intern("Value");
+        let failure_id = ItemId(200);
+        let failure_layout = VariantLayout {
+            name: failure_name,
+            type_params: vec![(TypeParamId(0), t)],
+            cases: vec![CaseLayout {
+                name: value_name,
+                payload: vec![Ty::Param(TypeParamId(0), t)],
+            }],
+        };
+
+        let mut function = valid_function(ItemId(0), f_name);
+        function.raises = vec![failure_id];
+
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            Vec::new(),
+            vec![(failure_id, failure_layout)],
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_RAISES_TYPE),
             "unexpected diagnostics: {diagnostics:?}"
         );
     }

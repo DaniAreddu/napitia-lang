@@ -144,6 +144,21 @@ mod codes {
     /// hand-built HIR could still hand this a case index that doesn't
     /// exist.
     pub const FAILURE_CASE_INDEX_OUT_OF_RANGE: &str = "T0058";
+    /// A function's own resolved `raises` entry names a variant that
+    /// isn't in `self.variants` at all -- unreachable for any HIR
+    /// `hir::lower` itself produced (every declared/imported variant is
+    /// always registered there), but a direct caller lowering hand-built
+    /// HIR could still hand this an entry naming an item that was never
+    /// registered. Never silently treated as a valid, non-generic raise:
+    /// that would let an unresolvable effect reach `check_raise`/
+    /// `check_try`/`check_handle` as if it were a real declared variant.
+    pub const RAISES_VARIANT_METADATA_MISSING: &str = "T0059";
+    /// `?`/`handle`'s own operand is a direct call to a `HirExpr::
+    /// Function` naming an item never registered in `self.functions` --
+    /// unreachable for any HIR `hir::lower` itself produced, but a
+    /// direct caller lowering hand-built HIR could still hand this a
+    /// dangling function reference.
+    pub const CALLEE_METADATA_MISSING: &str = "T0060";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -882,17 +897,30 @@ impl<'a> Checker<'a> {
         // than trusted, so `check_raise`/`check_try`/`check_handle`
         // below can never treat an applied generic variant as declared
         // just because its outer `ItemId` happens to match.
-        self.current_raises = sig
-            .raises
-            .iter()
-            .copied()
-            .filter(|item| {
-                self.variants
-                    .get(item)
-                    .map(|info| info.type_params.is_empty())
-                    .unwrap_or(true)
-            })
-            .collect();
+        let mut current_raises = std::collections::HashSet::with_capacity(sig.raises.len());
+        for item in sig.raises.iter().copied() {
+            match self.variants.get(&item) {
+                Some(info) if info.type_params.is_empty() => {
+                    current_raises.insert(item);
+                }
+                Some(_) => {}
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::RAISES_VARIANT_METADATA_MISSING,
+                            self.source,
+                            f.name_span,
+                            format!(
+                                "function `{}` raises an item that does not resolve to any declared variant",
+                                self.interner.resolve(f.name)
+                            ),
+                        )
+                        .with_primary_label("unresolvable raised effect"),
+                    );
+                }
+            }
+        }
+        self.current_raises = current_raises;
         if !f.uses.is_empty() {
             self.push_unsupported(f.name_span, "`uses` effect clauses");
         }
@@ -2457,17 +2485,22 @@ impl<'a> Checker<'a> {
     }
 
     /// The declared raised-error set of a plain function reference
-    /// (`rfcs/0010`) -- empty for anything else (a variant constructor
-    /// can never raise; an unresolved/unknown callee has already been
-    /// diagnosed elsewhere).
-    fn callee_raises(&self, callee: &HirExpr) -> Vec<ItemId> {
+    /// (`rfcs/0010`) -- `Some(&[])` for anything else (a variant
+    /// constructor can never raise), and `Some` of whatever `raises` the
+    /// callee's own registered signature declares (legitimately empty
+    /// for a real, infallible function) for a `HirExpr::Function` whose
+    /// `item` is registered. `None` only when the callee is a
+    /// `HirExpr::Function` naming an item that was never registered at
+    /// all -- unreachable for any HIR `hir::lower` itself produced
+    /// (every function it resolves to a `HirExpr::Function` is always
+    /// registered), but a direct caller lowering hand-built HIR could
+    /// still hand this a dangling reference. Kept distinct from "zero
+    /// raises" so callers never mistake missing metadata for a genuinely
+    /// infallible call.
+    fn callee_raises(&self, callee: &HirExpr) -> Option<Vec<ItemId>> {
         match callee {
-            HirExpr::Function { item, .. } => self
-                .functions
-                .get(item)
-                .map(|s| s.raises.clone())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            HirExpr::Function { item, .. } => self.functions.get(item).map(|s| s.raises.clone()),
+            _ => Some(Vec::new()),
         }
     }
 
@@ -2547,7 +2580,18 @@ impl<'a> Checker<'a> {
         {
             return Ty::Never;
         }
-        let raises = self.callee_raises(callee);
+        let Some(raises) = self.callee_raises(callee) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CALLEE_METADATA_MISSING,
+                    self.source,
+                    span,
+                    "`?`'s own operand calls a function that was never registered",
+                )
+                .with_primary_label("unresolvable callee"),
+            );
+            return Ty::Error;
+        };
         if raises.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -2622,7 +2666,21 @@ impl<'a> Checker<'a> {
         let operand_diverges = args
             .iter()
             .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)));
-        let raises = self.callee_raises(callee);
+        let raises = match self.callee_raises(callee) {
+            Some(raises) => raises,
+            None => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::CALLEE_METADATA_MISSING,
+                        self.source,
+                        span,
+                        "`handle`'s own operand calls a function that was never registered",
+                    )
+                    .with_primary_label("unresolvable callee"),
+                );
+                Vec::new()
+            }
+        };
         if raises.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -6478,6 +6536,109 @@ mod tests {
         assert!(
             result.diagnostics.iter().any(|d| d.code == "T0058"),
             "expected T0058, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_function_raising_an_item_with_no_declared_variant_is_a_diagnostic_not_a_panic() {
+        // `hir::lower`'s own `resolve_raises` never hands a function a
+        // `raises` entry naming an item that isn't a declared variant;
+        // this simulates a direct caller lowering hand-built HIR that
+        // bypasses it, confirming `check_function`'s own filter reports
+        // a diagnostic instead of silently accepting the dangling entry
+        // as if it were a real, non-generic raise.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let f_symbol = interner.intern("f");
+        let f_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == f_symbol)
+            .expect("f should have lowered");
+        f_fn.raises[0].variant = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0059"),
+            "expected T0059, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_try_on_a_callee_with_no_registered_signature_is_a_diagnostic_not_a_panic() {
+        // `hir::lower` never produces an `HirExpr::Function` naming an
+        // item outside `hir.functions`; this simulates a direct caller
+        // lowering hand-built HIR with a dangling function reference,
+        // confirming `check_try`'s own `callee_raises` lookup reports a
+        // diagnostic instead of silently treating the call as
+        // infallible.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 raises Failure { return f()? }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Try { expr, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a try expression");
+        };
+        let HirExpr::Call { callee, .. } = expr.as_mut() else {
+            panic!("expected a call expression");
+        };
+        let HirExpr::Function { item, .. } = callee.as_mut() else {
+            panic!("expected a function reference");
+        };
+        *item = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0060"),
+            "expected T0060, got {:?}",
             result.diagnostics
         );
     }

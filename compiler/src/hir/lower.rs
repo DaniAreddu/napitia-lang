@@ -74,6 +74,16 @@ mod codes {
     /// infallible too -- there is no protocol-visible effect for it to
     /// narrow.
     pub const EXTEND_METHOD_OWN_RAISES_CLAUSE: &str = "R0031";
+    /// A `raises` entry resolved to a declared variant whose own
+    /// type-parameter count was never recorded -- unreachable through
+    /// the ordinary pipeline (every variant, local or imported, has its
+    /// count recorded in `variant_type_param_count` before any function
+    /// is lowered), but a direct caller lowering hand-built import/type
+    /// data could still reach this. Never silently treated as
+    /// non-generic: a real generic error variant slipping through as if
+    /// it had zero type parameters would let `rfcs/0010`'s own explicit
+    /// non-goal (generic error variants) reach NIR undetected.
+    pub const RAISES_VARIANT_METADATA_MISSING: &str = "R0032";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -821,11 +831,21 @@ impl<'a> Lowering<'a> {
             // catches the *declaration* itself being generic
             // (`raises Failure` naming a `variant Failure[T] { .. }`),
             // which the grammar alone cannot rule out.
-            let type_param_count = self
-                .variant_type_param_count
-                .get(&item)
-                .copied()
-                .unwrap_or(0);
+            let Some(&type_param_count) = self.variant_type_param_count.get(&item) else {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::RAISES_VARIANT_METADATA_MISSING,
+                        self.source,
+                        ident.span,
+                        format!(
+                            "`{text}` resolves to a declared variant, but its type-parameter count was never recorded"
+                        ),
+                    )
+                    .with_primary_label("missing variant metadata"),
+                );
+                continue;
+            };
             if type_param_count > 0 {
                 let text = self.interner.resolve(ident.symbol);
                 self.diagnostics.push(
@@ -3095,6 +3115,65 @@ mod tests {
             lowering.diagnostics
         );
         assert_eq!(lowering.diagnostics[0].code, "R0015");
+    }
+
+    #[test]
+    fn a_raises_entry_resolving_to_a_variant_with_no_recorded_type_param_count_is_a_diagnostic_not_a_panic()
+     {
+        // `resolve_raises` reads a variant's own type-parameter count
+        // back from `variant_type_param_count` to reject a generic
+        // error variant -- every real variant (local or imported) is
+        // always registered there before any function is lowered, so
+        // this only tests the defense-in-depth path: `type_names`
+        // naming a variant `variant_type_param_count` was never told
+        // about, the only way a direct caller lowering hand-built
+        // `Lowering` state could reach it at all.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_sym = interner.intern("Shape");
+        let variant_item = ItemId(0);
+        let mut type_names = HashMap::new();
+        type_names.insert(
+            variant_sym,
+            (variant_item, TypeNameKind::Variant, variant_sym),
+        );
+        let mut lowering = Lowering {
+            source,
+            interner: &interner,
+            diagnostics: Vec::new(),
+            functions_by_name: HashMap::new(),
+            type_names,
+            protocol_names: HashMap::new(),
+            protocol_methods: HashMap::new(),
+            record_fields: HashMap::new(),
+            variant_cases: HashMap::new(),
+            variant_type_param_count: HashMap::new(),
+            case_lookup: HashMap::new(),
+            imported_record_field_public: HashMap::new(),
+            next_item_id: 0,
+            next_local_id: 0,
+            next_expr_id: 0,
+            next_pattern_id: 0,
+            type_param_scope: HashMap::new(),
+            next_type_param_id: 0,
+        };
+        let raises = vec![ast::Ident {
+            symbol: variant_sym,
+            span: Span::dummy(),
+        }];
+        let resolved = lowering.resolve_raises(&raises);
+        assert!(
+            resolved.is_empty(),
+            "an entry with no recorded metadata must be dropped, not resolved"
+        );
+        assert_eq!(
+            lowering.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            lowering.diagnostics
+        );
+        assert_eq!(lowering.diagnostics[0].code, "R0032");
     }
 
     #[test]

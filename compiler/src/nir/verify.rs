@@ -355,6 +355,47 @@ pub fn verify_module(
         }
     }
 
+    // Every protocol's own type parameters must be pairwise distinct,
+    // and every method's declared parameter/return type must be a valid
+    // type root scoped to that protocol's own type parameters (`rfcs/0009`)
+    // -- exactly the same shape of check a record's fields or a variant's
+    // case payloads already get. A protocol's method list is never
+    // iterated in a way whose *checking* order matters (unlike its
+    // declaration order, which is load-bearing for `protocol.call`'s own
+    // `method` index and is preserved automatically by walking the `Vec`
+    // in place).
+    for (id, protocol) in &module.protocols {
+        let context = format!("protocol `{}`", registry.qualified_name(*id, interner));
+        check_no_duplicate_type_params(&protocol.type_params, source, &context, &mut diagnostics);
+        let own_params: HashSet<TypeParamId> =
+            protocol.type_params.iter().map(|(id, _)| *id).collect();
+        for method in &protocol.methods {
+            let method_context = format!("{context}'s method `{}`", interner.resolve(method.name));
+            for param in &method.params {
+                check_type_root(
+                    param,
+                    &agg,
+                    &own_params,
+                    source,
+                    interner,
+                    registry,
+                    &method_context,
+                    &mut diagnostics,
+                );
+            }
+            check_type_root(
+                &method.return_type,
+                &agg,
+                &own_params,
+                source,
+                interner,
+                registry,
+                &method_context,
+                &mut diagnostics,
+            );
+        }
+    }
+
     for function in &module.functions {
         verify_function(
             function,
@@ -2126,7 +2167,7 @@ fn check_same_as_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nir::{BasicBlock, CaseLayout};
+    use crate::nir::{BasicBlock, CaseLayout, ProtocolMethodLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -4305,5 +4346,114 @@ mod tests {
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
         );
+    }
+
+    // -- Fix 3: protocol layout validation (`rfcs/0009`) -----------------
+
+    fn verify_module_with(
+        protocols: Vec<(ItemId, ProtocolLayout)>,
+        extends: Vec<(ItemId, ExtendLayout)>,
+        functions: Vec<Function>,
+        interner: &Interner,
+    ) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let module = Module {
+            protocols,
+            extends,
+            functions,
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        verify_module(&module, source, interner, &ItemRegistry::default())
+    }
+
+    /// A one-method `protocol Equal[T] { func equal(left: T, right: T)
+    /// -> bool; }` layout, for tests that mutate exactly one thing about
+    /// an otherwise-valid protocol declaration.
+    fn valid_equal_protocol(interner: &mut Interner) -> (ItemId, ProtocolLayout) {
+        let t = TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let equal = interner.intern("equal");
+        (
+            ItemId(0),
+            ProtocolLayout {
+                name: interner.intern("Equal"),
+                type_params: vec![(t, t_symbol)],
+                methods: vec![ProtocolMethodLayout {
+                    name: equal,
+                    params: vec![Ty::Param(t, t_symbol), Ty::Param(t, t_symbol)],
+                    return_type: Ty::Bool,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn a_valid_protocol_layout_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let (id, protocol) = valid_equal_protocol(&mut interner);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_protocol_declaring_the_same_type_parameter_twice_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let t = protocol.type_params[0];
+        protocol.type_params.push(t);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_protocol_method_using_a_foreign_type_parameter_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let foreign_symbol = interner.intern("U");
+        protocol.methods[0].params[0] = Ty::Param(TypeParamId(99), foreign_symbol);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::ESCAPING_TYPE_PARAMETER));
+    }
+
+    #[test]
+    fn a_protocol_method_returning_an_error_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        protocol.methods[0].return_type = Ty::Error;
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNEXPECTED_ERROR_TYPE));
+    }
+
+    #[test]
+    fn a_protocol_method_parameter_naming_an_unknown_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let bogus = interner.intern("Bogus");
+        protocol.methods[0].params[0] = Ty::Named(ItemId(999), bogus);
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::UNKNOWN_NAMED_TYPE));
+    }
+
+    #[test]
+    fn a_protocol_method_parameter_nested_deeper_than_the_generic_depth_limit_is_rejected() {
+        let mut interner = Interner::new();
+        let (id, mut protocol) = valid_equal_protocol(&mut interner);
+        let box_item = ItemId(50);
+        let t = protocol.type_params[0];
+        let mut deep = Ty::Param(t.0, t.1);
+        for _ in 0..(MAX_GENERIC_DEPTH + 2) {
+            deep = Ty::Applied(box_item, vec![deep]);
+        }
+        protocol.methods[0].params[0] = deep;
+        let diagnostics =
+            verify_module_with(vec![(id, protocol)], Vec::new(), Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::GENERIC_DEPTH_EXCEEDED));
     }
 }

@@ -80,6 +80,16 @@ mod codes {
     /// entirely, so such a program still gets a diagnostic instead of a
     /// silently invented `Ty::Error` with nothing said about why.
     pub const UNKNOWN_PROTOCOL_OR_METHOD: &str = "T0044";
+    /// The executable entry function (`rfcs/0009`) declares one or more
+    /// `uses` capability requirements. There is no caller for the entry
+    /// point (`napitia run` invokes it directly), so there is nowhere
+    /// for it to receive evidence from -- a requirement it declared
+    /// could only ever be satisfied by forwarding, and forwarding from
+    /// no caller at all is meaningless. A concrete protocol call inside
+    /// `main`'s own body remains legal without declaring `uses`: the
+    /// solver selects a concrete extension directly, needing no
+    /// forwarded evidence at all.
+    pub const ENTRY_MAIN_CAPABILITY_REQUIREMENT: &str = "T0045";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -819,6 +829,27 @@ impl<'a> Checker<'a> {
                     format!("`main` must take no parameters, found {}", f.params.len()),
                 )
                 .with_primary_label("`napitia run` calls `main` with no arguments"),
+            );
+        }
+        // The entry point has no caller of its own (`napitia run`
+        // invokes it directly), so a `uses` requirement it declared
+        // could only ever be satisfied by forwarding -- and there is no
+        // enclosing frame to forward from. Rejected here, at check time,
+        // rather than discovered as a runtime dispatch failure the
+        // moment the interpreter tries to resolve `Evidence::Forwarded`
+        // against an entry frame that was never given any evidence at
+        // all (`rfcs/0009`). A concrete protocol call inside `main`'s
+        // own body is unaffected: it never needs `uses` in the first
+        // place, since the solver picks a concrete extension directly.
+        if is_entry_main && !sig.requirements.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ENTRY_MAIN_CAPABILITY_REQUIREMENT,
+                    self.source,
+                    f.name_span,
+                    "the executable entry function cannot declare capability requirements; it has no caller to receive evidence from",
+                )
+                .with_primary_label("entry function declares a `uses` requirement"),
             );
         }
         let body_ty = self.check_block(&f.body);
@@ -5259,5 +5290,64 @@ mod tests {
             !diags.iter().any(|d| d.code == "T0039"),
             "the independent shallow resolution must not be poisoned into a missing-capability diagnostic: {diags:?}"
         );
+    }
+
+    // -- Fix 5: the entry function cannot declare capability requirements --
+
+    #[test]
+    fn an_entry_main_declaring_a_uses_requirement_is_rejected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            func main() -> bool
+            uses Equal[i64] {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "T0045"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_main_with_a_concrete_protocol_call_and_no_uses_clause_is_accepted() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> bool {
+                return Equal[i64].equal(1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_non_entry_function_declaring_a_uses_requirement_is_unaffected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func helper[T](left: T, right: T) -> bool
+            uses Equal[T] {
+                return Equal[T].equal(left, right)
+            }
+            func main() -> bool {
+                return helper[i64](1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 }

@@ -141,6 +141,23 @@ impl<'a> Interpreter<'a> {
                 args.len()
             )));
         }
+        // Mirrors the argument-count check just above: the verifier
+        // checks NIR-to-NIR evidence shape (`Call`'s own evidence list
+        // length against its callee's declared requirements), but never
+        // a value-level call across this API boundary (`Interpreter::
+        // call`/`call_item`, called directly by the CLI/tests, never
+        // through a `Call` instruction at all). A requirement-bearing
+        // function invoked with the wrong number of evidence entries
+        // fails here, immediately and by its own diagnosis, rather than
+        // deferred until whichever `protocol.call` first tries to index
+        // past the end of an evidence vector too short for it.
+        if function.requirements.len() != evidence.len() {
+            return Err(InterpreterError::InvalidOperation(format!(
+                "function declares {} capability requirement(s) but was given {} evidence entries",
+                function.requirements.len(),
+                evidence.len()
+            )));
+        }
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
             values.insert(param.value, arg);
@@ -1011,6 +1028,50 @@ mod tests {
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected an arity-mismatch error, got {outcome:?}"
+        );
+    }
+
+    /// Fix 5: `Interpreter::call`/`call_item` are a direct value-level
+    /// entry point into a function -- unlike a `Call` instruction, never
+    /// mediated by the verifier's own evidence-shape check. A
+    /// requirement-bearing function invoked this way with no evidence at
+    /// all must fail immediately, with its own diagnosis, rather than
+    /// deferred until whatever `protocol.call` inside its body first
+    /// tries to index past the end of an empty evidence vector.
+    #[test]
+    fn calling_a_requirement_bearing_function_with_no_evidence_is_an_immediate_error() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Function, Param, Terminator};
+        use crate::types::{CapabilityRequirement, Ty};
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                type_params: Vec::new(),
+                requirements: vec![CapabilityRequirement::new(ItemId(1), vec![Ty::I64])],
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: Ty::I64,
+                }],
+                return_type: Ty::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Some(ValueId(0))),
+                }],
+            }],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected an evidence-count error, got {outcome:?}"
         );
     }
 

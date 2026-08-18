@@ -1,0 +1,23 @@
+variant FileError {
+    Missing,
+    PermissionDenied,
+}
+
+func read_config(path: str) -> str raises FileError {
+    if path == "" {
+        raise FileError.Missing;
+    }
+    return "configuration";
+}
+
+func load(path: str) -> str raises FileError {
+    return read_config(path)?;
+}
+
+func main() -> str {
+    return handle load("") {
+        success text => text,
+        failure FileError.Missing => "default",
+        failure FileError.PermissionDenied => "denied",
+    };
+}

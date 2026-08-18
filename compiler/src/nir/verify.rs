@@ -518,14 +518,15 @@ pub fn verify_module(
         for ty in &extend.protocol_arguments {
             collect_occurring_type_params(ty, &mut occurring_params, 0);
         }
-        for (type_param_id, _) in &extend.type_params {
+        for (type_param_id, type_param_name) in &extend.type_params {
             if !occurring_params.contains(type_param_id) {
                 diagnostics.push(Diagnostic::error(
                     codes::UNCONSTRAINED_EXTEND_PARAMETER,
                     source,
                     Span::dummy(),
                     format!(
-                        "{context}'s type parameter does not occur in the protocol's own type arguments and cannot be determined by this extension's head"
+                        "{context}'s type parameter `{}` does not occur in the protocol arguments and cannot be determined by this extension's head",
+                        interner.resolve(*type_param_name)
                     ),
                 ));
             }
@@ -5649,6 +5650,38 @@ mod tests {
             &interner,
         );
         assert!(codes_of(&diagnostics).contains(&codes::UNCONSTRAINED_EXTEND_PARAMETER));
+    }
+
+    #[test]
+    fn two_unconstrained_extend_parameters_each_get_their_own_named_diagnostic_in_order() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let t = TypeParamId(40);
+        let u = TypeParamId(41);
+        let t_symbol = interner.intern("T");
+        let u_symbol = interner.intern("U");
+        let extend_id = ItemId(10);
+        let extend = ExtendLayout {
+            protocol: protocol_id,
+            type_params: vec![(t, t_symbol), (u, u_symbol)],
+            protocol_arguments: vec![Ty::I64],
+            requirements: Vec::new(),
+            methods: vec![ItemId(1)],
+        };
+        let method = equal_i64_method(&mut interner);
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        let v0059: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code == codes::UNCONSTRAINED_EXTEND_PARAMETER)
+            .collect();
+        assert_eq!(v0059.len(), 2, "{diagnostics:?}");
+        assert!(v0059[0].message.contains("`T`"), "{}", v0059[0].message);
+        assert!(v0059[1].message.contains("`U`"), "{}", v0059[1].message);
     }
 
     #[test]

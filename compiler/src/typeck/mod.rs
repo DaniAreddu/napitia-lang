@@ -137,6 +137,13 @@ mod codes {
     /// A `handle` failure arm's `Type.Case` does not belong to any effect
     /// its own operand actually raises.
     pub const FAILURE_PATTERN_WRONG_TYPE: &str = "T0057";
+    /// A `handle` failure arm's own resolved case index is out of range
+    /// for its variant's declared cases -- unreachable for any HIR
+    /// `hir::lower` itself produced (it only ever resolves a case index
+    /// that variant actually declares), but a direct caller lowering
+    /// hand-built HIR could still hand this a case index that doesn't
+    /// exist.
+    pub const FAILURE_CASE_INDEX_OUT_OF_RANGE: &str = "T0058";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -2751,6 +2758,35 @@ impl<'a> Checker<'a> {
                         }
                     };
                     if let Some((variant, case)) = key {
+                        // `hir::lower` only ever resolves a case index a
+                        // variant actually declares, so this is
+                        // unreachable for any HIR it produced -- but a
+                        // direct caller lowering hand-built HIR could
+                        // still hand this an out-of-range one. A
+                        // deterministic diagnostic, never a panic on the
+                        // indexing below.
+                        let Some(payload_tys) = self
+                            .variants
+                            .get(&variant)
+                            .and_then(|info| info.cases.get(case))
+                            .map(|(_, payload)| payload.clone())
+                        else {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    codes::FAILURE_CASE_INDEX_OUT_OF_RANGE,
+                                    self.source,
+                                    *pattern_span,
+                                    format!(
+                                        "case index {case} is out of range for `{}`",
+                                        self.registry.qualified_name(variant, self.interner)
+                                    ),
+                                )
+                                .with_primary_label("case index out of range"),
+                            );
+                            any_invalid = true;
+                            self.check_arm_body(&arm.body);
+                            continue;
+                        };
                         let reachable = !operand_diverges
                             && !wildcard_seen
                             && !covered.contains(&(variant, case));
@@ -2766,11 +2802,6 @@ impl<'a> Checker<'a> {
                             );
                         }
                         covered.insert((variant, case));
-                        let payload_tys = self
-                            .variants
-                            .get(&variant)
-                            .map(|info| info.cases[case].1.clone())
-                            .unwrap_or_default();
                         if payload_tys.len() != payload_args.len() {
                             self.diagnostics.push(
                                 Diagnostic::error(
@@ -6373,6 +6404,82 @@ mod tests {
             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_failure_case_index_within_range_is_valid() {
+        // Baseline/positive counterpart to the out-of-range regression
+        // below -- an ordinary, in-range case index has no diagnostics.
+        let diags = check(
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 1,
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_failure_case_index_out_of_range_is_a_diagnostic_not_a_panic() {
+        // `hir::lower` never resolves an out-of-range case index itself;
+        // this simulates a direct caller lowering hand-built HIR that
+        // bypasses it, confirming the indexing in check_handle no longer
+        // panics.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 1,
+                }
+            }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Handle { arms, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a handle expression");
+        };
+        let HirHandleArmKind::Failure(HirFailurePattern::Case { case, .. }) = &mut arms[1].kind
+        else {
+            panic!("expected a failure case arm");
+        };
+        *case = Some(999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0058"),
+            "expected T0058, got {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

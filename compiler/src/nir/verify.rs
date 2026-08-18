@@ -5976,6 +5976,58 @@ mod tests {
     }
 
     #[test]
+    fn a_protocol_call_passing_an_argument_of_the_wrong_type_is_rejected() {
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let method_fn = equal_i64_method(&mut interner);
+        // `Equal[i64].equal(left: i64, right: i64)` expects two `i64`s;
+        // this call passes a `bool` as its first argument instead.
+        let caller = Function {
+            id: ItemId(3),
+            name: interner.intern("f"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::Bool,
+                        kind: ValueKind::ProtocolCall {
+                            protocol: protocol_id,
+                            arguments: vec![Ty::I64],
+                            method: 0,
+                            evidence: valid_evidence_for_equal_i64(extend_id),
+                            args: vec![ValueId(0), ValueId(1)],
+                        },
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        };
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method_fn, caller],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::OPERAND_TYPE_MISMATCH));
+    }
+
+    #[test]
     fn a_protocol_call_whose_evidence_cannot_satisfy_the_exact_requirement_is_rejected() {
         let mut interner = Interner::new();
         let (protocol_id, protocol) = valid_equal_protocol(&mut interner);

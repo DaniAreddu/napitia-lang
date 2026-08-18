@@ -240,8 +240,12 @@ fn resolve_one_import(
         .iter()
         .find(|o| o.name == declared_name)
     {
+        // Only one `OtherItemKind` exists today; the message is written
+        // out in full (rather than built from a generic article + kind
+        // name) so it stays grammatically correct without needing an
+        // article table if a differently-named kind is ever added.
         let kind_text = match other.kind {
-            OtherItemKind::Import => "import",
+            OtherItemKind::Import => "an import declaration",
         };
         return Err(Box::new(
             Diagnostic::error(
@@ -249,7 +253,7 @@ fn resolve_one_import(
                 importing_source,
                 import.span,
                 format!(
-                    "`{item_name}` in module `{dotted}` is a `{kind_text}`, which cannot be imported in Alpha 0.1.2"
+                    "`{item_name}` in module `{dotted}` is {kind_text} and cannot itself be imported"
                 ),
             )
             .with_primary_label("not an importable kind")

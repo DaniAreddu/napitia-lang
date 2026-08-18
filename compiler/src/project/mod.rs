@@ -1720,4 +1720,37 @@ mod tests {
         assert_eq!(forward_result, reversed_result);
         assert_eq!(forward_result, Ok(crate::interpreter::Value::Bool(true)));
     }
+
+    /// Fix 5 (0.1.5 follow-up): importing an item that is itself only an
+    /// `import` declaration in its own module (re-exporting is not
+    /// supported) must report a grammatically correct, version-
+    /// independent message -- not the stale "cannot be imported in
+    /// Alpha 0.1.2" wording, and not "is a `import`".
+    #[test]
+    fn importing_an_import_declaration_reports_a_stable_grammatically_correct_message() {
+        let project = TempProject::new("import_of_an_import");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 {\n    return left + right\n}\n",
+        );
+        project.write("src/a.npt", "import math.add;\n");
+        project.write(
+            "src/main.npt",
+            "import a.add;\n\nfunc main() -> i64 {\n    return add(1, 2)\n}\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let diags = compile_project(&project.manifest_path(), &mut map, &mut interner).unwrap_err();
+        assert!(
+            diags.iter().any(|d| d.message
+                == "`add` in module `a` is an import declaration and cannot itself be imported"),
+            "unexpected diagnostics: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Alpha 0.1.2")),
+            "stale version-specific wording leaked: {diags:?}"
+        );
+    }
 }

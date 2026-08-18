@@ -40,24 +40,25 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.4
+## Current status: Alpha 0.1.5
 
-This milestone adds square-bracket generics to `func`/`record`/`variant`
-declarations: `func identity[T](value: T) -> T`, `record Box[T] { value: T
-}`, `variant Maybe[T] { Some(T), None }`, with explicit (`Box[i64]`,
-`identity[i64](42)`) or inferred (`identity(42)`) type application at every
-reference. A generic declaration's own body is checked exactly once,
-symbolically, against its own opaque type parameter — never re-checked per
-instantiation, and never permitting an operation (equality, ordering,
-arithmetic, bitwise, logical, field access, calling) nothing proves safe
-for an unconstrained `T`. Every instantiation is identified by one
-canonical key (declaration + concrete type arguments), reused across
-inference, NIR lowering, and verification; NIR itself stays fully
-parametric (a generic function lowers once, a call site records only its
-own concrete type arguments), and the interpreter erases those arguments
-at runtime the same way it always erased nominal identity to a bare item
-id. It builds on Alpha 0.1.3's module-qualified identity and import
-aliases (`rfcs/0007`) and Alpha 0.1.2's multi-file projects.
+This milestone adds `protocol`/`extend`/`uses`: a capability system for
+expressing "this type supports this operation" without inheritance,
+implicit receivers, or runtime type discovery. `protocol Equal[T] { func
+equal(left: T, right: T) -> bool; }` declares an explicit contract;
+`extend Equal[i64] { ... }` supplies a concrete (or conditionally generic)
+implementation; `Equal[i64].equal(a, b)` is the only way to call one —
+there is no `Self`, no implicit receiver, and `==` never routes through a
+protocol implicitly. Every capability requirement is resolved once,
+entirely at compile time, into one piece of evidence (a concrete
+extension, or a forward of the caller's own identical requirement) —
+dictionary passing, the same technique behind Haskell typeclasses without
+runtime dispatch, but a custom Napitia design, not a copy of Rust traits,
+Java/Go interfaces, or Haskell typeclasses. An independent NIR verifier
+pass re-checks every protocol/extend declaration and every call's evidence
+against hand-built NIR, never trusting the type checker to have already
+gotten it right. It builds on Alpha 0.1.4's generics (`rfcs/0008`) and
+Alpha 0.1.3's module-qualified identity and import aliases (`rfcs/0007`).
 
 ### Implemented in this milestone
 
@@ -118,6 +119,13 @@ aliases (`rfcs/0007`) and Alpha 0.1.2's multi-file projects.
   `match` over an instantiated payload type, substitution-aware infinite-
   layout detection, and depth/instance-count budgets shared across every
   stage that walks a type application — see below.
+- Capability protocols (`protocol`/`extend`/`uses`): explicit type
+  parameters and call syntax with no `Self`/implicit receiver, authority
+  and coherence checking for extensions, a dedicated capability solver
+  producing compile-time evidence (dictionary passing, not a runtime
+  vtable), exact-forwarding-only symbolic resolution, an entry-point
+  restriction, and an independent NIR verifier pass covering every
+  protocol/extend layout and every call's evidence — see below.
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -266,19 +274,63 @@ its own concrete type arguments — and there is no native-code
 monomorphization yet. See `rfcs/0008-canonical-generics.md` for the full
 design, the diagnostic codes, and the current honest limitations.
 
+### Capability protocols
+
+```napitia
+protocol Equal[T] {
+    func equal(left: T, right: T) -> bool;
+}
+
+extend Equal[i64] {
+    func equal(left: i64, right: i64) -> bool {
+        left == right
+    }
+}
+
+func pair_equal[T](a: T, b: T) -> bool uses Equal[T] {
+    Equal[T].equal(a, b)   // forwards this function's own requirement
+}
+
+func main() -> bool {
+    return pair_equal[i64](21, 21)
+}
+```
+
+An `extend` is only legal in the module that owns its protocol or the
+outermost nominal aggregate of its first type argument (a primitive
+first argument requires the protocol's own module) — this is what stops
+two unrelated modules from silently compiling contradictory
+implementations of the same capability for the same type. Two extends
+that could both match the same concrete instantiation are rejected as an
+overlap, checked by a sound, deterministic, bidirectional structural
+unifier over each extend's own head, entirely independent of any call
+site or declaration order. A still-generic function can only satisfy its
+own `uses` requirement by forwarding an identical caller requirement —
+never by deriving, weakening, or combining one symbolically — and the
+executable entry function cannot declare a `uses` requirement at all (it
+has no caller to receive evidence from). An independent NIR verifier pass
+re-checks every protocol/extend declaration's own shape and every call's
+evidence against hand-built NIR, bounded by an explicit depth/work
+budget, producing exactly one diagnostic per malformed evidence root.
+See `rfcs/0009-capability-protocols.md` for the full design, the
+diagnostic codes, and the current honest limitations.
+
 ### Explicitly not yet implemented
 
 Field mutation, record/variant equality, pattern guards, or-patterns,
-record-destructuring/slice/range patterns, protocols/trait-style
-constraints on a type parameter, checked `uses`/`raises` effects and
-errors, ownership/region enforcement (and the indirection that would lift
-the recursive-aggregate restriction), structured concurrency, remote
-packages/dependency declarations, wildcard/grouped imports, re-exports,
-package/module aliases (as opposed to the per-item import aliases that do
-exist — see above), incremental/cached compilation, an LLVM (or any
-native) backend, native-code generic specialization/monomorphization,
-garbage collection, and any domain-specific library (REST, ORM, tensors,
-GPU).
+record-destructuring/slice/range patterns, an inline `[T: Protocol]`
+bound spelling on a generic type parameter (the underlying capability
+requirement exists via `uses Protocol[T]` on the function — see above),
+protocol default methods/supertraits/first-class protocol values, checked
+`uses`/`raises` *effects* and errors (`spec/0005`, distinct from
+capability `uses`, which is fully checked), ownership/region enforcement
+(and the indirection that would lift the recursive-aggregate
+restriction), structured concurrency, remote packages/dependency
+declarations, wildcard/grouped imports, re-exports, package/module
+aliases (as opposed to the per-item import aliases that do exist — see
+above), incremental/cached compilation, an LLVM (or any native) backend,
+native-code generic specialization/monomorphization, garbage collection,
+and any domain-specific library (REST, ORM, tensors, GPU).
 Design direction for most of these exists in `rfcs/`;
 none of it is faked in the implementation.
 

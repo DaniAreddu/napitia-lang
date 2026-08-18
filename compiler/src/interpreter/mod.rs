@@ -1512,4 +1512,159 @@ mod tests {
             Ok(Value::Int(42))
         );
     }
+
+    // -- Typed outcomes: raise/?/handle (`rfcs/0010`) -------------------
+
+    #[test]
+    fn a_handled_raise_runs_the_matching_failure_arm() {
+        let text = "variant FileError { Missing, PermissionDenied } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure FileError.Missing => -1, \
+                             failure FileError.PermissionDenied => -2, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-1)));
+    }
+
+    #[test]
+    fn a_handled_success_runs_the_success_arm() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(true) { \
+                             success v => v, \
+                             failure _ => -1, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn postfix_try_forwards_a_raised_value_to_the_caller_unchanged() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func forward(ok: bool) -> i64 raises FileError { \
+                         return read(ok)?; \
+                     } \
+                     func main() -> i64 { \
+                         return handle forward(false) { \
+                             success v => v, \
+                             failure FileError.Missing => -7, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-7)));
+    }
+
+    #[test]
+    fn postfix_try_forwards_a_success_value_to_the_caller_unchanged() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func forward(ok: bool) -> i64 raises FileError { \
+                         return read(ok)?; \
+                     } \
+                     func main() -> i64 { \
+                         return handle forward(true) { \
+                             success v => v, \
+                             failure FileError.Missing => -7, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn handle_dispatches_the_right_case_among_multiple_raised_variants() {
+        let text = "variant FileError { Missing, PermissionDenied } \
+                     variant NetworkError { Timeout } \
+                     func read(mode: i64) -> i64 raises FileError, NetworkError { \
+                         if mode == 0 { return 42 } \
+                         if mode == 1 { raise FileError.Missing; } \
+                         if mode == 2 { raise FileError.PermissionDenied; } \
+                         raise NetworkError.Timeout; \
+                     } \
+                     func run_with(mode: i64) -> i64 { \
+                         return handle read(mode) { \
+                             success v => v, \
+                             failure FileError.Missing => -1, \
+                             failure FileError.PermissionDenied => -2, \
+                             failure NetworkError.Timeout => -3, \
+                         } \
+                     } \
+                     func main() -> i64 { \
+                         return run_with(0) * 1000 + run_with(1) * 100 + run_with(2) * 10 + run_with(3) \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42000 - 100 - 20 - 3)));
+    }
+
+    #[test]
+    fn handle_wildcard_covers_a_case_carrying_a_payload() {
+        let text = "variant FileError { Missing(i64), PermissionDenied } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing(9); \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure _ => -1, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-1)));
+    }
+
+    #[test]
+    fn handle_binds_a_raised_cases_payload() {
+        let text = "variant FileError { Missing(i64) } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing(9); \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure FileError.Missing(code) => code, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(9)));
+    }
+
+    #[test]
+    fn a_raise_inside_a_handled_arms_own_body_is_not_implicitly_caught() {
+        // A nested fallible call's own raise inside a `handle` arm's body
+        // needs its own `?`/`handle` -- the enclosing `handle` only ever
+        // dispatches on its own direct operand, never on anything a
+        // sibling arm's body happens to also raise.
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func outer() -> i64 raises FileError { \
+                         return handle read(true) { \
+                             success v => read(false)?, \
+                             failure FileError.Missing => -1, \
+                         } \
+                     } \
+                     func main() -> i64 { \
+                         return handle outer() { \
+                             success v => v, \
+                             failure FileError.Missing => -9, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-9)));
+    }
 }

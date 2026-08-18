@@ -90,6 +90,15 @@ mod codes {
     /// solver selects a concrete extension directly, needing no
     /// forwarded evidence at all.
     pub const ENTRY_MAIN_CAPABILITY_REQUIREMENT: &str = "T0045";
+    /// An `extend`'s own type parameter does not occur anywhere inside
+    /// its protocol's type arguments (`extend[T] Equal[i64] uses
+    /// Other[T]`) -- Alpha 0.1.5's capability resolution is exact-
+    /// forwarding-only (`rfcs/0009`): once a concrete requirement selects
+    /// this extend, every one of its own type parameters must already be
+    /// determined by that selection alone. A parameter this concrete head
+    /// never mentions has nothing to bind it to any concrete type, so
+    /// nothing could ever supply it, symbolically or otherwise.
+    pub const UNCONSTRAINED_EXTEND_PARAMETER: &str = "T0046";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -5342,6 +5351,128 @@ mod tests {
             }
             func helper[T](left: T, right: T) -> bool
             uses Equal[T] {
+                return Equal[T].equal(left, right)
+            }
+            func main() -> bool {
+                return helper[i64](1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Fix 3 (0.1.5 follow-up): exact-forwarding-only symbolic
+    //    semantics -- every extend type parameter must be determined by
+    //    its own protocol head (`rfcs/0009`) --------------------------
+
+    #[test]
+    fn an_extend_type_parameter_not_occurring_in_the_protocol_head_is_rejected() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            protocol Other[U] {
+                func other(payload: U) -> bool;
+            }
+            extend[T] Equal[i64] uses Other[T] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_extend_type_parameter_occurring_nested_inside_a_generic_argument_is_accepted() {
+        let diags = check(
+            "record Box[T] { payload: T }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[T] Equal[Box[T]] uses Equal[T] {
+                func equal(left: Box[T], right: Box[T]) -> bool {
+                    return Equal[T].equal(left.payload, right.payload)
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_unconstrained_extend_parameters_each_get_their_own_diagnostic_in_declared_order() {
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[A, B] Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        let t0046: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "T0046").collect();
+        assert_eq!(t0046.len(), 2, "unexpected diagnostics: {diags:?}");
+        assert!(t0046[0].primary_span.start < t0046[1].primary_span.start);
+    }
+
+    #[test]
+    fn every_extend_type_parameter_occurring_somewhere_in_a_multi_argument_head_is_accepted() {
+        let diags = check(
+            "record Pair[T, U] { left: T, right: U }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend[T, U] Equal[Pair[T, U]] {
+                func equal(left: Pair[T, U], right: Pair[T, U]) -> bool {
+                    return true
+                }
+            }
+            func main() -> i64 {
+                return 0
+            }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"T0046"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_still_symbolic_requirement_only_ever_resolves_by_forwarding() {
+        // `helper[T]`'s own call to `Equal[T].equal(..)` requires
+        // `Equal[T]`, still symbolic at this point in checking -- the
+        // solver's own entry point (`resolve_requirement`) only ever
+        // tries an exact structural match against `helper`'s own `uses`
+        // clause for a symbolic requirement (`Evidence::Forwarded`); it
+        // never falls through to concrete-extend search
+        // (`resolve_concrete`/`select_extension`, which only ever runs
+        // once a requirement is fully concrete), so this can never
+        // produce `Evidence::Extension` for a still-symbolic argument.
+        let diags = check(
+            "protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func helper[T](left: T, right: T) -> bool uses Equal[T] {
                 return Equal[T].equal(left, right)
             }
             func main() -> bool {

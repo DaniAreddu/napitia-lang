@@ -62,6 +62,35 @@ pub(super) struct ExtendInfo {
     pub span: Span,
 }
 
+/// Collects every `TypeParamId` occurring anywhere inside `ty`, recursing
+/// through `Ty::Applied`'s own argument list -- used to decide whether an
+/// extend's own type parameter is actually determined by its protocol
+/// head (`rfcs/0009`'s exact-forwarding-only requirement). Depth-bounded
+/// the same way every other stage that walks a type application is
+/// (`MAX_GENERIC_DEPTH`); a hostilely deep hand-built type simply stops
+/// contributing further occurrences past the bound rather than recursing
+/// without limit.
+fn collect_occurring_type_params(
+    ty: &Ty,
+    out: &mut std::collections::HashSet<TypeParamId>,
+    depth: usize,
+) {
+    if depth > MAX_GENERIC_DEPTH {
+        return;
+    }
+    match ty {
+        Ty::Param(id, _) => {
+            out.insert(*id);
+        }
+        Ty::Applied(_, args) => {
+            for arg in args {
+                collect_occurring_type_params(arg, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl<'a> Checker<'a> {
     /// Resolves every declared protocol's own method signatures, before
     /// any function/extend body (which may call one) or any extend
@@ -199,6 +228,41 @@ impl<'a> Checker<'a> {
             }
             let extend_type_params: std::collections::HashSet<TypeParamId> =
                 e.type_params.iter().map(|tp| tp.id).collect();
+
+            // Exact-forwarding-only symbolic semantics (`rfcs/0009`): an
+            // extend's own type parameter must be determined by its
+            // protocol head alone -- there is no other mechanism that
+            // could ever bind it. One diagnostic per unconstrained
+            // parameter, in declared order, and the whole extend is
+            // excluded from the solver (never silently dropped without a
+            // diagnostic, and never registered half-checked).
+            let mut occurring: std::collections::HashSet<TypeParamId> =
+                std::collections::HashSet::new();
+            for arg in &protocol_arguments {
+                collect_occurring_type_params(arg, &mut occurring, 0);
+            }
+            let mut has_unconstrained_param = false;
+            for tp in &e.type_params {
+                if !occurring.contains(&tp.id) {
+                    has_unconstrained_param = true;
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::UNCONSTRAINED_EXTEND_PARAMETER,
+                            self.source,
+                            tp.span,
+                            format!(
+                                "extend type parameter `{}` does not occur in the protocol's own type arguments and cannot be determined by this extension's head",
+                                self.interner.resolve(tp.name)
+                            ),
+                        )
+                        .with_primary_label("unconstrained extend type parameter"),
+                    );
+                }
+            }
+            if has_unconstrained_param {
+                continue;
+            }
+
             let requirements = self.resolve_requirements(&e.requirements);
 
             if !self.check_extension_authority(e, &protocol_arguments) {

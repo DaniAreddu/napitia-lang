@@ -32,6 +32,16 @@ concepts, and RFC 0004 corrects that.
   conditions as structured `InterpreterError` values rather than
   panicking or invoking undefined behavior (`spec/0006`) — a separate,
   lower layer than `raises`, not itself a checked language-surface effect.
+- Deterministic resource cleanup interacts with typed outcomes as of
+  Alpha 0.1.7 (`rfcs/0011`): a `raise`, and a postfix `?` that
+  propagates a failure out of the enclosing function, both run that
+  function's own registered `defer`s and implicit resource destruction
+  before the failure actually transfers control, exactly like an
+  ordinary `return` does — never bypassing cleanup the way an
+  unchecked exception unwind would. A `break`/`continue` loop exit, and
+  a nested-block-scoped exit distinct from its enclosing function's
+  own, do not yet get their own dedicated cleanup insertion (see
+  `rfcs/0011`'s own limitations).
 
 ## Accepted design direction
 

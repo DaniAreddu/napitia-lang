@@ -1,6 +1,7 @@
 # Spec 0006: Napitia IR (NIR)
 
-- Status: Partially implemented (Alpha 0.1.5)
+- Status: Partially implemented (Alpha 0.1.5; `drop` instruction and
+  resource-state verification added in Alpha 0.1.7, `rfcs/0011`)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -77,7 +78,18 @@ value is a real, typed value, not an absence of one.
 %d = record.field @<record>.<index> %base
 %d = variant.create @<variant>[<type-args>].<case>(%a, ...) ; payload in declaration order
 %d = variant.payload @<variant>.<case>.<index> %base
+      drop %v                          ; destroy a resource value (no result, rfcs/0011)
 ```
+
+`drop` (Alpha 0.1.7, `rfcs/0011`) destroys a resource-typed value:
+lowering emits one for every explicit `drop <expr>;`, and one more for
+every resource-typed local still owned at its own function's normal
+`return`/`raise`/postfix-`?`-propagation exit (in reverse declaration
+order, interleaved with any registered `defer` calls). The verifier
+independently checks its operand is resource-typed and, via the same
+reachability-aware forward must-dataflow analysis `Invoke`-slot
+initialization uses, that no value is ever the operand of two `Drop`s on
+any single reachable path.
 
 `record.create`/`variant.create` reference fields/cases by resolved
 **declaration index**, never by name, matching how `call` already

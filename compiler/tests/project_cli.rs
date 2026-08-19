@@ -594,3 +594,50 @@ fn a_raised_variant_and_a_fallible_function_imported_across_modules_run_end_to_e
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "-1");
 }
+
+/// An imported `resource` type (aliased on import), a `take` parameter
+/// crossing a module boundary, and cleanup across postfix `?` all work
+/// together across two files (`rfcs/0011`).
+#[test]
+fn an_imported_resource_type_and_a_take_parameter_work_across_modules() {
+    let dir = project("resource_two_file");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "5");
+}
+
+/// Same project as above, but every `import` in `main.npt` is written
+/// in reversed order -- the resulting NIR must be byte-identical,
+/// proving a resource type's own canonical identity (and its
+/// take/observation lowering) never depends on import declaration
+/// order.
+#[test]
+fn resource_nir_is_deterministic_under_reversed_import_order() {
+    let normal = project("resource_two_file");
+    let reordered = project("resource_two_file_reordered");
+
+    let normal_ir = stdout(&napitia(&["ir", &normal]));
+    let reordered_ir = stdout(&napitia(&["ir", &reordered]));
+    assert!(!normal_ir.is_empty());
+    assert_eq!(
+        normal_ir, reordered_ir,
+        "NIR must not depend on import declaration order"
+    );
+}

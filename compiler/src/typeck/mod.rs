@@ -163,16 +163,11 @@ mod codes {
     /// not a declared `resource` -- a primitive, `str`, or ordinary
     /// (non-affine) record/variant value is never a valid `drop` target.
     pub const DROP_OF_NON_RESOURCE: &str = "T0061";
-    /// `==`/`!=` applied to a resource-typed operand (`rfcs/0011`) --
-    /// resource equality is rejected outright, exactly like a protocol
-    /// value's own (there is no way to meaningfully compare two affine
-    /// values without an owner-observing side effect).
-    pub const RESOURCE_EQUALITY_REJECTED: &str = "T0062";
     /// A `resource` used where a protocol type argument or `extend`
     /// target is expected (`rfcs/0011`) -- protocols over resource types
     /// are out of scope this milestone; this is a dedicated diagnostic,
     /// never silent ordinary-value treatment.
-    pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0063";
+    pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0062";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -4515,6 +4510,77 @@ mod tests {
         let diags = check("func f() { defer true + 1; }");
         assert!(
             diags.iter().any(|d| d.code == "T0001"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_constructs_and_reads_fields_exactly_like_a_record() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() -> i64 { value file = File { descriptor: 3 }; return file.descriptor }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_construction_with_a_mistyped_field_is_a_diagnostic() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() -> File { return File { descriptor: true } }",
+        );
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn resource_equality_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f(a: File, b: File) -> bool { return a == b }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0016"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn drop_of_a_live_resource_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() { value file = File { descriptor: 3 }; drop file; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn drop_of_a_non_resource_is_rejected() {
+        let diags = check("func f() { value x = 1; drop x; }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0061"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_take_parameter_is_accepted_and_type_checked_normally() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> i64 { return file.descriptor }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_used_as_a_protocol_type_argument_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             protocol Equal[T] { func equal(left: T, right: T) -> bool; } \
+             extend Equal[File] { func equal(left: File, right: File) -> bool { return true } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0062"),
             "unexpected diagnostics: {diags:?}"
         );
     }

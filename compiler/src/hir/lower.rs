@@ -477,7 +477,11 @@ impl<'a> Lowering<'a> {
             .iter()
             .map(|(_, r)| (r.name.symbol, r.public))
             .chain(variant_decls.iter().map(|(_, v)| (v.name.symbol, v.public)))
-            .chain(resource_decls.iter().map(|(_, r)| (r.name.symbol, r.public)))
+            .chain(
+                resource_decls
+                    .iter()
+                    .map(|(_, r)| (r.name.symbol, r.public)),
+            )
             .collect();
         for (_, f) in &function_decls {
             if !f.public {

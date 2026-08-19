@@ -294,7 +294,7 @@ mod tests {
                     public: true,
                     type_params: Vec::new(),
                     fields: Vec::new(),
-                affine: false,
+                    affine: false,
                 },
                 HirRecord {
                     id: ItemId(1),
@@ -304,7 +304,7 @@ mod tests {
                     public: true,
                     type_params: Vec::new(),
                     fields: Vec::new(),
-                affine: false,
+                    affine: false,
                 },
             ],
             variants: Vec::new(),

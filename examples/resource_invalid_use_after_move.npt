@@ -1,0 +1,22 @@
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func consume(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+func main() -> i64 {
+    value file = open(3);
+    value first = consume(file);
+    // `file` was already moved into `consume` above -- using it again
+    // here is rejected at compile time (U0001).
+    value second = consume(file);
+    return first + second;
+}

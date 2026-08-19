@@ -1,0 +1,18 @@
+resource File {
+    descriptor: i64,
+}
+
+// `file` is an ordinary (non-`take`) parameter: a call-scoped
+// observation `identity` never owns. Returning it would let it escape
+// past the call that only ever lent it -- rejected at compile time
+// (U0005).
+func identity(file: File) -> File {
+    return file;
+}
+
+func main() -> i64 {
+    value file = File { descriptor: 3 };
+    value same = identity(file);
+    drop same;
+    return 0;
+}

@@ -170,6 +170,7 @@ fn lower_module_impl(
                 name: r.name,
                 type_params: r.type_params.iter().map(|p| (p.id, p.name)).collect(),
                 fields,
+                affine: r.affine,
             },
         );
     }
@@ -5128,6 +5129,7 @@ mod tests {
                 name: interner.intern("Box"),
                 type_params: vec![(t, interner.intern("T"))],
                 fields: vec![(interner.intern("value"), Ty::Param(t, interner.intern("T")))],
+                affine: false,
             },
         );
         let (local_types, expr_types, pattern_case) = empty_maps();
@@ -5511,6 +5513,7 @@ mod tests {
                 name: interner.intern("Point"),
                 type_params: Vec::new(),
                 fields: vec![(interner.intern("x"), Ty::I64)],
+                affine: false,
             },
         );
         let local_types = HashMap::new();
@@ -5575,6 +5578,7 @@ mod tests {
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
                 ],
+                affine: false,
             },
         );
         let local_types = HashMap::new();
@@ -5635,6 +5639,7 @@ mod tests {
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
                 ],
+                affine: false,
             },
         );
         let local_types = HashMap::new();

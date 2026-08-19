@@ -397,10 +397,9 @@ collector, a native heap allocator (Alpha 0.1.7's `resource` values are
 semantic runtime objects the interpreter tracks, not pointers into
 process memory — see `rfcs/0011`), generic resources, protocols over
 resource types, a user-defined destructor body attached directly to a
-`resource` declaration, cleanup insertion at a `break`/`continue`/
-nested-block-scoped exit distinct from its enclosing function's own
-(see `rfcs/0011`'s own limitations), the indirection that would lift
-the recursive-aggregate restriction, structured concurrency,
+`resource` declaration, cleanup insertion at a `break`/`continue` loop
+exit (see `rfcs/0011`'s own limitations), the indirection that would
+lift the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
 aliases that do exist — see above), incremental/cached compilation, an

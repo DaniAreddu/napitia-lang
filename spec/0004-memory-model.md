@@ -128,14 +128,14 @@ marker, not a file- or module-level ambient mode (RFC 0001).
 
 ### `defer`
 
-`defer` is implemented as of Alpha 0.1.7 (`rfcs/0011`), scoped to a
-function's own top-level exit rather than the fully general per-region
-design this section originally sketched: it schedules an expression to
-run exactly once, in LIFO order, at its enclosing function's own normal
-fallthrough, explicit `return`, `raise`, or postfix `?` propagation. A
-`break`/`continue` loop exit, and a nested-block-scoped exit distinct
-from its enclosing function's own, do not yet get their own dedicated
-cleanup insertion -- see `rfcs/0011`'s own limitations.
+`defer` is implemented as of Alpha 0.1.7 (`rfcs/0011`), scoped to its
+own immediately enclosing block rather than the fully general
+per-region design this section originally sketched: it schedules an
+expression to run exactly once, in LIFO order, at that block's own
+normal fallthrough, or (for the function's own top-level block) an
+explicit `return`, `raise`, or postfix `?` propagation. A `break`/
+`continue` loop exit does not yet run its own enclosing scopes'
+pending cleanup at all -- see `rfcs/0011`'s own limitations.
 
 ## Unresolved research questions
 

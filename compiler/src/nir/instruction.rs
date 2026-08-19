@@ -135,4 +135,12 @@ pub enum Instruction {
         slot: ValueId,
         value: ValueId,
     },
+    /// Destroys a resource value (`rfcs/0011`): an explicit `drop`, or a
+    /// scope's own implicit end-of-scope destruction of a still-owned
+    /// resource local. `value` must be resource-typed and must not
+    /// already have been the operand of another `Drop` on any path
+    /// reaching this one (`nir::verify`'s own job, not lowering's).
+    Drop {
+        value: ValueId,
+    },
 }

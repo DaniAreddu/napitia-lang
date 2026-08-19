@@ -92,6 +92,11 @@ pub struct RecordLayout {
     /// `(field name, declared type)`, in declaration order -- the order
     /// `record.create`'s arguments are always given in.
     pub fields: Vec<(Symbol, Ty)>,
+    /// Whether this was declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- see [`crate::hir::HirRecord::affine`]. Read back
+    /// by `nir::lower`'s own cleanup-insertion bookkeeping and by
+    /// `nir::verify`'s resource-state checks.
+    pub affine: bool,
 }
 
 #[derive(Debug, Clone)]

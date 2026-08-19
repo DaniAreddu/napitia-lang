@@ -38,9 +38,8 @@ concepts, and RFC 0004 corrects that.
   function's own registered `defer`s and implicit resource destruction
   before the failure actually transfers control, exactly like an
   ordinary `return` does — never bypassing cleanup the way an
-  unchecked exception unwind would. A `break`/`continue` loop exit, and
-  a nested-block-scoped exit distinct from its enclosing function's
-  own, do not yet get their own dedicated cleanup insertion (see
+  unchecked exception unwind would. A `break`/`continue` loop exit does
+  not yet run its own enclosing scopes' pending cleanup at all (see
   `rfcs/0011`'s own limitations).
 
 ## Accepted design direction

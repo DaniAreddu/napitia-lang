@@ -8,18 +8,21 @@
 //! `nir::lower` never re-derives ownership from spans or names: it is
 //! only ever invoked (via `driver::check`) once this stage's own
 //! diagnostics are empty, at which point it performs its own,
-//! independent, deliberately simpler bookkeeping (see `nir::lower`'s
-//! own `ResourceScope`) to decide where to insert `Drop`/deferred-call
-//! instructions -- trusting that a program this stage accepted can
-//! never make that bookkeeping ambiguous, without needing this stage to
-//! export a full cross-referenced ownership map of its own.
+//! independent, deliberately simpler bookkeeping (`nir::lower`'s own
+//! `FnBuilder::cleanup_actions`/`moved_out`) to decide where to insert
+//! `Drop`/deferred-call instructions -- trusting that a program this
+//! stage accepted can never make that bookkeeping ambiguous, without
+//! needing this stage to export a full cross-referenced ownership map
+//! of its own.
 //!
 //! Known, honest scope limits for this milestone: only a *whole*
 //! binding may ever be moved (moving a resource-typed value out of a
 //! record/resource field, `take other.file`, is not tracked -- field
 //! reads are always treated as a non-consuming observation); a
 //! `mutable` resource-typed binding's own old value is not specially
-//! validated for disposal when reassigned.
+//! validated for disposal when reassigned; a `break`/`continue` loop
+//! exit does not run any enclosing scope's pending cleanup
+//! (`nir::lower`'s own limitation, not checked/rejected here either).
 
 mod flow;
 mod state;

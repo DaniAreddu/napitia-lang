@@ -74,7 +74,7 @@ pub fn lower_module(
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
-    lower_module_with_paths(
+    lower_module_impl(
         hir,
         local_types,
         expr_types,
@@ -84,18 +84,19 @@ pub fn lower_module(
         protocol_call_evidence,
         interner,
         source,
-        &HashMap::new(),
+        ModulePathMode::SingleFile,
     )
 }
 
-/// Like [`lower_module`], but for a caller (single-file compilation has
-/// no project-level module path at all, so it goes through
-/// `lower_module`'s own empty-map wrapper instead) that can supply each
+/// Like [`lower_module`], but for a caller that can supply each
 /// declaring module's own dotted path -- read back by
 /// [`canonical_raises`] so two variants sharing a bare name from
 /// *different* modules still canonicalize to a stable, module-
 /// qualified order rather than an ambiguous tie (`rfcs/0007`,
-/// `rfcs/0010`).
+/// `rfcs/0010`). Always runs in [`ModulePathMode::Project`], even if
+/// `module_path_of` happens to be empty -- unlike `lower_module`'s own
+/// `SingleFile` mode, an empty table here means every lookup inside it
+/// is a genuine metadata gap, not "no project at all".
 #[allow(clippy::too_many_arguments)]
 pub fn lower_module_with_paths(
     hir: &HirModule,
@@ -108,6 +109,33 @@ pub fn lower_module_with_paths(
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
+) -> Result<Module, Vec<Diagnostic>> {
+    lower_module_impl(
+        hir,
+        local_types,
+        expr_types,
+        pattern_case,
+        call_type_args,
+        call_evidence,
+        protocol_call_evidence,
+        interner,
+        source,
+        ModulePathMode::Project(module_path_of),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_module_impl(
+    hir: &HirModule,
+    local_types: &HashMap<LocalId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    call_type_args: &HashMap<ExprId, Vec<Ty>>,
+    call_evidence: &HashMap<ExprId, Vec<Evidence>>,
+    protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    interner: &Interner,
+    source: SourceId,
+    module_path_mode: ModulePathMode<'_>,
 ) -> Result<Module, Vec<Diagnostic>> {
     // Every module-level item's ItemId must be globally unique across
     // records, variants, and functions alike -- not just unique within
@@ -200,7 +228,7 @@ pub fn lower_module_with_paths(
             f.raises.iter().map(|r| r.variant).collect(),
             &variant_layouts,
             &variant_source,
-            module_path_of,
+            module_path_mode,
             interner,
             source,
         ) {
@@ -297,7 +325,7 @@ pub fn lower_module_with_paths(
                 m.raises.iter().map(|r| r.variant).collect(),
                 &variant_layouts,
                 &variant_source,
-                module_path_of,
+                module_path_mode,
                 interner,
                 source,
             ) {
@@ -346,7 +374,7 @@ pub fn lower_module_with_paths(
         protocol_call_evidence,
         interner,
         source,
-        module_path_of,
+        module_path_mode,
         records: record_layouts,
         variants: variant_layouts,
         variant_source,
@@ -620,11 +648,33 @@ fn resolve_requirement(
 /// hand-built HIR bypassing that guarantee, so it fails atomically with
 /// a structured diagnostic rather than silently sorting an unresolvable
 /// entry as if it belonged first (or last).
+/// Which module-path identity a lowering call is running under --
+/// deciding *by the caller's own explicit choice*, never inferred from
+/// whether a supplied table happens to be empty. `lower_module`'s own
+/// wrapper always passes `SingleFile`; `lower_module_with_paths` always
+/// passes `Project`, even when its own `module_path_of` table happens
+/// to be empty (an empty table in `Project` mode means every lookup
+/// inside it is a genuine metadata gap, not "no project" -- exactly the
+/// distinction an `is_empty()` sentinel could never make).
+#[derive(Clone, Copy)]
+enum ModulePathMode<'a> {
+    /// Single-file compilation has no project-level module path at all
+    /// (`rfcs/0007`); every raised variant's own canonical module path
+    /// is legitimately empty.
+    SingleFile,
+    /// Project compilation: every raised variant's own declaring
+    /// `SourceId` must resolve to an entry in this table, built once,
+    /// up front, with one entry per module actually in the project
+    /// (`project::compile`). A miss is a genuine metadata gap, never a
+    /// legitimate empty path.
+    Project(&'a HashMap<SourceId, String>),
+}
+
 fn canonical_raises(
     mut raises: Vec<ItemId>,
     variant_layouts: &HashMap<ItemId, VariantLayout>,
     variant_source: &HashMap<ItemId, SourceId>,
-    module_path_of: &HashMap<SourceId, String>,
+    module_path_mode: ModulePathMode<'_>,
     interner: &Interner,
     source: SourceId,
 ) -> LowerResult<Vec<ItemId>> {
@@ -640,43 +690,31 @@ fn canonical_raises(
                 ),
             )));
         };
-        let module_path = if module_path_of.is_empty() {
-            // Single-file compilation intentionally has no project-level
-            // module path at all (`rfcs/0007`) -- every item's own
-            // canonical path is legitimately empty here, not a
-            // missing-metadata gap. `lower_module`'s own empty-map
-            // wrapper is the only caller that ever reaches this branch
-            // in the ordinary pipeline.
-            String::new()
-        } else {
-            // Project mode: `module_path_of` is built once, up front,
-            // with one entry per module actually in the project
-            // (`project::compile`), so every raised variant's own
-            // declaring `SourceId` must resolve here -- a miss is a
-            // genuine metadata gap, never a legitimate empty path, and
-            // must never silently sort as though the variant belonged
-            // to the project's root module.
-            let Some(&decl_source) = variant_source.get(item) else {
-                return Err(Box::new(Diagnostic::error(
-                    codes::INTERNAL_INVARIANT_VIOLATED,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "a function's own `raises` names id {item:?}, whose declaring module could not be resolved"
-                    ),
-                )));
-            };
-            let Some(path) = module_path_of.get(&decl_source) else {
-                return Err(Box::new(Diagnostic::error(
-                    codes::INTERNAL_INVARIANT_VIOLATED,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "a function's own `raises` names id {item:?}, declared in a module this project's own module-path table has no entry for"
-                    ),
-                )));
-            };
-            path.clone()
+        let module_path = match module_path_mode {
+            ModulePathMode::SingleFile => String::new(),
+            ModulePathMode::Project(module_path_of) => {
+                let Some(&decl_source) = variant_source.get(item) else {
+                    return Err(Box::new(Diagnostic::error(
+                        codes::INTERNAL_INVARIANT_VIOLATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "a function's own `raises` names id {item:?}, whose declaring module could not be resolved"
+                        ),
+                    )));
+                };
+                let Some(path) = module_path_of.get(&decl_source) else {
+                    return Err(Box::new(Diagnostic::error(
+                        codes::INTERNAL_INVARIANT_VIOLATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "a function's own `raises` names id {item:?}, declared in a module this project's own module-path table has no entry for"
+                        ),
+                    )));
+                };
+                path.clone()
+            }
         };
         let name = interner.resolve(layout.name).to_string();
         key_of.insert(*item, (module_path, name));
@@ -704,16 +742,16 @@ struct Lowering<'a> {
     protocol_call_evidence: &'a HashMap<ExprId, Evidence>,
     interner: &'a Interner,
     source: SourceId,
-    /// Every declaring module's own dotted path, by `SourceId` -- empty
-    /// for single-file compilation, which has no project-level module
-    /// path at all (`rfcs/0007`). Read back by `canonical_raises` so two
-    /// variants sharing a bare name from different modules still
-    /// canonicalize to a stable order (`rfcs/0010`).
-    module_path_of: &'a HashMap<SourceId, String>,
+    /// Whether this lowering is single-file or project-mode, and (in
+    /// project mode) every declaring module's own dotted path by
+    /// `SourceId` -- read back by `canonical_raises` so two variants
+    /// sharing a bare name from different modules still canonicalize to
+    /// a stable order (`rfcs/0007`, `rfcs/0010`).
+    module_path_mode: ModulePathMode<'a>,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
     /// Every declared variant's own declaring `SourceId`, by `ItemId` --
-    /// read back by `canonical_raises` (together with `module_path_of`)
+    /// read back by `canonical_raises` (together with `module_path_mode`)
     /// to resolve each raised variant's own stable qualified identity.
     variant_source: HashMap<ItemId, SourceId>,
     /// `(this function's own generic parameters, its param types, its
@@ -973,7 +1011,7 @@ impl<'a> Lowering<'a> {
             f.raises.iter().map(|r| r.variant).collect(),
             &self.variants,
             &self.variant_source,
-            self.module_path_of,
+            self.module_path_mode,
             self.interner,
             self.source,
         )?;
@@ -4460,6 +4498,74 @@ mod tests {
     }
 
     #[test]
+    fn lower_module_with_paths_given_a_completely_empty_map_is_still_project_mode() {
+        // `lower_module_with_paths` always runs in `ModulePathMode::
+        // Project`, even when its own `module_path_of` happens to be
+        // completely empty -- an `is_empty()` sentinel would have
+        // treated this identically to `lower_module`'s own single-file
+        // mode and silently canonicalized with an empty path; here it
+        // must instead fail atomically with I0002, since a real project
+        // caller's table is never actually empty (`project::compile`
+        // always builds one entry per loaded module) and an empty one
+        // can only mean a genuine gap.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(1),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = vec![entry_a];
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant_a],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &HashMap::new(),
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a completely empty project module-path map to fail lowering")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected I0002, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn duplicate_record_id_fails_lowering_atomically_not_a_panic() {
         let mut interner = Interner::new();
         let mut map = SourceMap::new();
@@ -4746,7 +4852,7 @@ mod tests {
             pattern_case,
             interner,
             source,
-            module_path_of: Box::leak(Box::new(HashMap::new())),
+            module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
             variant_source: HashMap::new(),
@@ -4782,7 +4888,7 @@ mod tests {
             pattern_case,
             interner,
             source,
-            module_path_of: Box::leak(Box::new(HashMap::new())),
+            module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
             variant_source: HashMap::new(),

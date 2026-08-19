@@ -1,0 +1,34 @@
+variant OpenError {
+    Invalid,
+}
+
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func close(file: File) -> unit {
+}
+
+// `file` is still owned by this scope when `raise` fires: the
+// compiler-inserted cleanup (the registered `defer`, then the implicit
+// drop of `file` itself) runs before the failure actually propagates
+// out of this function.
+func risky(descriptor: i64) -> i64 raises OpenError {
+    value file = open(descriptor);
+    defer close(file);
+    if descriptor < 0 {
+        raise OpenError.Invalid;
+    }
+    return file.descriptor;
+}
+
+func main() -> i64 {
+    return handle risky(5) {
+        success descriptor => descriptor,
+        failure OpenError.Invalid => -1,
+    };
+}

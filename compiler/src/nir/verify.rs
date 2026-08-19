@@ -9,7 +9,7 @@
 //! reach the interpreter (where it could panic or silently misbehave).
 //! It runs once, after lowering and before interpretation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
@@ -3595,6 +3595,12 @@ fn verify_invoke_slot_initialization(
     // `a_success_slot_loaded_from_a_block_also_reached_through_a_failure_edge_is_rejected`)
     // into a single, wrongly-shared gen fact.
     let mut incoming_edges: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
+    // The same edges as `incoming_edges`, indexed by *source* instead of
+    // target, purely to drive worklist propagation below (`invoke_slot_
+    // in_facts` never reads this -- it always recomputes a block's own
+    // incoming facts from `incoming_edges`, which alone carries each
+    // edge's own gen fact).
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for block in &function.blocks {
         match &block.terminator {
             Terminator::Branch(target) => {
@@ -3602,6 +3608,7 @@ fn verify_invoke_slot_initialization(
                     .entry(*target)
                     .or_default()
                     .push((block.id, None));
+                successors.entry(block.id).or_default().push(*target);
             }
             Terminator::CondBranch {
                 then_block,
@@ -3616,6 +3623,10 @@ fn verify_invoke_slot_initialization(
                     .entry(*else_block)
                     .or_default()
                     .push((block.id, None));
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend([*then_block, *else_block]);
             }
             Terminator::Switch { cases, .. } => {
                 for target in cases {
@@ -3624,6 +3635,7 @@ fn verify_invoke_slot_initialization(
                         .or_default()
                         .push((block.id, None));
                 }
+                successors.entry(block.id).or_default().extend(cases);
             }
             Terminator::Invoke {
                 ok_slot,
@@ -3635,29 +3647,56 @@ fn verify_invoke_slot_initialization(
                     .entry(*ok_target)
                     .or_default()
                     .push((block.id, Some(*ok_slot)));
+                successors.entry(block.id).or_default().push(*ok_target);
                 for target in err_targets {
                     incoming_edges
                         .entry(target.target)
                         .or_default()
                         .push((block.id, Some(target.slot)));
+                    successors.entry(block.id).or_default().push(target.target);
                 }
             }
             Terminator::Return(_) | Terminator::Raise { .. } => {}
         }
     }
 
-    // `OUT[b]` starts optimistic (the full guarded set) for every block
-    // except the entry (nothing is initialized before the function even
-    // starts) -- a "must" analysis's facts only ever shrink via
+    // Reachability from the entry block, computed the same way
+    // `compute_dominators` computes its own -- needed so an unreachable
+    // block is never seeded with an optimistic "everything already
+    // initialized" starting fact, which is not merely imprecise but
+    // actively unsound: a cycle purely among unreachable blocks (each
+    // one only ever reached from another block in the same cycle) would
+    // otherwise never have any real predecessor information flow in at
+    // all, so an optimistic start would just sit at "fully initialized"
+    // forever and could hide a genuine violation inside dead code that
+    // happens to also be an `Invoke` target.
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // `OUT[b]` starts optimistic (the full guarded set) for every
+    // *reachable* block except the entry (nothing is initialized before
+    // the function even starts); an unreachable block starts at the
+    // bottom of its own lattice (nothing guaranteed) instead, since
+    // there is no real predecessor to ever refine it down from "everything"
+    // in the first place. A "must" analysis's facts only ever shrink via
     // intersection as real predecessor information propagates in, so
-    // this is guaranteed to reach a unique least fixpoint, and visiting
-    // blocks in declaration order (never a `HashMap`'s) keeps that
-    // convergence deterministic run to run.
+    // every block's own `OUT` forms a monotonically non-increasing chain
+    // in a lattice of finite height (bounded by `guarded_slots.len()`),
+    // which is what guarantees the worklist loop below terminates at a
+    // unique least fixpoint regardless of how many blocks or how the CFG
+    // is shaped.
     let mut out: HashMap<BlockId, HashSet<ValueId>> = function
         .blocks
         .iter()
         .map(|b| {
-            let initial = if b.id == entry {
+            let initial = if b.id == entry || !reachable.contains(&b.id) {
                 HashSet::new()
             } else {
                 guarded_slots.clone()
@@ -3666,24 +3705,32 @@ fn verify_invoke_slot_initialization(
         })
         .collect();
 
-    // Bounded by the fact domain's own finite size: each block's own
-    // `OUT` can only shrink, never grow, so the whole fixpoint stabilizes
-    // within at most `guarded_slots.len()` full passes -- a couple extra
-    // rounds of slack, never an unbounded loop over a pathological (or
-    // adversarial hand-built) CFG.
-    let max_passes = guarded_slots.len() + 2;
-    for _ in 0..max_passes {
-        let mut changed = false;
-        for block in &function.blocks {
-            let in_facts = invoke_slot_in_facts(block.id, entry, &incoming_edges, &out);
-            let (new_out, _) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
-            if out.get(&block.id) != Some(&new_out) {
-                out.insert(block.id, new_out);
-                changed = true;
+    // Standard worklist ("chaotic iteration") fixpoint: every block is
+    // processed at least once (seeded here, in declaration order, so a
+    // rerun of the exact same CFG always explores it in the same order);
+    // whenever a block's own `OUT` actually changes, only *its own*
+    // successors -- read directly from the CFG, never a fixed count --
+    // are re-enqueued, since only they could possibly be affected.
+    // Termination follows from monotonicity: each processed change
+    // strictly shrinks that block's `OUT`, and the sum of every block's
+    // `OUT` size is a natural number bounded below by zero, so it cannot
+    // decrease forever.
+    let mut worklist: VecDeque<BlockId> = function.blocks.iter().map(|b| b.id).collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let in_facts = invoke_slot_in_facts(id, entry, &incoming_edges, &out);
+        let (new_out, _) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
+        if out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
             }
-        }
-        if !changed {
-            break;
         }
     }
 
@@ -8282,6 +8329,273 @@ mod tests {
         assert!(
             !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
             "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Builds a 10-block straight-line chain bb1 -> bb2 -> ... -> bb10,
+    /// pushed onto `caller.blocks` in *reverse* declaration order
+    /// (bb10 first, bb1 last) -- deliberately adversarial for any
+    /// analysis that sweeps blocks in declaration order once per pass
+    /// instead of following the CFG, since propagating a fact (or its
+    /// absence) from bb1 to bb10 then needs one full pass per hop. Ten
+    /// hops comfortably exceeds `guarded_slots.len() + 2` (2 + 2 = 4
+    /// here: `ok_slot` and the one failure slot), the old, incorrect
+    /// pass bound. bb10 ends with a `Load` of `ok_slot`; the caller
+    /// decides whether that load is genuinely justified.
+    fn reverse_order_chain_to_bb10(caller: &mut Function) {
+        for id in (1..=9u32).rev() {
+            caller.blocks.push(BasicBlock {
+                id: BlockId(id),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(id + 1)),
+            });
+        }
+        caller.blocks.push(BasicBlock {
+            id: BlockId(10),
+            instructions: vec![Instruction::Value {
+                result: ValueId(10),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(10))),
+        });
+    }
+
+    #[test]
+    fn a_deep_reverse_order_chain_with_a_genuinely_initialized_join_is_accepted() {
+        // bb11 (reached only through the Invoke's own failure edge)
+        // independently `Store`s ok_slot itself before joining bb1, so
+        // both of bb1's predecessors genuinely guarantee it; the fact
+        // must then survive propagating forward across all ten
+        // reverse-declared hops down to bb10's own `Load`.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(11),
+            }],
+        };
+        reverse_order_chain_to_bb10(&mut caller);
+        caller.blocks.push(BasicBlock {
+            id: BlockId(11),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(11),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(11),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_reverse_order_chain_with_an_uninitialized_join_is_rejected() {
+        // bb11 (reached only through the Invoke's own failure edge,
+        // which guarantees the *failure* slot, never ok_slot) branches
+        // straight into bb1 with no `Store` of its own -- bb1's true
+        // in-facts for ok_slot must resolve to "not guaranteed" (the
+        // intersection of the ok edge's guarantee and bb11's lack of
+        // one), and that absence must then correctly persist forward
+        // across all ten reverse-declared hops down to bb10's own
+        // `Load`, which must be rejected. A bound as low as
+        // `guarded_slots.len() + 2` cannot propagate this far in
+        // adversarial declaration order, so this is exactly the case
+        // the old fixed pass count would have silently missed.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(11),
+            }],
+        };
+        reverse_order_chain_to_bb10(&mut caller);
+        caller.blocks.push(BasicBlock {
+            id: BlockId(11),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the uninitialized join to be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_of_unreachable_blocks_never_inherits_optimistic_initialization() {
+        // bb20/bb21 only ever branch to each other -- neither is a
+        // target of anything reachable from the entry block, so the
+        // cycle as a whole is unreachable. Each has an "incoming edge"
+        // (from the other), so it is not caught by the simpler
+        // no-incoming-edge shortcut; if such a cycle were seeded with
+        // the same optimistic "everything already initialized" start
+        // every reachable block gets, the intersection within the
+        // cycle would never have any real information flow in and
+        // would just stay at "initialized" forever, silently hiding
+        // bb20's genuine, never-stored `Load` of ok_slot.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(3),
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        // Unreachable cycle: nothing reachable from the entry ever
+        // branches to bb20 or bb21.
+        caller.blocks.push(BasicBlock {
+            id: BlockId(20),
+            instructions: vec![Instruction::Value {
+                result: ValueId(20),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(21)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(21),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(20)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the unreachable cycle's own unstored load to be rejected: {diagnostics:?}"
         );
     }
 }

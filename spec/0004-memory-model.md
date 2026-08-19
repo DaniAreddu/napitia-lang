@@ -1,13 +1,25 @@
 # Spec 0004: Memory Model
 
-- Status: Design direction only. Not implemented in Alpha 0.1.
+- Status: Partially implemented as of Alpha 0.1.7 (`resource`/`take`/
+  `drop`/`defer`, `rfcs/0011-deterministic-resources.md`). The rest of
+  this document (universal ownership inference over every type,
+  automatic region inference, `owned`/`borrow`/`shared` boundary
+  annotations, `unsafe`) remains design direction only, not implemented.
 
-Alpha 0.1 has no `unsafe` blocks, no `owned`/`borrow`/`shared` boundary
-annotations, and no ownership enforcement — the NIR interpreter executes
-only primitive values and stack-local storage. This spec exists so later
-milestones build ownership/regions against a written-down design rather
-than an ad hoc one, and so nothing here is mistaken for already being
-enforced by the compiler.
+Alpha 0.1.7 adds a first, deliberately narrower memory-safety layer than
+the universal ownership-inference design this document originally
+sketched: rather than inferring move-vs-copy for *every* type, it
+introduces one new nominal kind, `resource`, that is *always* affine and
+non-copyable, tracked by a dedicated compiler stage (`resourceck/`).
+Every other type (primitives, `record`, `variant`) keeps its existing,
+unconditional copy semantics — this spec's own "value semantics by
+default" section describing implicit move-vs-copy *inference* for every
+type, and its "compiler-inferred memory regions"/`owned`/`borrow` API
+vocabulary, are not what Alpha 0.1.7 implements; see
+`rfcs/0011-deterministic-resources.md` for the actual design (`resource`
+declarations, `take` parameters, `drop`, `defer`) and its own explicit
+non-goals. The sections below describe the original, broader design
+direction this narrower feature does not (yet) fully realize.
 
 The vocabulary below (`owned`, `borrow`, `shared`, `region`) is the
 provisional set accepted in `rfcs/0004-language-independence.md`. It
@@ -23,8 +35,24 @@ the reasoning and the open questions this raises.
 
 - **Local storage in NIR**: NIR functions have named local slots
   (`spec/0006-napitia-ir.md`) that are simple value storage with no
-  ownership metadata attached yet. This is the only "memory model" that
-  actually exists in the current compiler.
+  ownership metadata attached for ordinary (non-`resource`) types.
+- **Affine `resource` values** (`rfcs/0011`, Alpha 0.1.7): a `resource`
+  declaration is a non-copyable nominal aggregate with exactly one
+  owner at a time. `resourceck/` tracks each owned resource-typed
+  local's own state (`Available`/`Moved`/`DropScheduled`/`Dropped`)
+  through a function body; assigning, returning, storing in a field, or
+  passing to a `take` parameter moves ownership; an ordinary parameter
+  is a call-scoped observation that can never escape its call. `drop`
+  destroys a live resource immediately; every resource still owned at
+  its own function's exit is destroyed implicitly, in reverse
+  declaration order; `defer` registers a call that runs exactly once,
+  in LIFO order, interleaved with implicit destruction. NIR represents
+  destruction explicitly (`Instruction::Drop`), independently verified
+  (no value is ever read or dropped twice on any reachable path) by the
+  same forward must-dataflow analysis Alpha 0.1.6's own `Invoke`-slot
+  verification uses. This is a real, if deliberately narrow, memory-
+  safety layer -- not the universal region-inference design sketched
+  below, which remains unimplemented.
 
 ## Accepted design direction
 
@@ -100,12 +128,14 @@ marker, not a file- or module-level ambient mode (RFC 0001).
 
 ### `defer`
 
-The `defer` statement (parsed today; using it is a checked, reported
-error rather than being executed — `spec/0002`) is intended to schedule
-an expression to run when the enclosing region ends,
-in reverse order of the `defer` statements encountered, independent of
-whether the region ends via normal control flow or an early
-error/`return`.
+`defer` is implemented as of Alpha 0.1.7 (`rfcs/0011`), scoped to a
+function's own top-level exit rather than the fully general per-region
+design this section originally sketched: it schedules an expression to
+run exactly once, in LIFO order, at its enclosing function's own normal
+fallthrough, explicit `return`, `raise`, or postfix `?` propagation. A
+`break`/`continue` loop exit, and a nested-block-scoped exit distinct
+from its enclosing function's own, do not yet get their own dedicated
+cleanup insertion -- see `rfcs/0011`'s own limitations.
 
 ## Unresolved research questions
 

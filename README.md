@@ -40,9 +40,41 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.6
+## Current status: Alpha 0.1.7
 
-This milestone adds `raises`/`raise`/postfix `?`/`handle`: a custom,
+This milestone adds `resource`/`take`/`drop`/`defer`: Napitia's first
+memory/resource-safety layer, not a copy of Rust's ownership/borrow/
+lifetime system, C++ destructors/`delete`, Java garbage collection, or
+Go's tuple-error convention. A `resource` declaration
+(`resource File { descriptor: i64 }`) is an affine, non-copyable nominal
+aggregate — reusing a `record`'s own construction syntax unchanged — with
+exactly one owner at a time, tracked through every function body by a
+dedicated compiler stage (`resourceck/`). Assigning, returning, storing
+in a field, or passing to a `take` parameter moves ownership; an
+ordinary (non-`take`) parameter is a call-scoped observation the callee
+never owns and can never let escape. `drop file` destroys a live
+resource immediately; every resource still owned at its own function's
+exit is destroyed implicitly, in reverse declaration order; `defer
+close(file)` registers a call that runs exactly once, in LIFO order,
+interleaved with implicit destruction. Use-after-move, use-after-drop,
+double-drop, moving a value a pending `defer` still needs, and an
+observation escaping its call are all compile-time diagnostics. NIR
+represents destruction explicitly (a new `Drop` instruction) and an
+independent verifier pass proves no value is ever read or dropped twice
+on any reachable path, using the same reachability-aware forward
+must-dataflow analysis Alpha 0.1.6's own `Invoke`-slot verification
+uses. It builds on Alpha 0.1.6's typed outcomes (`rfcs/0010`), Alpha
+0.1.5's capability protocols (`rfcs/0009`), Alpha 0.1.4's generics
+(`rfcs/0008`), and Alpha 0.1.3's module-qualified identity and import
+aliases (`rfcs/0007`). See `rfcs/0011-deterministic-resources.md` for
+the full design and current honest limitations — this defines and
+verifies memory *semantics*; it does not implement a native heap
+allocator, general references, lifetime annotations, shared ownership,
+reference counting, or a tracing garbage collector.
+
+### Alpha 0.1.6: typed outcomes
+
+Alpha 0.1.6 added `raises`/`raise`/postfix `?`/`handle`: a custom,
 statically checked failure model, not a copy of Rust's `Result`,
 Java/Python/C++ exceptions, or Go's tuple-return convention. A function's
 raised-error set is part of its signature, exactly like its return type
@@ -95,11 +127,13 @@ identity and import aliases (`rfcs/0007`).
   re-checks structural and type invariants before a module is ever
   interpreted. Record/variant construction, field/payload projection,
   `match` (lowered to a real decision tree over `switch`/`condbr`), and
-  `raise`/postfix `?`/`handle` (lowered to `Invoke`/`Raise`, see below)
-  all have full NIR representation now; casts, `defer`, and a
-  value-carrying `break` remain parsed-but-rejected, never silently
-  accepted or faked. Lowering the rest of a module is atomic: either
-  every function lowers, or the whole module fails with diagnostics.
+  `raise`/postfix `?`/`handle` (lowered to `Invoke`/`Raise`), and
+  `drop`/`defer`/implicit resource destruction (lowered to a new `Drop`
+  instruction, see below) all have full NIR representation now; casts
+  and a value-carrying `break` remain parsed-but-rejected, never
+  silently accepted or faked. Lowering the rest of a module is atomic:
+  either every function lowers, or the whole module fails with
+  diagnostics.
 - A tree-walking interpreter over NIR, used to execute the supported
   language subset (including records, variants, and `match`) without a
   native backend.
@@ -139,6 +173,21 @@ identity and import aliases (`rfcs/0007`).
   construct — see `rfcs/0010-typed-outcomes.md` for the full design and
   current honest limitations (there is no protocol/capability
   integration for typed failure yet).
+- Deterministic resources (`resource`/`take`/`drop`/`defer`): a
+  dedicated flow-sensitive resource checker (`resourceck/`) tracking
+  every affine value's own state (`Available`/`Moved`/`DropScheduled`/
+  `Dropped`) through a function body, joins that require reachable
+  branches to agree, and loop-carried invalidation detection; NIR
+  lowering inserts real `Drop`/deferred-call instructions at normal
+  return/fallthrough, `raise`, and postfix `?` propagation (a
+  `break`/`continue` loop exit does not yet get its own dedicated
+  cleanup insertion — see the RFC's own limitations); an
+  independent NIR verifier pass proves every `Drop` targets a live
+  resource value and no value is ever dropped twice on any reachable
+  path — see `rfcs/0011-deterministic-resources.md` for the full design
+  and current honest limitations (no general references, lifetimes,
+  shared ownership, reference counting, tracing GC, or native
+  allocator).
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -342,8 +391,16 @@ diagnosed, not merely unspellable — a `raises` entry naming a generic
 variant is rejected), partial `handle` (consuming only some raised
 effects and re-raising the rest), first-class effect/error values, stack
 traces or
-`panic`/`recover`, ownership/region enforcement (and the indirection that
-would lift the recursive-aggregate restriction), structured concurrency,
+`panic`/`recover`, general references/borrowing, lifetime annotations,
+raw pointers, shared ownership, reference counting, a tracing garbage
+collector, a native heap allocator (Alpha 0.1.7's `resource` values are
+semantic runtime objects the interpreter tracks, not pointers into
+process memory — see `rfcs/0011`), generic resources, protocols over
+resource types, a user-defined destructor body attached directly to a
+`resource` declaration, cleanup insertion at a `break`/`continue`/
+nested-block-scoped exit distinct from its enclosing function's own
+(see `rfcs/0011`'s own limitations), the indirection that would lift
+the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
 aliases that do exist — see above), incremental/cached compilation, an

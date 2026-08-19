@@ -159,6 +159,20 @@ mod codes {
     /// direct caller lowering hand-built HIR could still hand this a
     /// dangling function reference.
     pub const CALLEE_METADATA_MISSING: &str = "T0060";
+    /// `drop <expr>` (`rfcs/0011`) where `<expr>`'s own static type is
+    /// not a declared `resource` -- a primitive, `str`, or ordinary
+    /// (non-affine) record/variant value is never a valid `drop` target.
+    pub const DROP_OF_NON_RESOURCE: &str = "T0061";
+    /// `==`/`!=` applied to a resource-typed operand (`rfcs/0011`) --
+    /// resource equality is rejected outright, exactly like a protocol
+    /// value's own (there is no way to meaningfully compare two affine
+    /// values without an owner-observing side effect).
+    pub const RESOURCE_EQUALITY_REJECTED: &str = "T0062";
+    /// A `resource` used where a protocol type argument or `extend`
+    /// target is expected (`rfcs/0011`) -- protocols over resource types
+    /// are out of scope this milestone; this is a dedicated diagnostic,
+    /// never silent ordinary-value treatment.
+    pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0063";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -547,6 +561,9 @@ struct RecordInfo {
     /// This record's own generic parameters, in declaration order.
     /// Empty for a non-generic record.
     type_params: Vec<TypeParamId>,
+    /// Whether this was declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- see [`crate::hir::HirRecord::affine`].
+    affine: bool,
 }
 
 #[derive(Clone)]
@@ -608,6 +625,7 @@ impl<'a> Checker<'a> {
                     fields,
                     source: r.source,
                     type_params: r.type_params.iter().map(|p| p.id).collect(),
+                    affine: r.affine,
                 },
             );
         }
@@ -1065,9 +1083,18 @@ impl<'a> Checker<'a> {
                 value_ty
             }
             HirStmt::Expr(e) => self.check_expr(e),
-            HirStmt::Defer { expr, span } => {
+            HirStmt::Defer { expr, .. } => {
+                // Type-checked immediately, exactly like any other
+                // statement-expression, even though `resourceck`/NIR
+                // lowering only actually run the call later, at scope
+                // exit (`rfcs/0011`) -- there is no "check it when it
+                // eventually runs" deferred pass.
                 self.check_expr(expr);
-                self.push_unsupported(*span, "`defer`");
+                Ty::Unit
+            }
+            HirStmt::Drop { expr, span } => {
+                let ty = self.check_expr(expr);
+                self.check_drop_target(&ty, *span);
                 Ty::Unit
             }
             HirStmt::While {
@@ -3602,6 +3629,39 @@ impl<'a> Checker<'a> {
         self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
+    /// `true` iff `ty` is a resolved reference to a declared `resource`
+    /// (`rfcs/0011`), never a `record`/`variant`/primitive. Used by every
+    /// resource-specific check (`drop`, equality rejection, protocol
+    /// rejection) instead of each re-deriving it from `self.records`.
+    fn is_affine_resource(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|info| info.affine))
+    }
+
+    /// `drop <expr>;` (`rfcs/0011`) only ever accepts a resource-typed
+    /// operand -- a primitive, `str`, or ordinary record/variant value
+    /// has no owned resource state for `resourceck` to transition to
+    /// `Dropped` at all.
+    fn check_drop_target(&mut self, ty: &Ty, span: Span) {
+        let resolved = self.ctx.resolve(ty);
+        if matches!(resolved, Ty::Error | Ty::Never) {
+            return;
+        }
+        if !self.is_affine_resource(&resolved) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::DROP_OF_NON_RESOURCE,
+                    self.source,
+                    span,
+                    format!(
+                        "`drop` requires a resource value, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("not a resource"),
+            );
+        }
+    }
+
     /// `true` for a resolved type this checker can prove *no* operation
     /// is universally valid for -- specifically, one of the enclosing
     /// generic declaration's own unconstrained type parameters
@@ -4442,13 +4502,21 @@ mod tests {
     }
 
     #[test]
-    fn defer_statement_is_reported_as_an_unsupported_feature() {
-        // `defer` must never be silently dropped: it is parsed and its
-        // expression is still checked, but running it has no
-        // implemented semantics yet.
+    fn defer_statements_own_expression_is_type_checked_normally() {
+        // `defer` is real as of `rfcs/0011`: its expression is
+        // type-checked exactly like an ordinary statement-expression,
+        // with no unsupported-feature diagnostic.
         let diags = check("func f() { value x = 1; defer x + 1; }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_malformed_defer_expression_is_still_a_diagnostic() {
+        let diags = check("func f() { defer true + 1; }");
+        assert!(
+            diags.iter().any(|d| d.code == "T0001"),
+            "unexpected diagnostics: {diags:?}"
+        );
     }
 
     #[test]
@@ -5022,6 +5090,7 @@ mod tests {
                     },
                 },
             ],
+            affine: false,
         };
         let param_local = LocalId(0);
         let function = HirFunction {
@@ -5042,6 +5111,7 @@ mod tests {
                     args: Vec::new(),
                     span: Span::dummy(),
                 },
+                take: false,
             }],
             return_type: Some(HirType::Unresolved {
                 name: interner.intern("i64"),
@@ -5181,8 +5251,8 @@ mod tests {
         let diags = check(
             "variant Shape { Circle(i64) } \
              variant Other { X } \
-             func take(o: Other) { } \
-             func f() { take(Shape.Circle(1)); }",
+             func accept(o: Other) { } \
+             func f() { accept(Shape.Circle(1)); }",
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0001");

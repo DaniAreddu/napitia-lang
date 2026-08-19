@@ -240,6 +240,20 @@ mod tests {
     }
 
     #[test]
+    fn a_value_observed_only_inside_a_nested_if_within_a_defer_call_is_still_protected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 defer inspect(if cond { file } else { file }); \
+                 drop file; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0004"], "unexpected: {diags:?}");
+    }
+
+    #[test]
     fn inconsistent_branch_state_is_rejected() {
         let diags = check(
             "resource File { descriptor: i64 } \

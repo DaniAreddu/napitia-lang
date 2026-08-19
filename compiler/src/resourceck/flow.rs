@@ -202,12 +202,18 @@ impl<'a> FlowChecker<'a> {
     }
 
     fn check_drop(&mut self, expr: &HirExpr, span: Span) {
-        self.check_expr(expr);
+        // Deliberately does *not* run `expr` through the generic
+        // `check_expr`/`check_read` path first: `drop`'s own target is
+        // being consumed here, not read, and the match below already
+        // gives every state (including `Moved`/`Dropped`) its own more
+        // precise diagnostic (`double drop`, not the generic `use after
+        // drop` a plain read would report for the same case).
         let HirExpr::Local { local, name, .. } = expr else {
             // A non-local drop target (already rejected by typeck's own
             // static-type check if it isn't even a resource) has no
-            // owned binding here to transition; nothing further to
-            // check at the ownership level.
+            // owned binding here to transition; still walked generically
+            // for whatever nested reads it does contain.
+            self.check_expr(expr);
             return;
         };
         if self.observing.contains(local) {

@@ -168,6 +168,13 @@ mod codes {
     /// are out of scope this milestone; this is a dedicated diagnostic,
     /// never silent ordinary-value treatment.
     pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0062";
+    /// A `record`/`variant` (ordinary, freely copyable) declares a
+    /// field/payload whose type is itself an affine `resource`
+    /// (`rfcs/0011`). Copying a value of the ordinary aggregate would
+    /// duplicate the resource it holds, which affine values may never
+    /// be -- only another `resource` (itself already non-copyable) may
+    /// hold a resource-typed field.
+    pub const RESOURCE_FIELD_IN_ORDINARY_AGGREGATE: &str = "T0064";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -351,6 +358,7 @@ pub fn check_module_with_registry(
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
+    checker.check_resource_field_containment(hir);
     checker.check_aggregate_cycles(hir);
     checker.register_protocols(hir);
     checker.build_signatures(hir);
@@ -657,6 +665,66 @@ impl<'a> Checker<'a> {
                         .collect(),
                 ),
             );
+        }
+    }
+
+    /// An ordinary (non-affine) `record`/`variant` may never hold a
+    /// resource-typed field/payload (`rfcs/0011`): every ordinary
+    /// aggregate is freely copyable, and copying one that held a
+    /// resource would duplicate it, which affine values may never
+    /// allow. Run once, after `build_aggregate_info` has every field's
+    /// own resolved type available, before any function body is
+    /// checked -- reported even for a record/variant nothing ever
+    /// constructs.
+    fn check_resource_field_containment(&mut self, hir: &HirModule) {
+        for r in &hir.records {
+            if r.affine {
+                continue;
+            }
+            let Some(info) = self.records.get(&r.id) else {
+                continue;
+            };
+            for (field, (_, ty, _)) in r.fields.iter().zip(info.fields.iter()) {
+                if self.is_affine_resource(ty) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
+                            r.source,
+                            field.span,
+                            format!(
+                                "field `{}` of ordinary record `{}` cannot hold a resource; only another resource may",
+                                self.interner.resolve(field.name),
+                                self.interner.resolve(r.name),
+                            ),
+                        )
+                        .with_primary_label("resource field in an ordinary record"),
+                    );
+                }
+            }
+        }
+        for v in &hir.variants {
+            let Some(info) = self.variants.get(&v.id) else {
+                continue;
+            };
+            for (case, (_, payload_tys)) in v.cases.iter().zip(info.cases.iter()) {
+                for (payload_hir_ty, payload_ty) in case.payload.iter().zip(payload_tys.iter()) {
+                    if self.is_affine_resource(payload_ty) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
+                                v.source,
+                                payload_hir_ty.span(),
+                                format!(
+                                    "case `{}` of variant `{}` cannot carry a resource payload; only a resource may hold one",
+                                    self.interner.resolve(case.name),
+                                    self.interner.resolve(v.name),
+                                ),
+                            )
+                            .with_primary_label("resource payload in a variant case"),
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -217,7 +217,7 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file(
             "t.npt",
-            "func helper(x: i64) -> i64 { defer x; return x } \
+            "func helper(x: i64) -> i64 { value r = 0..x; return x } \
              func main() -> i64 { return helper(1) }",
         );
         let mut interner = Interner::new();

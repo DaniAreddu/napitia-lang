@@ -672,23 +672,43 @@ fn join_branch_states(
 }
 
 /// Every resource-typed local a defer's own expression reads (bare
-/// `Local` occurrences anywhere within it), used to promote each one
-/// still `Available` to `DropScheduled`. Deliberately a plain, direct
-/// collection (not `check_expr`'s own move-aware walk): a `defer`'s
-/// argument evaluation already ran through `check_expr` for its own
-/// diagnostics; this second, narrow pass only needs *which* locals it
-/// touched, not to re-validate them.
+/// `Local` occurrences anywhere within it, including inside a nested
+/// `if`/`match`/`handle`/block/record-literal argument), used to
+/// promote each one still `Available` to `DropScheduled`. Deliberately
+/// a plain, direct collection (not `check_expr`'s own move-aware walk):
+/// a `defer`'s argument evaluation already ran through `check_expr` for
+/// its own diagnostics; this second, narrow pass only needs *which*
+/// locals it touched, not to re-validate them. Exhaustive over every
+/// `HirExpr`/`HirStmt` shape (no wildcard arm) on purpose: an
+/// incomplete recursion here would under-protect a value a pending
+/// `defer` still needs whenever it is observed through anything other
+/// than a bare call argument, letting a later `drop`/move of it slip
+/// past this stage's own `U0004` check undetected.
 fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
     match expr {
+        HirExpr::Int { .. }
+        | HirExpr::Float { .. }
+        | HirExpr::Str { .. }
+        | HirExpr::Char { .. }
+        | HirExpr::Bool { .. }
+        | HirExpr::Function { .. }
+        | HirExpr::CaseRef { .. }
+        | HirExpr::ProtocolMethodRef { .. }
+        | HirExpr::Continue { .. }
+        | HirExpr::Error { .. } => {}
         HirExpr::Local { local, .. } => {
             out.insert(*local);
         }
-        HirExpr::Unary { operand, .. } | HirExpr::Cast { expr: operand, .. } => {
-            collect_observed_locals(operand, out)
-        }
+        HirExpr::Unary { operand, .. }
+        | HirExpr::Cast { expr: operand, .. }
+        | HirExpr::Try { expr: operand, .. } => collect_observed_locals(operand, out),
         HirExpr::Binary { left, right, .. } => {
             collect_observed_locals(left, out);
             collect_observed_locals(right, out);
+        }
+        HirExpr::Assign { target, value, .. } => {
+            collect_observed_locals(target, out);
+            collect_observed_locals(value, out);
         }
         HirExpr::Call { callee, args, .. } => {
             collect_observed_locals(callee, out);
@@ -697,7 +717,74 @@ fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
             }
         }
         HirExpr::Field { base, .. } => collect_observed_locals(base, out),
-        HirExpr::Try { expr, .. } => collect_observed_locals(expr, out),
-        _ => {}
+        HirExpr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_observed_locals(condition, out);
+            collect_observed_locals_block(then_branch, out);
+            match else_branch {
+                Some(HirElse::Block(block)) => collect_observed_locals_block(block, out),
+                Some(HirElse::If(inner)) => collect_observed_locals(inner, out),
+                None => {}
+            }
+        }
+        HirExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_observed_locals(scrutinee, out);
+            for arm in arms {
+                collect_observed_locals_arm_body(&arm.body, out);
+            }
+        }
+        HirExpr::Block(block) => collect_observed_locals_block(block, out),
+        HirExpr::Return { value, .. } | HirExpr::Break { value, .. } => {
+            if let Some(value) = value {
+                collect_observed_locals(value, out);
+            }
+        }
+        HirExpr::RecordLiteral { fields, .. } => {
+            for field in fields {
+                collect_observed_locals(&field.value, out);
+            }
+        }
+        HirExpr::Raise { operand, .. } => collect_observed_locals(operand, out),
+        HirExpr::Handle { operand, arms, .. } => {
+            collect_observed_locals(operand, out);
+            for arm in arms {
+                collect_observed_locals_arm_body(&arm.body, out);
+            }
+        }
+    }
+}
+
+fn collect_observed_locals_arm_body(body: &HirMatchArmBody, out: &mut HashSet<LocalId>) {
+    match body {
+        HirMatchArmBody::Expr(e) => collect_observed_locals(e, out),
+        HirMatchArmBody::Block(block) => collect_observed_locals_block(block, out),
+    }
+}
+
+fn collect_observed_locals_block(block: &HirBlock, out: &mut HashSet<LocalId>) {
+    for stmt in &block.statements {
+        match stmt {
+            HirStmt::Binding(b) => collect_observed_locals(&b.value, out),
+            HirStmt::Expr(e) => collect_observed_locals(e, out),
+            HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => {
+                collect_observed_locals(expr, out)
+            }
+            HirStmt::While {
+                condition, body, ..
+            } => {
+                collect_observed_locals(condition, out);
+                collect_observed_locals_block(body, out);
+            }
+            HirStmt::Loop { body, .. } => collect_observed_locals_block(body, out),
+        }
+    }
+    if let Some(tail) = &block.tail {
+        collect_observed_locals(tail, out);
     }
 }

@@ -876,9 +876,15 @@ struct FnBuilder {
     return_ty: Ty,
     /// Every resource local's own declaration, and every `defer`'s own
     /// registration, in the exact order lowering encountered them
-    /// (`rfcs/0011`) -- see [`CleanupAction`]. Function-scoped, not
-    /// nested-block-scoped, in this milestone (see `ResourceScope`'s own
-    /// doc comment).
+    /// (`rfcs/0011`) -- see [`CleanupAction`]. A single flat, function-
+    /// wide list: a nested block's own entries are appended onto the
+    /// same list as its enclosing scopes' (never a separate stack), but
+    /// [`Lowering::lower_scoped_block`]/[`Lowering::lower_scoped_block_void`]
+    /// remove a block's own entries again once that block's own normal
+    /// exit has replayed them, so an enclosing scope's later cleanup
+    /// never sees (and never re-replays) them. A `break`/`continue`
+    /// loop exit does not run any enclosing scope's pending cleanup at
+    /// all yet (`rfcs/0011`'s own limitations).
     cleanup_actions: Vec<CleanupAction>,
     /// Every resource local already moved out (by `return`, a `take`
     /// argument, storage in a constructed aggregate, or an explicit

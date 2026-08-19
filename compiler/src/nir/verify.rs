@@ -3498,17 +3498,26 @@ fn invoke_slot_block_transfer(
 
 /// Computes `block_id`'s own guaranteed-on-entry fact set from its
 /// recorded incoming edges' current exit facts (`out`) -- intersection
-/// across every edge, exactly like `verify_payload_refinement`'s own
-/// single-hop model, except each edge's own contribution here is
+/// across every edge *whose predecessor is reachable from the entry*,
+/// exactly like `verify_payload_refinement`'s own single-hop model,
+/// except each reachable edge's own contribution here is
 /// `out[predecessor] plus whatever that specific edge itself writes`,
 /// which is what lets a fact keep propagating across any number of
-/// ordinary hops in between. The entry block, and any block with no
-/// recorded incoming edge at all (genuinely unreachable), are defined
-/// to guarantee nothing.
+/// ordinary hops in between. An edge whose predecessor is *not*
+/// reachable is skipped entirely, never intersected in: an unreachable
+/// predecessor's own `out` is always the empty set (it is never seeded
+/// optimistically and never touched by the worklist), so folding it
+/// into a join would incorrectly wipe out a fact every genuinely live
+/// path into that join already guarantees, purely because some dead
+/// code elsewhere also happens to branch to the same block. The entry
+/// block, and any block with no *reachable* incoming edge at all
+/// (genuinely unreachable, or reachable only from unreachable
+/// predecessors), are defined to guarantee nothing.
 fn invoke_slot_in_facts(
     block_id: BlockId,
     entry: BlockId,
     incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
+    reachable: &HashSet<BlockId>,
     out: &HashMap<BlockId, HashSet<ValueId>>,
 ) -> HashSet<ValueId> {
     if block_id == entry {
@@ -3517,7 +3526,7 @@ fn invoke_slot_in_facts(
     let Some(edges) = incoming_edges.get(&block_id) else {
         return HashSet::new();
     };
-    let mut edges = edges.iter();
+    let mut edges = edges.iter().filter(|(pred, _)| reachable.contains(pred));
     let Some((first_pred, first_gen)) = edges.next() else {
         return HashSet::new();
     };
@@ -3776,7 +3785,7 @@ fn verify_invoke_slot_initialization(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_facts = invoke_slot_in_facts(id, entry, &incoming_edges, &out);
+        let in_facts = invoke_slot_in_facts(id, entry, &incoming_edges, &reachable, &out);
         let (new_out, _) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
         if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
@@ -3796,7 +3805,7 @@ fn verify_invoke_slot_initialization(
     // edge `incoming_edges` recorded for it.
     for block in &function.blocks {
         let in_facts = if reachable.contains(&block.id) {
-            invoke_slot_in_facts(block.id, entry, &incoming_edges, &out)
+            invoke_slot_in_facts(block.id, entry, &incoming_edges, &reachable, &out)
         } else {
             HashSet::new()
         };
@@ -8868,6 +8877,220 @@ mod tests {
             assert!(
                 diagnoses_v0073(&order),
                 "expected V0073 regardless of block order {order:?}"
+            );
+        }
+    }
+
+    /// bb1 is the join/load block, reached by two recorded predecessors:
+    /// entry (via its own `CondBranch` then-edge -- always reachable)
+    /// and bb20 (via a plain `Branch` -- never reachable from entry at
+    /// all, since nothing live ever targets it). bb5's own `Invoke`
+    /// (targeting the throwaway bb6/bb7) is what registers `%0` as a
+    /// guarded slot in the first place, entirely independent of bb1's
+    /// own join. When `entry_stores` is true, entry itself
+    /// unconditionally `Store`s `%0` before branching anywhere, and
+    /// bb20 does nothing; the join must accept bb1's load regardless of
+    /// bb20's mere presence as a recorded (but dead) predecessor. When
+    /// false, entry never stores `%0` at all, and instead bb20 -- the
+    /// unreachable predecessor -- performs its own unconditional
+    /// `Store`; that store must never be treated as initializing bb1's
+    /// join, since bb20 itself is never actually reached.
+    fn join_with_dead_predecessor_caller(
+        f_name: Symbol,
+        shape_id: ItemId,
+        shape_name: Symbol,
+        entry_stores: bool,
+    ) -> Function {
+        let mut entry_instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }];
+        if entry_stores {
+            entry_instructions.push(Instruction::Value {
+                result: ValueId(8),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            entry_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(8),
+            });
+        }
+        entry_instructions.push(Instruction::Value {
+            result: ValueId(9),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        });
+        let entry = BasicBlock {
+            id: BlockId(0),
+            instructions: entry_instructions,
+            terminator: Terminator::CondBranch {
+                condition: ValueId(9),
+                then_block: BlockId(1),
+                else_block: BlockId(5),
+            },
+        };
+        let bb1 = BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(11),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(11))),
+        };
+        let bb5 = BasicBlock {
+            id: BlockId(5),
+            instructions: vec![Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            }],
+            terminator: Terminator::Invoke {
+                callee: ItemId(0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+                evidence: Vec::new(),
+                ok_slot: ValueId(0),
+                ok_target: BlockId(6),
+                err_targets: vec![InvokeErrTarget {
+                    variant: shape_id,
+                    slot: ValueId(1),
+                    target: BlockId(7),
+                }],
+            },
+        };
+        let bb6 = BasicBlock {
+            id: BlockId(6),
+            instructions: vec![Instruction::Value {
+                result: ValueId(12),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(12))),
+        };
+        let bb7 = BasicBlock {
+            id: BlockId(7),
+            instructions: vec![Instruction::Value {
+                result: ValueId(13),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(13))),
+        };
+        let mut bb20_instructions = Vec::new();
+        if !entry_stores {
+            bb20_instructions.push(Instruction::Value {
+                result: ValueId(21),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            bb20_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(21),
+            });
+        }
+        let bb20 = BasicBlock {
+            id: BlockId(20),
+            instructions: bb20_instructions,
+            terminator: Terminator::Branch(BlockId(1)),
+        };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks = vec![bb7, bb6, bb5, bb20, bb1, entry];
+        caller
+    }
+
+    #[test]
+    fn a_dead_predecessor_never_wipes_a_reachable_joins_own_fact() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = join_with_dead_predecessor_caller(f_name, shape_id, shape_name, true);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "an unreachable predecessor's mere presence must not wipe a live fact: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_dead_predecessors_own_store_never_initializes_a_reachable_join() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = join_with_dead_predecessor_caller(f_name, shape_id, shape_name, false);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "a store only reachable through dead code must never initialize a live join: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permuting_the_block_vector_never_changes_the_dead_predecessor_result() {
+        fn check(entry_stores: bool, order: &[BlockId]) -> bool {
+            let mut interner = Interner::new();
+            let f_name = interner.intern("f");
+            let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+            let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+            let mut caller =
+                join_with_dead_predecessor_caller(f_name, shape_id, shape_name, entry_stores);
+            let by_id: HashMap<BlockId, BasicBlock> =
+                caller.blocks.drain(..).map(|b| (b.id, b)).collect();
+            caller.blocks = order.iter().map(|id| by_id[id].clone()).collect();
+
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions: vec![callee, caller],
+                records: Vec::new(),
+                variants: vec![(shape_id, shape_layout)],
+            };
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED)
+        }
+
+        let orderings: [[u32; 6]; 4] = [
+            [0, 1, 5, 6, 7, 20],
+            [20, 7, 6, 5, 1, 0],
+            [1, 0, 20, 5, 7, 6],
+            [5, 20, 0, 7, 1, 6],
+        ];
+        for raw in orderings {
+            let order: Vec<BlockId> = raw.into_iter().map(BlockId).collect();
+            assert!(
+                !check(true, &order),
+                "expected no V0073 (entry stores) with order {order:?}"
+            );
+            assert!(
+                check(false, &order),
+                "expected V0073 (only dead predecessor stores) with order {order:?}"
             );
         }
     }

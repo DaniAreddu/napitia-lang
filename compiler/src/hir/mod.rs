@@ -19,7 +19,7 @@ pub use registry::{ItemIdentity, ItemKind, ItemRegistry};
 use crate::lexer::IntBase;
 use crate::source::{SourceId, Span};
 use crate::symbol::Symbol;
-use crate::syntax::ast::{AssignOp, BinaryOp, Ident, Path, UnaryOp};
+use crate::syntax::ast::{AssignOp, BinaryOp, Path, UnaryOp};
 
 /// Identifies a module-level item (function, record, variant, protocol,
 /// extend, or import) for the lifetime of one compilation session.
@@ -265,9 +265,16 @@ pub struct HirFunction {
     /// parameters) type arguments, in declared order. Part of this
     /// function's public signature -- never inferred from its body.
     pub requirements: Vec<HirCapabilityRequirement>,
-    /// Error names from a `raises` clause, preserved as-parsed. Not
-    /// semantically checked (`spec/0005`), same as `uses`.
-    pub raises: Vec<Ident>,
+    /// This function's own declared raised-error set (`rfcs/0010`), each
+    /// entry resolved to its canonical declaring variant, in declared
+    /// order. A duplicate entry (same resolved `ItemId`, however it was
+    /// spelled) is diagnosed by `hir::lower` itself and dropped here --
+    /// unlike `requirements` above (whose own deduplication into a
+    /// canonical set is deferred to `typeck`), a `raises` clause has no
+    /// further meaning to preserve for a name this function already
+    /// declared, so there is nothing to gain by keeping the second
+    /// occurrence around for a later stage to also reject.
+    pub raises: Vec<HirRaisesEntry>,
     pub body: HirBlock,
     pub span: Span,
 }
@@ -580,11 +587,80 @@ pub enum HirExpr {
         name: Symbol,
         span: Span,
     },
+    /// `raise <operand>` (`rfcs/0010`). Always type `never`; `operand`'s
+    /// type must be one of the enclosing function's own declared raised
+    /// variants -- checked by `typeck`, not here.
+    Raise {
+        id: ExprId,
+        operand: Box<HirExpr>,
+        span: Span,
+    },
+    /// `handle <operand> { ... }` (`rfcs/0010`).
+    Handle {
+        id: ExprId,
+        operand: Box<HirExpr>,
+        arms: Vec<HirHandleArm>,
+        span: Span,
+    },
     /// A name that failed to resolve, or an expression the parser could
     /// not build. A diagnostic has already been recorded; later stages
     /// must skip this node rather than type-check it.
     Error {
         id: ExprId,
+        span: Span,
+    },
+}
+
+/// One `raises` clause entry, resolved to its declaring variant
+/// (`rfcs/0010`).
+#[derive(Debug, Clone)]
+pub struct HirRaisesEntry {
+    pub variant: ItemId,
+    pub name: Symbol,
+    pub span: Span,
+}
+
+/// One arm of a `handle` expression (`rfcs/0010`).
+#[derive(Debug, Clone)]
+pub struct HirHandleArm {
+    pub kind: HirHandleArmKind,
+    pub body: HirMatchArmBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum HirHandleArmKind {
+    /// `success <pattern>` -- `pattern` is only ever `Bind` or `Wildcard`
+    /// once resolved (`typeck` rejects anything else); kept as a full
+    /// [`HirPattern`] here only to reuse the same binding/local-minting
+    /// machinery an ordinary pattern already has.
+    Success(HirPattern),
+    Failure(HirFailurePattern),
+}
+
+/// A `handle` failure arm's own pattern (`rfcs/0010`) -- distinct from
+/// [`HirPattern`] because it must name *which* raised type a case
+/// belongs to, not just the case itself; an ordinary `match`'s single
+/// scrutinee type already pins that down, but a `handle` operand's
+/// raised effects may span more than one nominal variant.
+#[derive(Debug, Clone)]
+pub enum HirFailurePattern {
+    /// `_` -- a final catch-all for every raised case not otherwise
+    /// named.
+    Wildcard { span: Span },
+    /// `ErrorType.Case` or `ErrorType.Case(pattern, ...)`. `variant`/
+    /// `case` are `None` when the type or case name failed to resolve
+    /// (a diagnostic was already recorded at that point); `typeck` skips
+    /// exhaustiveness/type-checking for such an arm rather than treating
+    /// `None` as a fake resolved identity.
+    Case {
+        variant: Option<ItemId>,
+        case: Option<usize>,
+        case_name: Symbol,
+        /// Payload positions -- only `Bind`/`Wildcard` once resolved;
+        /// see `rfcs/0010`'s own honest limitation on nested failure-
+        /// payload patterns.
+        args: Vec<HirPattern>,
         span: Span,
     },
 }
@@ -716,6 +792,8 @@ impl HirExpr {
             | HirExpr::Continue { span, .. }
             | HirExpr::RecordLiteral { span, .. }
             | HirExpr::ProtocolMethodRef { span, .. }
+            | HirExpr::Raise { span, .. }
+            | HirExpr::Handle { span, .. }
             | HirExpr::Error { span, .. } => *span,
             HirExpr::Block(block) => block.span,
         }
@@ -748,6 +826,8 @@ impl HirExpr {
             | HirExpr::Continue { id, .. }
             | HirExpr::RecordLiteral { id, .. }
             | HirExpr::ProtocolMethodRef { id, .. }
+            | HirExpr::Raise { id, .. }
+            | HirExpr::Handle { id, .. }
             | HirExpr::Error { id, .. } => *id,
             HirExpr::Block(block) => block.id,
         }

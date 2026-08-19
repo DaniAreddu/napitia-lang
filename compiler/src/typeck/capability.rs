@@ -451,6 +451,32 @@ impl<'a> Checker<'a> {
                 );
                 ok = false;
             }
+            // A protocol method has no `raises` of its own yet
+            // (`rfcs/0010`'s own honest limitation), so every
+            // implementing method must be infallible too --
+            // `hir::lower`'s own `lower_extend_method` already rejects a
+            // source-level `raises` clause here and lowers with no
+            // raised-effect metadata at all (R0031), but this defends
+            // against a direct caller lowering hand-built HIR that
+            // bypasses that gate: a fallible implementation must fail
+            // conformance and never enter capability resolution, rather
+            // than silently satisfying an apparently infallible protocol
+            // method.
+            if !method_sig.raises.is_empty() {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::EXTENSION_SIGNATURE_MISMATCH,
+                        self.source,
+                        method.span,
+                        format!(
+                            "`{text}` declares `raises`, but its protocol method has no raised-effect signature to narrow"
+                        ),
+                    )
+                    .with_primary_label("unexpected `raises`"),
+                );
+                ok = false;
+            }
             method_ids.push(method.id);
         }
         let expected_names: std::collections::HashSet<Symbol> =

@@ -5,7 +5,7 @@ mod cycles;
 pub mod exhaustive;
 pub mod unify;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use context::{TypeContext, VarKind};
 use exhaustive::{LiteralKey, ResolvedPattern, VariantSpace};
@@ -13,8 +13,9 @@ use unify::unify;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFunction, HirMatchArm, HirMatchArmBody, HirModule,
-    HirPattern, HirStmt, HirType, ItemId, ItemRegistry, LocalId, TypeParamId,
+    ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
+    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, HirType,
+    ItemId, ItemRegistry, LocalId, TypeParamId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -105,6 +106,59 @@ mod codes {
     /// are excluded from the solver rather than risk asserting coherence
     /// (or incoherence) this checker could not actually prove.
     pub const OVERLAP_WORK_BUDGET_EXCEEDED: &str = "T0047";
+    /// A fallible call (one targeting a function whose own `raises` is
+    /// non-empty) was used as an ordinary expression -- outside the one
+    /// operand position `?` or `handle` controls (`rfcs/0010`). Nothing
+    /// about the enclosing function's own declared effects makes this
+    /// implicitly legal; propagation must stay visible through `?`.
+    pub const FALLIBLE_CALL_NOT_HANDLED: &str = "T0048";
+    /// Postfix `?`'s operand is not a call to a fallible function.
+    pub const TRY_ON_INFALLIBLE: &str = "T0049";
+    /// `?` would propagate an effect the enclosing function's own
+    /// `raises` clause does not declare.
+    pub const PROPAGATION_NOT_DECLARED: &str = "T0050";
+    /// `raise`'s operand is not one of the current function's own
+    /// declared raised variants.
+    pub const RAISE_TYPE_MISMATCH: &str = "T0051";
+    /// The executable entry function declares (or, through `?`, would
+    /// leak) a raised error -- it has no caller to propagate one to.
+    pub const ENTRY_MAIN_RAISES: &str = "T0052";
+    /// A `handle`'s own `failure` arms do not cover every case of every
+    /// effect its operand may raise.
+    pub const NON_EXHAUSTIVE_HANDLER: &str = "T0053";
+    /// A `handle`'s own `failure` arm can never be reached: every case it
+    /// names is already covered by an earlier arm (including an earlier
+    /// `_`).
+    pub const UNREACHABLE_HANDLE_ARM: &str = "T0054";
+    /// A `handle` declares no `success` arm.
+    pub const MISSING_SUCCESS_ARM: &str = "T0055";
+    /// A `handle` declares more than one `success` arm.
+    pub const DUPLICATE_SUCCESS_ARM: &str = "T0056";
+    /// A `handle` failure arm's `Type.Case` does not belong to any effect
+    /// its own operand actually raises.
+    pub const FAILURE_PATTERN_WRONG_TYPE: &str = "T0057";
+    /// A `handle` failure arm's own resolved case index is out of range
+    /// for its variant's declared cases -- unreachable for any HIR
+    /// `hir::lower` itself produced (it only ever resolves a case index
+    /// that variant actually declares), but a direct caller lowering
+    /// hand-built HIR could still hand this a case index that doesn't
+    /// exist.
+    pub const FAILURE_CASE_INDEX_OUT_OF_RANGE: &str = "T0058";
+    /// A function's own resolved `raises` entry names a variant that
+    /// isn't in `self.variants` at all -- unreachable for any HIR
+    /// `hir::lower` itself produced (every declared/imported variant is
+    /// always registered there), but a direct caller lowering hand-built
+    /// HIR could still hand this an entry naming an item that was never
+    /// registered. Never silently treated as a valid, non-generic raise:
+    /// that would let an unresolvable effect reach `check_raise`/
+    /// `check_try`/`check_handle` as if it were a real declared variant.
+    pub const RAISES_VARIANT_METADATA_MISSING: &str = "T0059";
+    /// `?`/`handle`'s own operand is a direct call to a `HirExpr::
+    /// Function` naming an item never registered in `self.functions` --
+    /// unreachable for any HIR `hir::lower` itself produced, but a
+    /// direct caller lowering hand-built HIR could still hand this a
+    /// dangling function reference.
+    pub const CALLEE_METADATA_MISSING: &str = "T0060";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -153,6 +207,13 @@ struct FunctionSig {
     /// substituted the same way `params`/`ret` are at a call site, then
     /// resolved into evidence for that specific call.
     requirements: Vec<CapabilityRequirement>,
+    /// This function's own declared raised-error set (`rfcs/0010`),
+    /// canonical (deduplicated, `ItemId`-based) -- empty means this
+    /// function is infallible. A call to it may only ever appear as the
+    /// direct operand of `?` or `handle`; every effect it raises must
+    /// already be a member of the *caller's* own set (for `?`) or be
+    /// exhaustively handled (for `handle`).
+    raises: Vec<ItemId>,
     span: Span,
     /// Where this function was declared -- a different file than the
     /// call site's, in every cross-module call. A diagnostic pointing at
@@ -261,6 +322,7 @@ pub fn check_module_with_registry(
         pending_defaults: Vec::new(),
         current_return_type: Ty::Unit,
         current_requirements: Vec::new(),
+        current_raises: HashSet::new(),
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
@@ -379,6 +441,11 @@ struct Checker<'a> {
     /// call inside this body can *forward* one of these rather than
     /// searching for a concrete extension.
     current_requirements: Vec<CapabilityRequirement>,
+    /// The currently-checked function/extend method's own canonical
+    /// declared raised-error set (`rfcs/0010`) -- how `check_raise`/
+    /// `check_try` decide whether a given effect may legally leave this
+    /// body. Empty means this function is infallible.
+    current_raises: HashSet<ItemId>,
     /// Every declared record's fields, resolved to `Ty` and in
     /// declaration order -- the layout NIR's `record.create`/
     /// `record.field` will follow.
@@ -622,6 +689,7 @@ impl<'a> Checker<'a> {
                 .map(|t| self.resolve_named_type(t))
                 .unwrap_or(Ty::Unit);
             let requirements = self.resolve_requirements(&f.requirements);
+            let raises = f.raises.iter().map(|r| r.variant).collect();
             self.functions.insert(
                 f.id,
                 FunctionSig {
@@ -629,6 +697,7 @@ impl<'a> Checker<'a> {
                     ret,
                     type_params: f.type_params.iter().map(|p| p.id).collect(),
                     requirements,
+                    raises,
                     span: f.span,
                     source: f.source,
                 },
@@ -655,6 +724,7 @@ impl<'a> Checker<'a> {
                     .map(|t| self.resolve_named_type(t))
                     .unwrap_or(Ty::Unit);
                 let requirements = self.resolve_requirements(&m.requirements);
+                let raises = m.raises.iter().map(|r| r.variant).collect();
                 self.functions.insert(
                     m.id,
                     FunctionSig {
@@ -662,6 +732,7 @@ impl<'a> Checker<'a> {
                         ret,
                         type_params: extend_type_params.clone(),
                         requirements,
+                        raises,
                         span: m.span,
                         source: m.source,
                     },
@@ -818,8 +889,40 @@ impl<'a> Checker<'a> {
         }
         self.current_return_type = sig.ret.clone();
         self.current_requirements = sig.requirements.clone();
-        if !f.uses.is_empty() || !f.raises.is_empty() {
-            self.push_unsupported(f.name_span, "`uses`/`raises` effect and error clauses");
+        // A generic error variant is never a legal `raises` member
+        // (`rfcs/0010`'s own non-goal) -- `hir::lower`'s own
+        // `resolve_raises` already rejects this for ordinary source, but
+        // a direct caller lowering hand-built HIR could still hand this
+        // function a `raises` entry naming one. Filtered out here rather
+        // than trusted, so `check_raise`/`check_try`/`check_handle`
+        // below can never treat an applied generic variant as declared
+        // just because its outer `ItemId` happens to match.
+        let mut current_raises = std::collections::HashSet::with_capacity(sig.raises.len());
+        for item in sig.raises.iter().copied() {
+            match self.variants.get(&item) {
+                Some(info) if info.type_params.is_empty() => {
+                    current_raises.insert(item);
+                }
+                Some(_) => {}
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::RAISES_VARIANT_METADATA_MISSING,
+                            self.source,
+                            f.name_span,
+                            format!(
+                                "function `{}` raises an item that does not resolve to any declared variant",
+                                self.interner.resolve(f.name)
+                            ),
+                        )
+                        .with_primary_label("unresolvable raised effect"),
+                    );
+                }
+            }
+        }
+        self.current_raises = current_raises;
+        if !f.uses.is_empty() {
+            self.push_unsupported(f.name_span, "`uses` effect clauses");
         }
         // `napitia run` always calls the entry point with zero arguments,
         // so a `main` declared with parameters can never actually
@@ -865,6 +968,21 @@ impl<'a> Checker<'a> {
                     "the executable entry function cannot declare capability requirements; it has no caller to receive evidence from",
                 )
                 .with_primary_label("entry function declares a `uses` requirement"),
+            );
+        }
+        // Same reasoning as the capability-requirement restriction just
+        // above, for raised errors instead of capabilities (`rfcs/0010`):
+        // `main` has no caller to propagate a raised value to, so a
+        // `raises` clause on it is unsatisfiable by construction.
+        if is_entry_main && !sig.raises.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::ENTRY_MAIN_RAISES,
+                    self.source,
+                    f.name_span,
+                    "the executable entry function cannot declare raised errors; it has no caller to propagate them to",
+                )
+                .with_primary_label("entry function declares a `raises` clause"),
             );
         }
         let body_ty = self.check_block(&f.body);
@@ -1096,11 +1214,14 @@ impl<'a> Checker<'a> {
                 self.push_unsupported(*span, "casts (`as`)");
                 Ty::Error
             }
-            HirExpr::Try { expr, span, .. } => {
-                self.check_expr(expr);
-                self.push_unsupported(*span, "postfix `?`");
-                Ty::Error
-            }
+            HirExpr::Try { expr, span, .. } => self.check_try(expr, *span),
+            HirExpr::Raise { operand, span, .. } => self.check_raise(operand, *span),
+            HirExpr::Handle {
+                operand,
+                arms,
+                span,
+                ..
+            } => self.check_handle(operand, arms, *span),
             HirExpr::If {
                 condition,
                 then_branch,
@@ -1731,6 +1852,24 @@ impl<'a> Checker<'a> {
         args: &[HirExpr],
         span: Span,
     ) -> Ty {
+        self.check_call_at(call_id, callee, args, span, false)
+    }
+
+    /// `handled` is `true` only when this call is the direct operand `?`
+    /// or `handle` itself is checking -- the *only* two positions
+    /// `rfcs/0010` allows a fallible call's result to be consumed from.
+    /// Every other route into this function (the ordinary `check_expr`
+    /// dispatch) passes `false`, so a fallible call used as an ordinary
+    /// expression is always caught here, regardless of which of the
+    /// several early-return paths below it would otherwise take.
+    fn check_call_at(
+        &mut self,
+        call_id: ExprId,
+        callee: &HirExpr,
+        args: &[HirExpr],
+        span: Span,
+        handled: bool,
+    ) -> Ty {
         if let HirExpr::CaseRef {
             variant,
             case,
@@ -1802,6 +1941,19 @@ impl<'a> Checker<'a> {
         let Some(sig) = self.functions.get(item).cloned() else {
             return if any_arg_never { Ty::Never } else { Ty::Error };
         };
+
+        if !handled && !sig.raises.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::FALLIBLE_CALL_NOT_HANDLED,
+                    self.source,
+                    span,
+                    "this call may fail, but its result is used without `?` or `handle`",
+                )
+                .with_primary_label("fallible call not propagated or handled")
+                .with_label_in(sig.source, sig.span, "declared fallible here"),
+            );
+        }
 
         let quoted = format!("`{}`", self.interner.resolve(*name));
         let Some((subst, inferred)) =
@@ -2329,6 +2481,554 @@ impl<'a> Checker<'a> {
                 self.unify_report(a, b, span, message);
                 a.clone()
             }
+        }
+    }
+
+    /// The declared raised-error set of a plain function reference
+    /// (`rfcs/0010`) -- `Some(&[])` for anything else (a variant
+    /// constructor can never raise), and `Some` of whatever `raises` the
+    /// callee's own registered signature declares (legitimately empty
+    /// for a real, infallible function) for a `HirExpr::Function` whose
+    /// `item` is registered. `None` only when the callee is a
+    /// `HirExpr::Function` naming an item that was never registered at
+    /// all -- unreachable for any HIR `hir::lower` itself produced
+    /// (every function it resolves to a `HirExpr::Function` is always
+    /// registered), but a direct caller lowering hand-built HIR could
+    /// still hand this a dangling reference. Kept distinct from "zero
+    /// raises" so callers never mistake missing metadata for a genuinely
+    /// infallible call.
+    fn callee_raises(&self, callee: &HirExpr) -> Option<Vec<ItemId>> {
+        match callee {
+            HirExpr::Function { item, .. } => self.functions.get(item).map(|s| s.raises.clone()),
+            _ => Some(Vec::new()),
+        }
+    }
+
+    /// `raise <operand>` (`rfcs/0010`). Always type `never`, exactly like
+    /// `return`/`break`: a raise whose operand type doesn't match still
+    /// unconditionally diverges the current path, so the diagnostic
+    /// (pushed, never silently skipped) does not need to change the
+    /// resulting type to be meaningful.
+    fn check_raise(&mut self, operand: &HirExpr, span: Span) -> Ty {
+        let operand_ty = self.check_expr(operand);
+        let resolved = self.ctx.resolve(&operand_ty);
+        if matches!(resolved, Ty::Error | Ty::Never) {
+            return Ty::Never;
+        }
+        let raised_item = match &resolved {
+            Ty::Named(item, _) | Ty::Applied(item, _) => Some(*item),
+            _ => None,
+        };
+        let ok = raised_item.is_some_and(|item| self.current_raises.contains(&item));
+        if !ok {
+            let text = self.display_for_diagnostic(&resolved);
+            let message = if self.current_raises.is_empty() {
+                format!(
+                    "cannot raise `{text}`; this function declares no `raises` clause, so nothing it does could ever propagate a failure"
+                )
+            } else {
+                format!(
+                    "cannot raise `{text}`; it is not one of this function's own declared `raises` types"
+                )
+            };
+            self.diagnostics.push(
+                Diagnostic::error(codes::RAISE_TYPE_MISMATCH, self.source, span, message)
+                    .with_primary_label("undeclared raise"),
+            );
+        }
+        Ty::Never
+    }
+
+    /// Postfix `?` (`rfcs/0010`). The operand must structurally be a
+    /// direct call to a fallible function -- checked through
+    /// `check_call_at(.., handled: true)` so the call itself is never
+    /// also flagged as an unhandled fallible expression (that is exactly
+    /// what `?` is handling). Every effect the callee might raise must
+    /// already be a member of the *enclosing* function's own declared
+    /// `raises` set.
+    fn check_try(&mut self, operand: &HirExpr, span: Span) -> Ty {
+        let HirExpr::Call {
+            id,
+            callee,
+            args,
+            span: call_span,
+        } = operand
+        else {
+            self.check_expr(operand);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TRY_ON_INFALLIBLE,
+                    self.source,
+                    span,
+                    "`?` may only follow a direct call to a fallible function",
+                )
+                .with_primary_label("not a fallible call"),
+            );
+            return Ty::Error;
+        };
+        let success_ty = self.check_call_at(*id, callee, args, *call_span, true);
+        // A call is strict in its arguments (`check_call_at`'s own doc):
+        // if one of them diverges, the call itself is never actually
+        // reached, so there is nothing here for `?` to ever propagate --
+        // distinct from the callee's own declared return type genuinely
+        // being `never` (which still really raises), so this checks the
+        // *arguments* specifically, re-derived from `expr_types` rather
+        // than re-evaluating any of them a second time.
+        if args
+            .iter()
+            .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)))
+        {
+            return Ty::Never;
+        }
+        let Some(raises) = self.callee_raises(callee) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CALLEE_METADATA_MISSING,
+                    self.source,
+                    span,
+                    "`?`'s own operand calls a function that was never registered",
+                )
+                .with_primary_label("unresolvable callee"),
+            );
+            return Ty::Error;
+        };
+        if raises.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TRY_ON_INFALLIBLE,
+                    self.source,
+                    span,
+                    "`?` may only follow a call to a fallible function; this call cannot fail",
+                )
+                .with_primary_label("infallible call"),
+            );
+            return success_ty;
+        }
+        for effect in &raises {
+            if !self.current_raises.contains(effect) {
+                let text = self.registry.qualified_name(*effect, self.interner);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROPAGATION_NOT_DECLARED,
+                        self.source,
+                        span,
+                        format!(
+                            "`?` would propagate `{text}`, which is not one of this function's own declared `raises` types"
+                        ),
+                    )
+                    .with_primary_label("undeclared propagation"),
+                );
+            }
+        }
+        success_ty
+    }
+
+    /// `handle <operand> { ... }` (`rfcs/0010`). The operand is checked
+    /// the same restricted way `?`'s is (a direct fallible call); every
+    /// case of every effect it may raise must be covered by a `failure`
+    /// arm (or a single trailing `failure _`), and exactly one `success`
+    /// arm binds its success value. Mirrors `check_match`'s own
+    /// structure (check every arm unconditionally first, for independent
+    /// diagnostics; only a *reachable* arm contributes to the result
+    /// join), generalized across however many distinct raised types are
+    /// in play.
+    fn check_handle(&mut self, operand: &HirExpr, arms: &[HirHandleArm], span: Span) -> Ty {
+        let HirExpr::Call {
+            id,
+            callee,
+            args,
+            span: call_span,
+        } = operand
+        else {
+            self.check_expr(operand);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TRY_ON_INFALLIBLE,
+                    self.source,
+                    span,
+                    "`handle`'s operand must be a direct call to a fallible function",
+                )
+                .with_primary_label("not a fallible call"),
+            );
+            return Ty::Error;
+        };
+        let success_ty = self.check_call_at(*id, callee, args, *call_span, true);
+        // A call is strict in its arguments (`check_call_at`'s own
+        // doc): if one of them diverges, the call itself is never
+        // actually reached, and neither is any `handle` arm -- mirrors
+        // `check_match`'s own diverging-scrutinee rule. Every arm's
+        // pattern/body is still checked below for its own independent
+        // diagnostics, but none of them may be joined into the result,
+        // analyzed for coverage, or flagged unreachable relative to each
+        // other (that would blame the wrong arm for what is really the
+        // operand's own unreachability). Re-derived from `expr_types`
+        // rather than re-evaluating any argument a second time.
+        let operand_diverges = args
+            .iter()
+            .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)));
+        let Some(raises) = self.callee_raises(callee) else {
+            // Missing callee metadata is not the same thing as "this
+            // callee legitimately raises nothing": treating it as an
+            // empty `raises` set here would additionally emit a
+            // misleading TRY_ON_INFALLIBLE right below, claiming the
+            // call is provably infallible when it is actually just
+            // unresolvable. Report CALLEE_METADATA_MISSING alone, still
+            // check every arm's own body for its own independent
+            // diagnostics (never skip visiting an expression), but skip
+            // the coverage/join analysis entirely -- it fundamentally
+            // depends on a real `raises` set to compare against.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CALLEE_METADATA_MISSING,
+                    self.source,
+                    span,
+                    "`handle`'s own operand calls a function that was never registered",
+                )
+                .with_primary_label("unresolvable callee"),
+            );
+            for arm in arms {
+                match &arm.kind {
+                    HirHandleArmKind::Success(pattern) => {
+                        if let HirPattern::Bind { local, .. } = pattern {
+                            self.locals.insert(
+                                *local,
+                                LocalInfo {
+                                    ty: success_ty.clone(),
+                                    mutable: false,
+                                },
+                            );
+                        }
+                    }
+                    HirHandleArmKind::Failure(HirFailurePattern::Case {
+                        variant: Some(variant),
+                        case: Some(case),
+                        args: payload_args,
+                        ..
+                    }) => {
+                        if let Some(payload_tys) = self
+                            .variants
+                            .get(variant)
+                            .and_then(|info| info.cases.get(*case))
+                            .map(|(_, payload)| payload.clone())
+                            && payload_tys.len() == payload_args.len()
+                        {
+                            for (pattern, ty) in payload_args.iter().zip(payload_tys.iter()) {
+                                if let HirPattern::Bind { local, .. } = pattern {
+                                    self.locals.insert(
+                                        *local,
+                                        LocalInfo {
+                                            ty: ty.clone(),
+                                            mutable: false,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    HirHandleArmKind::Failure(_) => {}
+                }
+                self.check_arm_body(&arm.body);
+            }
+            return Ty::Error;
+        };
+        if raises.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TRY_ON_INFALLIBLE,
+                    self.source,
+                    span,
+                    "`handle`'s operand cannot fail; there is nothing for its `failure` arms to catch",
+                )
+                .with_primary_label("infallible call"),
+            );
+        }
+
+        // Every (variant, case-index) pair any raised effect declares --
+        // what the `failure` arms together must fully cover.
+        let mut required: std::collections::HashSet<(ItemId, usize)> =
+            std::collections::HashSet::new();
+        for variant in &raises {
+            if let Some(info) = self.variants.get(variant) {
+                for case_index in 0..info.cases.len() {
+                    required.insert((*variant, case_index));
+                }
+            }
+        }
+
+        let mut success_count = 0usize;
+        let mut wildcard_seen = false;
+        let mut covered: std::collections::HashSet<(ItemId, usize)> =
+            std::collections::HashSet::new();
+        let mut any_invalid = false;
+        let mut arm_result: Option<Ty> = None;
+
+        for arm in arms {
+            match &arm.kind {
+                HirHandleArmKind::Success(pattern) => {
+                    success_count += 1;
+                    if success_count > 1 {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::DUPLICATE_SUCCESS_ARM,
+                                self.source,
+                                arm.span,
+                                "a `handle` may declare only one `success` arm",
+                            )
+                            .with_primary_label("duplicate `success` arm"),
+                        );
+                    }
+                    match pattern {
+                        HirPattern::Bind { local, .. } => {
+                            self.locals.insert(
+                                *local,
+                                LocalInfo {
+                                    ty: success_ty.clone(),
+                                    mutable: false,
+                                },
+                            );
+                        }
+                        HirPattern::Wildcard { .. } => {}
+                        other => {
+                            self.push_unsupported(
+                                other.span(),
+                                "a `success` arm's pattern other than a bare bind or `_`",
+                            );
+                        }
+                    }
+                    let body_ty = self.check_arm_body(&arm.body);
+                    if success_count == 1 && !operand_diverges {
+                        arm_result = Some(match arm_result {
+                            None => body_ty,
+                            Some(acc) => self.join_diverging_branches(
+                                &acc,
+                                &body_ty,
+                                arm.span,
+                                "handle arms must have the same type",
+                            ),
+                        });
+                    }
+                }
+                HirHandleArmKind::Failure(HirFailurePattern::Wildcard { .. }) => {
+                    let reachable =
+                        !operand_diverges && !wildcard_seen && !required.is_subset(&covered);
+                    if !reachable && !operand_diverges {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::UNREACHABLE_HANDLE_ARM,
+                                self.source,
+                                arm.span,
+                                "every raised case is already handled; this arm can never run",
+                            )
+                            .with_primary_label("unreachable failure arm"),
+                        );
+                    }
+                    wildcard_seen = true;
+                    let body_ty = self.check_arm_body(&arm.body);
+                    if reachable {
+                        arm_result = Some(match arm_result {
+                            None => body_ty,
+                            Some(acc) => self.join_diverging_branches(
+                                &acc,
+                                &body_ty,
+                                arm.span,
+                                "handle arms must have the same type",
+                            ),
+                        });
+                    }
+                }
+                HirHandleArmKind::Failure(HirFailurePattern::Case {
+                    variant,
+                    case,
+                    args: payload_args,
+                    span: pattern_span,
+                    ..
+                }) => {
+                    let key = match (variant, case) {
+                        (Some(v), Some(c)) if raises.contains(v) => Some((*v, *c)),
+                        (Some(_), Some(_)) => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    codes::FAILURE_PATTERN_WRONG_TYPE,
+                                    self.source,
+                                    *pattern_span,
+                                    "this case does not belong to any effect this operand actually raises",
+                                )
+                                .with_primary_label("unrelated failure case"),
+                            );
+                            any_invalid = true;
+                            None
+                        }
+                        _ => {
+                            // Already diagnosed at `hir::lower` (unknown
+                            // type/case name) -- nothing further to add.
+                            any_invalid = true;
+                            None
+                        }
+                    };
+                    if let Some((variant, case)) = key {
+                        // `hir::lower` only ever resolves a case index a
+                        // variant actually declares, so this is
+                        // unreachable for any HIR it produced -- but a
+                        // direct caller lowering hand-built HIR could
+                        // still hand this an out-of-range one. A
+                        // deterministic diagnostic, never a panic on the
+                        // indexing below.
+                        let Some(payload_tys) = self
+                            .variants
+                            .get(&variant)
+                            .and_then(|info| info.cases.get(case))
+                            .map(|(_, payload)| payload.clone())
+                        else {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    codes::FAILURE_CASE_INDEX_OUT_OF_RANGE,
+                                    self.source,
+                                    *pattern_span,
+                                    format!(
+                                        "case index {case} is out of range for `{}`",
+                                        self.registry.qualified_name(variant, self.interner)
+                                    ),
+                                )
+                                .with_primary_label("case index out of range"),
+                            );
+                            any_invalid = true;
+                            self.check_arm_body(&arm.body);
+                            continue;
+                        };
+                        let reachable = !operand_diverges
+                            && !wildcard_seen
+                            && !covered.contains(&(variant, case));
+                        if !reachable && !operand_diverges {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    codes::UNREACHABLE_HANDLE_ARM,
+                                    self.source,
+                                    arm.span,
+                                    "this case is already handled by an earlier arm",
+                                )
+                                .with_primary_label("unreachable failure arm"),
+                            );
+                        }
+                        covered.insert((variant, case));
+                        if payload_tys.len() != payload_args.len() {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    codes::ARITY_MISMATCH,
+                                    self.source,
+                                    *pattern_span,
+                                    format!(
+                                        "this case carries {} payload value(s), found {} pattern(s)",
+                                        payload_tys.len(),
+                                        payload_args.len()
+                                    ),
+                                )
+                                .with_primary_label("wrong payload pattern count"),
+                            );
+                        } else {
+                            for (pattern, ty) in payload_args.iter().zip(payload_tys.iter()) {
+                                match pattern {
+                                    HirPattern::Bind { local, .. } => {
+                                        self.locals.insert(
+                                            *local,
+                                            LocalInfo {
+                                                ty: ty.clone(),
+                                                mutable: false,
+                                            },
+                                        );
+                                    }
+                                    HirPattern::Wildcard { .. } => {}
+                                    other => {
+                                        self.push_unsupported(
+                                            other.span(),
+                                            "a failure arm's payload pattern other than a bare bind or `_`",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let body_ty = self.check_arm_body(&arm.body);
+                        if reachable {
+                            arm_result = Some(match arm_result {
+                                None => body_ty,
+                                Some(acc) => self.join_diverging_branches(
+                                    &acc,
+                                    &body_ty,
+                                    arm.span,
+                                    "handle arms must have the same type",
+                                ),
+                            });
+                        }
+                    } else {
+                        // Still check the body for its own independent
+                        // diagnostics, but never join an invalid arm's
+                        // type into the result.
+                        self.check_arm_body(&arm.body);
+                    }
+                }
+            }
+        }
+
+        // The operand call never actually happens (a diverging argument
+        // already ended this path) -- every arm above was still checked
+        // for its own independent diagnostics, but none of them are
+        // reachable, so neither coverage requirement below is
+        // meaningful: mirrors `check_match`'s own diverging-scrutinee
+        // rule of skipping exhaustiveness analysis entirely once
+        // divergence is already known.
+        if operand_diverges {
+            return Ty::Never;
+        }
+        if success_count == 0 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::MISSING_SUCCESS_ARM,
+                    self.source,
+                    span,
+                    "this `handle` declares no `success` arm",
+                )
+                .with_primary_label("missing `success` arm"),
+            );
+        }
+        if !any_invalid && !wildcard_seen && !required.is_subset(&covered) {
+            let mut missing: Vec<(ItemId, usize)> =
+                required.difference(&covered).copied().collect();
+            // Sorted by each candidate's own stable qualified name, never
+            // by raw `ItemId` (which is only ever assigned in whatever
+            // order declarations/imports happened to be discovered in,
+            // and can differ across two runs that reorder either without
+            // changing what the program actually means) -- the witness
+            // this reports must be identical regardless of that order.
+            missing.sort_unstable_by_key(|(item, case)| {
+                (self.registry.qualified_name(*item, self.interner), *case)
+            });
+            if let Some((variant, case)) = missing.first() {
+                let type_text = self.registry.qualified_name(*variant, self.interner);
+                let case_text = self
+                    .variants
+                    .get(variant)
+                    .map(|info| self.interner.resolve(info.cases[*case].0).to_string())
+                    .unwrap_or_default();
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::NON_EXHAUSTIVE_HANDLER,
+                        self.source,
+                        span,
+                        format!(
+                            "this `handle` does not cover every raised case; missing `failure {type_text}.{case_text}`"
+                        ),
+                    )
+                    .with_primary_label("non-exhaustive `handle`"),
+                );
+            }
+        }
+
+        arm_result.unwrap_or(Ty::Never)
+    }
+
+    fn check_arm_body(&mut self, body: &HirMatchArmBody) -> Ty {
+        match body {
+            HirMatchArmBody::Expr(e) => self.check_expr(e),
+            HirMatchArmBody::Block(b) => self.check_block(b),
         }
     }
 
@@ -3434,6 +4134,7 @@ mod tests {
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
             current_requirements: Vec::new(),
+            current_raises: HashSet::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -3490,6 +4191,7 @@ mod tests {
             pending_defaults: Vec::new(),
             current_return_type: Ty::Unit,
             current_requirements: Vec::new(),
+            current_raises: HashSet::new(),
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
@@ -3750,10 +4452,14 @@ mod tests {
     }
 
     #[test]
-    fn postfix_try_is_reported_as_an_unsupported_feature() {
+    fn postfix_try_on_a_non_call_operand_is_rejected() {
+        // `rfcs/0010`: `?` may only follow a direct call to a fallible
+        // function -- `x?` names a plain local, not a call at all.
         let diags = check("func f(x: i64) -> i64 { return x? }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert!(
+            codes_of(&diags).contains(&"T0049"),
+            "unexpected diagnostics: {diags:?}"
+        );
     }
 
     #[test]
@@ -3787,10 +4493,13 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_raises_clause_is_reported_as_an_unsupported_feature() {
-        let diags = check("func f() raises NotFound { }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+    fn a_raises_clause_naming_a_declared_variant_is_no_longer_unsupported() {
+        // `rfcs/0010`: `raises` is a real, checked feature now -- an
+        // undeclared name is `hir::lower`'s own `R0028` (see that
+        // module's tests), not the old blanket "unsupported" rejection
+        // this test used to assert.
+        let diags = check("variant NotFound { Missing }\nfunc f() raises NotFound { }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]
@@ -5539,6 +6248,758 @@ mod tests {
             }
             func main() -> bool {
                 return helper[i64](1, 1)
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Typed outcomes: raise/?/handle (`rfcs/0010`) -------------------
+
+    #[test]
+    fn a_direct_raise_of_a_declared_variant_has_no_diagnostics() {
+        let diags = check(
+            "variant FileError { Missing, PermissionDenied }
+            func read_config(path: str) -> str raises FileError {
+                if path == \"\" {
+                    raise FileError.Missing
+                }
+                return \"configuration\"
+            }
+            func main() -> str {
+                return handle read_config(\"x\") {
+                    success v => v,
+                    failure FileError.Missing => \"default\",
+                    failure FileError.PermissionDenied => \"denied\"
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn single_effect_propagation_with_try_has_no_diagnostics() {
+        let diags = check(
+            "variant FileError { Missing }
+            func read_config(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"configuration\"
+            }
+            func load(path: str) -> str raises FileError {
+                return read_config(path)?
+            }
+            func main() -> str {
+                return handle load(\"x\") {
+                    success v => v,
+                    failure FileError.Missing => \"default\"
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// A diverging *argument* to the fallible call under `?` means the
+    /// call itself is never actually reached -- `?` must not require
+    /// this function to have declared the callee's own `raises` types,
+    /// since nothing here could ever actually propagate one.
+    #[test]
+    fn postfix_try_with_a_diverging_argument_is_never_and_needs_no_propagation_declared() {
+        let diags = check(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return read({ return 7 })?
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The whole `?` expression's own checked type is `never` when its
+    /// argument diverges, exactly like an ordinary diverging call.
+    #[test]
+    fn postfix_try_with_a_diverging_argument_has_expression_type_never() {
+        let (hir, result) = check_full_with_hir(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 raises FileError {
+                return read({ return 7 })?
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        let HirExpr::Return { value, .. } = hir.functions[1].body.tail.as_deref().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let try_expr = value.as_deref().unwrap();
+        assert_eq!(result.expr_types.get(&try_expr.id()), Some(&Ty::Never));
+    }
+
+    /// A diverging argument under `handle` means the operand call is
+    /// never reached: no missing-`success`/non-exhaustive-handler
+    /// diagnostic, and mismatched arm result types must not be joined
+    /// into a false "handle arms must have the same type" diagnostic.
+    #[test]
+    fn handle_with_a_diverging_argument_needs_no_success_arm_or_exhaustive_coverage() {
+        let diags = check(
+            "variant FileError { Missing, PermissionDenied }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    failure FileError.Missing => \"a string\",
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The whole `handle` expression's own checked type is `never` when
+    /// its operand's argument diverges, exactly like a diverging `match`
+    /// scrutinee.
+    #[test]
+    fn handle_with_a_diverging_argument_has_expression_type_never() {
+        let (hir, result) = check_full_with_hir(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    success v => 1,
+                    failure FileError.Missing => 2,
+                }
+            }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        let HirExpr::Return { value, .. } = hir.functions[1].body.tail.as_deref().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let handle_expr = value.as_deref().unwrap();
+        assert_eq!(result.expr_types.get(&handle_expr.id()), Some(&Ty::Never));
+    }
+
+    /// Mismatched arm result types must not be joined -- and so must not
+    /// produce a "handle arms must have the same type" diagnostic --
+    /// when the operand's own argument diverges first, since none of
+    /// the arms are ever actually reachable.
+    #[test]
+    fn handle_with_a_diverging_argument_does_not_report_mismatched_arm_types() {
+        let diags = check(
+            "variant FileError { Missing }
+            func read(path: str) -> str raises FileError {
+                if path == \"\" { raise FileError.Missing }
+                return \"ok\"
+            }
+            func f() -> i64 {
+                return handle read({ return 7 }) {
+                    success v => \"a string, not an i64\",
+                    failure FileError.Missing => 2,
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The non-exhaustive-handler witness (which specific `Type.Case` is
+    /// reported missing) must be identical regardless of the unrelated
+    /// order the raised variants happen to be *declared* in -- sorted by
+    /// each candidate's own stable qualified name, never by raw
+    /// `ItemId` (`rfcs/0010`), which is only ever assigned in
+    /// declaration-discovery order.
+    #[test]
+    fn non_exhaustive_handler_witness_is_identical_regardless_of_declaration_order() {
+        let forward = check(
+            "variant FileError { Missing }
+            variant NetworkError { Timeout }
+            func fetch() -> i64 raises FileError, NetworkError {
+                raise FileError.Missing
+            }
+            func main() -> i64 {
+                return handle fetch() {
+                    success v => v,
+                }
+            }",
+        );
+        let reversed = check(
+            "variant NetworkError { Timeout }
+            variant FileError { Missing }
+            func fetch() -> i64 raises FileError, NetworkError {
+                raise FileError.Missing
+            }
+            func main() -> i64 {
+                return handle fetch() {
+                    success v => v,
+                }
+            }",
+        );
+        assert_eq!(forward.len(), 1, "unexpected diagnostics: {forward:?}");
+        assert_eq!(reversed.len(), 1, "unexpected diagnostics: {reversed:?}");
+        assert_eq!(
+            forward[0].message, reversed[0].message,
+            "the reported missing case must not depend on unrelated declaration order"
+        );
+        assert!(forward[0].message.contains("FileError.Missing"));
+    }
+
+    #[test]
+    fn multiple_sequential_propagations_have_no_diagnostics() {
+        let diags = check(
+            "variant FileError { Missing }
+            variant NetworkError { Timeout }
+            func download(path: str) -> str raises NetworkError {
+                if path == \"\" { raise NetworkError.Timeout }
+                return path
+            }
+            func parse_file(text: str) -> str raises FileError {
+                if text == \"\" { raise FileError.Missing }
+                return text
+            }
+            func load_remote(path: str) -> str raises FileError, NetworkError {
+                value text = download(path)?;
+                return parse_file(text)?
+            }
+            func main() -> str {
+                return handle load_remote(\"x\") {
+                    success v => v,
+                    failure FileError.Missing => \"a\",
+                    failure NetworkError.Timeout => \"b\"
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_covering_every_case_with_a_wildcard_has_no_diagnostics() {
+        let diags = check(
+            "variant FileError { Missing, PermissionDenied }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure _ => 0
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_payload_carrying_failure_arm_binds_its_payload() {
+        let diags = check(
+            "variant NetworkError { Timeout(i64) }
+            func f() -> i64 raises NetworkError { raise NetworkError.Timeout(5) }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure NetworkError.Timeout(ms) => ms
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_failure_case_index_within_range_is_valid() {
+        // Baseline/positive counterpart to the out-of-range regression
+        // below -- an ordinary, in-range case index has no diagnostics.
+        let diags = check(
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 1,
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_failure_case_index_out_of_range_is_a_diagnostic_not_a_panic() {
+        // `hir::lower` never resolves an out-of-range case index itself;
+        // this simulates a direct caller lowering hand-built HIR that
+        // bypasses it, confirming the indexing in check_handle no longer
+        // panics.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 1,
+                }
+            }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Handle { arms, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a handle expression");
+        };
+        let HirHandleArmKind::Failure(HirFailurePattern::Case { case, .. }) = &mut arms[1].kind
+        else {
+            panic!("expected a failure case arm");
+        };
+        *case = Some(999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0058"),
+            "expected T0058, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_function_raising_an_item_with_no_declared_variant_is_a_diagnostic_not_a_panic() {
+        // `hir::lower`'s own `resolve_raises` never hands a function a
+        // `raises` entry naming an item that isn't a declared variant;
+        // this simulates a direct caller lowering hand-built HIR that
+        // bypasses it, confirming `check_function`'s own filter reports
+        // a diagnostic instead of silently accepting the dangling entry
+        // as if it were a real, non-generic raise.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let f_symbol = interner.intern("f");
+        let f_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == f_symbol)
+            .expect("f should have lowered");
+        f_fn.raises[0].variant = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0059"),
+            "expected T0059, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_try_on_a_callee_with_no_registered_signature_is_a_diagnostic_not_a_panic() {
+        // `hir::lower` never produces an `HirExpr::Function` naming an
+        // item outside `hir.functions`; this simulates a direct caller
+        // lowering hand-built HIR with a dangling function reference,
+        // confirming `check_try`'s own `callee_raises` lookup reports a
+        // diagnostic instead of silently treating the call as
+        // infallible.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 raises Failure { return f()? }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Try { expr, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a try expression");
+        };
+        let HirExpr::Call { callee, .. } = expr.as_mut() else {
+            panic!("expected a call expression");
+        };
+        let HirExpr::Function { item, .. } = callee.as_mut() else {
+            panic!("expected a function reference");
+        };
+        *item = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0060"),
+            "expected T0060, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_handle_on_a_callee_with_no_registered_signature_is_t0060_only_not_t0049() {
+        // Mirrors the `?` case above, for `handle`: a dangling function
+        // reference must report T0060 (missing callee metadata) alone.
+        // Converting the missing signature into an empty `raises` set
+        // would additionally emit T0049 ("this call cannot fail"),
+        // which is actively misleading -- the call's own fallibility is
+        // simply unknown, never proven infallible.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 0,
+                }
+            }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Handle { operand, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a handle expression");
+        };
+        let HirExpr::Call { callee, .. } = operand.as_mut() else {
+            panic!("expected a call expression");
+        };
+        let HirExpr::Function { item, .. } = callee.as_mut() else {
+            panic!("expected a function reference");
+        };
+        *item = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0060"),
+            "expected T0060, got {:?}",
+            result.diagnostics
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "T0049"),
+            "T0049 must not also fire for a missing-metadata callee: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_fully_diverging_handler_has_type_never_and_no_diagnostics() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                handle f() {
+                    success v => return v,
+                    failure FileError.Missing => return 0
+                }
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn an_ignored_fallible_call_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                f();
+                return 1
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0048"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn try_on_an_infallible_call_is_rejected() {
+        let diags = check(
+            "func f() -> i64 { return 1 }
+            func main() -> i64 {
+                return f()?
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0049"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn propagation_outside_a_compatible_raises_clause_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { raise FileError.Missing }
+            func main() -> i64 {
+                return f()?
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0050"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn raising_an_undeclared_type_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            variant OtherError { Bad }
+            func f() -> i64 raises FileError { raise OtherError.Bad }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0051"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn raising_a_record_value_is_rejected() {
+        let diags = check(
+            "variant SomeError { X }
+            record NotAVariant { code: i64 }
+            func f() -> i64 raises SomeError { raise NotAVariant { code: 1 } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0051"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_exhaustive_handler_is_rejected_with_a_witness() {
+        let diags = check(
+            "variant FileError { Missing, PermissionDenied }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure FileError.Missing => 0
+                }
+            }",
+        );
+        let diag = diags
+            .iter()
+            .find(|d| d.code == "T0053")
+            .expect("expected a non-exhaustive-handler diagnostic");
+        assert!(
+            diag.message.contains("PermissionDenied"),
+            "{}",
+            diag.message
+        );
+    }
+
+    #[test]
+    fn an_unreachable_handle_arm_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure FileError.Missing => 0,
+                    failure FileError.Missing => 1
+                }
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0054"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_success_arm_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    failure FileError.Missing => 0
+                }
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0055"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_success_arm_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    success w => w,
+                    failure FileError.Missing => 0
+                }
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0056"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_variant_case_in_a_failure_arm_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }
+            variant OtherError { Bad }
+            func f() -> i64 raises FileError { return 1 }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure FileError.Missing => 0,
+                    failure OtherError.Bad => 1
+                }
+            }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0057"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fallible_main_is_rejected() {
+        let diags = check(
+            "variant FileError { Missing }\nfunc main() -> i64 raises FileError { return 1 }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0052"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_function_calling_a_fallible_concrete_function_works() {
+        let diags = check(
+            "variant FileError { Missing }
+            func fallible() -> i64 raises FileError { raise FileError.Missing }
+            func wrapper[T](x: T) -> T { return x }
+            func main() -> i64 {
+                return wrapper(handle fallible() {
+                    success v => v,
+                    failure FileError.Missing => 0
+                })
+            }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// `uses` (capability requirements) and `raises` (typed failure)
+    /// remain fully independent concepts on an ordinary named function:
+    /// declaring both together, and actually using both in the body,
+    /// must still type-check cleanly (`rfcs/0010`'s protocol-interaction
+    /// section).
+    #[test]
+    fn an_ordinary_function_may_combine_a_capability_requirement_and_a_raises_clause() {
+        let diags = check(
+            "variant Failure { Broken }
+            protocol Equal[T] {
+                func equal(left: T, right: T) -> bool;
+            }
+            extend Equal[i64] {
+                func equal(left: i64, right: i64) -> bool {
+                    return left == right
+                }
+            }
+            func compare(left: i64, right: i64) -> bool uses Equal[i64] raises Failure {
+                if Equal[i64].equal(left, right) {
+                    return true
+                }
+                raise Failure.Broken
+            }
+            func main() -> i64 {
+                return handle compare(1, 1) {
+                    success v => 0,
+                    failure Failure.Broken => 1,
+                }
             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");

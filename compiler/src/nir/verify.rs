@@ -9,7 +9,7 @@
 //! reach the interpreter (where it could panic or silently misbehave).
 //! It runs once, after lowering and before interpretation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
@@ -235,6 +235,77 @@ mod codes {
     /// situation; a concrete extend can only ever be legitimately
     /// selected once every argument is fully concrete.
     pub const EXTENSION_FOR_SYMBOLIC_REQUIREMENT: &str = "V0060";
+    /// A function's own `raises` (`rfcs/0010`) names an `ItemId` that
+    /// does not match any variant declared in this module.
+    pub const UNKNOWN_RAISES_TYPE: &str = "V0061";
+    /// A function's own `raises` names the same `ItemId` more than once
+    /// -- the set of effects a function may raise is canonical, never a
+    /// multiset.
+    pub const DUPLICATE_RAISES_ENTRY: &str = "V0062";
+    /// An ordinary `ValueKind::Call` targets a function whose own
+    /// `raises` is non-empty. A fallible callee may only ever be invoked
+    /// through `Terminator::Invoke`, which alone has a failure edge to
+    /// route a raised value to -- an ordinary `Call` has nowhere for one
+    /// to go.
+    pub const CALL_TO_FALLIBLE_FUNCTION: &str = "V0063";
+    /// A `Terminator::Invoke` targets a function whose own `raises` is
+    /// empty. Since it can never actually raise, this callee should have
+    /// been an ordinary `Call` -- an `Invoke` with no failure edges is
+    /// never a valid lowering of anything typeck accepts.
+    pub const INVOKE_OF_INFALLIBLE_FUNCTION: &str = "V0064";
+    /// A `Terminator::Invoke`'s own `ok_slot` was never allocated with
+    /// `alloc` -- mirrors `UNKNOWN_SLOT` for the slot an ordinary `Store`
+    /// writes into: `Invoke`'s success edge writes into `ok_slot` in
+    /// exactly the same way.
+    pub const INVOKE_SUCCESS_SLOT_UNALLOCATED: &str = "V0065";
+    /// A `Terminator::Invoke`'s own `ok_slot` is declared a different
+    /// type than its callee's own (substituted) return type.
+    pub const INVOKE_SUCCESS_TYPE_MISMATCH: &str = "V0066";
+    /// A `Terminator::Invoke`'s own `err_targets` does not have exactly
+    /// one entry per variant in its callee's own declared `raises`, in
+    /// any order, with no duplicate or unknown variant -- every effect
+    /// the callee can actually raise must have exactly one destination,
+    /// and no destination may exist for an effect the callee can never
+    /// raise.
+    pub const INVOKE_ERR_TARGET_COVERAGE_MISMATCH: &str = "V0067";
+    /// One of a `Terminator::Invoke`'s own `err_targets` entries has a
+    /// `slot` that was never allocated with `alloc` (mirrors
+    /// `INVOKE_SUCCESS_SLOT_UNALLOCATED`, for a failure edge instead of
+    /// the success edge).
+    pub const INVOKE_FAILURE_SLOT_UNALLOCATED: &str = "V0068";
+    /// One of a `Terminator::Invoke`'s own `err_targets` entries has a
+    /// `slot` declared a different type than `Ty::Named`/`Ty::Applied` of
+    /// that entry's own `variant`.
+    pub const INVOKE_FAILURE_TYPE_MISMATCH: &str = "V0069";
+    /// A `Terminator::Raise`'s own `value` is not declared a type that
+    /// matches any variant in the currently verified function's own
+    /// `raises` set -- a function may only ever raise an effect it
+    /// actually declares (`rfcs/0010`).
+    pub const UNDECLARED_RAISE: &str = "V0070";
+    /// A function's own `raises` names a variant declaring one or more
+    /// type parameters. Generic error variants are explicitly out of
+    /// scope (`rfcs/0010`); `hir::lower`'s own `resolve_raises` already
+    /// rejects this for ordinary source, but this verifier never trusts
+    /// hand-built NIR to already satisfy it.
+    pub const GENERIC_RAISES_TYPE: &str = "V0071";
+    /// An extend's method function's own `raises` is non-empty. A
+    /// protocol method has no `raises` of its own yet (`rfcs/0010`'s own
+    /// honest limitation), so every implementing method must be
+    /// infallible too -- `hir::lower`/`typeck` both already reject this
+    /// for ordinary source, but this verifier never trusts hand-built
+    /// NIR to already satisfy it.
+    pub const EXTEND_METHOD_MUST_BE_INFALLIBLE: &str = "V0072";
+    /// A `Load` reads a slot some `Terminator::Invoke` in this same
+    /// function writes on one of its own edges (`ok_slot`, or one of its
+    /// `err_targets`' own `slot`), from a block the CFG does not prove is
+    /// reached *only* through that one edge -- dominance from the slot's
+    /// own `alloc` (already required) proves the slot exists before this
+    /// point, but never that the specific edge which actually writes it
+    /// is the one that was taken to get here. Mirrors
+    /// `PAYLOAD_OUTSIDE_REFINEMENT`'s own single-hop "every incoming edge
+    /// must agree" model, applied to Invoke's own conditional writes
+    /// instead of a `Switch`'s own case refinement.
+    pub const INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0073";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -252,6 +323,11 @@ struct KnownFunction {
     /// many evidence entries, each independently checked against the
     /// corresponding substituted requirement here.
     requirements: Vec<CapabilityRequirement>,
+    /// This function's own declared raised-error set (`rfcs/0010`) --
+    /// empty means infallible (only ever legally targeted by an ordinary
+    /// `Call`), non-empty means fallible (only ever legally targeted by
+    /// `Terminator::Invoke`).
+    raises: Vec<ItemId>,
 }
 
 /// Every declared record's/variant's/protocol's/extend's layout, by
@@ -336,6 +412,7 @@ pub fn verify_module(
                 params: function.params.iter().map(|p| p.ty.clone()).collect(),
                 return_type: function.return_type.clone(),
                 requirements: function.requirements.clone(),
+                raises: function.raises.clone(),
             },
         );
     }
@@ -693,6 +770,24 @@ pub fn verify_module(
                     ),
                 ));
             }
+            // A protocol method has no `raises` of its own yet
+            // (`rfcs/0010`'s own honest limitation) -- an implementing
+            // method whose own `raises` is non-empty could otherwise
+            // satisfy an apparently infallible protocol method, and
+            // `ProtocolCall` (an ordinary value instruction with only
+            // one destination) would have nowhere for a raised value to
+            // go.
+            if !implementing.raises.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::EXTEND_METHOD_MUST_BE_INFALLIBLE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "{context}'s method[{index}] ({}) declares `raises`, but its protocol method has no raised-effect signature to narrow",
+                        registry.qualified_name(*method_id, interner)
+                    ),
+                ));
+            }
             let Some(protocol_method) = protocol.methods.get(index) else {
                 // Already reported above as EXTEND_METHOD_COUNT_MISMATCH;
                 // there is no protocol method at this index to check the
@@ -842,6 +937,47 @@ fn verify_function(
                 ));
             }
             Some(_) => {}
+        }
+    }
+
+    // A function's own declared effect set (`rfcs/0010`) must be
+    // well-formed independently of whatever built this NIR: every entry
+    // must actually be a variant declared in this module, and the set
+    // must be canonical (no `ItemId` repeated) -- exactly the two
+    // invariants `hir::lower` already establishes for ordinary source,
+    // re-derived here since this verifier never trusts hand-built NIR to
+    // already satisfy them.
+    let mut seen_raises: HashSet<ItemId> = HashSet::new();
+    for raised in &function.raises {
+        match agg.variants.get(raised) {
+            None => diagnostics.push(Diagnostic::error(
+                codes::UNKNOWN_RAISES_TYPE,
+                source,
+                Span::dummy(),
+                format!(
+                    "{fn_context}'s `raises` names id {}, which is not a variant declared in this module",
+                    raised.0
+                ),
+            )),
+            Some(layout) if !layout.type_params.is_empty() => diagnostics.push(Diagnostic::error(
+                codes::GENERIC_RAISES_TYPE,
+                source,
+                Span::dummy(),
+                format!(
+                    "{fn_context}'s `raises` names `{}`, which declares {} type parameter(s); generic error variants are not supported",
+                    registry.qualified_name(*raised, interner),
+                    layout.type_params.len()
+                ),
+            )),
+            Some(_) => {}
+        }
+        if !seen_raises.insert(*raised) {
+            diagnostics.push(Diagnostic::error(
+                codes::DUPLICATE_RAISES_ENTRY,
+                source,
+                Span::dummy(),
+                format!("{fn_context}'s `raises` names the same type more than once"),
+            ));
         }
     }
 
@@ -1125,10 +1261,295 @@ fn verify_function(
                     }
                 }
             }
+            Terminator::Invoke {
+                callee,
+                type_args,
+                args,
+                evidence,
+                ok_slot,
+                ok_target,
+                err_targets,
+            } => {
+                for arg in args {
+                    require_value(*arg, diagnostics);
+                }
+                // Every check in this block is about this `Invoke`'s own
+                // structure -- its argument values, its slots, its branch
+                // targets -- and never depends on the callee's own
+                // registered signature. An unknown callee must not short-
+                // circuit any of it: only the signature-dependent checks
+                // further down (type/arity/evidence matching, and the
+                // `raises`-coverage comparison, which genuinely cannot be
+                // performed without a signature to compare against) are
+                // skipped when the callee itself is unresolvable.
+                if !alloc_slots.contains(ok_slot) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SUCCESS_SLOT_UNALLOCATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's success slot %{} was never allocated with `alloc`",
+                            ok_slot.0
+                        ),
+                    ));
+                }
+                if !known_blocks.contains(ok_target) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_BRANCH_TARGET,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes to bb{}, which does not exist",
+                            ok_target.0
+                        ),
+                    ));
+                }
+                let mut target_variants: HashSet<ItemId> = HashSet::new();
+                let mut has_duplicate_target = false;
+                for target in err_targets {
+                    if !target_variants.insert(target.variant) {
+                        has_duplicate_target = true;
+                    }
+                    match agg.variants.get(&target.variant) {
+                        None => diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_VARIANT_OR_CASE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invoke's failure target names unknown variant id {}",
+                                target.variant.0
+                            ),
+                        )),
+                        Some(layout) => {
+                            if !alloc_slots.contains(&target.slot) {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_SLOT_UNALLOCATED,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} was never allocated with `alloc`",
+                                        target.slot.0
+                                    ),
+                                ));
+                            } else if let Some(slot_ty) = value_types.get(&target.slot)
+                                && *slot_ty != Ty::Named(target.variant, layout.name)
+                            {
+                                diagnostics.push(Diagnostic::error(
+                                    codes::INVOKE_FAILURE_TYPE_MISMATCH,
+                                    source,
+                                    Span::dummy(),
+                                    format!(
+                                        "function `{name}` invoke's failure slot %{} is declared `{}`, but its own failure target names `{}`",
+                                        target.slot.0,
+                                        crate::types::display_ty(slot_ty, interner),
+                                        registry.qualified_name(target.variant, interner)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if !known_blocks.contains(&target.target) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_BRANCH_TARGET,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` invokes to bb{}, which does not exist",
+                                target.target.0
+                            ),
+                        ));
+                    }
+                }
+                let Some(sig) = known_functions.get(callee) else {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNKNOWN_FUNCTION_REF,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function with id {}, which does not exist in this module",
+                            callee.0
+                        ),
+                    ));
+                    continue;
+                };
+                if sig.raises.is_empty() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_OF_INFALLIBLE_FUNCTION,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes `{}`, which declares no `raises` and can never actually fail -- use `call` instead",
+                            registry.qualified_name(*callee, interner)
+                        ),
+                    ));
+                }
+                let invoke_context = format!("function `{name}`'s invoke type argument");
+                for t in type_args {
+                    check_type_root(
+                        t,
+                        agg,
+                        &own_params,
+                        source,
+                        interner,
+                        registry,
+                        &invoke_context,
+                        diagnostics,
+                    );
+                }
+                let arity_matches = type_args.len() == sig.type_params.len();
+                let subst: HashMap<TypeParamId, Ty> = if arity_matches {
+                    sig.type_params
+                        .iter()
+                        .copied()
+                        .zip(type_args.iter().cloned())
+                        .collect()
+                } else {
+                    diagnostics.push(Diagnostic::error(
+                        codes::GENERIC_ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function declaring {} type parameter(s) with {} type argument(s)",
+                            sig.type_params.len(),
+                            type_args.len()
+                        ),
+                    ));
+                    HashMap::new()
+                };
+                let (return_ty, param_tys): (Ty, Vec<Ty>) = if arity_matches {
+                    (
+                        substitute(&sig.return_type, &subst),
+                        sig.params.iter().map(|p| substitute(p, &subst)).collect(),
+                    )
+                } else {
+                    (sig.return_type.clone(), sig.params.clone())
+                };
+                if arity_matches {
+                    let evidence_context = format!("function `{name}`'s invoke evidence");
+                    if evidence.len() != sig.requirements.len() {
+                        diagnostics.push(Diagnostic::error(
+                            codes::EVIDENCE_COUNT_MISMATCH,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "{evidence_context} carries {} entry(ies), but the callee declares {} capability requirement(s)",
+                                evidence.len(),
+                                sig.requirements.len()
+                            ),
+                        ));
+                    } else {
+                        for (entry, requirement) in evidence.iter().zip(sig.requirements.iter()) {
+                            let required_arguments: Vec<Ty> = requirement
+                                .arguments
+                                .iter()
+                                .map(|t| substitute(t, &subst))
+                                .collect();
+                            let mut budget = MAX_CAPABILITY_RESOLUTION_STEPS;
+                            if let Err(problem) = check_evidence(
+                                entry,
+                                requirement.protocol,
+                                &required_arguments,
+                                true,
+                                &function.requirements,
+                                agg,
+                                0,
+                                &mut budget,
+                            ) {
+                                diagnostics.push(Diagnostic::error(
+                                    problem.code(),
+                                    source,
+                                    Span::dummy(),
+                                    format!("{evidence_context} {}", problem.describe()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if param_tys.len() != args.len() {
+                    diagnostics.push(Diagnostic::error(
+                        codes::ARITY_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invokes a function expecting {} argument(s) with {}",
+                            param_tys.len(),
+                            args.len()
+                        ),
+                    ));
+                } else {
+                    for (param_ty, arg) in param_tys.iter().zip(args.iter()) {
+                        if let Some(arg_ty) = value_types.get(arg)
+                            && *arg_ty != *param_ty
+                        {
+                            diagnostics.push(Diagnostic::error(
+                                codes::OPERAND_TYPE_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}` invokes a function passing an argument of type `{}` where `{}` was expected",
+                                    crate::types::display_ty(arg_ty, interner),
+                                    crate::types::display_ty(param_ty, interner)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // The allocation checks for `ok_slot`/each err target's
+                // slot, and the branch-target validity checks, already
+                // ran above (callee-independent); only the type match
+                // against the callee's own resolved return type, and the
+                // coverage comparison against its own resolved `raises`
+                // set, need the signature and belong here.
+                if alloc_slots.contains(ok_slot)
+                    && let Some(slot_ty) = value_types.get(ok_slot)
+                    && *slot_ty != return_ty
+                {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_SUCCESS_TYPE_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's success slot %{} is declared `{}`, but the callee returns `{}`",
+                            ok_slot.0,
+                            crate::types::display_ty(slot_ty, interner),
+                            crate::types::display_ty(&return_ty, interner)
+                        ),
+                    ));
+                }
+                let raises_set: HashSet<ItemId> = sig.raises.iter().copied().collect();
+                if has_duplicate_target || target_variants != raises_set {
+                    diagnostics.push(Diagnostic::error(
+                        codes::INVOKE_ERR_TARGET_COVERAGE_MISMATCH,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` invoke's failure targets do not cover exactly the callee's declared `raises` set, with no duplicates"
+                        ),
+                    ));
+                }
+            }
+            Terminator::Raise { value } => {
+                require_value(*value, diagnostics);
+                let declared_variant = value_types.get(value).and_then(|ty| match ty {
+                    Ty::Named(v, _) => Some(*v),
+                    _ => None,
+                });
+                if !declared_variant.is_some_and(|v| function.raises.contains(&v)) {
+                    diagnostics.push(Diagnostic::error(
+                        codes::UNDECLARED_RAISE,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{name}` raises a value not in its own declared `raises` set"
+                        ),
+                    ));
+                }
+            }
         }
     }
 
     verify_payload_refinement(function, agg, source, &name, diagnostics);
+    verify_invoke_slot_initialization(function, source, &name, diagnostics);
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -1237,6 +1658,28 @@ fn verify_dominance(
             Terminator::Switch { scrutinee, .. } => {
                 check_use(*scrutinee, block.id, after_all, diagnostics);
             }
+            Terminator::Invoke {
+                args,
+                ok_slot,
+                err_targets,
+                ..
+            } => {
+                for arg in args {
+                    check_use(*arg, block.id, after_all, diagnostics);
+                }
+                // `ok_slot`/each failure target's `slot` are write
+                // destinations, exactly like `Instruction::Store`'s own
+                // `slot` -- the `alloc` that defined it must dominate
+                // this `Invoke`, or some path could reach it without
+                // ever allocating the slot it writes into.
+                check_use(*ok_slot, block.id, after_all, diagnostics);
+                for target in err_targets {
+                    check_use(target.slot, block.id, after_all, diagnostics);
+                }
+            }
+            Terminator::Raise { value } => {
+                check_use(*value, block.id, after_all, diagnostics);
+            }
             Terminator::Return(None) | Terminator::Branch(_) => {}
         }
     }
@@ -1309,6 +1752,16 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
                 ..
             } => vec![*then_block, *else_block],
             Terminator::Switch { cases, .. } => cases.clone(),
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                let mut targets = vec![*ok_target];
+                targets.extend(err_targets.iter().map(|t| t.target));
+                targets
+            }
+            Terminator::Raise { .. } => Vec::new(),
         }
     };
 
@@ -2228,6 +2681,17 @@ fn verify_value_kind(
                 ));
                 return;
             };
+            if !sig.raises.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::CALL_TO_FALLIBLE_FUNCTION,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} calls a fallible function through an ordinary `call`; only `invoke` may call a function declaring `raises`",
+                        result.0
+                    ),
+                ));
+            }
             let call_context = format!(
                 "function `{function_name}`: %{}'s call type argument",
                 result.0
@@ -2873,9 +3337,8 @@ fn verify_value_kind(
 
 /// A `variant.payload` instruction is only legal in a block reached
 /// through the matching case's own `Terminator::Switch` edge -- this
-/// re-derives that from the CFG itself (which block is a direct switch
-/// target for which `(scrutinee, variant, case)`), independent of how
-/// lowering happened to build it.
+/// re-derives that from the CFG itself, independent of how lowering
+/// happened to build it.
 /// A single guaranteed fact: the value `.0` is known to be case `.2` of
 /// variant `.1`.
 type RefinementFact = (ValueId, ItemId, usize);
@@ -2897,7 +3360,12 @@ fn verify_payload_refinement(
     // a target block reachable through more than one case of the same
     // switch is genuinely reachable via either case, so nothing about
     // that specific case can be assumed from having reached the block
-    // at all.
+    // at all. This check is deliberately single-hop (unlike
+    // `verify_invoke_slot_initialization`'s own full dataflow below):
+    // `nir::lower` only ever extracts a case's own payload immediately
+    // in that case's own direct switch-target block, never in some
+    // later, indirect one, so single-hop refinement is the exact
+    // invariant real lowering needs proven.
     let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
     for block in &function.blocks {
         match &block.terminator {
@@ -2929,7 +3397,20 @@ fn verify_payload_refinement(
                     incoming.entry(*target).or_default().push(fact);
                 }
             }
-            Terminator::Return(_) => {}
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                incoming.entry(*ok_target).or_default().push(HashSet::new());
+                for target in err_targets {
+                    incoming
+                        .entry(target.target)
+                        .or_default()
+                        .push(HashSet::new());
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
         }
     }
 
@@ -2984,6 +3465,365 @@ fn verify_payload_refinement(
     }
 }
 
+/// For a single block, given the facts already guaranteed on entry to
+/// it (`in_facts`), returns the facts guaranteed on exit from it
+/// (an unconditional `Store` to a guarded slot adds one, matching a
+/// real definite-assignment analysis: everything after that `Store`,
+/// in this block or any later one, may rely on it) alongside every
+/// `Load` of a guarded slot not yet proven initialized at the point it
+/// occurs.
+fn invoke_slot_block_transfer(
+    block: &BasicBlock,
+    guarded_slots: &HashSet<ValueId>,
+    in_facts: &HashSet<ValueId>,
+) -> (HashSet<ValueId>, Vec<ValueId>) {
+    let mut facts = in_facts.clone();
+    let mut violations = Vec::new();
+    for instruction in &block.instructions {
+        match instruction {
+            Instruction::Value {
+                kind: ValueKind::Load(slot),
+                ..
+            } if guarded_slots.contains(slot) && !facts.contains(slot) => {
+                violations.push(*slot);
+            }
+            Instruction::Store { slot, .. } if guarded_slots.contains(slot) => {
+                facts.insert(*slot);
+            }
+            _ => {}
+        }
+    }
+    (facts, violations)
+}
+
+/// Computes `block_id`'s own guaranteed-on-entry fact set from its
+/// recorded incoming edges' current exit facts (`out`) -- intersection
+/// across every edge *whose predecessor is reachable from the entry*,
+/// exactly like `verify_payload_refinement`'s own single-hop model,
+/// except each reachable edge's own contribution here is
+/// `out[predecessor] plus whatever that specific edge itself writes`,
+/// which is what lets a fact keep propagating across any number of
+/// ordinary hops in between. An edge whose predecessor is *not*
+/// reachable is skipped entirely, never intersected in: an unreachable
+/// predecessor's own `out` is always the empty set (it is never seeded
+/// optimistically and never touched by the worklist), so folding it
+/// into a join would incorrectly wipe out a fact every genuinely live
+/// path into that join already guarantees, purely because some dead
+/// code elsewhere also happens to branch to the same block. The entry
+/// block, and any block with no *reachable* incoming edge at all
+/// (genuinely unreachable, or reachable only from unreachable
+/// predecessors), are defined to guarantee nothing.
+fn invoke_slot_in_facts(
+    block_id: BlockId,
+    entry: BlockId,
+    incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
+    reachable: &HashSet<BlockId>,
+    out: &HashMap<BlockId, HashSet<ValueId>>,
+) -> HashSet<ValueId> {
+    if block_id == entry {
+        return HashSet::new();
+    }
+    let Some(edges) = incoming_edges.get(&block_id) else {
+        return HashSet::new();
+    };
+    let mut edges = edges.iter().filter(|(pred, _)| reachable.contains(pred));
+    let Some((first_pred, first_gen)) = edges.next() else {
+        return HashSet::new();
+    };
+    let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+    if let Some(slot) = first_gen {
+        acc.insert(*slot);
+    }
+    for (pred, edge_gen) in edges {
+        let mut edge_facts = out.get(pred).cloned().unwrap_or_default();
+        if let Some(slot) = edge_gen {
+            edge_facts.insert(*slot);
+        }
+        acc.retain(|f| edge_facts.contains(f));
+    }
+    acc
+}
+
+/// Proves a `Terminator::Invoke`'s own conditionally-written slots
+/// (`ok_slot`, or one of its `err_targets`' own `slot`) are *definitely
+/// initialized* by the time any `Load` reads them -- a full forward
+/// must-dataflow analysis, not merely a single-hop check of a `Load`'s
+/// own immediate predecessors. Dominance (checked separately,
+/// `verify_dominance`) only proves a slot's own `alloc` precedes a use,
+/// never that the specific edge which actually writes it is the one
+/// that was taken to reach that use, and a single-hop check would also
+/// wrongly reject a slot correctly propagated across several ordinary
+/// (non-`Invoke`) blocks before its own `Load` -- exactly the gap a
+/// real dataflow closes.
+///
+/// This computes a *greatest* fixed point: every reachable block except
+/// the entry starts optimistic (the complete guarded-slot set, i.e.
+/// "everything is already initialized"), and a block's own facts only
+/// ever shrink from there as real, restrictive predecessor information
+/// intersects in -- the analysis settles at the largest fact set that
+/// is still consistent with every edge in the CFG.
+///
+/// The entry block is not part of that iteration at all: its own IN is
+/// always the empty set, by definition, regardless of whatever
+/// `incoming_edges` a backedge into it might otherwise record, so its
+/// OUT is computed exactly once, up front, as a fixed boundary value
+/// the rest of the analysis is anchored to -- it is seeded into the
+/// fact map and never revisited. Treating the entry as just another
+/// block whose OUT starts at `{}` and gets updated later, alongside
+/// everything else, is what would make correctness depend on
+/// processing order: if the entry itself performs an unconditional
+/// `Store` to a guarded slot, its true OUT is *larger* than that
+/// placeholder `{}`, so any reachable block a still-unprocessed entry
+/// feeds into could transiently (and, without care, permanently)
+/// intersect down to less than it is actually owed, purely because it
+/// happened to be visited before the entry was. Computing the entry's
+/// boundary first removes that dependency entirely: every other
+/// reachable block's own OUT is then a true, monotonically
+/// non-increasing descent from the top of a finite lattice, which is
+/// what guarantees the worklist below converges to the same result no
+/// matter what order `function.blocks` stores them in.
+///
+/// A block unreachable from the entry is not part of the fixpoint
+/// either, and is never seeded with the optimistic "everything already
+/// initialized" start reachable blocks get -- there is no real
+/// predecessor that could ever refine such a block down from that
+/// starting point, so an optimistic start would simply never change,
+/// hiding a genuine violation inside dead code (including a cycle
+/// purely among unreachable blocks referencing only each other). Each
+/// unreachable block is instead checked independently, from an empty
+/// IN set, ignoring any incoming edge `incoming_edges` may have
+/// recorded for it -- a `Store` earlier in that same block can still
+/// initialize a `Load` later in it (the ordinary local transfer
+/// function already accounts for this), but nothing crosses into it
+/// from anywhere else.
+fn verify_invoke_slot_initialization(
+    function: &Function,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Every `ValueId` some `Terminator::Invoke` in this function writes
+    // conditionally on one of its own edges -- an ordinary mutable
+    // binding (always written unconditionally immediately after its own
+    // `alloc`, `rfcs/0002`) never needs this analysis at all, and
+    // restricting the fact domain to exactly this finite set is what
+    // keeps the fixpoint below guaranteed to terminate.
+    let mut guarded_slots: HashSet<ValueId> = HashSet::new();
+    for block in &function.blocks {
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            guarded_slots.insert(*ok_slot);
+            for target in err_targets {
+                guarded_slots.insert(target.slot);
+            }
+        }
+    }
+    if guarded_slots.is_empty() {
+        return;
+    }
+
+    let entry = BlockId(0);
+    if !function.blocks.iter().any(|b| b.id == entry) {
+        // Already reported elsewhere (missing entry block); nothing
+        // meaningful to analyze without one.
+        return;
+    }
+
+    // Built by matching each block's own terminator exactly once and
+    // pushing one entry per *logical* edge directly, each carrying its
+    // own gen fact -- never by first collecting a plain list of target
+    // `BlockId`s and re-deriving each edge's own gen from the target
+    // alone afterward, which would conflate two distinct edges into the
+    // same target block (an Invoke's own `ok_target` coinciding with one
+    // of its `err_targets`' own `target`, as in
+    // `a_success_slot_loaded_from_a_block_also_reached_through_a_failure_edge_is_rejected`)
+    // into a single, wrongly-shared gen fact.
+    let mut incoming_edges: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
+    // The same edges as `incoming_edges`, indexed by *source* instead of
+    // target, purely to drive worklist propagation below (`invoke_slot_
+    // in_facts` never reads this -- it always recomputes a block's own
+    // incoming facts from `incoming_edges`, which alone carries each
+    // edge's own gen fact).
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        match &block.terminator {
+            Terminator::Branch(target) => {
+                incoming_edges
+                    .entry(*target)
+                    .or_default()
+                    .push((block.id, None));
+                successors.entry(block.id).or_default().push(*target);
+            }
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                incoming_edges
+                    .entry(*then_block)
+                    .or_default()
+                    .push((block.id, None));
+                incoming_edges
+                    .entry(*else_block)
+                    .or_default()
+                    .push((block.id, None));
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend([*then_block, *else_block]);
+            }
+            Terminator::Switch { cases, .. } => {
+                for target in cases {
+                    incoming_edges
+                        .entry(*target)
+                        .or_default()
+                        .push((block.id, None));
+                }
+                successors.entry(block.id).or_default().extend(cases);
+            }
+            Terminator::Invoke {
+                ok_slot,
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                incoming_edges
+                    .entry(*ok_target)
+                    .or_default()
+                    .push((block.id, Some(*ok_slot)));
+                successors.entry(block.id).or_default().push(*ok_target);
+                for target in err_targets {
+                    incoming_edges
+                        .entry(target.target)
+                        .or_default()
+                        .push((block.id, Some(target.slot)));
+                    successors.entry(block.id).or_default().push(target.target);
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+    }
+
+    // Reachability from the entry block, computed the same way
+    // `compute_dominators` computes its own -- needed so an unreachable
+    // block is never seeded with an optimistic "everything already
+    // initialized" starting fact, which is not merely imprecise but
+    // actively unsound: a cycle purely among unreachable blocks (each
+    // one only ever reached from another block in the same cycle) would
+    // otherwise never have any real predecessor information flow in at
+    // all, so an optimistic start would just sit at "fully initialized"
+    // forever and could hide a genuine violation inside dead code that
+    // happens to also be an `Invoke` target.
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // The entry's own boundary value: its IN is always empty, by
+    // definition, so its OUT is exactly its own local transfer applied
+    // to nothing -- computed once, here, before the fixpoint below ever
+    // starts, and never revisited by it.
+    let entry_block = function
+        .blocks
+        .iter()
+        .find(|b| b.id == entry)
+        .expect("presence already checked above");
+    let (entry_out, _) = invoke_slot_block_transfer(entry_block, &guarded_slots, &HashSet::new());
+
+    // `OUT[b]` starts optimistic (the complete guarded set) for every
+    // *reachable* block other than the entry; the entry itself is
+    // seeded directly at its own precomputed, fixed `entry_out`; an
+    // unreachable block starts at (and, since it is never touched by
+    // the worklist below, permanently stays at) the empty set.
+    let mut out: HashMap<BlockId, HashSet<ValueId>> = function
+        .blocks
+        .iter()
+        .map(|b| {
+            let initial = if b.id == entry {
+                entry_out.clone()
+            } else if reachable.contains(&b.id) {
+                guarded_slots.clone()
+            } else {
+                HashSet::new()
+            };
+            (b.id, initial)
+        })
+        .collect();
+
+    // Standard worklist ("chaotic iteration") fixpoint over reachable
+    // non-entry blocks only -- the entry is a fixed boundary condition,
+    // never re-processed, so nothing can ever read a stale, not-yet-
+    // computed value for it regardless of `function.blocks`' own
+    // storage order. Every other reachable block is processed at least
+    // once (seeded here, in declaration order, so a rerun of the exact
+    // same CFG always explores it in the same order); whenever a
+    // block's own `OUT` actually changes, only *its own* reachable,
+    // non-entry successors -- read directly from the CFG, never a fixed
+    // count -- are re-enqueued, since only they could possibly be
+    // affected. Termination follows from monotonicity: each processed
+    // change strictly shrinks that block's `OUT` from the lattice's own
+    // top, and the sum of every block's `OUT` size is a natural number
+    // bounded below by zero, so it cannot decrease forever.
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let in_facts = invoke_slot_in_facts(id, entry, &incoming_edges, &reachable, &out);
+        let (new_out, _) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
+        if out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    // One diagnostic per malformed `Load`, read off the now-stable
+    // fixpoint -- never during an intermediate, not-yet-converged pass.
+    // A reachable block (entry included) reads its IN from the
+    // fixpoint's own `out` map; an unreachable block is always checked
+    // independently, from an empty IN, ignoring any (dead) incoming
+    // edge `incoming_edges` recorded for it.
+    for block in &function.blocks {
+        let in_facts = if reachable.contains(&block.id) {
+            invoke_slot_in_facts(block.id, entry, &incoming_edges, &reachable, &out)
+        } else {
+            HashSet::new()
+        };
+        let (_, violations) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
+        for slot in violations {
+            diagnostics.push(Diagnostic::error(
+                codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` loads %{} in bb{}, which is not definitely initialized on every path reaching it",
+                    slot.0, block.id.0
+                ),
+            ));
+        }
+    }
+}
+
 fn check_same_as_result(
     a: ValueId,
     b: ValueId,
@@ -3007,7 +3847,7 @@ fn check_same_as_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nir::{BasicBlock, CaseLayout, ProtocolMethodLayout};
+    use crate::nir::{BasicBlock, CaseLayout, InvokeErrTarget, ProtocolMethodLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -3022,6 +3862,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3435,6 +4276,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -3489,6 +4331,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_record, interner.intern("Ghost")),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -3601,6 +4444,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -3680,6 +4524,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(unknown_variant, interner.intern("Ghost")),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3711,6 +4556,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3743,6 +4589,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Named(variant, ty_name),
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -3932,6 +4779,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(1),
@@ -4045,6 +4893,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4093,6 +4942,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4163,6 +5013,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4268,6 +5119,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
@@ -4902,6 +5754,7 @@ mod tests {
                 ty: Ty::I64,
             }],
             return_type: Ty::I64,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: Vec::new(),
@@ -5319,6 +6172,7 @@ mod tests {
                 },
             ],
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -5361,6 +6215,30 @@ mod tests {
             &interner,
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_extend_method_declaring_raises_is_rejected() {
+        // hir::lower/typeck both already reject this for ordinary source
+        // (R0031/T0034); this verifier never trusts hand-built NIR to
+        // already satisfy it -- a fallible implementation could
+        // otherwise satisfy an apparently infallible protocol method.
+        // (`ItemId(20)` need not itself be a declared variant for this
+        // specific check -- it may also trigger the independent
+        // UNKNOWN_RAISES_TYPE check, which does not interfere with the
+        // assertion below.)
+        let mut interner = Interner::new();
+        let (protocol_id, protocol) = valid_equal_protocol(&mut interner);
+        let (extend_id, extend) = valid_equal_i64_extend();
+        let mut method = equal_i64_method(&mut interner);
+        method.raises = vec![ItemId(20)];
+        let diagnostics = verify_module_with(
+            vec![(protocol_id, protocol)],
+            vec![(extend_id, extend)],
+            vec![method],
+            &interner,
+        );
+        assert!(codes_of(&diagnostics).contains(&codes::EXTEND_METHOD_MUST_BE_INFALLIBLE));
     }
 
     #[test]
@@ -5832,6 +6710,7 @@ mod tests {
             requirements: vec![CapabilityRequirement::new(ItemId(0), vec![Ty::I64])],
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -5860,6 +6739,7 @@ mod tests {
             requirements,
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -6281,6 +7161,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: result_ty,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions,
@@ -6455,6 +7336,7 @@ mod tests {
             requirements: Vec::new(),
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -6539,6 +7421,7 @@ mod tests {
             requirements,
             params: Vec::new(),
             return_type: Ty::Bool,
+            raises: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![Instruction::Value {
@@ -6686,5 +7569,1529 @@ mod tests {
             &interner,
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    // -- Typed outcomes: Invoke/Raise (`rfcs/0010`) ---------------------
+
+    #[test]
+    fn an_ordinary_call_to_a_fallible_function_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Call(ItemId(0), Vec::new(), Vec::new(), Vec::new()),
+        });
+        caller.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::CALL_TO_FALLIBLE_FUNCTION),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_of_an_infallible_function_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let callee = valid_function(ItemId(0), g_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        });
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(1),
+            ok_target: BlockId(1),
+            err_targets: Vec::new(),
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_OF_INFALLIBLE_FUNCTION),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_of_an_unknown_callee_still_validates_its_own_slots_and_targets() {
+        // An unknown callee means there is no signature to check
+        // type/arity/evidence against -- but the `Invoke`'s own
+        // structure (its argument values, its success/failure slots,
+        // its branch targets) is independent of the callee entirely,
+        // and must still be validated rather than short-circuited by
+        // the callee lookup failing.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, _shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(999), // does not exist in this module
+            type_args: Vec::new(),
+            args: vec![ValueId(77)], // never defined anywhere
+            evidence: Vec::new(),
+            ok_slot: ValueId(2),   // never allocated
+            ok_target: BlockId(9), // does not exist
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(3),    // never allocated
+                target: BlockId(10), // does not exist
+            }],
+        };
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, _shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        let codes = codes_of(&diagnostics);
+        assert!(
+            codes.contains(&codes::UNKNOWN_FUNCTION_REF),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::UNKNOWN_VALUE),
+            "an unknown callee must not skip argument value validation: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::INVOKE_SUCCESS_SLOT_UNALLOCATED),
+            "an unknown callee must not skip success slot allocation validation: {diagnostics:?}"
+        );
+        assert!(
+            codes.contains(&codes::INVOKE_FAILURE_SLOT_UNALLOCATED),
+            "an unknown callee must not skip failure slot allocation validation: {diagnostics:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == codes::UNKNOWN_BRANCH_TARGET)
+                .count(),
+            2,
+            "an unknown callee must not skip either branch target's validation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_missing_a_failure_target_for_a_declared_raise_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, _shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        });
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(1),
+            ok_target: BlockId(1),
+            // Missing a failure target for `shape_id`, which the callee
+            // declares -- an unhandled effect at this Invoke's own
+            // failure edge.
+            err_targets: Vec::new(),
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_ERR_TARGET_COVERAGE_MISMATCH),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_raise_of_a_type_not_in_the_functions_own_raises_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+
+        // `function.raises` stays empty -- this function never declared
+        // it may raise `Shape` at all.
+        let mut function = valid_function(ItemId(0), f_name);
+        function.blocks[0].instructions.push(Instruction::Value {
+            result: ValueId(1),
+            ty: Ty::Named(shape_id, shape_name),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        });
+        function.blocks[0].terminator = Terminator::Raise { value: ValueId(1) };
+
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            Vec::new(),
+            vec![(shape_id, shape_layout)],
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::UNDECLARED_RAISE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_declaring_raises_of_a_generic_variant_is_rejected() {
+        // `hir::lower`'s own `resolve_raises` already rejects this for
+        // ordinary source (R0030); this verifier never trusts hand-built
+        // NIR to already satisfy it.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let failure_name = interner.intern("Failure");
+        let t = interner.intern("T");
+        let value_name = interner.intern("Value");
+        let failure_id = ItemId(200);
+        let failure_layout = VariantLayout {
+            name: failure_name,
+            type_params: vec![(TypeParamId(0), t)],
+            cases: vec![CaseLayout {
+                name: value_name,
+                payload: vec![Ty::Param(TypeParamId(0), t)],
+            }],
+        };
+
+        let mut function = valid_function(ItemId(0), f_name);
+        function.raises = vec![failure_id];
+
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            Vec::new(),
+            vec![(failure_id, failure_layout)],
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::GENERIC_RAISES_TYPE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_invoke_and_raise_round_trip_has_no_diagnostics() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let shape_ty = Ty::Named(shape_id, shape_name);
+
+        // `func g() -> i64 raises Shape { raise Shape.Empty }`
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+        callee.blocks[0].instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: shape_ty.clone(),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        }];
+        callee.blocks[0].terminator = Terminator::Raise { value: ValueId(0) };
+
+        // `func f() -> i64 { handle g() { success v => v, failure
+        // Shape.Circle(v) => v, failure Shape.Empty => -1 } }`, lowered
+        // by hand into the same Invoke/Switch shape `nir::lower` builds.
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: shape_ty.clone(),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![Instruction::Value {
+                result: ValueId(3),
+                ty: shape_ty,
+                kind: ValueKind::Load(ValueId(1)),
+            }],
+            terminator: Terminator::Switch {
+                scrutinee: ValueId(3),
+                variant: shape_id,
+                cases: vec![BlockId(3), BlockId(4)],
+            },
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: vec![Instruction::Value {
+                result: ValueId(4),
+                ty: Ty::I64,
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(3),
+                    variant: shape_id,
+                    case: 0,
+                    index: 0,
+                },
+            }],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(4),
+            instructions: vec![Instruction::Value {
+                result: ValueId(5),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(5))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Fix 7: Invoke slot definite initialization (`rfcs/0010`) -------
+
+    #[test]
+    fn a_success_slot_loaded_from_a_block_also_reached_through_a_failure_edge_is_rejected() {
+        // `ok_target` and the (single) failure target are the *same*
+        // block, which loads `ok_slot` -- but the failure edge never
+        // writes `ok_slot` at all, only its own `err_slot`. Dominance
+        // alone (the alloc precedes the Invoke) would wrongly accept
+        // this; only proving the load's own block is reached *solely*
+        // through the writing edge catches it.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let g_name = interner.intern("g");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+        callee.blocks[0].instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Named(shape_id, shape_name),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        }];
+        callee.blocks[0].terminator = Terminator::Raise { value: ValueId(0) };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            // Both edges land on bb1 -- the failure edge never wrote
+            // %0 (`ok_slot`), only %1 (its own failure slot).
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(1),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// `func g() -> i64 raises Shape { raise Shape.Empty }` at `ItemId(0)`
+    /// -- the shared fallible callee every real-dataflow test below
+    /// invokes.
+    fn raising_shape_callee(
+        interner: &mut Interner,
+        shape_id: ItemId,
+        shape_name: Symbol,
+    ) -> Function {
+        let g_name = interner.intern("g");
+        let mut callee = valid_function(ItemId(0), g_name);
+        callee.raises = vec![shape_id];
+        callee.blocks[0].instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::Named(shape_id, shape_name),
+            kind: ValueKind::VariantCreate {
+                variant: shape_id,
+                case: 1,
+                type_args: Vec::new(),
+                payload: Vec::new(),
+            },
+        }];
+        callee.blocks[0].terminator = Terminator::Raise { value: ValueId(0) };
+        callee
+    }
+
+    #[test]
+    fn a_success_slot_loaded_several_ordinary_hops_after_ok_target_is_accepted() {
+        // ok_target (bb1) branches through two plain, instruction-less
+        // blocks before finally loading ok_slot in bb3 -- a single-hop
+        // check would wrongly reject this (bb3's own immediate
+        // predecessor, bb2, guarantees nothing on its own); the real
+        // dataflow correctly propagates the fact across every ordinary
+        // hop in between.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(4),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(2)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(3)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(4),
+            instructions: vec![Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(3))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_success_slot_joined_from_an_ok_path_and_a_store_initialized_failure_path_is_accepted() {
+        // ok_target (bb1) branches straight to the merge block bb3
+        // (ok_slot already set by the Invoke's own edge); the failure
+        // target (bb2) independently overwrites ok_slot with its own
+        // unconditional `Store` before also branching to bb3 -- both
+        // predecessors of the join genuinely guarantee the fact, so the
+        // load in bb3 is accepted. Also exercises an unconditional
+        // `Store` establishing the fact across a block boundary on its
+        // own, unrelated to any Invoke edge.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(3)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(2),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(3)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: vec![Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(3))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_success_slot_read_after_a_same_block_store_needs_no_invoke_edge_at_all() {
+        // The failure block never reaches ok_slot through any Invoke
+        // edge at all -- but it unconditionally `Store`s into it before
+        // loading it back later in that very same block, which alone
+        // is enough to prove initialization for every following
+        // instruction.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(3),
+                },
+                Instruction::Value {
+                    result: ValueId(4),
+                    ty: Ty::I64,
+                    kind: ValueKind::Load(ValueId(0)),
+                },
+            ],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_success_slot_loaded_after_a_self_loop_converges_with_no_diagnostics() {
+        // ok_target (bb1) conditionally branches back to itself before
+        // eventually exiting to bb2, which loads ok_slot -- the
+        // fixpoint must converge deterministically through the back
+        // edge rather than looping forever or wrongly losing the fact.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(3),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::Bool,
+                kind: ValueKind::Const(Const::Bool(true)),
+            }],
+            terminator: Terminator::CondBranch {
+                condition: ValueId(2),
+                then_block: BlockId(1),
+                else_block: BlockId(2),
+            },
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![Instruction::Value {
+                result: ValueId(4),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: vec![Instruction::Value {
+                result: ValueId(5),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(5))),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Builds a 10-block straight-line chain bb1 -> bb2 -> ... -> bb10,
+    /// pushed onto `caller.blocks` in *reverse* declaration order
+    /// (bb10 first, bb1 last) -- deliberately adversarial for any
+    /// analysis that sweeps blocks in declaration order once per pass
+    /// instead of following the CFG, since propagating a fact (or its
+    /// absence) from bb1 to bb10 then needs one full pass per hop. Ten
+    /// hops comfortably exceeds `guarded_slots.len() + 2` (2 + 2 = 4
+    /// here: `ok_slot` and the one failure slot), the old, incorrect
+    /// pass bound. bb10 ends with a `Load` of `ok_slot`; the caller
+    /// decides whether that load is genuinely justified.
+    fn reverse_order_chain_to_bb10(caller: &mut Function) {
+        for id in (1..=9u32).rev() {
+            caller.blocks.push(BasicBlock {
+                id: BlockId(id),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(id + 1)),
+            });
+        }
+        caller.blocks.push(BasicBlock {
+            id: BlockId(10),
+            instructions: vec![Instruction::Value {
+                result: ValueId(10),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(10))),
+        });
+    }
+
+    #[test]
+    fn a_deep_reverse_order_chain_with_a_genuinely_initialized_join_is_accepted() {
+        // bb11 (reached only through the Invoke's own failure edge)
+        // independently `Store`s ok_slot itself before joining bb1, so
+        // both of bb1's predecessors genuinely guarantee it; the fact
+        // must then survive propagating forward across all ten
+        // reverse-declared hops down to bb10's own `Load`.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(11),
+            }],
+        };
+        reverse_order_chain_to_bb10(&mut caller);
+        caller.blocks.push(BasicBlock {
+            id: BlockId(11),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(11),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(11),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_reverse_order_chain_with_an_uninitialized_join_is_rejected() {
+        // bb11 (reached only through the Invoke's own failure edge,
+        // which guarantees the *failure* slot, never ok_slot) branches
+        // straight into bb1 with no `Store` of its own -- bb1's true
+        // in-facts for ok_slot must resolve to "not guaranteed" (the
+        // intersection of the ok edge's guarantee and bb11's lack of
+        // one), and that absence must then correctly persist forward
+        // across all ten reverse-declared hops down to bb10's own
+        // `Load`, which must be rejected. A bound as low as
+        // `guarded_slots.len() + 2` cannot propagate this far in
+        // adversarial declaration order, so this is exactly the case
+        // the old fixed pass count would have silently missed.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(11),
+            }],
+        };
+        reverse_order_chain_to_bb10(&mut caller);
+        caller.blocks.push(BasicBlock {
+            id: BlockId(11),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the uninitialized join to be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_of_unreachable_blocks_never_inherits_optimistic_initialization() {
+        // bb20/bb21 only ever branch to each other -- neither is a
+        // target of anything reachable from the entry block, so the
+        // cycle as a whole is unreachable. Each has an "incoming edge"
+        // (from the other), so it is not caught by the simpler
+        // no-incoming-edge shortcut; if such a cycle were seeded with
+        // the same optimistic "everything already initialized" start
+        // every reachable block gets, the intersection within the
+        // cycle would never have any real information flow in and
+        // would just stay at "initialized" forever, silently hiding
+        // bb20's genuine, never-stored `Load` of ok_slot.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(2),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(2))),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(1)),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(3),
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        // Unreachable cycle: nothing reachable from the entry ever
+        // branches to bb20 or bb21.
+        caller.blocks.push(BasicBlock {
+            id: BlockId(20),
+            instructions: vec![Instruction::Value {
+                result: ValueId(20),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(21)),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(21),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(20)),
+        });
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the unreachable cycle's own unstored load to be rejected: {diagnostics:?}"
+        );
+    }
+
+    /// Builds the caller for the entry-boundary tests below. `%0` is
+    /// allocated in the entry block, which then `CondBranch`es to a
+    /// self-looping block (bb1, which exits to bb2 and loads `%0`) or to
+    /// bb5, a separate, always-structurally-reachable block whose own
+    /// `Invoke` uses `%0` as its own `ok_slot` -- which is what makes
+    /// `%0` a guarded slot at all, entirely independent of bb1's own
+    /// loop, which never goes through that `Invoke`'s own edges at all.
+    /// When `entry_stores` is true, the entry also unconditionally
+    /// `Store`s `%0` itself before branching anywhere, which must make
+    /// bb2's load valid on *every* path (including straight through
+    /// bb1's loop, which bb5's `Invoke` edges never reach). When false,
+    /// the only initialization of `%0` is bb5's own `Invoke` edge into
+    /// bb6, which bb1's loop never passes through, so bb2's load must be
+    /// rejected.
+    fn entry_boundary_caller(
+        f_name: Symbol,
+        shape_id: ItemId,
+        shape_name: Symbol,
+        entry_stores: bool,
+    ) -> Function {
+        let mut entry_instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }];
+        if entry_stores {
+            entry_instructions.push(Instruction::Value {
+                result: ValueId(8),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            entry_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(8),
+            });
+        }
+        entry_instructions.push(Instruction::Value {
+            result: ValueId(9),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        });
+        let entry = BasicBlock {
+            id: BlockId(0),
+            instructions: entry_instructions,
+            terminator: Terminator::CondBranch {
+                condition: ValueId(9),
+                then_block: BlockId(1),
+                else_block: BlockId(5),
+            },
+        };
+        let bb1 = BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(10),
+                ty: Ty::Bool,
+                kind: ValueKind::Const(Const::Bool(true)),
+            }],
+            terminator: Terminator::CondBranch {
+                condition: ValueId(10),
+                then_block: BlockId(1),
+                else_block: BlockId(2),
+            },
+        };
+        let bb2 = BasicBlock {
+            id: BlockId(2),
+            instructions: vec![Instruction::Value {
+                result: ValueId(11),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(11))),
+        };
+        let bb5 = BasicBlock {
+            id: BlockId(5),
+            instructions: vec![Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            }],
+            terminator: Terminator::Invoke {
+                callee: ItemId(0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+                evidence: Vec::new(),
+                ok_slot: ValueId(0),
+                ok_target: BlockId(6),
+                err_targets: vec![InvokeErrTarget {
+                    variant: shape_id,
+                    slot: ValueId(1),
+                    target: BlockId(7),
+                }],
+            },
+        };
+        let bb6 = BasicBlock {
+            id: BlockId(6),
+            instructions: vec![Instruction::Value {
+                result: ValueId(12),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(12))),
+        };
+        let bb7 = BasicBlock {
+            id: BlockId(7),
+            instructions: vec![Instruction::Value {
+                result: ValueId(13),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(13))),
+        };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        // BlockId(0) deliberately last: correctness must not depend on
+        // the entry being visited before any other block.
+        caller.blocks = vec![bb7, bb6, bb5, bb2, bb1, entry];
+        caller
+    }
+
+    #[test]
+    fn an_entry_boundary_stored_only_via_its_own_unconditional_store_is_accepted() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = entry_boundary_caller(f_name, shape_id, shape_name, true);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_boundary_without_its_own_store_and_a_loop_bypassing_the_invoke_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = entry_boundary_caller(f_name, shape_id, shape_name, false);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the loop bypassing the Invoke's own edges to be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permuting_the_block_vector_never_changes_the_v0073_result() {
+        // The same rejected CFG as above, re-verified under several
+        // different `function.blocks` storage orders (including entry
+        // first, entry last, and reversed) -- the result must be
+        // identical every time, since correctness must never depend on
+        // Vec order, only on the CFG itself.
+        fn diagnoses_v0073(order: &[BlockId]) -> bool {
+            let mut interner = Interner::new();
+            let f_name = interner.intern("f");
+            let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+            let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+            let mut caller = entry_boundary_caller(f_name, shape_id, shape_name, false);
+            let by_id: HashMap<BlockId, BasicBlock> =
+                caller.blocks.drain(..).map(|b| (b.id, b)).collect();
+            caller.blocks = order.iter().map(|id| by_id[id].clone()).collect();
+
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions: vec![callee, caller],
+                records: Vec::new(),
+                variants: vec![(shape_id, shape_layout)],
+            };
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED)
+        }
+
+        let entry_last = [1u32, 2, 5, 6, 7, 0];
+        let entry_first = [0u32, 1, 2, 5, 6, 7];
+        let reversed = [7u32, 6, 5, 2, 1, 0];
+        let shuffled = [5u32, 0, 7, 1, 6, 2];
+
+        for order in [entry_last, entry_first, reversed, shuffled] {
+            let order: Vec<BlockId> = order.into_iter().map(BlockId).collect();
+            assert!(
+                diagnoses_v0073(&order),
+                "expected V0073 regardless of block order {order:?}"
+            );
+        }
+    }
+
+    /// bb1 is the join/load block, reached by two recorded predecessors:
+    /// entry (via its own `CondBranch` then-edge -- always reachable)
+    /// and bb20 (via a plain `Branch` -- never reachable from entry at
+    /// all, since nothing live ever targets it). bb5's own `Invoke`
+    /// (targeting the throwaway bb6/bb7) is what registers `%0` as a
+    /// guarded slot in the first place, entirely independent of bb1's
+    /// own join. When `entry_stores` is true, entry itself
+    /// unconditionally `Store`s `%0` before branching anywhere, and
+    /// bb20 does nothing; the join must accept bb1's load regardless of
+    /// bb20's mere presence as a recorded (but dead) predecessor. When
+    /// false, entry never stores `%0` at all, and instead bb20 -- the
+    /// unreachable predecessor -- performs its own unconditional
+    /// `Store`; that store must never be treated as initializing bb1's
+    /// join, since bb20 itself is never actually reached.
+    fn join_with_dead_predecessor_caller(
+        f_name: Symbol,
+        shape_id: ItemId,
+        shape_name: Symbol,
+        entry_stores: bool,
+    ) -> Function {
+        let mut entry_instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }];
+        if entry_stores {
+            entry_instructions.push(Instruction::Value {
+                result: ValueId(8),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            entry_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(8),
+            });
+        }
+        entry_instructions.push(Instruction::Value {
+            result: ValueId(9),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        });
+        let entry = BasicBlock {
+            id: BlockId(0),
+            instructions: entry_instructions,
+            terminator: Terminator::CondBranch {
+                condition: ValueId(9),
+                then_block: BlockId(1),
+                else_block: BlockId(5),
+            },
+        };
+        let bb1 = BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(11),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(11))),
+        };
+        let bb5 = BasicBlock {
+            id: BlockId(5),
+            instructions: vec![Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            }],
+            terminator: Terminator::Invoke {
+                callee: ItemId(0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+                evidence: Vec::new(),
+                ok_slot: ValueId(0),
+                ok_target: BlockId(6),
+                err_targets: vec![InvokeErrTarget {
+                    variant: shape_id,
+                    slot: ValueId(1),
+                    target: BlockId(7),
+                }],
+            },
+        };
+        let bb6 = BasicBlock {
+            id: BlockId(6),
+            instructions: vec![Instruction::Value {
+                result: ValueId(12),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(12))),
+        };
+        let bb7 = BasicBlock {
+            id: BlockId(7),
+            instructions: vec![Instruction::Value {
+                result: ValueId(13),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(13))),
+        };
+        let mut bb20_instructions = Vec::new();
+        if !entry_stores {
+            bb20_instructions.push(Instruction::Value {
+                result: ValueId(21),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            bb20_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(21),
+            });
+        }
+        let bb20 = BasicBlock {
+            id: BlockId(20),
+            instructions: bb20_instructions,
+            terminator: Terminator::Branch(BlockId(1)),
+        };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.blocks = vec![bb7, bb6, bb5, bb20, bb1, entry];
+        caller
+    }
+
+    #[test]
+    fn a_dead_predecessor_never_wipes_a_reachable_joins_own_fact() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = join_with_dead_predecessor_caller(f_name, shape_id, shape_name, true);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "an unreachable predecessor's mere presence must not wipe a live fact: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_dead_predecessors_own_store_never_initializes_a_reachable_join() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = join_with_dead_predecessor_caller(f_name, shape_id, shape_name, false);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "a store only reachable through dead code must never initialize a live join: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permuting_the_block_vector_never_changes_the_dead_predecessor_result() {
+        fn check(entry_stores: bool, order: &[BlockId]) -> bool {
+            let mut interner = Interner::new();
+            let f_name = interner.intern("f");
+            let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+            let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+            let mut caller =
+                join_with_dead_predecessor_caller(f_name, shape_id, shape_name, entry_stores);
+            let by_id: HashMap<BlockId, BasicBlock> =
+                caller.blocks.drain(..).map(|b| (b.id, b)).collect();
+            caller.blocks = order.iter().map(|id| by_id[id].clone()).collect();
+
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions: vec![callee, caller],
+                records: Vec::new(),
+                variants: vec![(shape_id, shape_layout)],
+            };
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED)
+        }
+
+        let orderings: [[u32; 6]; 4] = [
+            [0, 1, 5, 6, 7, 20],
+            [20, 7, 6, 5, 1, 0],
+            [1, 0, 20, 5, 7, 6],
+            [5, 20, 0, 7, 1, 6],
+        ];
+        for raw in orderings {
+            let order: Vec<BlockId> = raw.into_iter().map(BlockId).collect();
+            assert!(
+                !check(true, &order),
+                "expected no V0073 (entry stores) with order {order:?}"
+            );
+            assert!(
+                check(false, &order),
+                "expected V0073 (only dead predecessor stores) with order {order:?}"
+            );
+        }
     }
 }

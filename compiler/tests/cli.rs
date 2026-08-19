@@ -677,3 +677,130 @@ fn invalid_protocol_examples_fail_at_every_stage_with_no_leaked_internal_diagnos
         }
     }
 }
+
+// -- Typed outcomes (`rfcs/0010`) ------------------------------------
+
+/// Every valid raises example must `check`, `ir`, and `run` cleanly,
+/// leaking no internal `Vxxxx` diagnostic, and return exactly the given
+/// value.
+fn assert_raises_example_runs(name: &str, expected_run_output: &str) {
+    let path = example(name);
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed for {name}: {}",
+        stderr(&checked)
+    );
+
+    let ired = napitia(&["ir", &path]);
+    assert!(
+        ired.status.success(),
+        "ir failed for {name}: {}",
+        stderr(&ired)
+    );
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "{name} leaked an internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(
+        ran.status.success(),
+        "run failed for {name}: {}",
+        stderr(&ran)
+    );
+    assert_eq!(stdout(&ran).trim(), expected_run_output);
+}
+
+#[test]
+fn raises_basic_example_runs_end_to_end() {
+    assert_raises_example_runs("raises_basic.npt", "default");
+}
+
+#[test]
+fn raises_exhaustive_handler_example_runs_end_to_end() {
+    assert_raises_example_runs("raises_exhaustive_handler.npt", "36");
+}
+
+/// A generic fallible function's own `Invoke` must substitute its own
+/// success slot's type through the call site's own concrete type
+/// arguments -- a regression test for a bug Fix 6's own new coverage
+/// found: an unsubstituted symbolic `Ty::Param` success slot leaked
+/// V0032/V0066/V0008 from `ir`/`run` even though `check` accepted the
+/// program cleanly.
+#[test]
+fn raises_generic_fallible_function_example_runs_end_to_end() {
+    assert_raises_example_runs("raises_generic_fallible_function.npt", "42");
+}
+
+#[test]
+fn raises_non_exhaustive_handler_example_is_t0053() {
+    let output = napitia(&[
+        "check",
+        &example("raises_non_exhaustive_handler_invalid.npt"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("error[T0053]"));
+}
+
+/// A `raises` entry naming a generic variant is rejected at the
+/// frontend (R0030), at every stage, with no leaked internal (`Ixxxx`/
+/// `Vxxxx`) diagnostic and no panic (generic error variants are
+/// explicitly out of scope, `rfcs/0010`).
+#[test]
+fn raises_generic_variant_example_is_r0030_at_every_stage_with_no_leaked_internal_diagnostic() {
+    let path = example("raises_generic_variant_invalid.npt");
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should fail with exit code 1"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error[R0030]"),
+            "`{cmd}` should report R0030: {err}"
+        );
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{cmd}` leaked an internal diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+}
+
+/// An `extend` method declaring its own `raises` clause is rejected at
+/// the frontend (R0031), at every stage, with no leaked internal
+/// (`Ixxxx`/`Vxxxx`) diagnostic and no panic -- protocol methods have no
+/// raised-effect signature yet (`rfcs/0010`).
+#[test]
+fn raises_extend_method_example_is_r0031_at_every_stage_with_no_leaked_internal_diagnostic() {
+    let path = example("raises_extend_method_invalid.npt");
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should fail with exit code 1"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error[R0031]"),
+            "`{cmd}` should report R0031: {err}"
+        );
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{cmd}` leaked an internal diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic: {err}"
+        );
+    }
+}

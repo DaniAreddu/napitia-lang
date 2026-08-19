@@ -199,6 +199,7 @@ fn resolve_one_import(
                 item: variant.id,
                 declared_name: variant.name,
                 cases,
+                type_param_count: variant.type_params.len(),
             },
             import_span: import.span,
             local_name_span,

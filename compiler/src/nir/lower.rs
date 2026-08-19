@@ -20,13 +20,15 @@
 use std::collections::HashMap;
 
 use super::{
-    BasicBlock, CaseLayout, Const, ExtendLayout, Function, Module, Param, ProtocolLayout,
-    ProtocolMethodLayout, RecordLayout, Terminator, ValueId, ValueKind, VariantLayout,
+    BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
+    ProtocolLayout, ProtocolMethodLayout, RecordLayout, Terminator, ValueId, ValueKind,
+    VariantLayout,
 };
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    ExprId, HirBlock, HirElse, HirExpr, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
-    HirModule, HirPattern, HirStmt, ItemId, LocalId, PatternId,
+    ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFieldInit, HirFunction, HirHandleArm,
+    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, ItemId,
+    LocalId, PatternId,
 };
 use crate::limits::MAX_PATTERN_DEPTH;
 use crate::source::{SourceId, Span};
@@ -72,6 +74,69 @@ pub fn lower_module(
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
+    lower_module_impl(
+        hir,
+        local_types,
+        expr_types,
+        pattern_case,
+        call_type_args,
+        call_evidence,
+        protocol_call_evidence,
+        interner,
+        source,
+        ModulePathMode::SingleFile,
+    )
+}
+
+/// Like [`lower_module`], but for a caller that can supply each
+/// declaring module's own dotted path -- read back by
+/// [`canonical_raises`] so two variants sharing a bare name from
+/// *different* modules still canonicalize to a stable, module-
+/// qualified order rather than an ambiguous tie (`rfcs/0007`,
+/// `rfcs/0010`). Always runs in [`ModulePathMode::Project`], even if
+/// `module_path_of` happens to be empty -- unlike `lower_module`'s own
+/// `SingleFile` mode, an empty table here means every lookup inside it
+/// is a genuine metadata gap, not "no project at all".
+#[allow(clippy::too_many_arguments)]
+pub fn lower_module_with_paths(
+    hir: &HirModule,
+    local_types: &HashMap<LocalId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    call_type_args: &HashMap<ExprId, Vec<Ty>>,
+    call_evidence: &HashMap<ExprId, Vec<Evidence>>,
+    protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    interner: &Interner,
+    source: SourceId,
+    module_path_of: &HashMap<SourceId, String>,
+) -> Result<Module, Vec<Diagnostic>> {
+    lower_module_impl(
+        hir,
+        local_types,
+        expr_types,
+        pattern_case,
+        call_type_args,
+        call_evidence,
+        protocol_call_evidence,
+        interner,
+        source,
+        ModulePathMode::Project(module_path_of),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_module_impl(
+    hir: &HirModule,
+    local_types: &HashMap<LocalId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
+    pattern_case: &HashMap<PatternId, (ItemId, usize)>,
+    call_type_args: &HashMap<ExprId, Vec<Ty>>,
+    call_evidence: &HashMap<ExprId, Vec<Evidence>>,
+    protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    interner: &Interner,
+    source: SourceId,
+    module_path_mode: ModulePathMode<'_>,
+) -> Result<Module, Vec<Diagnostic>> {
     // Every module-level item's ItemId must be globally unique across
     // records, variants, and functions alike -- not just unique within
     // its own kind. hir::lower's own name resolution already keeps this
@@ -109,8 +174,10 @@ pub fn lower_module(
         );
     }
     let mut variant_layouts: HashMap<ItemId, VariantLayout> = HashMap::new();
+    let mut variant_source: HashMap<ItemId, SourceId> = HashMap::new();
     let mut variant_order: Vec<ItemId> = Vec::new();
     for v in &hir.variants {
+        variant_source.insert(v.id, v.source);
         let cases = v
             .cases
             .iter()
@@ -136,6 +203,7 @@ pub fn lower_module(
 
     let mut function_sigs = HashMap::new();
     let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
+    let mut function_raises: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -156,6 +224,18 @@ pub fn lower_module(
                 .map(|r| resolve_requirement(interner, r))
                 .collect(),
         );
+        let raises = match canonical_raises(
+            f.raises.iter().map(|r| r.variant).collect(),
+            &variant_layouts,
+            &variant_source,
+            module_path_mode,
+            interner,
+            source,
+        ) {
+            Ok(raises) => raises,
+            Err(diagnostic) => return Err(vec![*diagnostic]),
+        };
+        function_raises.insert(f.id, raises);
     }
 
     // Every declared protocol's layout, in declaration order -- built
@@ -241,6 +321,18 @@ pub fn lower_module(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
+            let method_raises = match canonical_raises(
+                m.raises.iter().map(|r| r.variant).collect(),
+                &variant_layouts,
+                &variant_source,
+                module_path_mode,
+                interner,
+                source,
+            ) {
+                Ok(raises) => raises,
+                Err(diagnostic) => return Err(vec![*diagnostic]),
+            };
+            function_raises.insert(m.id, method_raises);
             if let Some(index) = proto_method_names.iter().position(|n| *n == m.name) {
                 methods_by_index[index] = Some(m.id);
             }
@@ -282,10 +374,13 @@ pub fn lower_module(
         protocol_call_evidence,
         interner,
         source,
+        module_path_mode,
         records: record_layouts,
         variants: variant_layouts,
+        variant_source,
         function_sigs,
         function_requirements,
+        function_raises,
         function_named_type_params,
     };
     let mut functions = Vec::new();
@@ -522,6 +617,112 @@ fn resolve_requirement(
     )
 }
 
+/// Canonicalizes a function's own raised-effect set (`rfcs/0010`) by
+/// each variant's own *stable qualified identity* -- its declaring
+/// module's own dotted path (`""` for single-file compilation, which
+/// has no project-level module path at all, `rfcs/0007`) paired with
+/// its own declared name -- never by raw `ItemId`, which is only ever
+/// assigned in whatever order declarations/imports happened to be
+/// discovered in, and can differ across two otherwise-identical
+/// compilations that merely reorder those without changing what the
+/// program means. Two variants sharing a bare name from *different*
+/// modules are still correctly distinguished (their own module paths
+/// differ); the only way an actual tie could survive is two items
+/// genuinely sharing both a module and a name, which duplicate-
+/// declaration checking already rejects independently -- `sort_by_key`
+/// is stable, so even that unreachable case would just preserve the
+/// (already-deterministic, source-declaration-order) input order rather
+/// than fall back to `ItemId`. `Function.raises`'s own stored order is
+/// what `lower_invoke` iterates to build each `Invoke`'s own
+/// `err_targets`, so this is what actually keeps two semantically
+/// identical programs' NIR (block/value numbering, not just the printed
+/// signature) byte-identical under such reordering -- HIR's own
+/// `raises` stays in source declaration order throughout (needed for
+/// its own diagnostics' span-accurate reporting); only this NIR-facing
+/// copy is canonicalized.
+///
+/// Every entry here was already resolved to a real declared variant by
+/// `hir::lower`'s own `resolve_raises`, so a missing `variant_layouts`
+/// entry is unreachable for any HIR it produced -- but this is a public
+/// entry point (`lower_module`) a direct caller can invoke with
+/// hand-built HIR bypassing that guarantee, so it fails atomically with
+/// a structured diagnostic rather than silently sorting an unresolvable
+/// entry as if it belonged first (or last).
+/// Which module-path identity a lowering call is running under --
+/// deciding *by the caller's own explicit choice*, never inferred from
+/// whether a supplied table happens to be empty. `lower_module`'s own
+/// wrapper always passes `SingleFile`; `lower_module_with_paths` always
+/// passes `Project`, even when its own `module_path_of` table happens
+/// to be empty (an empty table in `Project` mode means every lookup
+/// inside it is a genuine metadata gap, not "no project" -- exactly the
+/// distinction an `is_empty()` sentinel could never make).
+#[derive(Clone, Copy)]
+enum ModulePathMode<'a> {
+    /// Single-file compilation has no project-level module path at all
+    /// (`rfcs/0007`); every raised variant's own canonical module path
+    /// is legitimately empty.
+    SingleFile,
+    /// Project compilation: every raised variant's own declaring
+    /// `SourceId` must resolve to an entry in this table, built once,
+    /// up front, with one entry per module actually in the project
+    /// (`project::compile`). A miss is a genuine metadata gap, never a
+    /// legitimate empty path.
+    Project(&'a HashMap<SourceId, String>),
+}
+
+fn canonical_raises(
+    mut raises: Vec<ItemId>,
+    variant_layouts: &HashMap<ItemId, VariantLayout>,
+    variant_source: &HashMap<ItemId, SourceId>,
+    module_path_mode: ModulePathMode<'_>,
+    interner: &Interner,
+    source: SourceId,
+) -> LowerResult<Vec<ItemId>> {
+    let mut key_of: HashMap<ItemId, (String, String)> = HashMap::with_capacity(raises.len());
+    for item in &raises {
+        let Some(layout) = variant_layouts.get(item) else {
+            return Err(Box::new(Diagnostic::error(
+                codes::INTERNAL_INVARIANT_VIOLATED,
+                source,
+                Span::dummy(),
+                format!(
+                    "a function's own `raises` names id {item:?}, which does not resolve to any declared variant"
+                ),
+            )));
+        };
+        let module_path = match module_path_mode {
+            ModulePathMode::SingleFile => String::new(),
+            ModulePathMode::Project(module_path_of) => {
+                let Some(&decl_source) = variant_source.get(item) else {
+                    return Err(Box::new(Diagnostic::error(
+                        codes::INTERNAL_INVARIANT_VIOLATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "a function's own `raises` names id {item:?}, whose declaring module could not be resolved"
+                        ),
+                    )));
+                };
+                let Some(path) = module_path_of.get(&decl_source) else {
+                    return Err(Box::new(Diagnostic::error(
+                        codes::INTERNAL_INVARIANT_VIOLATED,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "a function's own `raises` names id {item:?}, declared in a module this project's own module-path table has no entry for"
+                        ),
+                    )));
+                };
+                path.clone()
+            }
+        };
+        let name = interner.resolve(layout.name).to_string();
+        key_of.insert(*item, (module_path, name));
+    }
+    raises.sort_by(|a, b| key_of[a].cmp(&key_of[b]));
+    Ok(raises)
+}
+
 struct Lowering<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<ExprId, Ty>,
@@ -541,8 +742,18 @@ struct Lowering<'a> {
     protocol_call_evidence: &'a HashMap<ExprId, Evidence>,
     interner: &'a Interner,
     source: SourceId,
+    /// Whether this lowering is single-file or project-mode, and (in
+    /// project mode) every declaring module's own dotted path by
+    /// `SourceId` -- read back by `canonical_raises` so two variants
+    /// sharing a bare name from different modules still canonicalize to
+    /// a stable order (`rfcs/0007`, `rfcs/0010`).
+    module_path_mode: ModulePathMode<'a>,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
+    /// Every declared variant's own declaring `SourceId`, by `ItemId` --
+    /// read back by `canonical_raises` (together with `module_path_mode`)
+    /// to resolve each raised variant's own stable qualified identity.
+    variant_source: HashMap<ItemId, SourceId>,
     /// `(this function's own generic parameters, its param types, its
     /// return type)`. The parameter/return types may reference the
     /// first element via `Ty::Param`; a call site substitutes its own
@@ -552,6 +763,14 @@ struct Lowering<'a> {
     /// (`rfcs/0009`), in declared order -- a `Call` targeting one of
     /// these carries exactly this many evidence entries.
     function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>>,
+    /// Every function/extend method's own declared raised-error set
+    /// (`rfcs/0010`), canonical and in a fixed order -- read back by
+    /// `lower_invoke` to decide postfix `?`/`handle`'s own `Invoke`
+    /// failure edges, one per entry here, without re-deriving it from
+    /// whichever `Function` this callee eventually lowers to (which may
+    /// not even exist yet, since lowering order is not the same as
+    /// declaration order for extend methods).
+    function_raises: HashMap<ItemId, Vec<ItemId>>,
     /// An extend method's own *displayed* generic parameters -- always
     /// its owning extend's own `type_params` (never empty the way its
     /// own `HirFunction::type_params` is), keyed by the method's own
@@ -788,6 +1007,14 @@ impl<'a> Lowering<'a> {
             .get(&f.id)
             .cloned()
             .unwrap_or_default();
+        let raises = canonical_raises(
+            f.raises.iter().map(|r| r.variant).collect(),
+            &self.variants,
+            &self.variant_source,
+            self.module_path_mode,
+            self.interner,
+            self.source,
+        )?;
         Ok(Function {
             id: f.id,
             name: f.name,
@@ -795,6 +1022,7 @@ impl<'a> Lowering<'a> {
             requirements,
             params,
             return_type,
+            raises,
             blocks,
         })
     }
@@ -1065,7 +1293,12 @@ impl<'a> Lowering<'a> {
             // unpropagated inner value would let either "succeed" while
             // lying about what it does.
             HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
-            HirExpr::Try { span, .. } => Err(self.unsupported(*span, "postfix `?`")),
+            HirExpr::Try { expr: inner, .. } => self.lower_try(fb, inner),
+            HirExpr::Raise { operand, .. } => self.lower_raise(fb, operand),
+            HirExpr::Handle { operand, arms, .. } => {
+                let result_ty = self.expr_ty(expr);
+                self.lower_handle(fb, operand, arms, result_ty)
+            }
             HirExpr::If {
                 condition,
                 then_branch,
@@ -1394,11 +1627,7 @@ impl<'a> Lowering<'a> {
             }
             return Err(self.internal_error("call target does not resolve to a function"));
         };
-        let (type_params, param_tys, _ret_ty) = self
-            .function_sigs
-            .get(item)
-            .cloned()
-            .unwrap_or_else(|| (Vec::new(), Vec::new(), Ty::Error));
+        let (type_params, param_tys, _ret_ty) = self.lookup_function_sig(*item, "a call")?;
         // Resolved once by `typeck` (inferred or explicit) and read back
         // here, never re-inferred -- the same "typeck already decided"
         // discipline every other type in this module already follows
@@ -1419,16 +1648,388 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
-        let requirements = self
-            .function_requirements
-            .get(item)
-            .cloned()
-            .unwrap_or_default();
+        let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
         Ok(LoweredExpr::Value(fb.push_value(
             self.expr_ty(call_expr),
             ValueKind::Call(*item, type_args, arg_values, evidence),
         )))
+    }
+
+    /// Shared setup for postfix `?`/`handle` (`rfcs/0010`): both require
+    /// their own operand to structurally be a direct call to a fallible
+    /// function (`typeck`'s own `check_try`/`check_handle` already
+    /// enforce this before a well-typed program ever reaches lowering).
+    /// Lowers the callee's own arguments exactly like an ordinary call,
+    /// then terminates the current block with `Terminator::Invoke`.
+    ///
+    /// Returns `None` (never emitting an `Invoke` at all) when the
+    /// operand itself was not actually a fallible call -- either because
+    /// evaluating it (for its own independent side effects/divergence,
+    /// still required even though the result is never used as a value)
+    /// diverged, or because a direct caller bypassed `typeck` with
+    /// malformed HIR; the caller must propagate `LoweredExpr::Diverged`
+    /// in the former case exactly as if this were any other diverging
+    /// subexpression.
+    ///
+    /// On success, returns the callee's own return type, the slot/block
+    /// its success edge stores into and continues at, one
+    /// `(variant, slot, block)` triple per effect the callee declares in
+    /// `raises` (in that same canonical order), and -- only when
+    /// `merge_result_ty` was given -- an extra slot/block allocated on
+    /// this same still-open block for the caller's own use (`handle`'s
+    /// own result slot/merge block, which must dominate every arm the
+    /// same way `lower_match`'s own result slot does; allocating it here,
+    /// before the `Invoke` that is about to terminate this block, is the
+    /// only way to still append to it -- the caller is responsible for
+    /// actually lowering each failure block's own body before the
+    /// enclosing function is finished.
+    #[allow(clippy::type_complexity)]
+    fn lower_invoke(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        context: &str,
+        merge_result_ty: Option<&Ty>,
+    ) -> LowerResult<
+        Option<(
+            Ty,
+            ValueId,
+            BlockId,
+            Vec<(ItemId, ValueId, BlockId)>,
+            Option<(ValueId, BlockId)>,
+        )>,
+    > {
+        let HirExpr::Call { callee, args, .. } = operand else {
+            if matches!(self.lower_expr(fb, operand)?, LoweredExpr::Diverged) {
+                return Ok(None);
+            }
+            return Err(self.internal_error(&format!(
+                "{context}'s operand is not a direct call to a fallible function"
+            )));
+        };
+        let HirExpr::Function { item, .. } = &**callee else {
+            if matches!(self.lower_expr(fb, callee)?, LoweredExpr::Diverged) {
+                return Ok(None);
+            }
+            for arg in args {
+                if matches!(self.lower_expr(fb, arg)?, LoweredExpr::Diverged) {
+                    return Ok(None);
+                }
+            }
+            return Err(self.internal_error(&format!(
+                "{context}'s operand does not call a named function"
+            )));
+        };
+        let (type_params, param_tys, ret_ty) = self.lookup_function_sig(*item, context)?;
+        let type_args = self.resolve_call_type_args(operand.id(), &type_params, context)?;
+        let subst: HashMap<crate::hir::TypeParamId, Ty> = type_params
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
+        // Unlike an ordinary `Call` (which reads its own already-
+        // substituted result type back from `expr_types`, since typeck
+        // recorded the whole call expression's type there), `Invoke`
+        // builds its own `ok_slot` type directly from the callee's own
+        // declared (still-symbolic, for a generic callee) signature --
+        // so it must substitute this itself, or a generic fallible
+        // callee's success slot would keep a dangling `Ty::Param` no
+        // concrete value ever actually has, corrupting every downstream
+        // instruction that reads it (`rfcs/0008`).
+        let ret_ty = crate::types::substitute(&ret_ty, &subst);
+        let mut arg_values = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let hint = param_tys
+                .get(i)
+                .map(|t| crate::types::substitute(t, &subst))
+                .unwrap_or(Ty::Error);
+            match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => arg_values.push(v),
+                LoweredExpr::Diverged => return Ok(None),
+            }
+        }
+        let requirements = self.lookup_function_requirements(*item, context)?;
+        let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
+        let raises = self.lookup_function_raises(*item, context)?;
+
+        // Allocated here, before the `Invoke` below terminates this
+        // block -- not by the caller afterward, when it would already be
+        // too late to append anything to it.
+        let merge = merge_result_ty.map(|ty| (fb.alloc_slot(ty.clone()), fb.new_block()));
+
+        let ok_slot = fb.alloc_slot(ret_ty.clone());
+        let ok_target = fb.new_block();
+        let mut err_targets = Vec::with_capacity(raises.len());
+        let mut err_blocks = Vec::with_capacity(raises.len());
+        for variant in &raises {
+            let Some(layout) = self.variants.get(variant) else {
+                return Err(self.internal_error(&format!(
+                    "{context}'s callee declares raising unknown variant id {variant:?}"
+                )));
+            };
+            let err_slot = fb.alloc_slot(Ty::Named(*variant, layout.name));
+            let dispatch_block = fb.new_block();
+            err_targets.push(InvokeErrTarget {
+                variant: *variant,
+                slot: err_slot,
+                target: dispatch_block,
+            });
+            err_blocks.push((*variant, err_slot, dispatch_block));
+        }
+
+        fb.terminate(Terminator::Invoke {
+            callee: *item,
+            type_args,
+            args: arg_values,
+            evidence,
+            ok_slot,
+            ok_target,
+            err_targets,
+        });
+        Ok(Some((ret_ty, ok_slot, ok_target, err_blocks, merge)))
+    }
+
+    /// Postfix `?` (`rfcs/0010`). On the callee's success edge, simply
+    /// loads and forwards the success value; on each failure edge,
+    /// forwards the exact same raised value onward unchanged via this
+    /// function's own `Terminator::Raise` -- `typeck`'s own
+    /// `PROPAGATION_NOT_DECLARED` check already proved every one of
+    /// those effects is also a member of this function's own `raises`.
+    fn lower_try(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+        let Some((ret_ty, ok_slot, ok_target, err_blocks, _)) =
+            self.lower_invoke(fb, operand, "postfix `?`", None)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+        for (variant, err_slot, dispatch_block) in err_blocks {
+            let Some(layout) = self.variants.get(&variant) else {
+                return Err(self.internal_error("postfix `?` propagates an unknown variant"));
+            };
+            let name = layout.name;
+            fb.switch_to(dispatch_block);
+            let loaded = fb.push_value(Ty::Named(variant, name), ValueKind::Load(err_slot));
+            fb.terminate(Terminator::Raise { value: loaded });
+        }
+        fb.switch_to(ok_target);
+        Ok(LoweredExpr::Value(
+            fb.push_value(ret_ty, ValueKind::Load(ok_slot)),
+        ))
+    }
+
+    /// `raise <operand>` (`rfcs/0010`). Always diverges, exactly like
+    /// `return`/`break`: `operand` is evaluated exactly once, then the
+    /// current block ends with `Terminator::Raise` instead of falling
+    /// through to anything else.
+    fn lower_raise(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+        let value = match self.lower_expr(fb, operand)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        fb.terminate(Terminator::Raise { value });
+        Ok(LoweredExpr::Diverged)
+    }
+
+    /// `handle <operand> { ... }` (`rfcs/0010`). The callee's success
+    /// edge binds `success`'s pattern and lowers its body; each failure
+    /// edge is switched on its own variant's case, dispatching to
+    /// whichever `failure` arm's body `typeck`'s own exhaustiveness check
+    /// already proved covers it (a `Case` arm covers exactly the one
+    /// case it names; a single trailing wildcard covers everything no
+    /// `Case` arm already claimed, across every raised type at once) --
+    /// every arm body is lowered exactly once, in a block shared by
+    /// every case it covers, mirroring how an ordinary `match`'s own
+    /// wildcard/binding arm reuses one target across several
+    /// `Terminator::Switch` cases.
+    fn lower_handle(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        arms: &[HirHandleArm],
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
+        // No result slot/merge block at all when every reachable arm
+        // diverges (`typeck` already proved this) -- mirrors
+        // `lower_match`'s own `Ty::Never` short-circuit. Requested from
+        // `lower_invoke` itself (rather than allocated here afterward),
+        // since by the time it returns, the block it would need to
+        // allocate into is already terminated by the `Invoke`.
+        let merge_result_ty = (result_ty != Ty::Never).then_some(&result_ty);
+        let Some((ok_ty, ok_slot, ok_target, err_blocks, merge)) =
+            self.lower_invoke(fb, operand, "`handle`", merge_result_ty)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+
+        // For every (variant, case-index) pair any raised effect
+        // declares, which arm (by index into `arms`) actually covers it:
+        // the first `Case` arm naming it, or else the single trailing
+        // wildcard. Only ever consulted for pairs `typeck` already
+        // proved are covered by exactly one of these.
+        let mut case_arm: HashMap<(ItemId, usize), usize> = HashMap::new();
+        let mut wildcard_arm: Option<usize> = None;
+        for (i, arm) in arms.iter().enumerate() {
+            match &arm.kind {
+                HirHandleArmKind::Failure(HirFailurePattern::Case {
+                    variant: Some(v),
+                    case: Some(c),
+                    ..
+                }) => {
+                    case_arm.entry((*v, *c)).or_insert(i);
+                }
+                HirHandleArmKind::Failure(HirFailurePattern::Wildcard { .. })
+                    if wildcard_arm.is_none() =>
+                {
+                    wildcard_arm = Some(i);
+                }
+                _ => {}
+            }
+        }
+
+        // Each failure arm's own block, built (and immediately lowered)
+        // the first time any case reaches it -- a later case reaching
+        // the very same arm just reuses the block already recorded here.
+        let mut arm_blocks: HashMap<usize, BlockId> = HashMap::new();
+
+        for (variant, err_slot, dispatch_block) in err_blocks {
+            let Some(layout) = self.variants.get(&variant) else {
+                return Err(self.internal_error("`handle` dispatches an unknown raised variant"));
+            };
+            let variant_name = layout.name;
+            // Cloned out from under `layout` up front, so the borrow
+            // doesn't linger into the loop below (which needs `&mut
+            // self` to bind patterns and lower each arm's body).
+            let case_payload_tys: Vec<Vec<Ty>> =
+                layout.cases.iter().map(|c| c.payload.clone()).collect();
+            let num_cases = case_payload_tys.len();
+            fb.switch_to(dispatch_block);
+            let loaded = fb.push_value(Ty::Named(variant, variant_name), ValueKind::Load(err_slot));
+
+            let mut case_targets = Vec::with_capacity(num_cases);
+            for (case_index, payload_tys) in case_payload_tys.iter().enumerate() {
+                let Some(&arm_index) = case_arm
+                    .get(&(variant, case_index))
+                    .or(wildcard_arm.as_ref())
+                else {
+                    return Err(self.internal_error(&format!(
+                        "`handle` has no covering arm for case {case_index} of a raised variant; typeck should have already rejected this as non-exhaustive"
+                    )));
+                };
+                if let Some(&block) = arm_blocks.get(&arm_index) {
+                    case_targets.push(block);
+                    continue;
+                }
+                let block = fb.new_block();
+                arm_blocks.insert(arm_index, block);
+                case_targets.push(block);
+
+                fb.switch_to(block);
+                let HirHandleArmKind::Failure(pattern) = &arms[arm_index].kind else {
+                    return Err(self.internal_error(
+                        "`handle`'s failure dispatch resolved to a non-failure arm",
+                    ));
+                };
+                if let HirFailurePattern::Case { args: payload, .. } = pattern {
+                    if payload.len() != payload_tys.len() {
+                        return Err(self.internal_error(&format!(
+                            "failure pattern for case {case_index} of a raised variant has {} sub-pattern(s), expected {}",
+                            payload.len(),
+                            payload_tys.len()
+                        )));
+                    }
+                    for (i, (pat, ty)) in payload.iter().zip(payload_tys.iter()).enumerate() {
+                        let v = fb.push_value(
+                            ty.clone(),
+                            ValueKind::VariantPayload {
+                                base: loaded,
+                                variant,
+                                case: case_index,
+                                index: i,
+                            },
+                        );
+                        self.bind_arm_pattern(fb, pat, v)?;
+                    }
+                }
+                self.lower_arm_body(fb, &arms[arm_index].body, merge)?;
+                fb.switch_to(dispatch_block);
+            }
+            fb.terminate(Terminator::Switch {
+                scrutinee: loaded,
+                variant,
+                cases: case_targets,
+            });
+        }
+
+        fb.switch_to(ok_target);
+        let ok_value = fb.push_value(ok_ty, ValueKind::Load(ok_slot));
+        let Some(success_arm) = arms
+            .iter()
+            .find(|a| matches!(a.kind, HirHandleArmKind::Success(_)))
+        else {
+            return Err(self.internal_error(
+                "`handle` has no success arm; typeck should have already rejected this",
+            ));
+        };
+        let HirHandleArmKind::Success(pattern) = &success_arm.kind else {
+            unreachable!("just matched Success above");
+        };
+        self.bind_arm_pattern(fb, pattern, ok_value)?;
+        self.lower_arm_body(fb, &success_arm.body, merge)?;
+
+        match merge {
+            Some((slot, after)) => {
+                fb.switch_to(after);
+                Ok(LoweredExpr::Value(
+                    fb.push_value(result_ty, ValueKind::Load(slot)),
+                ))
+            }
+            None => Ok(LoweredExpr::Diverged),
+        }
+    }
+
+    /// Binds a `success`/failure-payload pattern -- always a bare `Bind`
+    /// or `Wildcard` once resolved (`typeck` rejects anything else) -- to
+    /// an already-computed value.
+    fn bind_arm_pattern(
+        &mut self,
+        fb: &mut FnBuilder,
+        pattern: &HirPattern,
+        value: ValueId,
+    ) -> LowerResult<()> {
+        match pattern {
+            HirPattern::Bind { local, .. } => {
+                fb.local_bindings
+                    .insert(*local, LocalBinding::Direct(value));
+                Ok(())
+            }
+            HirPattern::Wildcard { .. } => Ok(()),
+            other => Err(self.internal_error(&format!(
+                "a `handle` arm's pattern other than a bare bind or wildcard reached lowering: {other:?}"
+            ))),
+        }
+    }
+
+    /// Lowers one `handle` arm's body, storing its value into `merge`'s
+    /// slot and branching to its block -- exactly `lower_decision`'s own
+    /// tail behavior for an ordinary `match` arm. Does nothing further
+    /// when the body diverged on its own (it already terminated its
+    /// block itself).
+    fn lower_arm_body(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        merge: Option<(ValueId, BlockId)>,
+    ) -> LowerResult<()> {
+        let result = match body {
+            HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
+            HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+        };
+        if let LoweredExpr::Value(v) = result
+            && let Some((slot, after)) = merge
+        {
+            fb.push_store(slot, v);
+            fb.terminate(Terminator::Branch(after));
+        }
+        Ok(())
     }
 
     /// Lowers an explicit protocol-call expression,
@@ -2338,6 +2939,63 @@ impl<'a> Lowering<'a> {
             Span::dummy(),
             message.to_string(),
         ))
+    }
+
+    /// Reads a callee's own already-resolved signature -- shared by
+    /// `lower_call` and `lower_invoke` so the two can never drift into
+    /// different fallback behavior for the same missing-metadata case.
+    /// Every function/extend method this module's own upfront pass in
+    /// `lower_module` actually processed always has an entry here, even
+    /// one declaring no type parameters (an empty `Vec`, a legitimate,
+    /// already-`Some` value, never confused with a missing entry) --
+    /// a missing entry can only mean `item` names a function this
+    /// module never itself resolved a signature for at all (a direct
+    /// caller's hand-built HIR referencing a nonexistent/foreign
+    /// function), which must fail atomically with a structured
+    /// diagnostic rather than silently fabricating an empty signature
+    /// returning `Ty::Error`.
+    #[allow(clippy::type_complexity)]
+    fn lookup_function_sig(
+        &self,
+        item: ItemId,
+        context: &str,
+    ) -> LowerResult<(Vec<crate::hir::TypeParamId>, Vec<Ty>, Ty)> {
+        self.function_sigs.get(&item).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "{context} targets a function this module never resolved a signature for"
+            ))
+        })
+    }
+
+    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
+    /// missing-vs-legitimately-empty distinction, for a callee's own
+    /// capability requirements (`rfcs/0009`).
+    fn lookup_function_requirements(
+        &self,
+        item: ItemId,
+        context: &str,
+    ) -> LowerResult<Vec<CapabilityRequirement>> {
+        self.function_requirements
+            .get(&item)
+            .cloned()
+            .ok_or_else(|| {
+                self.internal_error(&format!(
+                    "{context} targets a function this module never resolved capability requirements for"
+                ))
+            })
+    }
+
+    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
+    /// missing-vs-legitimately-empty distinction, for a callee's own
+    /// declared raised-effect set (`rfcs/0010`). Only `lower_invoke`
+    /// needs this: an ordinary `Call`'s own callee is never fallible, so
+    /// `lower_call` never looks its `raises` up at all.
+    fn lookup_function_raises(&self, item: ItemId, context: &str) -> LowerResult<Vec<ItemId>> {
+        self.function_raises.get(&item).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "{context} targets a function this module never resolved a raised-effect set for"
+            ))
+        })
     }
 
     /// Reads `expr_id`'s already-resolved type arguments back from
@@ -3660,6 +4318,253 @@ mod tests {
         assert!(diagnostics.iter().any(|d| d.code == "I0002"));
     }
 
+    /// Two variants named `Err`, one declared in module `a` and one in
+    /// module `b`, raised by the same function -- `canonical_raises`
+    /// must order them by their *declaring module's own path*, never by
+    /// declaration order (of either the `variants` list or the
+    /// function's own `raises` clause) and never by raw `ItemId`. Run
+    /// with the module-list order and the `raises`-clause order each
+    /// reversed relative to the other, both must produce the identical
+    /// canonical order.
+    fn assert_err_variants_canonicalize_by_module_path(
+        variants_in_b_then_a_order: bool,
+        raises_in_b_then_a_order: bool,
+    ) {
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let source_b = map.add_file("b.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let item_b = ItemId(1);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+        let variant_b = minimal_variant(item_b, err_name, source_b);
+        let variants = if variants_in_b_then_a_order {
+            vec![variant_b, variant_a]
+        } else {
+            vec![variant_a, variant_b]
+        };
+        let mut module_path_of = HashMap::new();
+        module_path_of.insert(source_a, "a".to_string());
+        module_path_of.insert(source_b, "b".to_string());
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let entry_b = crate::hir::HirRaisesEntry {
+            variant: item_b,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(2),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = if raises_in_b_then_a_order {
+            vec![entry_b, entry_a]
+        } else {
+            vec![entry_a, entry_b]
+        };
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants,
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &module_path_of,
+        )
+        .expect("lowering with two distinct-module, same-name variants should succeed");
+        let f = result
+            .functions
+            .iter()
+            .find(|f| f.id == ItemId(2))
+            .expect("lowered function must be present");
+        assert_eq!(
+            f.raises,
+            vec![item_a, item_b],
+            "module `a`'s variant must sort before module `b`'s regardless of declaration order"
+        );
+    }
+
+    #[test]
+    fn canonical_raises_orders_by_module_path_with_b_declared_before_a() {
+        assert_err_variants_canonicalize_by_module_path(true, true);
+    }
+
+    #[test]
+    fn canonical_raises_orders_by_module_path_with_a_declared_before_b() {
+        assert_err_variants_canonicalize_by_module_path(false, false);
+    }
+
+    #[test]
+    fn a_raises_entry_missing_its_project_module_path_entry_is_a_diagnostic_not_an_empty_path() {
+        // `module_path_of` here is non-empty (as it always is in real
+        // project compilation, `project::compile`), but has no entry at
+        // all for `source_a`, the raised variant's own declaring module
+        // -- unreachable through the ordinary pipeline (project::compile
+        // always builds one entry per module it actually loaded), but a
+        // direct caller of `lower_module_with_paths` could still hand
+        // this an incomplete table. Distinct from single-file mode
+        // (`module_path_of` empty), where every path is legitimately
+        // empty: here a missing entry must fail atomically with I0002,
+        // never silently canonicalize as though the variant belonged to
+        // the project's root module.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let source_b = map.add_file("b.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+        // Non-empty (this is project mode), but deliberately missing
+        // `source_a`'s own entry -- only `source_b`'s is present, e.g.
+        // some unrelated sibling module in the same project.
+        let mut module_path_of = HashMap::new();
+        module_path_of.insert(source_b, "b".to_string());
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(1),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = vec![entry_a];
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant_a],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &module_path_of,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a missing project module-path entry to fail lowering")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected I0002, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn lower_module_with_paths_given_a_completely_empty_map_is_still_project_mode() {
+        // `lower_module_with_paths` always runs in `ModulePathMode::
+        // Project`, even when its own `module_path_of` happens to be
+        // completely empty -- an `is_empty()` sentinel would have
+        // treated this identically to `lower_module`'s own single-file
+        // mode and silently canonicalized with an empty path; here it
+        // must instead fail atomically with I0002, since a real project
+        // caller's table is never actually empty (`project::compile`
+        // always builds one entry per loaded module) and an empty one
+        // can only mean a genuine gap.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(1),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = vec![entry_a];
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant_a],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &HashMap::new(),
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a completely empty project module-path map to fail lowering")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected I0002, got {diagnostics:?}"
+        );
+    }
+
     #[test]
     fn duplicate_record_id_fails_lowering_atomically_not_a_panic() {
         let mut interner = Interner::new();
@@ -3947,13 +4852,16 @@ mod tests {
             pattern_case,
             interner,
             source,
+            module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
+            variant_source: HashMap::new(),
             function_sigs: HashMap::new(),
             call_type_args: Box::leak(Box::new(HashMap::new())),
             call_evidence: Box::leak(Box::new(HashMap::new())),
             protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
             function_requirements: HashMap::new(),
+            function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
         }
     }
@@ -3980,13 +4888,16 @@ mod tests {
             pattern_case,
             interner,
             source,
+            module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
+            variant_source: HashMap::new(),
             function_sigs,
             call_type_args,
             call_evidence: Box::leak(Box::new(HashMap::new())),
             protocol_call_evidence: Box::leak(Box::new(HashMap::new())),
             function_requirements: HashMap::new(),
+            function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
         }
     }
@@ -4284,6 +5195,15 @@ mod tests {
             function_sigs,
             &call_type_args,
         );
+        // A genuinely infallible, requirement-free callee still needs
+        // its own (empty) entry registered -- lower_call/lower_invoke's
+        // shared lookup helpers never fabricate one for a missing entry
+        // (Fix 6), so this test declares it explicitly rather than
+        // relying on the test harness's own otherwise-empty default map.
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        lowering.function_raises.insert(callee_item, Vec::new());
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),
@@ -4303,6 +5223,234 @@ mod tests {
             result.is_ok(),
             "a non-generic call must lower cleanly with no recorded type arguments: {result:?}"
         );
+    }
+
+    // -- Fix 6: no fake metadata fallbacks in lower_call/lower_invoke ---
+
+    #[test]
+    fn a_call_to_a_function_with_no_registered_signature_fails_lowering_atomically() {
+        // `function_sigs` never has an entry for `callee_item` at all --
+        // must fail with a structured diagnostic, never silently
+        // fabricate a zero-argument, `Ty::Error`-returning signature.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &call_type_args,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee.clone()),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!("expected lowering to fail for a call with no registered signature")
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn a_call_to_a_function_missing_capability_requirement_metadata_fails_lowering_atomically() {
+        // `function_sigs` has a real entry, but `function_requirements`
+        // was never populated for it at all -- distinct from genuinely
+        // declaring an empty requirement list (`Some(vec![])`), and must
+        // fail rather than silently treat "missing" the same as "none".
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            function_sigs,
+            &call_type_args,
+        );
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee.clone()),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_call(&mut fb, &callee, &[], &call_expr);
+        let Err(diagnostic) = result else {
+            panic!(
+                "expected lowering to fail for a call whose callee has no registered capability requirements"
+            )
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn an_invoke_of_a_function_missing_raised_effect_metadata_fails_lowering_atomically() {
+        // `function_sigs`/`function_requirements` both have real
+        // (empty) entries, but `function_raises` was never populated at
+        // all -- must fail rather than silently treat this callee as
+        // infallible.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            HashMap::new(),
+            function_sigs,
+            &call_type_args,
+        );
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let operand = HirExpr::Call {
+            id: ExprId(1),
+            callee: Box::new(callee),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);
+        let Err(diagnostic) = result else {
+            panic!(
+                "expected lowering to fail for an invoke whose callee has no registered raises metadata"
+            )
+        };
+        assert_eq!(diagnostic.code, "I0002");
+    }
+
+    #[test]
+    fn a_valid_fallible_generic_call_lowers_through_invoke_with_no_diagnostics() {
+        // A generic callee declaring a real (non-empty) raises set, all
+        // three metadata maps genuinely populated -- the positive
+        // counterpart to the three failing cases above, confirming the
+        // strict lookups don't reject a legitimately well-formed invoke.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let callee_item = ItemId(0);
+        let error_item = ItemId(1);
+        let t = crate::hir::TypeParamId(0);
+        let t_symbol = interner.intern("T");
+        let mut function_sigs = HashMap::new();
+        function_sigs.insert(
+            callee_item,
+            (
+                vec![t],
+                vec![Ty::Param(t, t_symbol)],
+                Ty::Param(t, t_symbol),
+            ),
+        );
+        let mut variants = HashMap::new();
+        let error_name = interner.intern("Failure");
+        let case_name = interner.intern("Broken");
+        variants.insert(
+            error_item,
+            VariantLayout {
+                name: error_name,
+                type_params: Vec::new(),
+                cases: vec![CaseLayout {
+                    name: case_name,
+                    payload: Vec::new(),
+                }],
+            },
+        );
+        let g_name = interner.intern("g");
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let call_expr_id = ExprId(1);
+        let mut call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
+        call_type_args.insert(call_expr_id, vec![Ty::I64]);
+        let mut lowering = direct_lowering_with_generics(
+            source,
+            &interner,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            HashMap::new(),
+            variants,
+            function_sigs,
+            &call_type_args,
+        );
+        lowering
+            .function_requirements
+            .insert(callee_item, Vec::new());
+        lowering
+            .function_raises
+            .insert(callee_item, vec![error_item]);
+        let mut fb = FnBuilder::new(Ty::I64);
+        let callee = HirExpr::Function {
+            id: ExprId(0),
+            item: callee_item,
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let operand = HirExpr::Call {
+            id: call_expr_id,
+            callee: Box::new(callee),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);
+        let Ok(Some((ret_ty, _, _, err_blocks, _))) = result else {
+            panic!("expected a valid fallible generic invoke to lower successfully: {result:?}")
+        };
+        assert_eq!(ret_ty, Ty::I64);
+        assert_eq!(err_blocks.len(), 1);
+        assert_eq!(err_blocks[0].0, error_item);
     }
 
     #[test]
@@ -4831,8 +5979,15 @@ mod tests {
     }
 
     #[test]
-    fn postfix_try_fails_lowering_instead_of_forwarding_the_inner_value() {
-        assert_fails_with_i0001("func f(x: i64) -> i64 { return x? }", "?");
+    fn postfix_try_on_a_non_call_operand_fails_lowering_instead_of_forwarding_the_inner_value() {
+        // typeck's own TRY_ON_INFALLIBLE already rejects `?` on anything
+        // but a direct call to a fallible function; a caller that lowers
+        // past that gate anyway must not have `?` silently become a
+        // no-op forwarding `x` unchanged.
+        assert_fails_with_i0002(
+            "func f(x: i64) -> i64 { return x? }",
+            "not a direct call to a fallible function",
+        );
     }
 
     #[test]
@@ -5125,6 +6280,63 @@ mod tests {
             create_type_args,
             Some(vec![Ty::I64]),
             "a bare generic unit case must not silently default to an empty type argument list"
+        );
+    }
+
+    // -- Fix 3: diverging operands under `?`/`handle` (`rfcs/0010`) -----
+
+    #[test]
+    fn postfix_try_with_a_diverging_argument_lowers_with_no_invoke() {
+        let module = lower(
+            "variant FileError { Missing }
+             func read(path: str) -> str raises FileError {
+                 if path == \"\" { raise FileError.Missing }
+                 return \"ok\"
+             }
+             func f() -> i64 {
+                 return read({ return 7 })?
+             }",
+        );
+        let f = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        assert!(
+            f.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Terminator::Invoke { .. })),
+            "a diverging argument means the fallible call is never reached, so no Invoke should ever be built: {:?}",
+            f.blocks
+        );
+    }
+
+    #[test]
+    fn handle_with_a_diverging_argument_lowers_with_no_invoke() {
+        let module = lower(
+            "variant FileError { Missing }
+             func read(path: str) -> str raises FileError {
+                 if path == \"\" { raise FileError.Missing }
+                 return \"ok\"
+             }
+             func f() -> i64 {
+                 return handle read({ return 7 }) {
+                     success v => 1,
+                     failure FileError.Missing => 2,
+                 }
+             }",
+        );
+        let f = module
+            .functions
+            .iter()
+            .find(|f| f.params.is_empty())
+            .unwrap();
+        assert!(
+            f.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Terminator::Invoke { .. })),
+            "a diverging argument means the fallible call is never reached, so no Invoke should ever be built: {:?}",
+            f.blocks
         );
     }
 }

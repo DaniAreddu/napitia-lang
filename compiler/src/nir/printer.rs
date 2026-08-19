@@ -239,6 +239,27 @@ fn requirements_suffix(
     format!("\nuses {}", parts.join(", "))
 }
 
+/// A function's own declared raised-effect set (`rfcs/0010`), as
+/// `\nraises [@a#1, @b#2]` -- omitted entirely (the one, documented
+/// stable representation of an empty set, mirroring `requirements_suffix`'s
+/// own convention for an empty `uses`) when the function is infallible.
+/// Printed sorted by qualified name rather than in whatever order
+/// `Function.raises` itself happens to store them: two declarations with
+/// the same semantic effect set (however their own source spelled or
+/// ordered it) must always print identically here, and this printer
+/// never trusts an upstream representation to already be canonical.
+fn raises_suffix(raises: &[ItemId], interner: &Interner, registry: &ItemRegistry) -> String {
+    if raises.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = raises
+        .iter()
+        .map(|r| format!("@{}", qualified_ref(*r, registry, interner)))
+        .collect();
+    parts.sort();
+    format!("\nraises [{}]", parts.join(", "))
+}
+
 fn format_evidence(evidence: &Evidence, interner: &Interner, registry: &ItemRegistry) -> String {
     match evidence {
         Evidence::Forwarded(index) => format!("forwarded[{index}]"),
@@ -289,11 +310,12 @@ fn print_function(
         .join(", ");
     let _ = writeln!(
         out,
-        "func @{}{}({params}) -> {}{} {{",
+        "func @{}{}({params}) -> {}{}{} {{",
         qualified_ref(function.id, registry, interner),
         declared_type_params_suffix(&function.type_params, interner),
         format_ty(&function.return_type, interner, registry),
-        requirements_suffix(&function.requirements, interner, registry)
+        requirements_suffix(&function.requirements, interner, registry),
+        raises_suffix(&function.raises, interner, registry)
     );
     // Comparisons produce `bool` but are tagged with their *operand*
     // type (`eq.i64`, not `eq.bool`) per spec/0006; this table lets the
@@ -565,6 +587,49 @@ fn format_terminator(term: &Terminator, interner: &Interner, registry: &ItemRegi
                 qualified_ref(*variant, registry, interner)
             )
         }
+        Terminator::Invoke {
+            callee,
+            type_args,
+            args,
+            evidence,
+            ok_slot,
+            ok_target,
+            err_targets,
+        } => {
+            let args = args
+                .iter()
+                .map(|v| format!("%{}", v.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Sorted by `variant`'s own qualified name, not by
+            // declaration order -- so two `err_targets` lists holding the
+            // same edges in a different order (a nondeterminism source
+            // an unordered set-of-effects representation could otherwise
+            // introduce upstream) always print identically here, keeping
+            // this text usable as golden output (module doc comment).
+            let mut err_targets: Vec<String> = err_targets
+                .iter()
+                .map(|t| {
+                    format!(
+                        "@{} -> %{}, bb{}",
+                        qualified_ref(t.variant, registry, interner),
+                        t.slot.0,
+                        t.target.0
+                    )
+                })
+                .collect();
+            err_targets.sort();
+            format!(
+                "invoke @{}{}({args}){} -> %{}, bb{} else {{{}}}",
+                qualified_ref(*callee, registry, interner),
+                type_args_suffix(type_args, interner, registry),
+                evidence_list_suffix(evidence, interner, registry),
+                ok_slot.0,
+                ok_target.0,
+                err_targets.join("; ")
+            )
+        }
+        Terminator::Raise { value } => format!("raise %{}", value.0),
     }
 }
 
@@ -621,6 +686,108 @@ mod tests {
         assert!(text.contains("bb0:\n"));
         assert!(text.contains("add.i64"));
         assert!(text.contains("ret"));
+    }
+
+    // -- Fix 4: complete raised-effect signatures (`rfcs/0010`) ---------
+
+    #[test]
+    fn an_infallible_functions_signature_prints_no_raises_suffix_at_all() {
+        // The one, documented stable representation of an empty raised-
+        // effect set: omitted entirely, mirroring `uses`'s own
+        // convention for an empty capability requirement list.
+        let text = print("func f() -> i64 { return 1 }");
+        assert!(text.starts_with("func @f#0() -> i64 {\n"));
+        assert!(!text.contains("raises"));
+    }
+
+    #[test]
+    fn a_functions_signature_prints_its_single_raised_effect() {
+        let text = print(
+            "variant FileError { Missing } \
+             func f() -> i64 raises FileError { raise FileError.Missing }",
+        );
+        assert!(
+            text.contains("raises [@FileError#0]"),
+            "expected a raises suffix naming FileError, got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_functions_signature_prints_every_raised_effect() {
+        let text = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises FileError, NetworkError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        assert!(
+            text.contains("raises [@FileError#0, @NetworkError#1]"),
+            "expected a raises suffix naming both effects in canonical order, got: {text}"
+        );
+    }
+
+    #[test]
+    fn raised_effects_print_in_the_same_canonical_order_regardless_of_raises_clause_order() {
+        // Same variant declarations, in the same order (so both compile
+        // to the same underlying ids) -- only the `raises` clause's own
+        // entry order is reversed.
+        let forward = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises FileError, NetworkError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        let reversed = print(
+            "variant FileError { Missing } \
+             variant NetworkError { Timeout } \
+             func f(mode: bool) -> i64 raises NetworkError, FileError { \
+                 if mode { raise FileError.Missing; } \
+                 raise NetworkError.Timeout; \
+             }",
+        );
+        let forward_suffix = forward.lines().find(|l| l.starts_with("raises")).unwrap();
+        let reversed_suffix = reversed.lines().find(|l| l.starts_with("raises")).unwrap();
+        assert_eq!(
+            forward_suffix, reversed_suffix,
+            "the same semantic effect set must print identically regardless of the raises clause's own entry order"
+        );
+    }
+
+    /// Not just the printed header (covered above) -- reversing a
+    /// fallible callee's own `raises` clause order must not change a
+    /// single byte of the *whole* module's NIR, including every
+    /// `Invoke`'s own `err_targets`/slot/block numbering, which iterates
+    /// `Function.raises`'s own stored order (`rfcs/0010`).
+    #[test]
+    fn reversing_a_callees_raises_clause_order_produces_byte_identical_nir() {
+        let program = |order: &str| {
+            format!(
+                "variant FileError {{ Missing }} \
+                 variant NetworkError {{ Timeout }} \
+                 func fetch(mode: i64) -> i64 raises {order} {{ \
+                     if mode == 0 {{ return 42; }} \
+                     if mode == 1 {{ raise FileError.Missing; }} \
+                     raise NetworkError.Timeout; \
+                 }} \
+                 func main() -> i64 {{ \
+                     return handle fetch(1) {{ \
+                         success v => v, \
+                         failure FileError.Missing => -1, \
+                         failure NetworkError.Timeout => -2, \
+                     }} \
+                 }}"
+            )
+        };
+        let forward = print(&program("FileError, NetworkError"));
+        let reversed = print(&program("NetworkError, FileError"));
+        assert_eq!(
+            forward, reversed,
+            "reversing a callee's own raises clause order must not change any NIR output"
+        );
     }
 
     #[test]

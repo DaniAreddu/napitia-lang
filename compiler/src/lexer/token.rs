@@ -70,6 +70,10 @@ pub enum TokenKind {
     Private,
     Uses,
     Raises,
+    Raise,
+    Handle,
+    Success,
+    Failure,
     As,
     Is,
     Unsafe,
@@ -169,6 +173,10 @@ pub fn keyword_kind(text: &str) -> Option<TokenKind> {
         "private" => TokenKind::Private,
         "uses" => TokenKind::Uses,
         "raises" => TokenKind::Raises,
+        "raise" => TokenKind::Raise,
+        "handle" => TokenKind::Handle,
+        "success" => TokenKind::Success,
+        "failure" => TokenKind::Failure,
         "as" => TokenKind::As,
         "is" => TokenKind::Is,
         "unsafe" => TokenKind::Unsafe,
@@ -189,8 +197,9 @@ mod tests {
         let keywords = [
             "func", "value", "mutable", "const", "return", "if", "else", "while", "for", "in",
             "loop", "break", "continue", "true", "false", "record", "variant", "match", "protocol",
-            "extend", "with", "import", "module", "public", "private", "uses", "raises", "as",
-            "is", "unsafe", "async", "await", "region", "defer",
+            "extend", "with", "import", "module", "public", "private", "uses", "raises", "raise",
+            "handle", "success", "failure", "as", "is", "unsafe", "async", "await", "region",
+            "defer",
         ];
         for kw in keywords {
             assert!(keyword_kind(kw).is_some(), "{kw} should be a keyword");

@@ -56,6 +56,16 @@ pub enum InterpreterError {
     InvalidOperation(String),
 }
 
+/// A function frame's own two possible ways to end (`rfcs/0010`) -- never
+/// a Rust panic/unwind. `Raised` always carries a `Value::Variant`: the
+/// exact value a `Terminator::Raise` produced (directly, or forwarded
+/// unchanged from an `Invoke`'s own failure edge), with its own dynamic
+/// item/case identity intact.
+enum Outcome {
+    Returned(Value),
+    Raised(Value),
+}
+
 pub struct Interpreter<'a> {
     module: &'a Module,
 }
@@ -85,7 +95,7 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function `{name}`"))
             })?;
-        self.call_function(function, args, Vec::new())
+        into_result(self.call_function(function, args, Vec::new())?)
     }
 
     /// Calls the function identified by `item` with no arguments -- a
@@ -108,7 +118,7 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function {item:?}"))
             })?;
-        self.call_function(function, args, Vec::new())
+        into_result(self.call_function(function, args, Vec::new())?)
     }
 
     /// `evidence` is this call's own resolved capability evidence
@@ -124,7 +134,7 @@ impl<'a> Interpreter<'a> {
         function: &Function,
         args: Vec<Value>,
         evidence: Vec<Evidence>,
-    ) -> Result<Value, InterpreterError> {
+    ) -> Result<Outcome, InterpreterError> {
         // `Vec::zip` silently truncates to the shorter side: too few
         // arguments would leave the missing parameters unbound (an
         // arbitrary "value not found" error later, from whichever
@@ -196,8 +206,8 @@ impl<'a> Interpreter<'a> {
             }
 
             match &block.terminator {
-                Terminator::Return(Some(id)) => return get(&values, id),
-                Terminator::Return(None) => return Ok(Value::Unit),
+                Terminator::Return(Some(id)) => return Ok(Outcome::Returned(get(&values, id)?)),
+                Terminator::Return(None) => return Ok(Outcome::Returned(Value::Unit)),
                 Terminator::Branch(target) => block_id = *target,
                 Terminator::CondBranch {
                     condition,
@@ -230,6 +240,54 @@ impl<'a> Interpreter<'a> {
                     block_id = *cases.get(case).ok_or_else(|| {
                         invalid("switch scrutinee's case has no corresponding target")
                     })?;
+                }
+                Terminator::Invoke {
+                    callee,
+                    type_args: _,
+                    args,
+                    evidence: call_evidence,
+                    ok_slot,
+                    ok_target,
+                    err_targets,
+                } => {
+                    let arg_values = args
+                        .iter()
+                        .map(|id| get(&values, id))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let callee_fn = self
+                        .module
+                        .functions
+                        .iter()
+                        .find(|f| f.id == *callee)
+                        .ok_or_else(|| {
+                            invalid("invoke targets a function not present in this module")
+                        })?;
+                    let resolved_evidence = call_evidence
+                        .iter()
+                        .map(|e| resolve_evidence(&evidence, e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    match self.call_function(callee_fn, arg_values, resolved_evidence)? {
+                        Outcome::Returned(value) => {
+                            values.insert(*ok_slot, value);
+                            block_id = *ok_target;
+                        }
+                        Outcome::Raised(raised) => {
+                            let Value::Variant { item, .. } = &raised else {
+                                return Err(invalid("a raised value must be a variant value"));
+                            };
+                            let target = err_targets
+                                .iter()
+                                .find(|t| t.variant == *item)
+                                .ok_or_else(|| {
+                                    invalid("invoke has no failure target for the raised variant")
+                                })?;
+                            values.insert(target.slot, raised);
+                            block_id = target.target;
+                        }
+                    }
+                }
+                Terminator::Raise { value } => {
+                    return Ok(Outcome::Raised(get(&values, value)?));
                 }
             }
         }
@@ -320,7 +378,18 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .map(|e| resolve_evidence(current_evidence, e))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.call_function(callee, arg_values, resolved_evidence)
+                // An ordinary `Call` never targets a fallible function
+                // (`rfcs/0010`) -- that always lowers to `Invoke` instead
+                // (the verifier's job to guarantee). A `Raised` outcome
+                // here means the callee's own `raises` metadata and its
+                // actual body disagree; guarded defensively rather than
+                // silently treated as the raised value itself.
+                match self.call_function(callee, arg_values, resolved_evidence)? {
+                    Outcome::Returned(value) => Ok(value),
+                    Outcome::Raised(_) => Err(invalid(
+                        "an ordinary call's callee raised a failure; only Invoke may call a fallible function",
+                    )),
+                }
             }
             // Dispatches through this specific call's own resolved
             // evidence (`rfcs/0009`): a concrete extension is looked up
@@ -366,7 +435,12 @@ impl<'a> Interpreter<'a> {
                             "protocol call's implementing function is not present in this module",
                         )
                     })?;
-                self.call_function(callee, arg_values, nested)
+                match self.call_function(callee, arg_values, nested)? {
+                    Outcome::Returned(value) => Ok(value),
+                    Outcome::Raised(_) => Err(invalid(
+                        "a protocol call's implementing method raised a failure; protocol methods that raise are not yet supported",
+                    )),
+                }
             }
             ValueKind::RecordCreate(item, _type_args, field_ids) => {
                 let fields = field_ids
@@ -440,6 +514,24 @@ fn get(values: &HashMap<ValueId, Value>, id: &ValueId) -> Result<Value, Interpre
 
 fn invalid(message: impl Into<String>) -> InterpreterError {
     InterpreterError::InvalidOperation(message.into())
+}
+
+/// Converts a top-level call's own [`Outcome`] to this module's public
+/// `Result<Value, InterpreterError>` API. A well-typed `main` (or any
+/// other function reached directly through `Interpreter::call`/
+/// `call_item`, never through an `Invoke`) can never legally raise
+/// (`rfcs/0010`'s entry-point restriction, enforced at typeck) -- so a
+/// `Raised` outcome reaching this boundary means it was never caught by
+/// any `Invoke` along the way, which is only reachable through
+/// malformed/hand-built NIR; guarded defensively rather than surfaced as
+/// if it were an ordinary return value.
+fn into_result(outcome: Outcome) -> Result<Value, InterpreterError> {
+    match outcome {
+        Outcome::Returned(value) => Ok(value),
+        Outcome::Raised(_) => Err(invalid(
+            "an unhandled failure reached the program's entry point",
+        )),
+    }
 }
 
 /// Resolves one static [`Evidence`] entry (from a `Call`/`ProtocolCall`
@@ -977,6 +1069,7 @@ mod tests {
                     },
                 ],
                 return_type: Ty::I64,
+                raises: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
                     instructions: Vec::new(),
@@ -1014,6 +1107,7 @@ mod tests {
                     ty: Ty::I64,
                 }],
                 return_type: Ty::I64,
+                raises: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
                     instructions: Vec::new(),
@@ -1059,6 +1153,7 @@ mod tests {
                     ty: Ty::I64,
                 }],
                 return_type: Ty::I64,
+                raises: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
                     instructions: Vec::new(),
@@ -1096,6 +1191,7 @@ mod tests {
                 requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::Unit,
+                raises: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(1),
                     instructions: Vec::new(),
@@ -1245,6 +1341,7 @@ mod tests {
                 requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
+                raises: Vec::new(),
                 blocks: vec![
                     BasicBlock {
                         id: BlockId(0),
@@ -1296,6 +1393,7 @@ mod tests {
                 requirements: Vec::new(),
                 params: Vec::new(),
                 return_type: Ty::I64,
+                raises: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
                     instructions: vec![
@@ -1413,5 +1511,194 @@ mod tests {
                  }"),
             Ok(Value::Int(42))
         );
+    }
+
+    // -- Typed outcomes: raise/?/handle (`rfcs/0010`) -------------------
+
+    #[test]
+    fn a_handled_raise_runs_the_matching_failure_arm() {
+        let text = "variant FileError { Missing, PermissionDenied } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure FileError.Missing => -1, \
+                             failure FileError.PermissionDenied => -2, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-1)));
+    }
+
+    #[test]
+    fn a_handled_success_runs_the_success_arm() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(true) { \
+                             success v => v, \
+                             failure _ => -1, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn postfix_try_forwards_a_raised_value_to_the_caller_unchanged() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func forward(ok: bool) -> i64 raises FileError { \
+                         return read(ok)?; \
+                     } \
+                     func main() -> i64 { \
+                         return handle forward(false) { \
+                             success v => v, \
+                             failure FileError.Missing => -7, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-7)));
+    }
+
+    #[test]
+    fn postfix_try_forwards_a_success_value_to_the_caller_unchanged() {
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func forward(ok: bool) -> i64 raises FileError { \
+                         return read(ok)?; \
+                     } \
+                     func main() -> i64 { \
+                         return handle forward(true) { \
+                             success v => v, \
+                             failure FileError.Missing => -7, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn handle_dispatches_the_right_case_among_multiple_raised_variants() {
+        let text = "variant FileError { Missing, PermissionDenied } \
+                     variant NetworkError { Timeout } \
+                     func read(mode: i64) -> i64 raises FileError, NetworkError { \
+                         if mode == 0 { return 42 } \
+                         if mode == 1 { raise FileError.Missing; } \
+                         if mode == 2 { raise FileError.PermissionDenied; } \
+                         raise NetworkError.Timeout; \
+                     } \
+                     func run_with(mode: i64) -> i64 { \
+                         return handle read(mode) { \
+                             success v => v, \
+                             failure FileError.Missing => -1, \
+                             failure FileError.PermissionDenied => -2, \
+                             failure NetworkError.Timeout => -3, \
+                         } \
+                     } \
+                     func main() -> i64 { \
+                         return run_with(0) * 1000 + run_with(1) * 100 + run_with(2) * 10 + run_with(3) \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(42000 - 100 - 20 - 3)));
+    }
+
+    #[test]
+    fn handle_wildcard_covers_a_case_carrying_a_payload() {
+        let text = "variant FileError { Missing(i64), PermissionDenied } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing(9); \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure _ => -1, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-1)));
+    }
+
+    #[test]
+    fn handle_binds_a_raised_cases_payload() {
+        let text = "variant FileError { Missing(i64) } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing(9); \
+                     } \
+                     func main() -> i64 { \
+                         return handle read(false) { \
+                             success v => v, \
+                             failure FileError.Missing(code) => code, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(9)));
+    }
+
+    #[test]
+    fn a_raise_inside_a_handled_arms_own_body_is_not_implicitly_caught() {
+        // A nested fallible call's own raise inside a `handle` arm's body
+        // needs its own `?`/`handle` -- the enclosing `handle` only ever
+        // dispatches on its own direct operand, never on anything a
+        // sibling arm's body happens to also raise.
+        let text = "variant FileError { Missing } \
+                     func read(ok: bool) -> i64 raises FileError { \
+                         if ok { return 42 } \
+                         raise FileError.Missing; \
+                     } \
+                     func outer() -> i64 raises FileError { \
+                         return handle read(true) { \
+                             success v => read(false)?, \
+                             failure FileError.Missing => -1, \
+                         } \
+                     } \
+                     func main() -> i64 { \
+                         return handle outer() { \
+                             success v => v, \
+                             failure FileError.Missing => -9, \
+                         } \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(-9)));
+    }
+
+    // -- Fix 3: diverging operands under `?`/`handle` (`rfcs/0010`) -----
+
+    #[test]
+    fn postfix_try_with_a_diverging_argument_returns_through_the_argument_exactly_once() {
+        // `read` is never actually invoked -- the argument's own `return`
+        // ends `main` first, exactly once, before the fallible call (and
+        // therefore the postfix `?` after it) is ever reached.
+        let text = "variant FileError { Missing } \
+                     func read(path: str) -> str raises FileError { \
+                         if path == \"\" { raise FileError.Missing; } \
+                         return \"ok\"; \
+                     } \
+                     func main() -> i64 { \
+                         return read({ return 7 })?; \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn handle_with_a_diverging_argument_returns_through_the_argument_exactly_once() {
+        let text = "variant FileError { Missing } \
+                     func read(path: str) -> str raises FileError { \
+                         if path == \"\" { raise FileError.Missing; } \
+                         return \"ok\"; \
+                     } \
+                     func main() -> i64 { \
+                         return handle read({ return 7 }) { \
+                             success v => 1, \
+                             failure FileError.Missing => 2, \
+                         }; \
+                     }";
+        assert_eq!(run(text), Ok(Value::Int(7)));
     }
 }

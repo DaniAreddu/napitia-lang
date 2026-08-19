@@ -1,0 +1,17 @@
+variant Failure {
+    Broken,
+}
+
+protocol Operation[T] {
+    func run(input: T) -> i64;
+}
+
+extend Operation[i64] {
+    func run(input: i64) -> i64 raises Failure {
+        raise Failure.Broken;
+    }
+}
+
+func main() -> i64 {
+    return Operation[i64].run(1);
+}

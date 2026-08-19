@@ -1,0 +1,10 @@
+public variant ConfigError {
+    Missing,
+}
+
+public func read_config(ok: bool) -> i64 raises ConfigError {
+    if ok {
+        return 42;
+    }
+    raise ConfigError.Missing;
+}

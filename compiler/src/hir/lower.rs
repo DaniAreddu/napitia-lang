@@ -11,9 +11,10 @@ use std::collections::HashMap;
 
 use super::{
     AggregateKind, ExprId, HirBinding, HirBlock, HirCapabilityRequirement, HirCase, HirElse,
-    HirExpr, HirExtend, HirField, HirFieldInit, HirFunction, HirMatchArm, HirMatchArmBody,
-    HirModule, HirParam, HirPattern, HirProtocol, HirProtocolMethod, HirRecord, HirStmt, HirType,
-    HirTypeParam, HirVariant, ItemId, LocalId, OtherItem, OtherItemKind, PatternId, TypeParamId,
+    HirExpr, HirExtend, HirFailurePattern, HirField, HirFieldInit, HirFunction, HirHandleArm,
+    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirParam, HirPattern, HirProtocol,
+    HirProtocolMethod, HirRaisesEntry, HirRecord, HirStmt, HirType, HirTypeParam, HirVariant,
+    ItemId, LocalId, OtherItem, OtherItemKind, PatternId, TypeParamId,
 };
 use crate::diagnostics::Diagnostic;
 use crate::limits::MAX_GENERIC_DEPTH;
@@ -52,6 +53,37 @@ mod codes {
     pub const EXTEND_METHOD_OWN_TYPE_PARAMS: &str = "R0025";
     pub const PROTOCOL_NOT_A_VALUE: &str = "R0026";
     pub const EXTEND_METHOD_OWN_USES_CLAUSE: &str = "R0027";
+    /// A `raises` clause entry (`rfcs/0010`) does not name a declared
+    /// `variant` -- an unknown name, or one that resolves to a record or
+    /// primitive instead.
+    pub const UNKNOWN_RAISES_TYPE: &str = "R0028";
+    /// The same variant appears twice in one `raises` clause.
+    pub const DUPLICATE_RAISES_ENTRY: &str = "R0029";
+    /// A `raises` entry names a variant declaring one or more type
+    /// parameters (`rfcs/0010`'s own explicit non-goal: generic error
+    /// variants are out of scope). The `raises` grammar has no bracketed
+    /// type-argument position at all (`raises Box[T]` cannot even parse
+    /// as an entry), so this only ever fires for the *bare* declaration
+    /// itself being generic (`raises Failure` where `variant
+    /// Failure[T] { .. }`).
+    pub const GENERIC_RAISES_TYPE: &str = "R0030";
+    /// An `extend` method declares its own `raises` clause. Protocol
+    /// declarations have no `raises` of their own yet (`rfcs/0010`'s own
+    /// honest limitation: there is no protocol/capability integration
+    /// for typed failure), so every implementing method must be
+    /// infallible too -- there is no protocol-visible effect for it to
+    /// narrow.
+    pub const EXTEND_METHOD_OWN_RAISES_CLAUSE: &str = "R0031";
+    /// A `raises` entry resolved to a declared variant whose own
+    /// type-parameter count was never recorded -- unreachable through
+    /// the ordinary pipeline (every variant, local or imported, has its
+    /// count recorded in `variant_type_param_count` before any function
+    /// is lowered), but a direct caller lowering hand-built import/type
+    /// data could still reach this. Never silently treated as
+    /// non-generic: a real generic error variant slipping through as if
+    /// it had zero type parameters would let `rfcs/0010`'s own explicit
+    /// non-goal (generic error variants) reach NIR undetected.
+    pub const RAISES_VARIANT_METADATA_MISSING: &str = "R0032";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -129,6 +161,12 @@ pub enum ImportedItemKind {
         declared_name: Symbol,
         /// `(case name, declaration index)`, in declaration order.
         cases: Vec<(Symbol, usize)>,
+        /// This variant's own declared type-parameter count (`rfcs/0010`)
+        /// -- `resolve_raises` needs this for an imported candidate the
+        /// same way it needs it for a local one, since a `raises` entry
+        /// is a bare identifier with no way to tell genericity from the
+        /// reference site alone.
+        type_param_count: usize,
     },
     Protocol {
         item: ItemId,
@@ -195,6 +233,7 @@ pub fn lower_module_with_imports(
         protocol_methods: HashMap::new(),
         record_fields: HashMap::new(),
         variant_cases: HashMap::new(),
+        variant_type_param_count: HashMap::new(),
         case_lookup: HashMap::new(),
         imported_record_field_public: HashMap::new(),
         type_param_scope: HashMap::new(),
@@ -251,6 +290,13 @@ struct Lowering<'a> {
     /// Per-variant case name -> declaration index, for resolving a
     /// qualified (`Variant.Case`) or scrutinee-typed pattern reference.
     variant_cases: HashMap<ItemId, HashMap<Symbol, usize>>,
+    /// Every declared/imported variant's own type-parameter count
+    /// (`rfcs/0010`) -- `resolve_raises` needs this for every candidate
+    /// regardless of whether it is declared in this module or imported,
+    /// since a `raises` entry can never spell type arguments explicitly
+    /// (there is no way to tell from the bare identifier alone whether
+    /// its declaration is generic without looking this up).
+    variant_type_param_count: HashMap<ItemId, usize>,
     /// Case name -> every `(variant, case index)` it names anywhere in
     /// the module, for resolving an *unqualified* constructor reference
     /// and detecting ambiguity when it names more than one variant.
@@ -326,11 +372,13 @@ impl<'a> Lowering<'a> {
                     item,
                     declared_name,
                     cases,
+                    type_param_count,
                 } => {
                     self.type_names.insert(
                         imported.local_name,
                         (item, TypeNameKind::Variant, declared_name),
                     );
+                    self.variant_type_param_count.insert(item, type_param_count);
                     let mut case_indices = HashMap::new();
                     for (name, index) in cases {
                         case_indices.insert(name, index);
@@ -432,6 +480,13 @@ impl<'a> Lowering<'a> {
             if let Some(ret) = &f.return_type {
                 self.check_public_api_leak(ret, &local_public);
             }
+            // `rfcs/0010`: a public function's own `raises` clause is
+            // just as much a part of its public API as its parameter/
+            // return types -- a private error type named there is
+            // exposed to every caller exactly the same way.
+            for raised in &f.raises {
+                self.check_raises_public_api_leak(*raised, &local_public);
+            }
         }
         for (_, r) in &record_decls {
             if !r.public {
@@ -462,6 +517,13 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|(id, v)| self.lower_variant(id, v))
             .collect();
+        // Populated before any function is lowered (functions are next,
+        // below) -- `resolve_raises` needs every local variant's own
+        // type-parameter count already known.
+        for variant in &variants {
+            self.variant_type_param_count
+                .insert(variant.id, variant.type_params.len());
+        }
         // Protocols are lowered before any function or extend body: a
         // `Protocol[Args].method(...)` call anywhere in either needs
         // `self.protocol_methods`'s name -> index table already built
@@ -528,6 +590,31 @@ impl<'a> Lowering<'a> {
         // resolution itself is (`rfcs/0008`).
         for arg in &ty.args {
             self.check_public_api_leak(arg, local_public);
+        }
+    }
+
+    /// The `raises`-clause counterpart of [`Self::check_public_api_leak`]
+    /// (`rfcs/0010`): a bare identifier, never generic, so there is no
+    /// argument list to recurse into and no primitive-name precedence to
+    /// consider (a raised type is always a variant).
+    fn check_raises_public_api_leak(
+        &mut self,
+        raised: ast::Ident,
+        local_public: &HashMap<Symbol, bool>,
+    ) {
+        if let Some(&is_public) = local_public.get(&raised.symbol)
+            && !is_public
+        {
+            let text = self.interner.resolve(raised.symbol);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    crate::project::codes::PRIVATE_TYPE_LEAKED,
+                    self.source,
+                    raised.span,
+                    format!("`{text}` is private, but is exposed here through a public API"),
+                )
+                .with_primary_label("private type used in a public signature"),
+            );
         }
     }
 
@@ -699,6 +786,103 @@ impl<'a> Lowering<'a> {
     /// genuinely unknown, neither of which HIR lowering itself decides.
     fn resolve_type_ref(&mut self, ty: &ast::Type) -> HirType {
         self.resolve_type_ref_at_depth(ty, 0)
+    }
+
+    /// Resolves a `raises` clause's own entries to their canonical
+    /// declaring variant (`rfcs/0010`) -- an unknown name or one that
+    /// resolves to a record/primitive is diagnosed and dropped; a
+    /// duplicate (same resolved `ItemId`, however it was spelled -- an
+    /// import alias never changes this) is diagnosed and dropped too, so
+    /// one malformed entry never hides another, valid one.
+    fn resolve_raises(&mut self, raises: &[ast::Ident]) -> Vec<HirRaisesEntry> {
+        let mut resolved = Vec::with_capacity(raises.len());
+        let mut seen: HashMap<ItemId, Span> = HashMap::new();
+        for ident in raises {
+            let Some(&(item, kind, _)) = self.type_names.get(&ident.symbol) else {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_RAISES_TYPE,
+                        self.source,
+                        ident.span,
+                        format!("`{text}` is not a declared variant type"),
+                    )
+                    .with_primary_label("unknown raised type"),
+                );
+                continue;
+            };
+            if kind != TypeNameKind::Variant {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_RAISES_TYPE,
+                        self.source,
+                        ident.span,
+                        format!("`{text}` is not a variant type and cannot be raised"),
+                    )
+                    .with_primary_label("not a variant type"),
+                );
+                continue;
+            }
+            // Generic error variants are explicitly out of scope
+            // (`rfcs/0010`): the `raises` grammar has no bracketed
+            // type-argument position at all, so there is no way to
+            // spell `raises Failure[i64]` in the first place -- this
+            // catches the *declaration* itself being generic
+            // (`raises Failure` naming a `variant Failure[T] { .. }`),
+            // which the grammar alone cannot rule out.
+            let Some(&type_param_count) = self.variant_type_param_count.get(&item) else {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::RAISES_VARIANT_METADATA_MISSING,
+                        self.source,
+                        ident.span,
+                        format!(
+                            "`{text}` resolves to a declared variant, but its type-parameter count was never recorded"
+                        ),
+                    )
+                    .with_primary_label("missing variant metadata"),
+                );
+                continue;
+            };
+            if type_param_count > 0 {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::GENERIC_RAISES_TYPE,
+                        self.source,
+                        ident.span,
+                        format!(
+                            "`{text}` declares {type_param_count} type parameter(s); generic error variants are not supported in a `raises` clause"
+                        ),
+                    )
+                    .with_primary_label("generic raised type"),
+                );
+                continue;
+            }
+            if let Some(&first_span) = seen.get(&item) {
+                let text = self.interner.resolve(ident.symbol);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::DUPLICATE_RAISES_ENTRY,
+                        self.source,
+                        ident.span,
+                        format!("`{text}` is already declared in this raises clause"),
+                    )
+                    .with_primary_label("duplicate raised type")
+                    .with_label(first_span, "first declared here"),
+                );
+                continue;
+            }
+            seen.insert(item, ident.span);
+            resolved.push(HirRaisesEntry {
+                variant: item,
+                name: ident.symbol,
+                span: ident.span,
+            });
+        }
+        resolved
     }
 
     /// `depth` counts one level per bracketed nesting level
@@ -1011,7 +1195,7 @@ impl<'a> Lowering<'a> {
             return_type,
             uses,
             requirements,
-            raises: f.raises.clone(),
+            raises: self.resolve_raises(&f.raises),
             body,
             span: f.span,
         }
@@ -1163,6 +1347,28 @@ impl<'a> Lowering<'a> {
                 .with_primary_label("unexpected `uses` clause"),
             );
         }
+        // A protocol method has no `raises` signature of its own yet
+        // (`rfcs/0010`'s own honest limitation), so every implementing
+        // method must be infallible too -- diagnosed here, and never
+        // resolved into (even partial) raised-effect metadata: a
+        // fallible implementation could otherwise satisfy an apparently
+        // infallible protocol method, and `protocol.call` -- an ordinary
+        // value instruction with only one destination -- would have
+        // nowhere for a raised value to go.
+        if let Some((first, rest)) = f.raises.split_first() {
+            let raises_span = rest
+                .iter()
+                .fold(first.span, |acc, entry| acc.join(entry.span));
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::EXTEND_METHOD_OWN_RAISES_CLAUSE,
+                    self.source,
+                    raises_span,
+                    "an extend method may not declare its own `raises` clause; protocol methods have no raised-effect signature yet",
+                )
+                .with_primary_label("unexpected `raises` clause"),
+            );
+        }
         let mut scopes = Scopes::new();
         let params = self.lower_params(&f.params, &mut scopes);
         let return_type = f.return_type.as_ref().map(|t| self.resolve_type_ref(t));
@@ -1178,7 +1384,7 @@ impl<'a> Lowering<'a> {
             return_type,
             uses: Vec::new(),
             requirements: requirements.to_vec(),
-            raises: f.raises.clone(),
+            raises: Vec::new(),
             body,
             span: f.span,
         }
@@ -1345,10 +1551,159 @@ impl<'a> Lowering<'a> {
             ast::Expr::TypeApply { base, args, span } => {
                 self.lower_type_apply(base, args, *span, scopes)
             }
+            ast::Expr::Raise { operand, span } => HirExpr::Raise {
+                id: self.fresh_expr_id(),
+                operand: Box::new(self.lower_expr(operand, scopes)),
+                span: *span,
+            },
+            ast::Expr::Handle(handle_expr) => self.lower_handle(handle_expr, scopes),
             ast::Expr::Error { span } => HirExpr::Error {
                 id: self.fresh_expr_id(),
                 span: *span,
             },
+        }
+    }
+
+    fn lower_handle(&mut self, h: &ast::HandleExpr, scopes: &mut Scopes) -> HirExpr {
+        let operand = Box::new(self.lower_expr(&h.operand, scopes));
+        let arms = h
+            .arms
+            .iter()
+            .map(|arm| self.lower_handle_arm(arm, scopes))
+            .collect();
+        HirExpr::Handle {
+            id: self.fresh_expr_id(),
+            operand,
+            arms,
+            span: h.span,
+        }
+    }
+
+    fn lower_handle_arm(&mut self, arm: &ast::HandleArm, scopes: &mut Scopes) -> HirHandleArm {
+        match arm {
+            ast::HandleArm::Success {
+                pattern,
+                body,
+                span,
+            } => {
+                scopes.push();
+                let mut bound = HashMap::new();
+                let pattern = self.lower_pattern(pattern, scopes, &mut bound);
+                let body = self.lower_arm_body(body, scopes);
+                scopes.pop();
+                HirHandleArm {
+                    kind: HirHandleArmKind::Success(pattern),
+                    body,
+                    span: *span,
+                }
+            }
+            ast::HandleArm::Failure {
+                pattern,
+                body,
+                span,
+            } => {
+                scopes.push();
+                let pattern = self.lower_failure_pattern(pattern, scopes);
+                let body = self.lower_arm_body(body, scopes);
+                scopes.pop();
+                HirHandleArm {
+                    kind: HirHandleArmKind::Failure(pattern),
+                    body,
+                    span: *span,
+                }
+            }
+        }
+    }
+
+    fn lower_arm_body(&mut self, body: &ast::MatchArmBody, scopes: &mut Scopes) -> HirMatchArmBody {
+        match body {
+            ast::MatchArmBody::Expr(e) => HirMatchArmBody::Expr(self.lower_expr(e, scopes)),
+            ast::MatchArmBody::Block(b) => HirMatchArmBody::Block(self.lower_block(b, scopes)),
+        }
+    }
+
+    /// Resolves `_` or `ErrorType.Case(args...)` (`rfcs/0010`). Payload
+    /// positions are lowered through the ordinary pattern machinery
+    /// (fresh bindings, duplicate-binding detection scoped to this one
+    /// arm) but restricted to `Bind`/`Wildcard` by `typeck` afterward --
+    /// this milestone has no nested refutable matching on a raised
+    /// value's own payload.
+    fn lower_failure_pattern(
+        &mut self,
+        pattern: &ast::FailurePattern,
+        scopes: &mut Scopes,
+    ) -> HirFailurePattern {
+        match pattern {
+            ast::FailurePattern::Wildcard { span } => HirFailurePattern::Wildcard { span: *span },
+            ast::FailurePattern::Case {
+                error_type,
+                case,
+                args,
+                span,
+            } => {
+                let variant = match self.type_names.get(&error_type.symbol) {
+                    Some(&(item, TypeNameKind::Variant, _)) => Some(item),
+                    Some(&(_, TypeNameKind::Record, _)) => {
+                        let text = self.interner.resolve(error_type.symbol);
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::UNKNOWN_VARIANT_TYPE,
+                                self.source,
+                                error_type.span,
+                                format!("`{text}` is a record, which has no cases to qualify"),
+                            )
+                            .with_primary_label("not a variant type"),
+                        );
+                        None
+                    }
+                    None => {
+                        let text = self.interner.resolve(error_type.symbol);
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::UNKNOWN_VARIANT_TYPE,
+                                self.source,
+                                error_type.span,
+                                format!("`{text}` is not a declared variant type"),
+                            )
+                            .with_primary_label("unknown type"),
+                        );
+                        None
+                    }
+                };
+                let case_index = variant.and_then(|v| {
+                    let index = self
+                        .variant_cases
+                        .get(&v)
+                        .and_then(|cases| cases.get(&case.symbol))
+                        .copied();
+                    if index.is_none() {
+                        let case_text = self.interner.resolve(case.symbol);
+                        let type_text = self.interner.resolve(error_type.symbol);
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::UNKNOWN_VARIANT_CASE,
+                                self.source,
+                                case.span,
+                                format!("`{type_text}` has no case named `{case_text}`"),
+                            )
+                            .with_primary_label("unknown case"),
+                        );
+                    }
+                    index
+                });
+                let mut bound = HashMap::new();
+                let args = args
+                    .iter()
+                    .map(|a| self.lower_pattern(a, scopes, &mut bound))
+                    .collect();
+                HirFailurePattern::Case {
+                    variant,
+                    case: case_index,
+                    case_name: case.symbol,
+                    args,
+                    span: *span,
+                }
+            }
         }
     }
 
@@ -2333,12 +2688,207 @@ mod tests {
     #[test]
     fn uses_and_raises_clauses_are_preserved_not_discarded() {
         let (hir, diags) = lower(
-            "func loadUser(id: i64) -> i64 uses Database.Read raises UserNotFound { return id }",
+            "variant UserNotFound { Missing }\n\
+             func loadUser(id: i64) -> i64 uses Database.Read raises UserNotFound { return id }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
-        assert_eq!(hir.functions[0].uses.len(), 1);
-        assert_eq!(hir.functions[0].uses[0].segments.len(), 2);
+        let f = &hir.functions[0];
+        assert_eq!(f.uses.len(), 1);
+        assert_eq!(f.uses[0].segments.len(), 2);
+        assert_eq!(f.raises.len(), 1);
+    }
+
+    #[test]
+    fn a_raises_entry_naming_an_undeclared_type_is_a_diagnostic() {
+        let (_, diags) = lower("func f() raises NotFound { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0028");
+    }
+
+    #[test]
+    fn a_raises_entry_naming_a_record_is_a_diagnostic() {
+        let (_, diags) = lower("record NotFound { code: i64 }\nfunc f() raises NotFound { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0028");
+    }
+
+    #[test]
+    fn a_duplicate_raises_entry_is_a_diagnostic() {
+        let (hir, diags) =
+            lower("variant NotFound { Missing }\nfunc f() raises NotFound, NotFound { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0029");
         assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn a_raises_entry_naming_a_local_generic_variant_is_a_diagnostic() {
+        let (_, diags) = lower("variant Failure[T] { Value(T) }\nfunc f() raises Failure { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0030");
+    }
+
+    #[test]
+    fn a_raises_entry_naming_an_imported_generic_variant_is_a_diagnostic() {
+        let (_, diags) =
+            lower_with_imports("func f() raises Failure { }", |interner, other_source| {
+                let failure_name = interner.intern("Failure");
+                let value_name = interner.intern("Value");
+                vec![ImportedItem {
+                    local_name: failure_name,
+                    kind: ImportedItemKind::Variant {
+                        item: ItemId(0),
+                        declared_name: failure_name,
+                        cases: vec![(value_name, 0)],
+                        type_param_count: 1,
+                    },
+                    import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            });
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0030");
+    }
+
+    #[test]
+    fn a_non_generic_variant_in_raises_remains_valid() {
+        let (hir, diags) = lower("variant Failure { Missing }\nfunc f() raises Failure { }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn an_extend_method_declaring_its_own_raises_clause_is_a_diagnostic() {
+        let text = "variant Failure { Broken }\n\
+             protocol Operation[T] { func run(input: T) -> i64; }\n\
+             extend Operation[i64] { func run(input: i64) -> i64 raises Failure { return 0 } }\n\
+             func main() -> i64 { return 0 }";
+        let (hir, diags) = lower(text);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0031");
+        // Diagnosed, never resolved into raised-effect metadata -- the
+        // method still lowers, but with no raises at all, not a partial
+        // or fake one.
+        assert!(hir.extends[0].methods[0].raises.is_empty());
+        // The primary span must point at the raised-type list itself
+        // (`Failure`, in `raises Failure`), never the whole extend
+        // method -- narrower than the method's own span, and exactly
+        // covering the one raised name here.
+        let raises_clause = "raises Failure";
+        let clause_start = text.find(raises_clause).unwrap() as u32;
+        let expected_start = clause_start + "raises ".len() as u32;
+        let expected_end = expected_start + "Failure".len() as u32;
+        assert_eq!(
+            diags[0].primary_span,
+            Span::new(expected_start, expected_end),
+            "R0031 must point at the raised-type list, not the whole method"
+        );
+    }
+
+    #[test]
+    fn an_extend_method_raises_clause_span_covers_every_entry_not_just_the_first() {
+        let text = "variant Failure { Broken }\n\
+             variant Other { Broken }\n\
+             protocol Operation[T] { func run(input: T) -> i64; }\n\
+             extend Operation[i64] { func run(input: i64) -> i64 raises Failure, Other { return 0 } }\n\
+             func main() -> i64 { return 0 }";
+        let (_, diags) = lower(text);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0031");
+        let raises_clause = "raises Failure, Other";
+        let clause_start = text.find(raises_clause).unwrap() as u32;
+        let expected_start = clause_start + "raises ".len() as u32;
+        let expected_end = expected_start + "Failure, Other".len() as u32;
+        assert_eq!(
+            diags[0].primary_span,
+            Span::new(expected_start, expected_end),
+            "R0031's span must span from the first raised entry through the last"
+        );
+    }
+
+    #[test]
+    fn an_aliased_import_of_a_non_generic_error_in_raises_remains_valid() {
+        // `import errors.Failure as MyFailure;` -- the alias is a purely
+        // local spelling (`rfcs/0007`); resolution and genericity must
+        // both go by the imported item's own identity, never the alias.
+        let (hir, diags) =
+            lower_with_imports("func f() raises MyFailure { }", |interner, other_source| {
+                let declared_name = interner.intern("Failure");
+                let alias_name = interner.intern("MyFailure");
+                let value_name = interner.intern("Value");
+                vec![ImportedItem {
+                    local_name: alias_name,
+                    kind: ImportedItemKind::Variant {
+                        item: ItemId(0),
+                        declared_name,
+                        cases: vec![(value_name, 0)],
+                        type_param_count: 0,
+                    },
+                    import_span: Span::dummy(),
+                    local_name_span: Span::dummy(),
+                    declared_source: other_source,
+                    declared_span: Span::dummy(),
+                }]
+            });
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+        assert_eq!(hir.functions[0].raises[0].variant, ItemId(0));
+    }
+
+    #[test]
+    fn two_aliases_of_the_same_imported_error_in_one_raises_clause_is_a_duplicate() {
+        // `import errors.Failure; import errors.Failure as MyFailure;`
+        // -- two distinct local names, but the same underlying `ItemId`
+        // (`rfcs/0007`): naming both in one `raises` clause is exactly
+        // as duplicate as writing the same name twice.
+        let (hir, diags) = lower_with_imports(
+            "func f() raises Failure, MyFailure { }",
+            |interner, other_source| {
+                let declared_name = interner.intern("Failure");
+                let alias_name = interner.intern("MyFailure");
+                let value_name = interner.intern("Value");
+                vec![
+                    ImportedItem {
+                        local_name: declared_name,
+                        kind: ImportedItemKind::Variant {
+                            item: ItemId(0),
+                            declared_name,
+                            cases: vec![(value_name, 0)],
+                            type_param_count: 0,
+                        },
+                        import_span: Span::dummy(),
+                        local_name_span: Span::dummy(),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                    ImportedItem {
+                        local_name: alias_name,
+                        kind: ImportedItemKind::Variant {
+                            item: ItemId(0),
+                            declared_name,
+                            cases: vec![(value_name, 0)],
+                            type_param_count: 0,
+                        },
+                        import_span: Span::dummy(),
+                        local_name_span: Span::dummy(),
+                        declared_source: other_source,
+                        declared_span: Span::dummy(),
+                    },
+                ]
+            },
+        );
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0029");
+        assert_eq!(hir.functions[0].raises.len(), 1);
+    }
+
+    #[test]
+    fn a_public_function_raising_a_private_variant_leaks_it() {
+        let (_, diags) = lower("variant Secret { X }\npublic func f() raises Secret { }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "M0012");
     }
 
     #[test]
@@ -2562,6 +3112,7 @@ mod tests {
             protocol_methods: HashMap::new(),
             record_fields: HashMap::new(),
             variant_cases: HashMap::new(),
+            variant_type_param_count: HashMap::new(),
             case_lookup: HashMap::new(),
             imported_record_field_public: HashMap::new(),
             next_item_id: 0,
@@ -2600,6 +3151,65 @@ mod tests {
             lowering.diagnostics
         );
         assert_eq!(lowering.diagnostics[0].code, "R0015");
+    }
+
+    #[test]
+    fn a_raises_entry_resolving_to_a_variant_with_no_recorded_type_param_count_is_a_diagnostic_not_a_panic()
+     {
+        // `resolve_raises` reads a variant's own type-parameter count
+        // back from `variant_type_param_count` to reject a generic
+        // error variant -- every real variant (local or imported) is
+        // always registered there before any function is lowered, so
+        // this only tests the defense-in-depth path: `type_names`
+        // naming a variant `variant_type_param_count` was never told
+        // about, the only way a direct caller lowering hand-built
+        // `Lowering` state could reach it at all.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let variant_sym = interner.intern("Shape");
+        let variant_item = ItemId(0);
+        let mut type_names = HashMap::new();
+        type_names.insert(
+            variant_sym,
+            (variant_item, TypeNameKind::Variant, variant_sym),
+        );
+        let mut lowering = Lowering {
+            source,
+            interner: &interner,
+            diagnostics: Vec::new(),
+            functions_by_name: HashMap::new(),
+            type_names,
+            protocol_names: HashMap::new(),
+            protocol_methods: HashMap::new(),
+            record_fields: HashMap::new(),
+            variant_cases: HashMap::new(),
+            variant_type_param_count: HashMap::new(),
+            case_lookup: HashMap::new(),
+            imported_record_field_public: HashMap::new(),
+            next_item_id: 0,
+            next_local_id: 0,
+            next_expr_id: 0,
+            next_pattern_id: 0,
+            type_param_scope: HashMap::new(),
+            next_type_param_id: 0,
+        };
+        let raises = vec![ast::Ident {
+            symbol: variant_sym,
+            span: Span::dummy(),
+        }];
+        let resolved = lowering.resolve_raises(&raises);
+        assert!(
+            resolved.is_empty(),
+            "an entry with no recorded metadata must be dropped, not resolved"
+        );
+        assert_eq!(
+            lowering.diagnostics.len(),
+            1,
+            "unexpected diagnostics: {:?}",
+            lowering.diagnostics
+        );
+        assert_eq!(lowering.diagnostics[0].code, "R0032");
     }
 
     #[test]

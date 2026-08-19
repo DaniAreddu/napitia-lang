@@ -227,9 +227,15 @@ pub struct Block {
 pub enum Stmt {
     Binding(BindingStmt),
     Expr(Expr),
-    Defer { expr: Expr, span: Span },
+    Defer {
+        expr: Expr,
+        span: Span,
+    },
     /// `drop file;` (`rfcs/0011`): consumes a live resource immediately.
-    Drop { expr: Expr, span: Span },
+    Drop {
+        expr: Expr,
+        span: Span,
+    },
     While(WhileStmt),
     Loop(LoopStmt),
 }

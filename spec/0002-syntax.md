@@ -1,6 +1,7 @@
 # Spec 0002: Syntax
 
-- Status: Partially implemented (Alpha 0.1.3)
+- Status: Partially implemented (Alpha 0.1.3; extended for `resource`/
+  `take`/`drop`/`defer` in Alpha 0.1.7, `rfcs/0011`)
 
 The grammar below uses the provisional vocabulary accepted in
 `rfcs/0004-language-independence.md`. It replaces an earlier version of
@@ -26,6 +27,7 @@ Item = FunctionDecl
      | ProtocolDecl
      | ExtendDecl
      | ImportDecl
+     | ResourceDecl
      ;
 ```
 
@@ -134,6 +136,30 @@ constructors, pattern matching — see below and `spec/0003`).
 resolution (`uses`), and an explicit `Protocol[Args].method(...)` call
 expression — see "Protocol calls", below, and `spec/0003`/
 `spec/0006`/`rfcs/0009` for the full semantic model.
+
+### Resources (`rfcs/0011`, Alpha 0.1.7)
+
+```text
+ResourceDecl = [ "public" ] "resource" IDENT "{" [ FieldList ] "}" ;
+
+Param  = [ "take" ] IDENT ":" Type ;
+
+DropStmt  = "drop" Expression ";" ;
+DeferStmt = "defer" Expression ";" ;
+```
+
+`ResourceDecl` reuses `Field`/`FieldList` unchanged: a resource's own
+construction (`File { descriptor: 3 }`) is the exact same
+`RecordLiteral` production a `record` construction already uses.
+Deliberately has no type-parameter list at all: generic resources are
+out of scope this milestone. `Param`'s optional leading `take` (this
+replaces the single-line `Param` rule above wherever it appears in this
+grammar) marks an ownership-transferring parameter; a parameter without
+it is an ordinary, call-scoped observation. `DropStmt`/`DeferStmt` are
+ordinary statements inside a block (`defer` was already reserved and
+parsed as of Alpha 0.1.1's own lexical grammar, but rejected as
+unsupported until Alpha 0.1.7 made it real). See `rfcs/0011` for the
+full ownership/state-machine semantics these forms carry.
 
 A named `record`/`variant` type is nominal (two declarations are
 distinct types even with identical fields, compared by declaration

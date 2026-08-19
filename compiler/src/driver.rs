@@ -70,6 +70,13 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
     diagnostics.extend(resolve_diags);
     let typeck_result = typeck::check_module(&hir, source, interner, typeck::EntryMain::ByName);
     diagnostics.extend(typeck_result.diagnostics);
+    let resourceck_diags = crate::resourceck::check_module(
+        &hir,
+        &typeck_result.local_types,
+        &typeck_result.expr_types,
+        interner,
+    );
+    diagnostics.extend(resourceck_diags);
     CheckOutput {
         hir,
         local_types: typeck_result.local_types,

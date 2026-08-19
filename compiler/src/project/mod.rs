@@ -242,6 +242,16 @@ pub fn compile_project(
         return Err(typeck_result.diagnostics);
     }
 
+    let resourceck_diagnostics = crate::resourceck::check_module(
+        &merged,
+        &typeck_result.local_types,
+        &typeck_result.expr_types,
+        interner,
+    );
+    if !resourceck_diagnostics.is_empty() {
+        return Err(resourceck_diagnostics);
+    }
+
     let nir_module = nir::lower_module_with_paths(
         &merged,
         &typeck_result.local_types,

@@ -1121,14 +1121,14 @@ impl<'a> Lowering<'a> {
                 self.lower_expr(fb, e)?;
                 Ok(())
             }
-            // typeck rejects a non-empty `defer` outright (T0007) before
-            // lowering ever runs in the normal pipeline. A direct caller
-            // that bypasses that gate must not have it silently
-            // dropped (which would run the enclosing block as though
-            // the `defer` had never been written at all) -- this
-            // milestone's interpreter has nowhere correct to run
-            // deferred cleanup (spec/0004), so it is rejected here too.
+            // Real `defer`/`drop` lowering (`rfcs/0011`) lands in a
+            // later commit of this same milestone, alongside the
+            // cleanup-planning/resourceck machinery it depends on; until
+            // then this is a placeholder rejection, exactly like every
+            // other not-yet-lowered construct in this match, never a
+            // silent no-op.
             HirStmt::Defer { span, .. } => Err(self.unsupported(*span, "`defer`")),
+            HirStmt::Drop { span, .. } => Err(self.unsupported(*span, "`drop`")),
             HirStmt::While {
                 condition, body, ..
             } => self.lower_while(fb, condition, body),
@@ -4102,6 +4102,7 @@ mod tests {
             public: true,
             type_params: Vec::new(),
             fields: vec![],
+            affine: false,
         }
     }
 
@@ -5910,6 +5911,7 @@ mod tests {
                 name: variant_sym,
                 span: Span::dummy(),
                 ty: variant_ty_name,
+                take: false,
             }],
             return_type: Some(i64_name),
             uses: vec![],

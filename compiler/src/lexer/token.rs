@@ -81,6 +81,9 @@ pub enum TokenKind {
     Await,
     Region,
     Defer,
+    Resource,
+    Take,
+    Drop,
 
     // Operators and punctuation.
     Plus,
@@ -184,6 +187,9 @@ pub fn keyword_kind(text: &str) -> Option<TokenKind> {
         "await" => TokenKind::Await,
         "region" => TokenKind::Region,
         "defer" => TokenKind::Defer,
+        "resource" => TokenKind::Resource,
+        "take" => TokenKind::Take,
+        "drop" => TokenKind::Drop,
         _ => return None,
     })
 }
@@ -199,7 +205,7 @@ mod tests {
             "loop", "break", "continue", "true", "false", "record", "variant", "match", "protocol",
             "extend", "with", "import", "module", "public", "private", "uses", "raises", "raise",
             "handle", "success", "failure", "as", "is", "unsafe", "async", "await", "region",
-            "defer",
+            "defer", "resource", "take", "drop",
         ];
         for kw in keywords {
             assert!(keyword_kind(kw).is_some(), "{kw} should be a keyword");

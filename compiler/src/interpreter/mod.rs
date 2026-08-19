@@ -202,6 +202,17 @@ impl<'a> Interpreter<'a> {
                         let v = get(&values, value)?;
                         values.insert(*slot, v);
                     }
+                    crate::nir::Instruction::Drop { value } => {
+                        // Destroys the resource value exactly once
+                        // (`rfcs/0011`): removed from this function's own
+                        // value map, so any use afterward -- which
+                        // `nir::verify`'s own V0075 already rejects at
+                        // compile time -- would independently fail here
+                        // too, through `get`'s own existing structured
+                        // error, rather than silently reading stale data
+                        // or panicking.
+                        values.remove(value);
+                    }
                 }
             }
 

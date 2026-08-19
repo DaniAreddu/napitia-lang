@@ -380,6 +380,7 @@ fn format_instruction(
             )
         }
         Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
+        Instruction::Drop { value } => format!("drop %{}", value.0),
     }
 }
 

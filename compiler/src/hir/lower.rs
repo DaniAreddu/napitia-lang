@@ -401,6 +401,7 @@ impl<'a> Lowering<'a> {
 
         let mut function_decls: Vec<(ItemId, &ast::FunctionDecl)> = Vec::new();
         let mut record_decls: Vec<(ItemId, &ast::RecordDecl)> = Vec::new();
+        let mut resource_decls: Vec<(ItemId, &ast::ResourceDecl)> = Vec::new();
         let mut variant_decls: Vec<(ItemId, &ast::VariantDecl)> = Vec::new();
         let mut protocol_decls: Vec<(ItemId, &ast::ProtocolDecl)> = Vec::new();
         let mut extend_decls: Vec<(ItemId, &ast::ExtendDecl)> = Vec::new();
@@ -455,6 +456,13 @@ impl<'a> Lowering<'a> {
                         .expect("a path has at least one segment");
                     other_items.push(other_item(id, name, i.span, OtherItemKind::Import));
                 }
+                ast::Item::Resource(r) => {
+                    let id = self.fresh_item();
+                    self.check_duplicate(&mut names, r.name, id);
+                    self.type_names
+                        .insert(r.name.symbol, (id, TypeNameKind::Record, r.name.symbol));
+                    resource_decls.push((id, r));
+                }
             }
         }
 
@@ -469,6 +477,7 @@ impl<'a> Lowering<'a> {
             .iter()
             .map(|(_, r)| (r.name.symbol, r.public))
             .chain(variant_decls.iter().map(|(_, v)| (v.name.symbol, v.public)))
+            .chain(resource_decls.iter().map(|(_, r)| (r.name.symbol, r.public)))
             .collect();
         for (_, f) in &function_decls {
             if !f.public {
@@ -508,11 +517,26 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        for (_, r) in &resource_decls {
+            if !r.public {
+                continue;
+            }
+            for field in &r.fields {
+                if field.public {
+                    self.check_public_api_leak(&field.ty, &local_public);
+                }
+            }
+        }
 
-        let records: Vec<HirRecord> = record_decls
+        let mut records: Vec<HirRecord> = record_decls
             .into_iter()
             .map(|(id, r)| self.lower_record(id, r))
             .collect();
+        records.extend(
+            resource_decls
+                .into_iter()
+                .map(|(id, r)| self.lower_resource(id, r)),
+        );
         let variants: Vec<HirVariant> = variant_decls
             .into_iter()
             .map(|(id, v)| self.lower_variant(id, v))
@@ -620,9 +644,48 @@ impl<'a> Lowering<'a> {
 
     fn lower_record(&mut self, id: ItemId, r: &ast::RecordDecl) -> HirRecord {
         let type_params = self.lower_type_params(&r.type_params);
+        let fields = self.lower_aggregate_fields(id, &r.fields);
+        self.clear_type_param_scope();
+        HirRecord {
+            id,
+            name: r.name.symbol,
+            type_params,
+            span: r.span,
+            source: self.source,
+            public: r.public,
+            fields,
+            affine: false,
+        }
+    }
+
+    /// `resource File { descriptor: i64 }` (`rfcs/0011`) -- shares
+    /// `lower_record`'s own field-lowering entirely (a resource's shape
+    /// is exactly a record's), differing only in `affine: true` and the
+    /// complete absence of a type-parameter list (generic resources are
+    /// out of scope this milestone, so there is no `lower_type_params`
+    /// call to make here at all).
+    fn lower_resource(&mut self, id: ItemId, r: &ast::ResourceDecl) -> HirRecord {
+        let fields = self.lower_aggregate_fields(id, &r.fields);
+        HirRecord {
+            id,
+            name: r.name.symbol,
+            type_params: Vec::new(),
+            span: r.span,
+            source: self.source,
+            public: r.public,
+            fields,
+            affine: true,
+        }
+    }
+
+    /// Shared by [`Self::lower_record`] and [`Self::lower_resource`]:
+    /// resolves every field's type, rejecting a same-named duplicate,
+    /// and records `id`'s own name -> declaration-index table
+    /// (`self.record_fields`) for later field-access resolution.
+    fn lower_aggregate_fields(&mut self, id: ItemId, fields: &[ast::Field]) -> Vec<HirField> {
         let mut seen: HashMap<Symbol, usize> = HashMap::new();
-        let mut fields = Vec::new();
-        for field in &r.fields {
+        let mut resolved = Vec::new();
+        for field in fields {
             if let Some(&first_index) = seen.get(&field.name.symbol) {
                 let text = self.interner.resolve(field.name.symbol);
                 self.diagnostics.push(
@@ -633,13 +696,13 @@ impl<'a> Lowering<'a> {
                         format!("field `{text}` is declared more than once"),
                     )
                     .with_primary_label("duplicate field")
-                    .with_label(r.fields[first_index].name.span, "first declared here"),
+                    .with_label(fields[first_index].name.span, "first declared here"),
                 );
                 continue;
             }
-            seen.insert(field.name.symbol, fields.len());
+            seen.insert(field.name.symbol, resolved.len());
             let ty = self.resolve_type_ref(&field.ty);
-            fields.push(HirField {
+            resolved.push(HirField {
                 name: field.name.symbol,
                 span: field.span,
                 public: field.public,
@@ -647,16 +710,7 @@ impl<'a> Lowering<'a> {
             });
         }
         self.record_fields.insert(id, seen);
-        self.clear_type_param_scope();
-        HirRecord {
-            id,
-            name: r.name.symbol,
-            type_params,
-            span: r.span,
-            source: self.source,
-            public: r.public,
-            fields,
-        }
+        resolved
     }
 
     fn lower_variant(&mut self, id: ItemId, v: &ast::VariantDecl) -> HirVariant {
@@ -1112,6 +1166,7 @@ impl<'a> Lowering<'a> {
                     name: p.name.symbol,
                     span: p.span,
                     ty,
+                    take: p.take,
                 }
             })
             .collect()
@@ -1428,6 +1483,10 @@ impl<'a> Lowering<'a> {
             }
             ast::Stmt::Expr(e) => HirStmt::Expr(self.lower_expr(e, scopes)),
             ast::Stmt::Defer { expr, span } => HirStmt::Defer {
+                expr: self.lower_expr(expr, scopes),
+                span: *span,
+            },
+            ast::Stmt::Drop { expr, span } => HirStmt::Drop {
                 expr: self.lower_expr(expr, scopes),
                 span: *span,
             },

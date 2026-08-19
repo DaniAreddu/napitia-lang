@@ -711,7 +711,7 @@ enum StmtOrTail {
 #[cfg(test)]
 mod tests {
     use super::super::tests::parse;
-    use crate::syntax::ast::Item;
+    use crate::syntax::ast::{Item, Stmt};
 
     #[test]
     fn parses_function_with_params_and_return_type() {
@@ -796,6 +796,89 @@ mod tests {
             panic!("expected record")
         };
         assert_eq!(r.fields.len(), 1, "expected only `y` to survive recovery");
+    }
+
+    #[test]
+    fn parses_resource_declaration() {
+        let (module, diags) = parse("resource File { descriptor: i64 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Resource(r) = &module.items[0] else {
+            panic!("expected resource")
+        };
+        assert_eq!(r.fields.len(), 1);
+        assert!(!r.public);
+    }
+
+    #[test]
+    fn parses_public_resource_with_a_public_field() {
+        let (module, diags) = parse("public resource File { public descriptor: i64 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Resource(r) = &module.items[0] else {
+            panic!("expected resource")
+        };
+        assert!(r.public);
+        assert!(r.fields[0].public);
+    }
+
+    #[test]
+    fn malformed_resource_field_recovers_and_still_parses_the_rest() {
+        let (module, diags) = parse("resource File { x, descriptor: i64 }");
+        assert!(!diags.is_empty());
+        let Item::Resource(r) = &module.items[0] else {
+            panic!("expected resource")
+        };
+        assert_eq!(
+            r.fields.len(),
+            1,
+            "expected only `descriptor` to survive recovery"
+        );
+    }
+
+    #[test]
+    fn a_resource_declaration_never_parses_a_type_parameter_list() {
+        // Generic resources are out of scope this milestone
+        // (`rfcs/0011`) -- the grammar simply never looks for `[...]`
+        // after a resource's own name, so `resource Box[T] { .. }`
+        // fails to parse (a diagnostic, never a panic or a silently
+        // accepted generic resource).
+        let (_, diags) = parse("resource Box[T] { value: T }");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn parses_take_parameter() {
+        let (module, diags) = parse("func consume(take file: File) -> unit { }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert!(f.params[0].take);
+    }
+
+    #[test]
+    fn an_ordinary_parameter_is_not_take() {
+        let (module, diags) = parse("func inspect(file: File) -> i64 { return 0 }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert!(!f.params[0].take);
+    }
+
+    #[test]
+    fn parses_drop_statement() {
+        let (module, diags) = parse("func f() { drop file; }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert!(matches!(f.body.statements[0], Stmt::Drop { .. }));
+    }
+
+    #[test]
+    fn a_drop_statement_missing_its_expression_is_a_diagnostic_not_a_hang() {
+        let (_, diags) = parse("func f() { drop ; }");
+        assert!(!diags.is_empty());
     }
 
     #[test]

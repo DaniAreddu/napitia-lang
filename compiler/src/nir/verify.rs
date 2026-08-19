@@ -306,6 +306,14 @@ mod codes {
     /// must agree" model, applied to Invoke's own conditional writes
     /// instead of a `Switch`'s own case refinement.
     pub const INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0073";
+    /// `Instruction::Drop`'s own operand is not a resource-typed value
+    /// (`rfcs/0011`) -- only a declared `resource` may ever be dropped.
+    pub const DROP_OF_NON_RESOURCE_VALUE: &str = "V0074";
+    /// The same value is definitely already `Drop`ped on every path
+    /// reaching a second `Drop` of it (`rfcs/0011`) -- a full forward
+    /// must-dataflow analysis, the same shape as
+    /// `INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED`'s own.
+    pub const DOUBLE_DROP: &str = "V0075";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1123,6 +1131,23 @@ fn verify_function(
                         ));
                     }
                 }
+                Instruction::Drop { value } => {
+                    require_value(*value, diagnostics);
+                    let is_resource = value_types
+                        .get(value)
+                        .is_some_and(|ty| matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)));
+                    if !is_resource {
+                        diagnostics.push(Diagnostic::error(
+                            codes::DROP_OF_NON_RESOURCE_VALUE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}` drops %{}, which is not a resource value",
+                                value.0
+                            ),
+                        ));
+                    }
+                }
             }
         }
 
@@ -1550,6 +1575,7 @@ fn verify_function(
 
     verify_payload_refinement(function, agg, source, &name, diagnostics);
     verify_invoke_slot_initialization(function, source, &name, diagnostics);
+    verify_drop_state(function, source, &name, diagnostics);
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -1642,6 +1668,9 @@ fn verify_dominance(
                 }
                 Instruction::Store { slot, value } => {
                     check_use(*slot, block.id, idx, diagnostics);
+                    check_use(*value, block.id, idx, diagnostics);
+                }
+                Instruction::Drop { value } => {
                     check_use(*value, block.id, idx, diagnostics);
                 }
             }
@@ -3596,6 +3625,200 @@ fn invoke_slot_in_facts(
 /// initialize a `Load` later in it (the ordinary local transfer
 /// function already accounts for this), but nothing crosses into it
 /// from anywhere else.
+/// Proves no value is ever the operand of two `Instruction::Drop`s on
+/// any single reachable path (`rfcs/0011`) -- the same shape of forward
+/// must-dataflow analysis as
+/// [`verify_invoke_slot_initialization`] (reachability computed the
+/// same way, the same fixed entry boundary, the same worklist over
+/// reachable non-entry blocks only, joins intersecting reachable
+/// predecessors only), simplified by having no edge-specific gen at
+/// all: unlike an `Invoke`'s own edges, which each unconditionally
+/// write a *specific* slot, a `Drop` only ever "generates" its own
+/// already-dropped fact from within the block that contains it, so
+/// every CFG edge here carries the same, unconditional meaning ordinary
+/// (non-`Invoke`) edges already do in that analysis.
+fn verify_drop_state(
+    function: &Function,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut dropped_values: HashSet<ValueId> = HashSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Drop { value } = instruction {
+                dropped_values.insert(*value);
+            }
+        }
+    }
+    if dropped_values.is_empty() {
+        return;
+    }
+
+    let entry = BlockId(0);
+    if !function.blocks.iter().any(|b| b.id == entry) {
+        return;
+    }
+
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        match &block.terminator {
+            Terminator::Branch(target) => successors.entry(block.id).or_default().push(*target),
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => successors
+                .entry(block.id)
+                .or_default()
+                .extend([*then_block, *else_block]),
+            Terminator::Switch { cases, .. } => {
+                successors.entry(block.id).or_default().extend(cases)
+            }
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                successors.entry(block.id).or_default().push(*ok_target);
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend(err_targets.iter().map(|t| t.target));
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+    }
+    let mut incoming: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for (&from, tos) in &successors {
+        for &to in tos {
+            incoming.entry(to).or_default().push(from);
+        }
+    }
+
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    fn transfer(
+        block: &BasicBlock,
+        dropped_values: &HashSet<ValueId>,
+        in_facts: &HashSet<ValueId>,
+    ) -> (HashSet<ValueId>, Vec<ValueId>) {
+        let mut facts = in_facts.clone();
+        let mut violations = Vec::new();
+        for instruction in &block.instructions {
+            if let Instruction::Drop { value } = instruction
+                && dropped_values.contains(value)
+            {
+                if facts.contains(value) {
+                    violations.push(*value);
+                } else {
+                    facts.insert(*value);
+                }
+            }
+        }
+        (facts, violations)
+    }
+
+    fn in_facts_for(
+        block_id: BlockId,
+        entry: BlockId,
+        incoming: &HashMap<BlockId, Vec<BlockId>>,
+        reachable: &HashSet<BlockId>,
+        out: &HashMap<BlockId, HashSet<ValueId>>,
+    ) -> HashSet<ValueId> {
+        if block_id == entry {
+            return HashSet::new();
+        }
+        let Some(preds) = incoming.get(&block_id) else {
+            return HashSet::new();
+        };
+        let mut preds = preds.iter().filter(|p| reachable.contains(p));
+        let Some(first) = preds.next() else {
+            return HashSet::new();
+        };
+        let mut acc = out.get(first).cloned().unwrap_or_default();
+        for pred in preds {
+            let other = out.get(pred).cloned().unwrap_or_default();
+            acc.retain(|f| other.contains(f));
+        }
+        acc
+    }
+
+    let entry_block = function
+        .blocks
+        .iter()
+        .find(|b| b.id == entry)
+        .expect("presence already checked above");
+    let (entry_out, _) = transfer(entry_block, &dropped_values, &HashSet::new());
+
+    let mut out: HashMap<BlockId, HashSet<ValueId>> = function
+        .blocks
+        .iter()
+        .map(|b| {
+            let initial = if b.id == entry {
+                entry_out.clone()
+            } else if reachable.contains(&b.id) {
+                dropped_values.clone()
+            } else {
+                HashSet::new()
+            };
+            (b.id, initial)
+        })
+        .collect();
+
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let in_facts = in_facts_for(id, entry, &incoming, &reachable, &out);
+        let (new_out, _) = transfer(block, &dropped_values, &in_facts);
+        if out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    for block in &function.blocks {
+        let in_facts = if reachable.contains(&block.id) {
+            in_facts_for(block.id, entry, &incoming, &reachable, &out)
+        } else {
+            HashSet::new()
+        };
+        let (_, violations) = transfer(block, &dropped_values, &in_facts);
+        for value in violations {
+            diagnostics.push(Diagnostic::error(
+                codes::DOUBLE_DROP,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` drops %{} in bb{}, which was already dropped on every path reaching it",
+                    value.0, block.id.0
+                ),
+            ));
+        }
+    }
+}
+
 fn verify_invoke_slot_initialization(
     function: &Function,
     source: SourceId,
@@ -4258,6 +4481,7 @@ mod tests {
                 name: point,
                 type_params: Vec::new(),
                 fields: vec![(x, Ty::I64)],
+                affine: false,
             },
             point,
         )
@@ -5264,6 +5488,7 @@ mod tests {
             name: point,
             type_params: vec![(TypeParamId(0), t), (TypeParamId(0), t)],
             fields: vec![],
+            affine: false,
         };
         let function = valid_function(ItemId(0), name);
         let diagnostics =
@@ -5310,6 +5535,7 @@ mod tests {
             name: boxed,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![],
+            affine: false,
         };
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Applied(record, vec![Ty::Var(crate::types::TyVar(0))]);
@@ -5332,6 +5558,7 @@ mod tests {
             name: boxed,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![],
+            affine: false,
         };
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Applied(record, vec![Ty::Error]);
@@ -5363,11 +5590,13 @@ mod tests {
             name: outer_name,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![],
+            affine: false,
         };
         let pair_layout = RecordLayout {
             name: pair_name,
             type_params: vec![(TypeParamId(1), a), (TypeParamId(2), b)],
             fields: vec![],
+            affine: false,
         };
         let mut function = valid_function(ItemId(0), name);
         function.return_type = Ty::Applied(outer, vec![Ty::Applied(pair, vec![Ty::I64])]);
@@ -5496,6 +5725,7 @@ mod tests {
             name: marker,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![(interner.intern("tag"), Ty::I64)],
+            affine: false,
         };
         let mut function = valid_function(ItemId(0), name);
         function.blocks[0].instructions[0] = Instruction::Value {
@@ -5538,6 +5768,7 @@ mod tests {
             name: boxed,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![],
+            affine: false,
         };
         let depth = crate::limits::MAX_GENERIC_DEPTH + 200;
         let mut ty = Ty::I64;
@@ -5582,6 +5813,7 @@ mod tests {
                 name: boxed,
                 type_params: vec![(TypeParamId(0), t)],
                 fields: vec![],
+                affine: false,
             },
         )
     }
@@ -5869,6 +6101,7 @@ mod tests {
             name: pair_name,
             type_params: vec![(TypeParamId(1), a), (TypeParamId(2), b)],
             fields: vec![],
+            affine: false,
         };
         let caller = caller_calling_g_with_type_arg(f_name, Ty::Applied(pair, vec![Ty::I64]));
         let module = Module {
@@ -5901,6 +6134,7 @@ mod tests {
             name: boxed,
             type_params: vec![(TypeParamId(1), box_t)],
             fields: vec![],
+            affine: false,
         };
         let depth = crate::limits::MAX_GENERIC_DEPTH + 50;
         let mut deep_ty = Ty::I64;
@@ -5965,6 +6199,7 @@ mod tests {
             name: boxed,
             type_params: vec![(TypeParamId(0), t)],
             fields: vec![(interner.intern("value"), Ty::Param(TypeParamId(0), t))],
+            affine: false,
         };
         let mut function = valid_function(ItemId(0), name);
         function.blocks[0].instructions[0] = Instruction::Value {

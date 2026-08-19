@@ -14,6 +14,7 @@ pub(super) fn is_item_start(kind: &TokenKind) -> bool {
             | TokenKind::Extend
             | TokenKind::Import
             | TokenKind::Public
+            | TokenKind::Resource
     )
 }
 
@@ -27,6 +28,7 @@ pub(super) fn is_stmt_start(kind: &TokenKind) -> bool {
             TokenKind::Value
                 | TokenKind::Mutable
                 | TokenKind::Defer
+                | TokenKind::Drop
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::Loop

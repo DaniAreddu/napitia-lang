@@ -5,7 +5,8 @@ use crate::lexer::TokenKind;
 use crate::source::Span;
 use crate::syntax::ast::{
     Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
-    Path, ProtocolDecl, ProtocolMember, RecordDecl, Stmt, Type, UsesClause, VariantDecl, WhileStmt,
+    Path, ProtocolDecl, ProtocolMember, RecordDecl, ResourceDecl, Stmt, Type, UsesClause,
+    VariantDecl, WhileStmt,
 };
 
 /// Whether `expr`'s surface syntax already ends in a `}` (`if`/`match`/
@@ -39,8 +40,11 @@ impl<'a> Parser<'a> {
             TokenKind::Protocol => self.parse_protocol(public).map(Item::Protocol),
             TokenKind::Extend => self.parse_extend().map(Item::Extend),
             TokenKind::Import => self.parse_import().map(Item::Import),
+            TokenKind::Resource => self.parse_resource(public).map(Item::Resource),
             _ => {
-                self.error_expected("an item (func, record, variant, protocol, extend, or import)");
+                self.error_expected(
+                    "an item (func, record, variant, protocol, extend, resource, or import)",
+                );
                 None
             }
         }
@@ -210,11 +214,21 @@ impl<'a> Parser<'a> {
             return Some(params);
         }
         loop {
+            let take_span = self.check(&TokenKind::Take).then(|| self.current_span());
+            let take = take_span.is_some();
+            if take {
+                self.advance();
+            }
             let name = self.expect_ident("a parameter name")?;
             self.expect(&TokenKind::Colon, "`:`")?;
             let ty = self.parse_type()?;
-            let span = name.span.join(ty.span());
-            params.push(Param { name, ty, span });
+            let span = take_span.unwrap_or(name.span).join(ty.span());
+            params.push(Param {
+                name,
+                ty,
+                take,
+                span,
+            });
             if self.eat(&TokenKind::Comma) {
                 if self.check(&TokenKind::RParen) {
                     break;
@@ -336,6 +350,50 @@ impl<'a> Parser<'a> {
             public,
             name,
             type_params,
+            fields,
+            span: start.join(end),
+        })
+    }
+
+    /// `resource File { descriptor: i64 }` (`rfcs/0011`). Deliberately
+    /// has no type-parameter list: generic resources are out of scope
+    /// this milestone, so unlike `parse_record`/`parse_variant` there is
+    /// no `[T, U]` production to even attempt here.
+    fn parse_resource(&mut self, public: bool) -> Option<ResourceDecl> {
+        let start = self.current_span();
+        self.advance(); // 'resource'
+        let name = self.expect_ident("a resource name")?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.at_eof() {
+            let field_public = self.parse_visibility();
+            let Some(fname) = self.expect_ident("a field name") else {
+                recovery::synchronize_to_list_item(self);
+                continue;
+            };
+            self.expect(&TokenKind::Colon, "`:`");
+            let Some(ty) = self.parse_type() else {
+                recovery::synchronize_to_list_item(self);
+                continue;
+            };
+            let fspan = fname.span.join(ty.span());
+            fields.push(Field {
+                public: field_public,
+                name: fname,
+                ty,
+                span: fspan,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RBrace, "`}`")
+            .map(|t| t.span)
+            .unwrap_or(self.current_span());
+        Some(ResourceDecl {
+            public,
+            name,
             fields,
             span: start.join(end),
         })
@@ -538,6 +596,7 @@ impl<'a> Parser<'a> {
         match self.current() {
             TokenKind::Value | TokenKind::Mutable => StmtOrTail::Stmt(self.parse_binding_stmt()),
             TokenKind::Defer => StmtOrTail::Stmt(self.parse_defer_stmt()),
+            TokenKind::Drop => StmtOrTail::Stmt(self.parse_drop_stmt()),
             TokenKind::While => StmtOrTail::Stmt(Stmt::While(self.parse_while_stmt())),
             TokenKind::Loop => StmtOrTail::Stmt(Stmt::Loop(self.parse_loop_stmt())),
             _ => {
@@ -597,6 +656,18 @@ impl<'a> Parser<'a> {
         let expr_span = expr.span();
         self.expect(&TokenKind::Semi, "`;`");
         Stmt::Defer {
+            expr,
+            span: start.join(expr_span),
+        }
+    }
+
+    fn parse_drop_stmt(&mut self) -> Stmt {
+        let start = self.current_span();
+        self.advance(); // 'drop'
+        let expr = self.parse_expression();
+        let expr_span = expr.span();
+        self.expect(&TokenKind::Semi, "`;`");
+        Stmt::Drop {
             expr,
             span: start.join(expr_span),
         }

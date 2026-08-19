@@ -3538,16 +3538,55 @@ fn invoke_slot_in_facts(
 /// Proves a `Terminator::Invoke`'s own conditionally-written slots
 /// (`ok_slot`, or one of its `err_targets`' own `slot`) are *definitely
 /// initialized* by the time any `Load` reads them -- a full forward
-/// must-dataflow analysis (the standard definite-assignment shape:
-/// facts only ever shrink via intersection at a join, an unconditional
-/// `Store` adds one, unreachable blocks assume none), not merely a
-/// single-hop check of a `Load`'s own immediate predecessors. Dominance
-/// (checked separately, `verify_dominance`) only proves a slot's own
-/// `alloc` precedes a use, never that the specific edge which actually
-/// writes it is the one that was taken to reach that use, and a
-/// single-hop check would also wrongly reject a slot correctly
-/// propagated across several ordinary (non-`Invoke`) blocks before its
-/// own `Load` -- exactly the gap a real dataflow closes.
+/// must-dataflow analysis, not merely a single-hop check of a `Load`'s
+/// own immediate predecessors. Dominance (checked separately,
+/// `verify_dominance`) only proves a slot's own `alloc` precedes a use,
+/// never that the specific edge which actually writes it is the one
+/// that was taken to reach that use, and a single-hop check would also
+/// wrongly reject a slot correctly propagated across several ordinary
+/// (non-`Invoke`) blocks before its own `Load` -- exactly the gap a
+/// real dataflow closes.
+///
+/// This computes a *greatest* fixed point: every reachable block except
+/// the entry starts optimistic (the complete guarded-slot set, i.e.
+/// "everything is already initialized"), and a block's own facts only
+/// ever shrink from there as real, restrictive predecessor information
+/// intersects in -- the analysis settles at the largest fact set that
+/// is still consistent with every edge in the CFG.
+///
+/// The entry block is not part of that iteration at all: its own IN is
+/// always the empty set, by definition, regardless of whatever
+/// `incoming_edges` a backedge into it might otherwise record, so its
+/// OUT is computed exactly once, up front, as a fixed boundary value
+/// the rest of the analysis is anchored to -- it is seeded into the
+/// fact map and never revisited. Treating the entry as just another
+/// block whose OUT starts at `{}` and gets updated later, alongside
+/// everything else, is what would make correctness depend on
+/// processing order: if the entry itself performs an unconditional
+/// `Store` to a guarded slot, its true OUT is *larger* than that
+/// placeholder `{}`, so any reachable block a still-unprocessed entry
+/// feeds into could transiently (and, without care, permanently)
+/// intersect down to less than it is actually owed, purely because it
+/// happened to be visited before the entry was. Computing the entry's
+/// boundary first removes that dependency entirely: every other
+/// reachable block's own OUT is then a true, monotonically
+/// non-increasing descent from the top of a finite lattice, which is
+/// what guarantees the worklist below converges to the same result no
+/// matter what order `function.blocks` stores them in.
+///
+/// A block unreachable from the entry is not part of the fixpoint
+/// either, and is never seeded with the optimistic "everything already
+/// initialized" start reachable blocks get -- there is no real
+/// predecessor that could ever refine such a block down from that
+/// starting point, so an optimistic start would simply never change,
+/// hiding a genuine violation inside dead code (including a cycle
+/// purely among unreachable blocks referencing only each other). Each
+/// unreachable block is instead checked independently, from an empty
+/// IN set, ignoring any incoming edge `incoming_edges` may have
+/// recorded for it -- a `Store` earlier in that same block can still
+/// initialize a `Load` later in it (the ordinary local transfer
+/// function already accounts for this), but nothing crosses into it
+/// from anywhere else.
 fn verify_invoke_slot_initialization(
     function: &Function,
     source: SourceId,
@@ -3680,42 +3719,57 @@ fn verify_invoke_slot_initialization(
         }
     }
 
-    // `OUT[b]` starts optimistic (the full guarded set) for every
-    // *reachable* block except the entry (nothing is initialized before
-    // the function even starts); an unreachable block starts at the
-    // bottom of its own lattice (nothing guaranteed) instead, since
-    // there is no real predecessor to ever refine it down from "everything"
-    // in the first place. A "must" analysis's facts only ever shrink via
-    // intersection as real predecessor information propagates in, so
-    // every block's own `OUT` forms a monotonically non-increasing chain
-    // in a lattice of finite height (bounded by `guarded_slots.len()`),
-    // which is what guarantees the worklist loop below terminates at a
-    // unique least fixpoint regardless of how many blocks or how the CFG
-    // is shaped.
+    // The entry's own boundary value: its IN is always empty, by
+    // definition, so its OUT is exactly its own local transfer applied
+    // to nothing -- computed once, here, before the fixpoint below ever
+    // starts, and never revisited by it.
+    let entry_block = function
+        .blocks
+        .iter()
+        .find(|b| b.id == entry)
+        .expect("presence already checked above");
+    let (entry_out, _) = invoke_slot_block_transfer(entry_block, &guarded_slots, &HashSet::new());
+
+    // `OUT[b]` starts optimistic (the complete guarded set) for every
+    // *reachable* block other than the entry; the entry itself is
+    // seeded directly at its own precomputed, fixed `entry_out`; an
+    // unreachable block starts at (and, since it is never touched by
+    // the worklist below, permanently stays at) the empty set.
     let mut out: HashMap<BlockId, HashSet<ValueId>> = function
         .blocks
         .iter()
         .map(|b| {
-            let initial = if b.id == entry || !reachable.contains(&b.id) {
-                HashSet::new()
-            } else {
+            let initial = if b.id == entry {
+                entry_out.clone()
+            } else if reachable.contains(&b.id) {
                 guarded_slots.clone()
+            } else {
+                HashSet::new()
             };
             (b.id, initial)
         })
         .collect();
 
-    // Standard worklist ("chaotic iteration") fixpoint: every block is
-    // processed at least once (seeded here, in declaration order, so a
-    // rerun of the exact same CFG always explores it in the same order);
-    // whenever a block's own `OUT` actually changes, only *its own*
-    // successors -- read directly from the CFG, never a fixed count --
-    // are re-enqueued, since only they could possibly be affected.
-    // Termination follows from monotonicity: each processed change
-    // strictly shrinks that block's `OUT`, and the sum of every block's
-    // `OUT` size is a natural number bounded below by zero, so it cannot
-    // decrease forever.
-    let mut worklist: VecDeque<BlockId> = function.blocks.iter().map(|b| b.id).collect();
+    // Standard worklist ("chaotic iteration") fixpoint over reachable
+    // non-entry blocks only -- the entry is a fixed boundary condition,
+    // never re-processed, so nothing can ever read a stale, not-yet-
+    // computed value for it regardless of `function.blocks`' own
+    // storage order. Every other reachable block is processed at least
+    // once (seeded here, in declaration order, so a rerun of the exact
+    // same CFG always explores it in the same order); whenever a
+    // block's own `OUT` actually changes, only *its own* reachable,
+    // non-entry successors -- read directly from the CFG, never a fixed
+    // count -- are re-enqueued, since only they could possibly be
+    // affected. Termination follows from monotonicity: each processed
+    // change strictly shrinks that block's `OUT` from the lattice's own
+    // top, and the sum of every block's `OUT` size is a natural number
+    // bounded below by zero, so it cannot decrease forever.
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
     let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
     while let Some(id) = worklist.pop_front() {
         queued.remove(&id);
@@ -3727,7 +3781,7 @@ fn verify_invoke_slot_initialization(
         if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
-                if queued.insert(succ) {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
                     worklist.push_back(succ);
                 }
             }
@@ -3736,8 +3790,16 @@ fn verify_invoke_slot_initialization(
 
     // One diagnostic per malformed `Load`, read off the now-stable
     // fixpoint -- never during an intermediate, not-yet-converged pass.
+    // A reachable block (entry included) reads its IN from the
+    // fixpoint's own `out` map; an unreachable block is always checked
+    // independently, from an empty IN, ignoring any (dead) incoming
+    // edge `incoming_edges` recorded for it.
     for block in &function.blocks {
-        let in_facts = invoke_slot_in_facts(block.id, entry, &incoming_edges, &out);
+        let in_facts = if reachable.contains(&block.id) {
+            invoke_slot_in_facts(block.id, entry, &incoming_edges, &out)
+        } else {
+            HashSet::new()
+        };
         let (_, violations) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
         for slot in violations {
             diagnostics.push(Diagnostic::error(
@@ -8597,5 +8659,216 @@ mod tests {
             codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
             "expected the unreachable cycle's own unstored load to be rejected: {diagnostics:?}"
         );
+    }
+
+    /// Builds the caller for the entry-boundary tests below. `%0` is
+    /// allocated in the entry block, which then `CondBranch`es to a
+    /// self-looping block (bb1, which exits to bb2 and loads `%0`) or to
+    /// bb5, a separate, always-structurally-reachable block whose own
+    /// `Invoke` uses `%0` as its own `ok_slot` -- which is what makes
+    /// `%0` a guarded slot at all, entirely independent of bb1's own
+    /// loop, which never goes through that `Invoke`'s own edges at all.
+    /// When `entry_stores` is true, the entry also unconditionally
+    /// `Store`s `%0` itself before branching anywhere, which must make
+    /// bb2's load valid on *every* path (including straight through
+    /// bb1's loop, which bb5's `Invoke` edges never reach). When false,
+    /// the only initialization of `%0` is bb5's own `Invoke` edge into
+    /// bb6, which bb1's loop never passes through, so bb2's load must be
+    /// rejected.
+    fn entry_boundary_caller(
+        f_name: Symbol,
+        shape_id: ItemId,
+        shape_name: Symbol,
+        entry_stores: bool,
+    ) -> Function {
+        let mut entry_instructions = vec![Instruction::Value {
+            result: ValueId(0),
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }];
+        if entry_stores {
+            entry_instructions.push(Instruction::Value {
+                result: ValueId(8),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            });
+            entry_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(8),
+            });
+        }
+        entry_instructions.push(Instruction::Value {
+            result: ValueId(9),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        });
+        let entry = BasicBlock {
+            id: BlockId(0),
+            instructions: entry_instructions,
+            terminator: Terminator::CondBranch {
+                condition: ValueId(9),
+                then_block: BlockId(1),
+                else_block: BlockId(5),
+            },
+        };
+        let bb1 = BasicBlock {
+            id: BlockId(1),
+            instructions: vec![Instruction::Value {
+                result: ValueId(10),
+                ty: Ty::Bool,
+                kind: ValueKind::Const(Const::Bool(true)),
+            }],
+            terminator: Terminator::CondBranch {
+                condition: ValueId(10),
+                then_block: BlockId(1),
+                else_block: BlockId(2),
+            },
+        };
+        let bb2 = BasicBlock {
+            id: BlockId(2),
+            instructions: vec![Instruction::Value {
+                result: ValueId(11),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(11))),
+        };
+        let bb5 = BasicBlock {
+            id: BlockId(5),
+            instructions: vec![Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            }],
+            terminator: Terminator::Invoke {
+                callee: ItemId(0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+                evidence: Vec::new(),
+                ok_slot: ValueId(0),
+                ok_target: BlockId(6),
+                err_targets: vec![InvokeErrTarget {
+                    variant: shape_id,
+                    slot: ValueId(1),
+                    target: BlockId(7),
+                }],
+            },
+        };
+        let bb6 = BasicBlock {
+            id: BlockId(6),
+            instructions: vec![Instruction::Value {
+                result: ValueId(12),
+                ty: Ty::I64,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(12))),
+        };
+        let bb7 = BasicBlock {
+            id: BlockId(7),
+            instructions: vec![Instruction::Value {
+                result: ValueId(13),
+                ty: Ty::I64,
+                kind: ValueKind::Const(Const::Int(1)),
+            }],
+            terminator: Terminator::Return(Some(ValueId(13))),
+        };
+
+        let mut caller = valid_function(ItemId(1), f_name);
+        // BlockId(0) deliberately last: correctness must not depend on
+        // the entry being visited before any other block.
+        caller.blocks = vec![bb7, bb6, bb5, bb2, bb1, entry];
+        caller
+    }
+
+    #[test]
+    fn an_entry_boundary_stored_only_via_its_own_unconditional_store_is_accepted() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = entry_boundary_caller(f_name, shape_id, shape_name, true);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_boundary_without_its_own_store_and_a_loop_bypassing_the_invoke_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+        let caller = entry_boundary_caller(f_name, shape_id, shape_name, false);
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: Vec::new(),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED),
+            "expected the loop bypassing the Invoke's own edges to be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permuting_the_block_vector_never_changes_the_v0073_result() {
+        // The same rejected CFG as above, re-verified under several
+        // different `function.blocks` storage orders (including entry
+        // first, entry last, and reversed) -- the result must be
+        // identical every time, since correctness must never depend on
+        // Vec order, only on the CFG itself.
+        fn diagnoses_v0073(order: &[BlockId]) -> bool {
+            let mut interner = Interner::new();
+            let f_name = interner.intern("f");
+            let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+            let callee = raising_shape_callee(&mut interner, shape_id, shape_name);
+            let mut caller = entry_boundary_caller(f_name, shape_id, shape_name, false);
+            let by_id: HashMap<BlockId, BasicBlock> =
+                caller.blocks.drain(..).map(|b| (b.id, b)).collect();
+            caller.blocks = order.iter().map(|id| by_id[id].clone()).collect();
+
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions: vec![callee, caller],
+                records: Vec::new(),
+                variants: vec![(shape_id, shape_layout)],
+            };
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+            codes_of(&diagnostics).contains(&codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED)
+        }
+
+        let entry_last = [1u32, 2, 5, 6, 7, 0];
+        let entry_first = [0u32, 1, 2, 5, 6, 7];
+        let reversed = [7u32, 6, 5, 2, 1, 0];
+        let shuffled = [5u32, 0, 7, 1, 6, 2];
+
+        for order in [entry_last, entry_first, reversed, shuffled] {
+            let order: Vec<BlockId> = order.into_iter().map(BlockId).collect();
+            assert!(
+                diagnoses_v0073(&order),
+                "expected V0073 regardless of block order {order:?}"
+            );
+        }
     }
 }

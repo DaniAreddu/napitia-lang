@@ -2062,6 +2062,12 @@ impl<'a> Lowering<'a> {
             let name = layout.name;
             fb.switch_to(dispatch_block);
             let loaded = fb.push_value(Ty::Named(variant, name), ValueKind::Load(err_slot));
+            // Propagating out via `?` leaves this function's own scope
+            // exactly like an explicit `raise`/`return` does
+            // (`rfcs/0011`): each failure dispatch block gets its own
+            // copy of this function's own cleanup sequence, since it is
+            // its own distinct exit path.
+            self.emit_cleanup(fb)?;
             fb.terminate(Terminator::Raise { value: loaded });
         }
         fb.switch_to(ok_target);
@@ -2079,6 +2085,12 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
+        // `raise` leaves this function's own scope exactly like `return`
+        // does (`rfcs/0011`): every still-owned resource this function's
+        // own top-level scope owns, and every registered `defer`, must
+        // still run before control actually transfers to the caller's
+        // own failure edge.
+        self.emit_cleanup(fb)?;
         fb.terminate(Terminator::Raise { value });
         Ok(LoweredExpr::Diverged)
     }
@@ -3622,6 +3634,70 @@ mod tests {
             sequence,
             vec!["call", "drop", "call", "drop"],
             "expected defer/drop cleanup interleaved in declaration-reversed order, got {sequence:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_is_cleaned_up_before_an_explicit_raise() {
+        let diags = lower_and_verify(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 raise Failure.Broken; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 raise Failure.Broken; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the still-owned resource to be dropped before the raise"
+        );
+    }
+
+    #[test]
+    fn a_resource_is_cleaned_up_before_a_postfix_try_propagates() {
+        let diags = lower_and_verify(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func fail() -> i64 raises Failure { raise Failure.Broken; } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 return fail()?; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func fail() -> i64 raises Failure { raise Failure.Broken; } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 return fail()?; \
+             }",
+        );
+        // Declaration order: `fail` first, `f` second. Two reachable
+        // exit paths out of `f` (the `?`'s own ok edge, continuing to
+        // `f`'s own `return`, and its one failure edge, propagating
+        // onward) each get their own copy of the cleanup sequence, so
+        // two `Drop`s total -- one per path, never a double-drop on
+        // either path individually.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected the still-owned resource to be dropped on both the ok and the propagating path"
         );
     }
 

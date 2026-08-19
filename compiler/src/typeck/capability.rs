@@ -226,6 +226,31 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
+            // Protocols over resource types are out of scope this
+            // milestone (`rfcs/0011`): a resource used as one of this
+            // extend's own protocol type arguments is rejected with a
+            // dedicated diagnostic here, rather than silently letting an
+            // affine value flow through capability resolution as though
+            // it were an ordinary observable value.
+            let mut has_resource_argument = false;
+            for arg in &protocol_arguments {
+                if self.is_affine_resource(arg) {
+                    has_resource_argument = true;
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::RESOURCE_PROTOCOL_UNSUPPORTED,
+                            self.source,
+                            e.protocol_ref_span,
+                            "a resource type cannot be used as a protocol type argument",
+                        )
+                        .with_primary_label("resource used as a protocol argument"),
+                    );
+                }
+            }
+            if has_resource_argument {
+                continue;
+            }
+
             let extend_type_params: std::collections::HashSet<TypeParamId> =
                 e.type_params.iter().map(|tp| tp.id).collect();
 

@@ -1343,13 +1343,25 @@ impl<'a> Lowering<'a> {
     fn mark_defer_observed(&self, _fb: &mut FnBuilder, _expr: &HirExpr) {}
 
     /// Replays every still-owned resource drop and every registered
-    /// `defer`, in declaration-reversed order (`rfcs/0011`), before a
-    /// cleanup point's own terminator. Idempotent to call at most once
-    /// per actual exit: this milestone's own scope limit is a single,
-    /// function-wide cleanup list run at every `return` (explicit or
-    /// implicit fallthrough) -- see `PendingDefer`'s own doc comment.
+    /// `defer` from the *whole* function's own cleanup list, in
+    /// declaration-reversed order (`rfcs/0011`), before a function-level
+    /// cleanup point's own terminator (`return`, `raise`, a postfix `?`
+    /// propagation edge). See [`Self::emit_cleanup_since`] for the
+    /// nested-scope version this delegates to.
     fn emit_cleanup(&mut self, fb: &mut FnBuilder) -> LowerResult<()> {
-        let actions: Vec<CleanupAction> = fb.cleanup_actions.clone();
+        self.emit_cleanup_since(fb, 0)
+    }
+
+    /// Replays every entry in `fb.cleanup_actions[marker..]` (a single
+    /// scope's own resource drops and registered `defer`s, never a
+    /// shallower enclosing scope's), in reverse. Used both by
+    /// `emit_cleanup` (`marker == 0`, the whole function) and by
+    /// [`Self::lower_scoped_block`] (a nested block's own slice, run
+    /// once at that block's own normal exit, before its own entries are
+    /// removed from the function-wide list so an enclosing scope's own
+    /// later cleanup never replays them again).
+    fn emit_cleanup_since(&mut self, fb: &mut FnBuilder, marker: usize) -> LowerResult<()> {
+        let actions: Vec<CleanupAction> = fb.cleanup_actions[marker..].to_vec();
         for action in actions.into_iter().rev() {
             match action {
                 CleanupAction::Drop(local) => {
@@ -1375,6 +1387,53 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Lowers a *nested* block (an `if`/`match`/`handle` arm body, a
+    /// `while`/`loop` body, or a bare `{ ... }` block expression) as its
+    /// own resource-cleanup scope, distinct from the enclosing
+    /// function's own top-level one (`rfcs/0011`). Any resource local
+    /// this block itself declares and never moves is destroyed exactly
+    /// once, right here, at this block's own normal fallthrough exit --
+    /// never left in the function-wide cleanup list for an *enclosing*
+    /// scope's own later cleanup to also (incorrectly) replay, which
+    /// would either double-drop it or, since a value only ever a nested
+    /// block's own nested basic blocks defined does not dominate
+    /// anywhere outside that block, fail NIR verification outright. A
+    /// block that itself diverges (`return`/`raise`/`break`/`continue`)
+    /// needs no separate handling here: whichever function-level
+    /// cleanup point it already terminated through has already replayed
+    /// every entry up to and including this scope's own (`emit_cleanup`
+    /// always covers the *whole*, still-flat list) -- this only ever
+    /// needs to act, and truncate, on top of that.
+    fn lower_scoped_block(
+        &mut self,
+        fb: &mut FnBuilder,
+        block: &HirBlock,
+    ) -> LowerResult<LoweredExpr> {
+        let marker = fb.cleanup_actions.len();
+        let result = self.lower_block_value(fb, block)?;
+        if !fb.current_terminated() {
+            self.emit_cleanup_since(fb, marker)?;
+        }
+        fb.cleanup_actions.truncate(marker);
+        Ok(result)
+    }
+
+    /// Like [`Self::lower_scoped_block`], for a `while`/`loop` body
+    /// (`lower_block_void`'s own void-result shape) -- a resource this
+    /// loop body itself declares fresh each iteration is destroyed at
+    /// the body's own normal fallthrough (the back edge to the loop
+    /// header), never left for the function-wide list to replay after
+    /// the loop, where its own value would not dominate at all.
+    fn lower_scoped_block_void(&mut self, fb: &mut FnBuilder, block: &HirBlock) -> LowerResult<()> {
+        let marker = fb.cleanup_actions.len();
+        self.lower_block_void(fb, block)?;
+        if !fb.current_terminated() {
+            self.emit_cleanup_since(fb, marker)?;
+        }
+        fb.cleanup_actions.truncate(marker);
         Ok(())
     }
 
@@ -1418,7 +1477,7 @@ impl<'a> Lowering<'a> {
             break_target: after,
             continue_target: header,
         });
-        self.lower_block_void(fb, body)?;
+        self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
@@ -1438,7 +1497,7 @@ impl<'a> Lowering<'a> {
             break_target: after,
             continue_target: header,
         });
-        self.lower_block_void(fb, body)?;
+        self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
@@ -1556,7 +1615,7 @@ impl<'a> Lowering<'a> {
                 let result_ty = self.expr_ty(expr);
                 self.lower_match(fb, scrutinee, arms, result_ty)
             }
-            HirExpr::Block(b) => self.lower_block_value(fb, b),
+            HirExpr::Block(b) => self.lower_scoped_block(fb, b),
             HirExpr::RecordLiteral { record, fields, .. } => {
                 self.lower_record_literal(fb, *record, fields, expr)
             }
@@ -2287,7 +2346,7 @@ impl<'a> Lowering<'a> {
     ) -> LowerResult<()> {
         let result = match body {
             HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
-            HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+            HirMatchArmBody::Block(b) => self.lower_scoped_block(fb, b)?,
         };
         if let LoweredExpr::Value(v) = result
             && let Some((slot, after)) = merge
@@ -2583,11 +2642,11 @@ impl<'a> Lowering<'a> {
             });
 
             fb.switch_to(then_block);
-            let then_result = self.lower_block_value(fb, then_branch)?;
+            let then_result = self.lower_scoped_block(fb, then_branch)?;
 
             fb.switch_to(else_block);
             let else_result = match else_branch {
-                Some(HirElse::Block(b)) => self.lower_block_value(fb, b)?,
+                Some(HirElse::Block(b)) => self.lower_scoped_block(fb, b)?,
                 Some(HirElse::If(inner)) => self.lower_expr(fb, inner)?,
                 // An else-less `if` always types as `unit` (see below),
                 // never `never` -- typeck cannot have produced this
@@ -2622,7 +2681,7 @@ impl<'a> Lowering<'a> {
         });
 
         fb.switch_to(then_block);
-        if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
+        if let LoweredExpr::Value(then_value) = self.lower_scoped_block(fb, then_branch)? {
             if else_branch.is_none() {
                 // No `else`: typeck gives the whole expression type
                 // `unit` regardless of what the then-branch's own tail
@@ -2645,7 +2704,7 @@ impl<'a> Lowering<'a> {
         fb.switch_to(else_block);
         match else_branch {
             Some(HirElse::Block(b)) => {
-                if let LoweredExpr::Value(else_value) = self.lower_block_value(fb, b)? {
+                if let LoweredExpr::Value(else_value) = self.lower_scoped_block(fb, b)? {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
                 }
@@ -2776,7 +2835,7 @@ impl<'a> Lowering<'a> {
             let arm = &arms[winner.arm_index];
             let result = match &arm.body {
                 HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
-                HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+                HirMatchArmBody::Block(b) => self.lower_scoped_block(fb, b)?,
             };
             if let LoweredExpr::Value(v) = result
                 && let Some((slot, after)) = merge
@@ -3698,6 +3757,42 @@ mod tests {
             drop_count(f),
             2,
             "expected the still-owned resource to be dropped on both the ok and the propagating path"
+        );
+    }
+
+    #[test]
+    fn a_resource_declared_inside_an_if_branch_is_cleaned_up_in_its_own_scope() {
+        // A resource declared and left unmoved inside one arm of an
+        // `if` must be destroyed at that arm's own end, not left for
+        // the enclosing function's own cleanup to replay after the
+        // join -- the value never dominates anywhere past its own arm,
+        // so replaying it there would fail NIR verification (this was
+        // a real bug this milestone's own internal review caught: the
+        // function-wide cleanup list must have each nested scope's own
+        // entries removed once that scope's own cleanup already ran).
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 if cond { \
+                     value file = File { descriptor: 3 }; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 if cond { \
+                     value file = File { descriptor: 3 }; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the if-branch's own resource to be dropped exactly once, inside its own arm"
         );
     }
 

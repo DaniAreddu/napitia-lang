@@ -640,11 +640,44 @@ fn canonical_raises(
                 ),
             )));
         };
-        let module_path = variant_source
-            .get(item)
-            .and_then(|src| module_path_of.get(src))
-            .cloned()
-            .unwrap_or_default();
+        let module_path = if module_path_of.is_empty() {
+            // Single-file compilation intentionally has no project-level
+            // module path at all (`rfcs/0007`) -- every item's own
+            // canonical path is legitimately empty here, not a
+            // missing-metadata gap. `lower_module`'s own empty-map
+            // wrapper is the only caller that ever reaches this branch
+            // in the ordinary pipeline.
+            String::new()
+        } else {
+            // Project mode: `module_path_of` is built once, up front,
+            // with one entry per module actually in the project
+            // (`project::compile`), so every raised variant's own
+            // declaring `SourceId` must resolve here -- a miss is a
+            // genuine metadata gap, never a legitimate empty path, and
+            // must never silently sort as though the variant belonged
+            // to the project's root module.
+            let Some(&decl_source) = variant_source.get(item) else {
+                return Err(Box::new(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "a function's own `raises` names id {item:?}, whose declaring module could not be resolved"
+                    ),
+                )));
+            };
+            let Some(path) = module_path_of.get(&decl_source) else {
+                return Err(Box::new(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "a function's own `raises` names id {item:?}, declared in a module this project's own module-path table has no entry for"
+                    ),
+                )));
+            };
+            path.clone()
+        };
         let name = interner.resolve(layout.name).to_string();
         key_of.insert(*item, (module_path, name));
     }
@@ -4348,6 +4381,82 @@ mod tests {
     #[test]
     fn canonical_raises_orders_by_module_path_with_a_declared_before_b() {
         assert_err_variants_canonicalize_by_module_path(false, false);
+    }
+
+    #[test]
+    fn a_raises_entry_missing_its_project_module_path_entry_is_a_diagnostic_not_an_empty_path() {
+        // `module_path_of` here is non-empty (as it always is in real
+        // project compilation, `project::compile`), but has no entry at
+        // all for `source_a`, the raised variant's own declaring module
+        // -- unreachable through the ordinary pipeline (project::compile
+        // always builds one entry per module it actually loaded), but a
+        // direct caller of `lower_module_with_paths` could still hand
+        // this an incomplete table. Distinct from single-file mode
+        // (`module_path_of` empty), where every path is legitimately
+        // empty: here a missing entry must fail atomically with I0002,
+        // never silently canonicalize as though the variant belonged to
+        // the project's root module.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source_a = map.add_file("a.npt", "");
+        let source_b = map.add_file("b.npt", "");
+        let manifest_source = map.add_file("main.npt", "");
+        let err_name = interner.intern("Err");
+        let f_name = interner.intern("f");
+        let item_a = ItemId(0);
+        let variant_a = minimal_variant(item_a, err_name, source_a);
+        // Non-empty (this is project mode), but deliberately missing
+        // `source_a`'s own entry -- only `source_b`'s is present, e.g.
+        // some unrelated sibling module in the same project.
+        let mut module_path_of = HashMap::new();
+        module_path_of.insert(source_b, "b".to_string());
+
+        let entry_a = crate::hir::HirRaisesEntry {
+            variant: item_a,
+            name: err_name,
+            span: Span::dummy(),
+        };
+        let mut function = function_with_tail(
+            ItemId(1),
+            f_name,
+            HirExpr::Int {
+                id: ExprId(0),
+                value: 0,
+                base: crate::lexer::IntBase::Decimal,
+                span: Span::dummy(),
+            },
+            manifest_source,
+        );
+        function.raises = vec![entry_a];
+
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![variant_a],
+            other_items: vec![],
+        };
+        let (local_types, expr_types, pattern_case) = empty_maps();
+        let result = lower_module_with_paths(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            manifest_source,
+            &module_path_of,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected a missing project module-path entry to fail lowering")
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.code == "I0002"),
+            "expected I0002, got {diagnostics:?}"
+        );
     }
 
     #[test]

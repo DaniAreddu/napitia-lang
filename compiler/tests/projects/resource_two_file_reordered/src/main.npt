@@ -1,0 +1,15 @@
+import resources.close;
+import resources.open;
+import resources.OpenError;
+import resources.File as ResourceFile;
+
+func acquire(descriptor: i64) -> ResourceFile raises OpenError {
+    return open(descriptor)?;
+}
+
+func main() -> i64 {
+    return handle acquire(5) {
+        success file => close(file),
+        failure OpenError.Invalid => -1,
+    };
+}

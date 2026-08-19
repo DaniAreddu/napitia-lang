@@ -3013,6 +3013,18 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_construction_reuses_record_field_resolution() {
+        // `rfcs/0011`: resource construction is the exact same
+        // `RecordLiteral` production a record construction already uses
+        // -- missing/unknown field validation is inherited unchanged.
+        let (_, diags) =
+            lower("resource File { descriptor: i64 } func f() { value f = File { z: 1 }; }");
+        assert_eq!(diags.len(), 2, "unexpected diagnostics: {diags:?}");
+        assert_eq!(diags[0].code, "R0008");
+        assert_eq!(diags[1].code, "R0009");
+    }
+
+    #[test]
     fn missing_fields_are_reported_in_declaration_order() {
         // Three missing fields, named so alphabetical/insertion order
         // would disagree with declaration order if either leaked

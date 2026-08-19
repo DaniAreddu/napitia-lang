@@ -1,0 +1,20 @@
+public variant OpenError {
+    Invalid,
+}
+
+public resource File {
+    descriptor: i64,
+}
+
+public func open(descriptor: i64) -> File raises OpenError {
+    if descriptor < 0 {
+        raise OpenError.Invalid;
+    }
+    return File { descriptor: descriptor };
+}
+
+public func close(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}

@@ -2666,20 +2666,70 @@ impl<'a> Checker<'a> {
         let operand_diverges = args
             .iter()
             .any(|a| matches!(self.expr_types.get(&a.id()), Some(Ty::Never)));
-        let raises = match self.callee_raises(callee) {
-            Some(raises) => raises,
-            None => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        codes::CALLEE_METADATA_MISSING,
-                        self.source,
-                        span,
-                        "`handle`'s own operand calls a function that was never registered",
-                    )
-                    .with_primary_label("unresolvable callee"),
-                );
-                Vec::new()
+        let Some(raises) = self.callee_raises(callee) else {
+            // Missing callee metadata is not the same thing as "this
+            // callee legitimately raises nothing": treating it as an
+            // empty `raises` set here would additionally emit a
+            // misleading TRY_ON_INFALLIBLE right below, claiming the
+            // call is provably infallible when it is actually just
+            // unresolvable. Report CALLEE_METADATA_MISSING alone, still
+            // check every arm's own body for its own independent
+            // diagnostics (never skip visiting an expression), but skip
+            // the coverage/join analysis entirely -- it fundamentally
+            // depends on a real `raises` set to compare against.
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::CALLEE_METADATA_MISSING,
+                    self.source,
+                    span,
+                    "`handle`'s own operand calls a function that was never registered",
+                )
+                .with_primary_label("unresolvable callee"),
+            );
+            for arm in arms {
+                match &arm.kind {
+                    HirHandleArmKind::Success(pattern) => {
+                        if let HirPattern::Bind { local, .. } = pattern {
+                            self.locals.insert(
+                                *local,
+                                LocalInfo {
+                                    ty: success_ty.clone(),
+                                    mutable: false,
+                                },
+                            );
+                        }
+                    }
+                    HirHandleArmKind::Failure(HirFailurePattern::Case {
+                        variant: Some(variant),
+                        case: Some(case),
+                        args: payload_args,
+                        ..
+                    }) => {
+                        if let Some(payload_tys) = self
+                            .variants
+                            .get(variant)
+                            .and_then(|info| info.cases.get(*case))
+                            .map(|(_, payload)| payload.clone())
+                            && payload_tys.len() == payload_args.len()
+                        {
+                            for (pattern, ty) in payload_args.iter().zip(payload_tys.iter()) {
+                                if let HirPattern::Bind { local, .. } = pattern {
+                                    self.locals.insert(
+                                        *local,
+                                        LocalInfo {
+                                            ty: ty.clone(),
+                                            mutable: false,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    HirHandleArmKind::Failure(_) => {}
+                }
+                self.check_arm_body(&arm.body);
             }
+            return Ty::Error;
         };
         if raises.is_empty() {
             self.diagnostics.push(
@@ -6639,6 +6689,74 @@ mod tests {
         assert!(
             result.diagnostics.iter().any(|d| d.code == "T0060"),
             "expected T0060, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_handle_on_a_callee_with_no_registered_signature_is_t0060_only_not_t0049() {
+        // Mirrors the `?` case above, for `handle`: a dangling function
+        // reference must report T0060 (missing callee metadata) alone.
+        // Converting the missing signature into an empty `raises` set
+        // would additionally emit T0049 ("this call cannot fail"),
+        // which is actively misleading -- the call's own fallibility is
+        // simply unknown, never proven infallible.
+        let mut map = SourceMap::new();
+        let id = map.add_file(
+            "t.npt",
+            "variant Failure { Broken }
+            func f() -> i64 raises Failure { raise Failure.Broken }
+            func main() -> i64 {
+                return handle f() {
+                    success v => v,
+                    failure Failure.Broken => 0,
+                }
+            }",
+        );
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (mut hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let main_symbol = interner.intern("main");
+        let main_fn = hir
+            .functions
+            .iter_mut()
+            .find(|f| f.name == main_symbol)
+            .expect("main should have lowered");
+        let HirExpr::Return { value, .. } = main_fn.body.tail.as_deref_mut().unwrap() else {
+            panic!("expected a return statement");
+        };
+        let HirExpr::Handle { operand, .. } = value.as_deref_mut().unwrap() else {
+            panic!("expected a handle expression");
+        };
+        let HirExpr::Call { callee, .. } = operand.as_mut() else {
+            panic!("expected a call expression");
+        };
+        let HirExpr::Function { item, .. } = callee.as_mut() else {
+            panic!("expected a function reference");
+        };
+        *item = ItemId(9999);
+        let result = check_module(&hir, id, &interner, EntryMain::ByName);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "T0060"),
+            "expected T0060, got {:?}",
+            result.diagnostics
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "T0049"),
+            "T0049 must not also fire for a missing-metadata callee: {:?}",
             result.diagnostics
         );
     }

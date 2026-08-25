@@ -3,26 +3,37 @@
 //! value's own ownership state through a function body -- use-after-
 //! move, use-after-drop, double-drop, moving a value a pending `defer`
 //! still needs, an ordinary parameter's own observation escaping its
-//! call, and inconsistent state across a join or loop back-edge.
+//! call, inconsistent state across a join or loop back-edge, and (as
+//! of Blocker 2) a compound `if`/`match`/`handle`/block origin whose
+//! own underlying resource differs by branch.
 //!
 //! `nir::lower` never re-derives ownership from spans or names: it is
 //! only ever invoked (via `driver::check`) once this stage's own
 //! diagnostics are empty, at which point it performs its own,
-//! independent, deliberately simpler bookkeeping (`nir::lower`'s own
-//! `FnBuilder::cleanup_actions`/`moved_out`) to decide where to insert
-//! `Drop`/deferred-call instructions -- trusting that a program this
-//! stage accepted can never make that bookkeeping ambiguous, without
-//! needing this stage to export a full cross-referenced ownership map
-//! of its own.
+//! independent bookkeeping (`nir::lower`'s own `FnBuilder::
+//! cleanup_actions`/`moved_out`, isolated per branch through
+//! `FnBuilder::move_join_stack`) to decide where to insert `Drop`/
+//! deferred-call instructions -- trusting that a program this stage
+//! accepted can never make that bookkeeping ambiguous, without needing
+//! this stage to export a full cross-referenced ownership map of its
+//! own. A resource-typed `return`/tail value that is itself a compound
+//! `if`/block is the one shape `nir::lower` handles by pushing that
+//! `return`'s own cleanup into each branch separately
+//! (`Lowering::lower_into_return_sink`), rather than by this
+//! bookkeeping alone.
 //!
 //! Known, honest scope limits for this milestone: only a *whole*
-//! binding may ever be moved (moving a resource-typed value out of a
-//! record/resource field, `take other.file`, is not tracked -- field
-//! reads are always treated as a non-consuming observation); a
-//! `mutable` resource-typed binding's own old value is not specially
-//! validated for disposal when reassigned; a `break`/`continue` loop
-//! exit does not run any enclosing scope's pending cleanup
-//! (`nir::lower`'s own limitation, not checked/rejected here either).
+//! binding may ever be moved -- moving a resource-typed value out of a
+//! record/resource field (`take other.file`) is rejected outright
+//! (`U0009`), not silently mis-tracked as a non-consuming observation;
+//! a resource-typed `match`/`handle`, or a resource-typed `if` in any
+//! consuming position other than `return`/the function's own implicit
+//! tail, is rejected outright too (`U0008`), since `nir::lower` has no
+//! per-branch sink for those yet; a `mutable` resource-typed binding's
+//! own old value is not specially validated for disposal when
+//! reassigned; a `break`/`continue` loop exit does not run any
+//! enclosing scope's pending cleanup (`nir::lower`'s own limitation,
+//! not checked/rejected here either).
 
 mod flow;
 mod state;

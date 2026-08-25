@@ -62,6 +62,17 @@ mod codes {
     /// lowering this milestone, so it is rejected here rather than
     /// silently mis-lowered into a double-drop or a leak.
     pub const UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN: &str = "U0008";
+    /// A resource-typed field projected out of its containing resource
+    /// (`box.file`) is moved, bound, assigned, passed to a `take`
+    /// parameter, stored, raised, or scheduled through `defer`
+    /// (Blocker 3). Only a *whole* resource binding may ever be moved
+    /// this milestone -- a partial/field-level move is not tracked at
+    /// all, so allowing one here would silently let `box`'s own
+    /// `file` field be read again later as if it were still owned,
+    /// double-destroying it (once through whatever the field's own
+    /// extracted value fed into, once through `box`'s own eventual
+    /// destruction).
+    pub const RESOURCE_FIELD_EXTRACTION: &str = "U0009";
 }
 
 pub use codes::*;
@@ -429,7 +440,21 @@ impl<'a> FlowChecker<'a> {
                     );
                 }
             }
-            HirExpr::Field { base, .. } => self.check_expr(base),
+            HirExpr::Field { base, id, span, .. } => {
+                self.check_expr(base);
+                if kind != ConsumeKind::Read && self.is_affine_expr(*id) {
+                    self.diagnose(
+                        RESOURCE_FIELD_EXTRACTION,
+                        *span,
+                        "a resource-typed field cannot be moved, bound, assigned, passed to a \
+                         `take` parameter, stored, raised, or scheduled through `defer` this \
+                         milestone; only a whole resource binding may ever be moved, never a \
+                         field projected out of one"
+                            .to_string(),
+                        "resource field extraction",
+                    );
+                }
+            }
             HirExpr::Cast { expr, .. } => self.check_expr(expr),
             HirExpr::Try { expr, .. } => self.check_expr(expr),
             HirExpr::If {

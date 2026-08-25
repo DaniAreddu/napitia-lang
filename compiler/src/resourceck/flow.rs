@@ -73,6 +73,14 @@ mod codes {
     /// extracted value fed into, once through `box`'s own eventual
     /// destruction).
     pub const RESOURCE_FIELD_EXTRACTION: &str = "U0009";
+    /// A `mutable` resource-typed binding is reassigned while it still
+    /// owns an available (or `defer`-protected) value (Blocker 4) --
+    /// overwriting it without first moving or dropping the old value
+    /// would leak it, since nothing would ever destroy it again.
+    /// Reassignment is only accepted once the path-sensitive state
+    /// proves the slot is provably empty (`Moved`/`Dropped`) on every
+    /// incoming path.
+    pub const REASSIGNMENT_OF_LIVE_RESOURCE: &str = "U0010";
 }
 
 pub use codes::*;
@@ -414,10 +422,12 @@ impl<'a> FlowChecker<'a> {
             }
             HirExpr::Assign { target, value, .. } => {
                 self.check_expr_ctx(value, ConsumeKind::Other);
-                if let HirExpr::Local { local, .. } = target.as_ref()
+                if let HirExpr::Local {
+                    local, name, span, ..
+                } = target.as_ref()
                     && self.is_resource_local(*local)
                 {
-                    self.states.insert(*local, ResourceState::Available);
+                    self.check_reassignment(*local, *name, *span);
                 } else {
                     self.check_expr(target);
                 }
@@ -662,6 +672,41 @@ impl<'a> FlowChecker<'a> {
                         self.local_name(local, name)
                     ),
                     "moved before its defer ran",
+                );
+                self.states.insert(local, ResourceState::Error);
+            }
+        }
+    }
+
+    /// Reassigning a `mutable` resource-typed binding (Blocker 4):
+    /// accepted -- and transitions `local` to `Available`, exactly
+    /// like a fresh binding -- only when the path-sensitive state
+    /// already proves the slot holds nothing needing destruction
+    /// (`Moved`/`Dropped`) on every incoming path; an `Available` or
+    /// `DropScheduled` old value would otherwise be silently
+    /// overwritten and leaked, since nothing would ever destroy it
+    /// again. A local absent from `self.states` (an ordinary, non-
+    /// resource-typed target the caller already filtered out, or one
+    /// this checker never saw declared) has nothing here to protect.
+    fn check_reassignment(&mut self, local: LocalId, name: crate::symbol::Symbol, span: Span) {
+        let Some(state) = self.states.get(&local).copied() else {
+            return;
+        };
+        match state {
+            ResourceState::Moved | ResourceState::Dropped => {
+                self.states.insert(local, ResourceState::Available);
+            }
+            ResourceState::Error => {}
+            ResourceState::Available | ResourceState::DropScheduled => {
+                self.diagnose(
+                    REASSIGNMENT_OF_LIVE_RESOURCE,
+                    span,
+                    format!(
+                        "`{}` still owns a resource that was never moved or dropped; \
+                         reassigning it would leak the old value",
+                        self.local_name(local, name)
+                    ),
+                    "reassigning a live resource",
                 );
                 self.states.insert(local, ResourceState::Error);
             }

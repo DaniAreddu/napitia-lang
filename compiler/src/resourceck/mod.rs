@@ -461,6 +461,7 @@ mod tests {
              func f() -> File { return File { descriptor: 1 } } \
              func steal(box: Box) { \
                  mutable file = f(); \
+                 drop file; \
                  file = box.file; \
                  drop file; \
              }",
@@ -507,6 +508,99 @@ mod tests {
              resource Box { file: File } \
              func inspect(file: File) -> i64 { return file.descriptor } \
              func peek(box: Box) -> i64 { return inspect(box.file); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn reassigning_a_mutable_resource_that_still_owns_a_value_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func open_first() -> File { return File { descriptor: 1 } } \
+             func open_second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = open_first(); \
+                 file = open_second(); \
+                 drop file; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0010"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn reassigning_a_mutable_resource_after_an_explicit_drop_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func open_first() -> File { return File { descriptor: 1 } } \
+             func open_second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = open_first(); \
+                 drop file; \
+                 file = open_second(); \
+                 drop file; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn reassigning_a_mutable_resource_after_it_was_moved_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func open_first() -> File { return File { descriptor: 1 } } \
+             func open_second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = open_first(); \
+                 consume(file); \
+                 file = open_second(); \
+                 drop file; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn reassigning_a_mutable_resource_consumed_on_only_one_branch_is_rejected() {
+        // The old value is consumed on only one branch, so the two
+        // branches disagree about the slot's own state; reassignment
+        // must not be accepted regardless of which branch actually ran.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func open_second() -> File { return File { descriptor: 2 } } \
+             func f(cond: bool) { \
+                 mutable file = open_second(); \
+                 if cond { \
+                     consume(file); \
+                 } \
+                 file = open_second(); \
+                 drop file; \
+             }",
+        );
+        assert!(!diags.is_empty(), "expected a diagnostic: {diags:?}");
+    }
+
+    #[test]
+    fn reassigning_a_mutable_resource_consumed_on_every_branch_is_accepted() {
+        // Both branches agree the slot is empty on entry to the
+        // reassignment, even though it was consumed through two
+        // different call sites -- this is not the same local moved
+        // twice, so no disagreement.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func open_second() -> File { return File { descriptor: 2 } } \
+             func f(cond: bool) { \
+                 mutable file = open_second(); \
+                 if cond { \
+                     consume(file); \
+                 } else { \
+                     consume(file); \
+                 } \
+                 file = open_second(); \
+                 drop file; \
+             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }

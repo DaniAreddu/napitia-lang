@@ -51,9 +51,50 @@ mod codes {
     /// declared outside the loop disagrees with its state on entry --
     /// a second iteration could not safely reuse it.
     pub const LOOP_CARRIED_INVALIDATION: &str = "U0007";
+    /// A resource-typed `match`/`handle` (any consuming position), or a
+    /// resource-typed `if` in a consuming position other than `return`/
+    /// the function's own implicit tail, whose own value is directly
+    /// moved, bound, assigned, passed to a `take` parameter, stored in
+    /// a constructed aggregate, or raised. `nir::lower` can only push a
+    /// `return`'s own per-branch cleanup into a nested `if`/block's own
+    /// branches (`rfcs/0011`); every other compound origin shape (and
+    /// `match`/`handle` even as a `return`'s own operand) has no sound
+    /// lowering this milestone, so it is rejected here rather than
+    /// silently mis-lowered into a double-drop or a leak.
+    pub const UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN: &str = "U0008";
 }
 
 pub use codes::*;
+
+/// What position an expression's own value is being checked in
+/// (`rfcs/0011`, Blocker 2) -- threaded down through every recursive
+/// [`FlowChecker`] walk so a resource-typed `if`/`match`/`handle`/block
+/// nested arbitrarily deep still resolves the *same* underlying
+/// question at its own terminal (usually a bare local) reference: is
+/// this read, or consumed, and if consumed, by a position `nir::lower`
+/// can actually represent a compound (branch-specific) origin for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeKind {
+    /// An ordinary, non-consuming observation -- the default for any
+    /// subexpression that isn't itself a move/return/store/etc.
+    Read,
+    /// Consumed by `return`, or the function's own implicit tail
+    /// return. `nir::lower` pushes this sink into each reachable
+    /// branch of a nested `if`/block separately (Blocker 2), so a
+    /// resource-typed `if` is accepted here even when its two branches
+    /// resolve to different underlying locals; `match`/`handle` are
+    /// still not supported even in this position.
+    Return,
+    /// Consumed by anything else that transfers ownership: a `value`/
+    /// `mutable` binding's own initializer, an assignment's own value,
+    /// a `take` argument, a constructed aggregate's own field, or
+    /// `raise`'s own operand. `nir::lower` has no per-branch sink for
+    /// any of these yet, so a compound (`if`/`match`/`handle`) origin
+    /// is rejected outright here; only an expression that bottoms out
+    /// directly at a single resource-producing site (a bare local, or
+    /// a fresh call/construction) is accepted.
+    Other,
+}
 
 pub struct FlowChecker<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
@@ -117,7 +158,7 @@ impl<'a> FlowChecker<'a> {
                 self.observing.insert(param.local);
             }
         }
-        self.check_block(&f.body);
+        self.check_block_ctx(&f.body, ConsumeKind::Return);
     }
 
     fn is_resource_local(&self, local: LocalId) -> bool {
@@ -146,13 +187,24 @@ impl<'a> FlowChecker<'a> {
 
     // -- Statements ----------------------------------------------------
 
-    fn check_block(&mut self, block: &HirBlock) {
+    /// Checks `block`'s own statements (always `ConsumeKind::Read`
+    /// contexts on their own -- a statement's value, if any, is always
+    /// discarded), then its own tail expression, if any, in `kind`'s
+    /// own context -- a block is transparent to whatever consumes its
+    /// own value (Blocker 2): `{ ...; tail }` used as a `return`'s own
+    /// operand consumes `tail` exactly like a bare `return tail`
+    /// would, not merely reads it.
+    fn check_block_ctx(&mut self, block: &HirBlock, kind: ConsumeKind) {
         for stmt in &block.statements {
             self.check_stmt(stmt);
         }
         if let Some(tail) = &block.tail {
-            self.check_expr(tail);
+            self.check_expr_ctx(tail, kind);
         }
+    }
+
+    fn check_block(&mut self, block: &HirBlock) {
+        self.check_block_ctx(block, ConsumeKind::Read);
     }
 
     fn check_stmt(&mut self, stmt: &HirStmt) {
@@ -172,8 +224,7 @@ impl<'a> FlowChecker<'a> {
     }
 
     fn check_binding(&mut self, b: &HirBinding) {
-        self.check_expr(&b.value);
-        self.check_consume(&b.value);
+        self.check_expr_ctx(&b.value, ConsumeKind::Other);
         if self.is_resource_local(b.local) {
             self.states.insert(b.local, ResourceState::Available);
         }
@@ -211,9 +262,12 @@ impl<'a> FlowChecker<'a> {
         let HirExpr::Local { local, name, .. } = expr else {
             // A non-local drop target (already rejected by typeck's own
             // static-type check if it isn't even a resource) has no
-            // owned binding here to transition; still walked generically
-            // for whatever nested reads it does contain.
-            self.check_expr(expr);
+            // owned binding here to transition; still walked with
+            // `ConsumeKind::Other` for whatever nested reads/moves it
+            // does contain -- a compound `if`/`match`/`handle` origin
+            // here hits the same `nir::lower` limitation as any other
+            // non-`return` consuming position (Blocker 2).
+            self.check_expr_ctx(expr, ConsumeKind::Other);
             return;
         };
         if self.observing.contains(local) {
@@ -307,6 +361,27 @@ impl<'a> FlowChecker<'a> {
     // -- Expressions -----------------------------------------------------
 
     fn check_expr(&mut self, expr: &HirExpr) {
+        self.check_expr_ctx(expr, ConsumeKind::Read);
+    }
+
+    /// Checks `expr` in `kind`'s own context (`rfcs/0011`, Blocker 2).
+    /// `kind` is only ever actually consulted at a leaf: a bare
+    /// `Local` (transitions its own state when consumed, merely
+    /// validates it when read) or a resource-typed `match`/`handle`/
+    /// non-`return` `if` (rejected outright when `kind` isn't `Read`,
+    /// see [`ConsumeKind`]). Every other node either always uses
+    /// `Read` for its own subexpressions (an operand, a call's own
+    /// callee, a condition -- none of these are the value actually
+    /// flowing onward) or is one of the handful of forms that are
+    /// *transparent* to their own outer context (`block`/`if`/`match`/
+    /// `handle`, which propagate `kind` into their own tail/arm
+    /// bodies) or that unconditionally force their own sub-value into
+    /// a specific kind regardless of the outer one (`return`'s own
+    /// operand, a binding/assignment's own value, a `take` argument, a
+    /// constructed field, `raise`'s own operand -- always at least
+    /// `ConsumeKind::Other`, since each of these really does transfer
+    /// ownership no matter what encloses it).
+    fn check_expr_ctx(&mut self, expr: &HirExpr, kind: ConsumeKind) {
         match expr {
             HirExpr::Int { .. }
             | HirExpr::Float { .. }
@@ -320,15 +395,14 @@ impl<'a> FlowChecker<'a> {
             | HirExpr::Error { .. } => {}
             HirExpr::Local {
                 local, name, span, ..
-            } => self.check_read(*local, *name, *span),
+            } => self.check_local_use(*local, *name, *span, kind),
             HirExpr::Unary { operand, .. } => self.check_expr(operand),
             HirExpr::Binary { left, right, .. } => {
                 self.check_expr(left);
                 self.check_expr(right);
             }
             HirExpr::Assign { target, value, .. } => {
-                self.check_expr(value);
-                self.check_consume(value);
+                self.check_expr_ctx(value, ConsumeKind::Other);
                 if let HirExpr::Local { local, .. } = target.as_ref()
                     && self.is_resource_local(*local)
                 {
@@ -341,14 +415,18 @@ impl<'a> FlowChecker<'a> {
                 self.check_expr(callee);
                 let take_flags = self.take_flags_for_callee(callee);
                 for (index, arg) in args.iter().enumerate() {
-                    self.check_expr(arg);
                     let takes = take_flags
                         .and_then(|flags| flags.get(index))
                         .copied()
                         .unwrap_or(false);
-                    if takes {
-                        self.check_consume(arg);
-                    }
+                    self.check_expr_ctx(
+                        arg,
+                        if takes {
+                            ConsumeKind::Other
+                        } else {
+                            ConsumeKind::Read
+                        },
+                    );
                 }
             }
             HirExpr::Field { base, .. } => self.check_expr(base),
@@ -362,7 +440,8 @@ impl<'a> FlowChecker<'a> {
                 ..
             } => {
                 self.check_expr(condition);
-                self.check_if(*id, then_branch, else_branch.as_ref());
+                let kind = self.check_compound_origin(*id, kind, "if");
+                self.check_if(*id, then_branch, else_branch.as_ref(), kind);
             }
             HirExpr::Match {
                 scrutinee,
@@ -371,31 +450,94 @@ impl<'a> FlowChecker<'a> {
                 ..
             } => {
                 self.check_expr(scrutinee);
-                self.check_match_arms(*id, arms);
+                let kind = self.check_compound_origin(*id, kind, "match");
+                self.check_match_arms(*id, arms, kind);
             }
-            HirExpr::Block(block) => self.check_block(block),
-            HirExpr::Return { value, .. } | HirExpr::Break { value, .. } => {
+            HirExpr::Block(block) => self.check_block_ctx(block, kind),
+            HirExpr::Return { value, .. } => {
                 if let Some(value) = value {
-                    self.check_expr(value);
-                    self.check_consume(value);
+                    self.check_expr_ctx(value, ConsumeKind::Return);
+                }
+            }
+            HirExpr::Break { value, .. } => {
+                if let Some(value) = value {
+                    self.check_expr_ctx(value, ConsumeKind::Other);
                 }
             }
             HirExpr::RecordLiteral { fields, .. } => {
                 for field in fields {
-                    self.check_expr(&field.value);
-                    self.check_consume(&field.value);
+                    self.check_expr_ctx(&field.value, ConsumeKind::Other);
                 }
             }
             HirExpr::Raise { operand, .. } => {
-                self.check_expr(operand);
-                self.check_consume(operand);
+                self.check_expr_ctx(operand, ConsumeKind::Other);
             }
             HirExpr::Handle {
                 operand, arms, id, ..
             } => {
                 self.check_expr(operand);
-                self.check_handle_arms(*id, arms);
+                let kind = self.check_compound_origin(*id, kind, "handle");
+                self.check_handle_arms(*id, arms, kind);
             }
+        }
+    }
+
+    /// Rejects a resource-typed `match`/`handle`, or a resource-typed
+    /// `if` used in a consuming position other than `return`, with
+    /// [`UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN`] (Blocker 2:
+    /// `nir::lower` cannot yet represent a compound origin there --
+    /// see [`ConsumeKind`]) -- returning `ConsumeKind::Read` in that
+    /// case so the rest of this walk still validates ordinary use/move
+    /// correctness inside every branch/arm, just without pretending
+    /// the construct's own overall value is soundly consumed. Returns
+    /// `kind` unchanged whenever no rejection is needed (a `Read`
+    /// context, a non-affine type, or -- for `if` specifically -- a
+    /// `Return` context).
+    fn check_compound_origin(
+        &mut self,
+        id: crate::hir::ExprId,
+        kind: ConsumeKind,
+        construct: &'static str,
+    ) -> ConsumeKind {
+        let supported = match kind {
+            ConsumeKind::Read => true,
+            ConsumeKind::Return => construct == "if",
+            ConsumeKind::Other => false,
+        };
+        if supported || !self.is_affine_expr(id) {
+            return kind;
+        }
+        self.diagnose(
+            UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN,
+            Span::dummy(),
+            format!(
+                "a resource-typed `{construct}` cannot be directly moved, bound, assigned, \
+                 passed to a `take` parameter, stored, or raised this milestone; consume each \
+                 branch/arm's own resource individually instead (e.g. `return` it from inside \
+                 that branch/arm)"
+            ),
+            "unsupported compound resource origin",
+        );
+        ConsumeKind::Read
+    }
+
+    fn is_affine_expr(&self, id: crate::hir::ExprId) -> bool {
+        self.expr_types
+            .get(&id)
+            .is_some_and(|ty| self.is_affine(ty))
+    }
+
+    fn check_local_use(
+        &mut self,
+        local: LocalId,
+        name: crate::symbol::Symbol,
+        span: Span,
+        kind: ConsumeKind,
+    ) {
+        if kind == ConsumeKind::Read {
+            self.check_read(local, name, span);
+        } else {
+            self.check_consume(local, name, span);
         }
     }
 
@@ -436,77 +578,67 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    /// Transitions `expr`'s own source binding to `Moved`, if `expr` is
-    /// a bare local reference naming one -- the only shape an existing
-    /// owned binding can be consumed *from*. Any other expression shape
-    /// (a fresh call/construction result, a literal, a field read) has
-    /// no existing owned binding to transition at all: it simply
-    /// produces a new value for whatever consumed it to own from here
-    /// on. Moving a resource-typed value *out of* a field
-    /// (`take other.file`) is not supported this milestone -- only a
-    /// whole binding may ever be moved.
-    fn check_consume(&mut self, expr: &HirExpr) {
-        let HirExpr::Local {
-            local, name, span, ..
-        } = expr
-        else {
-            return;
-        };
-        if self.observing.contains(local) {
+    /// Transitions `local`'s own state to `Moved` -- the only shape an
+    /// existing owned binding can be consumed *from* is a bare local
+    /// reference naming one. Moving a resource-typed value *out of* a
+    /// field (`take other.file`) is not supported this milestone --
+    /// only a whole binding may ever be moved.
+    fn check_consume(&mut self, local: LocalId, name: crate::symbol::Symbol, span: Span) {
+        if self.observing.contains(&local) {
             self.diagnose(
                 OBSERVATION_ESCAPES,
-                *span,
+                span,
                 format!(
                     "`{}` is an ordinary parameter's own call-scoped observation and cannot be moved, returned, or stored",
-                    self.local_name(*local, *name)
+                    self.local_name(local, name)
                 ),
                 "observation escapes its call",
             );
             return;
         }
-        let Some(state) = self.states.get(local).copied() else {
+        let Some(state) = self.states.get(&local).copied() else {
             return;
         };
         match state {
             ResourceState::Available => {
-                self.states.insert(*local, ResourceState::Moved);
+                self.states.insert(local, ResourceState::Moved);
             }
             ResourceState::Error => {}
             ResourceState::Moved => {
                 self.diagnose(
                     USE_AFTER_MOVE,
-                    *span,
+                    span,
                     format!(
                         "`{}` was already moved and cannot be moved again",
-                        self.local_name(*local, *name)
+                        self.local_name(local, name)
                     ),
                     "use after move",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.states.insert(local, ResourceState::Error);
             }
             ResourceState::Dropped => {
                 self.diagnose(
                     USE_AFTER_DROP,
-                    *span,
+                    span,
                     format!(
                         "`{}` was already dropped and cannot be moved",
-                        self.local_name(*local, *name)
+                        self.local_name(local, name)
                     ),
                     "use after drop",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.states.insert(local, ResourceState::Error);
             }
             ResourceState::DropScheduled => {
                 self.diagnose(
                     MOVE_AFTER_DEFER_CAPTURED,
-                    *span,
+                    span,
                     format!(
                         "`{}` is still needed by a pending `defer` and cannot be moved away",
-                        self.local_name(*local, *name)
+                        self.local_name(local, name)
                     ),
                     "moved before its defer ran",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.states.insert(local, ResourceState::Error);
             }
         }
     }
@@ -518,20 +650,21 @@ impl<'a> FlowChecker<'a> {
         if_id: crate::hir::ExprId,
         then_branch: &HirBlock,
         else_branch: Option<&HirElse>,
+        kind: ConsumeKind,
     ) {
         let entry = self.states.clone();
-        self.check_block(then_branch);
+        self.check_block_ctx(then_branch, kind);
         let then_diverges = self.diverges(then_branch.id);
         let then_exit = std::mem::replace(&mut self.states, entry.clone());
 
         let (else_exit, else_diverges) = match else_branch {
             Some(HirElse::Block(block)) => {
-                self.check_block(block);
+                self.check_block_ctx(block, kind);
                 let diverges = self.diverges(block.id);
                 (std::mem::replace(&mut self.states, entry.clone()), diverges)
             }
             Some(HirElse::If(inner)) => {
-                self.check_expr(inner);
+                self.check_expr_ctx(inner, kind);
                 let diverges = self.diverges(inner.id());
                 (self.states.clone(), diverges)
             }
@@ -542,14 +675,33 @@ impl<'a> FlowChecker<'a> {
             &entry,
             &[(then_exit, then_diverges), (else_exit, else_diverges)],
         );
-        if self.states.values().any(|s| *s == ResourceState::Error)
+        // In a `ConsumeKind::Return` context, this `if`'s own value is
+        // being consumed by an enclosing `return` right here, at this
+        // exact point (Blocker 2) -- `nir::lower` pushes that
+        // `return`'s own cleanup+terminate into each branch separately
+        // (`Lowering::lower_into_return_sink`), so a branch moving
+        // exactly the local that *is* its own tail while a sibling
+        // branch leaves that same local untouched is the expected
+        // shape of a compound return, not a real ambiguity: nothing
+        // ever reads `self.states` again on either path, since both
+        // already end the function right here. Only a *different*
+        // kind of disagreement (anything other than a clean
+        // entry-`Available`-to-branch-`Moved`/`Available` split) still
+        // indicates a real bug and is still reported.
+        if kind != ConsumeKind::Return
+            && self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
             self.diagnose_inconsistent_join(if_id);
         }
     }
 
-    fn check_match_arms(&mut self, match_id: crate::hir::ExprId, arms: &[HirMatchArm]) {
+    fn check_match_arms(
+        &mut self,
+        match_id: crate::hir::ExprId,
+        arms: &[HirMatchArm],
+        kind: ConsumeKind,
+    ) {
         let entry = self.states.clone();
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
@@ -557,11 +709,11 @@ impl<'a> FlowChecker<'a> {
             self.check_pattern(&arm.pattern);
             let diverges = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
-                    self.check_expr(e);
+                    self.check_expr_ctx(e, kind);
                     self.diverges(e.id())
                 }
                 HirMatchArmBody::Block(block) => {
-                    self.check_block(block);
+                    self.check_block_ctx(block, kind);
                     self.diverges(block.id)
                 }
             };
@@ -575,7 +727,12 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    fn check_handle_arms(&mut self, handle_id: crate::hir::ExprId, arms: &[HirHandleArm]) {
+    fn check_handle_arms(
+        &mut self,
+        handle_id: crate::hir::ExprId,
+        arms: &[HirHandleArm],
+        kind: ConsumeKind,
+    ) {
         let entry = self.states.clone();
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
@@ -591,11 +748,11 @@ impl<'a> FlowChecker<'a> {
             }
             let diverges = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
-                    self.check_expr(e);
+                    self.check_expr_ctx(e, kind);
                     self.diverges(e.id())
                 }
                 HirMatchArmBody::Block(block) => {
-                    self.check_block(block);
+                    self.check_block_ctx(block, kind);
                     self.diverges(block.id)
                 }
             };

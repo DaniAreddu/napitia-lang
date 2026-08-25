@@ -329,4 +329,85 @@ mod tests {
         );
         assert_eq!(codes_of(&diags), vec!["U0001"], "unexpected: {diags:?}");
     }
+
+    #[test]
+    fn a_compound_return_choosing_between_two_taken_resources_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 return if cond { left } else { right }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn an_implicit_compound_tail_return_choosing_between_two_taken_resources_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 if cond { left } else { right } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_nested_if_inside_a_compound_return_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func choose(a: bool, b: bool, take x: File, take y: File, take z: File) -> File { \
+                 return if a { x } else if b { y } else { z }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_compound_return_with_one_diverging_arm_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func fail() -> i64 { return 0 } \
+             func choose(cond: bool, take left: File) -> File { \
+                 return if cond { left } else { return left; }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_match_directly_returned_is_rejected() {
+        let diags = check(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func choose(c: Choice, take left: File, take right: File) -> File { \
+                 return match c { A => left, B => right }; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_if_bound_to_a_value_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 value picked = if cond { left } else { right }; \
+                 return picked; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_if_passed_to_a_take_parameter_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func choose(cond: bool, take left: File, take right: File) -> i64 { \
+                 return sink(if cond { left } else { right }); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
+    }
 }

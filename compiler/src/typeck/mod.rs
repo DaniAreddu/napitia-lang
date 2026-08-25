@@ -175,6 +175,12 @@ mod codes {
     /// be -- only another `resource` (itself already non-copyable) may
     /// hold a resource-typed field.
     pub const RESOURCE_FIELD_IN_ORDINARY_AGGREGATE: &str = "T0064";
+    /// A parameter declared `take` whose own static type is not a
+    /// declared `resource` (`rfcs/0011`). `take` transfers ownership
+    /// into the call; an ordinary (non-affine) value has no ownership
+    /// state to transfer at all, so this is a dedicated diagnostic
+    /// rather than silently treating it like an ordinary parameter.
+    pub const TAKE_OF_NON_RESOURCE: &str = "T0065";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -759,11 +765,14 @@ impl<'a> Checker<'a> {
     fn build_signatures(&mut self, hir: &HirModule) {
         for f in &hir.functions {
             self.source = f.source;
-            let params = f
+            let params: Vec<Ty> = f
                 .params
                 .iter()
                 .map(|p| self.resolve_named_type(&p.ty))
                 .collect();
+            for (p, ty) in f.params.iter().zip(&params) {
+                self.check_take_target(p, ty);
+            }
             let ret = f
                 .return_type
                 .as_ref()
@@ -794,11 +803,14 @@ impl<'a> Checker<'a> {
             self.source = e.source;
             let extend_type_params: Vec<TypeParamId> = e.type_params.iter().map(|p| p.id).collect();
             for m in &e.methods {
-                let params = m
+                let params: Vec<Ty> = m
                     .params
                     .iter()
                     .map(|p| self.resolve_named_type(&p.ty))
                     .collect();
+                for (p, ty) in m.params.iter().zip(&params) {
+                    self.check_take_target(p, ty);
+                }
                 let ret = m
                     .return_type
                     .as_ref()
@@ -3725,6 +3737,39 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// A `take` parameter's own declared type must be a resource
+    /// (`rfcs/0011`, Blocker 9) -- `take` transfers ownership into the
+    /// call, and an ordinary (non-affine) value has no ownership state
+    /// at all for `resourceck`/`nir::lower` to transfer. Declared on a
+    /// still-unresolved generic parameter type is intentionally not
+    /// flagged here (never a concrete resource or not, until a call
+    /// site substitutes it) -- this milestone's own resources are never
+    /// generic, so a real violation always resolves to a concrete
+    /// non-resource type here regardless.
+    fn check_take_target(&mut self, param: &crate::hir::HirParam, ty: &Ty) {
+        if !param.take {
+            return;
+        }
+        let resolved = self.ctx.resolve(ty);
+        if matches!(resolved, Ty::Error | Ty::Never | Ty::Param(..)) {
+            return;
+        }
+        if !self.is_affine_resource(&resolved) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TAKE_OF_NON_RESOURCE,
+                    self.source,
+                    param.span,
+                    format!(
+                        "`take` requires a resource parameter, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("not a resource"),
+            );
+        }
+    }
+
     /// `true` for a resolved type this checker can prove *no* operation
     /// is universally valid for -- specifically, one of the enclosing
     /// generic declaration's own unconstrained type parameters
@@ -4638,6 +4683,43 @@ mod tests {
              func consume(take file: File) -> i64 { return file.descriptor }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn take_on_a_non_resource_parameter_is_rejected() {
+        let diags = check("func bad(take number: i64) -> i64 { return number }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0065"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_non_resource_extend_method_parameter_is_rejected() {
+        let diags = check(
+            "record Box { amount: i64 } \
+             protocol Bad[T] { func bad(take number: i64) -> i64; } \
+             extend Bad[Box] { func bad(take number: i64) -> i64 { return number } }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0065"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_non_resource_parameter_points_at_the_take_declaration() {
+        let diags = check("func bad(take number: i64) -> i64 { return number }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        let span = diags[0].primary_span;
+        let text = "func bad(take number: i64) -> i64 { return number }";
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "take number: i64",
+            "expected the diagnostic to span the `take` declaration itself"
+        );
     }
 
     #[test]

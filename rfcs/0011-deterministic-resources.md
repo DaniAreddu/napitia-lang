@@ -27,13 +27,17 @@ func inspect(file: File) -> i64 {
     return file.descriptor
 }
 
-func consume(take file: File) -> unit {
-    drop file
+// An ordinary (non-`take`) parameter: `close` only observes `file` for
+// the duration of this call -- `main` still owns it afterward, and may
+// still read it below.
+func close(file: File) -> unit {
 }
 
 func main() -> i64 {
     value file = open(3);
-    defer consume(file);
+    // Registered now, run once this scope exits (after the tail
+    // expression below is computed, before `main` actually returns).
+    defer close(file);
     return inspect(file)
 }
 ```

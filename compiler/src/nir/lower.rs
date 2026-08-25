@@ -1067,24 +1067,39 @@ impl<'a> Lowering<'a> {
             params.push(Param { value, ty });
         }
 
-        let body_result = self.lower_block_value(&mut fb, &f.body)?;
-        if !fb.current_terminated() {
-            // `Diverged` always means the block that produced it is
-            // already terminated (see `LoweredExpr`), so reaching here
-            // means the body itself did produce a real value.
-            let LoweredExpr::Value(body_value) = body_result else {
-                unreachable!(
-                    "internal invariant: a Diverged result always already terminated its block"
-                );
-            };
-            if let Some(tail) = f.body.tail.as_deref() {
-                self.mark_moved(&mut fb, tail);
-            }
-            self.emit_cleanup(&mut fb)?;
-            if matches!(return_type, Ty::Unit) {
+        // The function's own implicit tail return is lowered through
+        // the same per-branch sink [`Self::lower_into_return_sink`]
+        // explicit `return` uses (Blocker 2) -- a resource-typed
+        // compound tail (`if cond { left } else { right }`, with no
+        // explicit `return` at all) needs exactly the same per-branch
+        // cleanup+terminate, not a single post-merge guess.
+        let return_type_for_tail = return_type.clone();
+        let mut finish_tail = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+            this.emit_cleanup(fb)?;
+            if matches!(return_type_for_tail, Ty::Unit) {
                 fb.terminate(Terminator::Return(None));
             } else {
-                fb.terminate(Terminator::Return(Some(body_value)));
+                fb.terminate(Terminator::Return(Some(v)));
+            }
+            Ok(LoweredExpr::Diverged)
+        };
+        if self.is_affine(&return_type) {
+            self.lower_into_return_sink_block(&mut fb, &f.body, &return_type, &mut finish_tail)?;
+        } else {
+            let body_result = self.lower_block_value(&mut fb, &f.body)?;
+            if !fb.current_terminated() {
+                // `Diverged` always means the block that produced it is
+                // already terminated (see `LoweredExpr`), so reaching
+                // here means the body itself did produce a real value.
+                let LoweredExpr::Value(body_value) = body_result else {
+                    unreachable!(
+                        "internal invariant: a Diverged result always already terminated its block"
+                    );
+                };
+                if let Some(tail) = f.body.tail.as_deref() {
+                    self.mark_moved(&mut fb, tail);
+                }
+                finish_tail(self, &mut fb, body_value)?;
             }
         }
 
@@ -1528,6 +1543,157 @@ impl<'a> Lowering<'a> {
         fb.moved_out = join.exits.into_iter().next().unwrap_or(join.entry);
     }
 
+    /// `return <expr>;`/`return;` (`rfcs/0011`, Blocker 2). A
+    /// resource-typed `expr` that is itself a nested `if`/block is
+    /// lowered through [`Self::lower_into_return_sink`] rather than
+    /// the ordinary value-producing path (`if`/`match`/`handle`'s own
+    /// shared-slot-then-merge machinery): a different underlying
+    /// resource local may be the one actually transferred on each
+    /// reachable branch (e.g. `return if cond { left } else { right
+    /// }`, where `left` is moved and `right` must still be dropped on
+    /// the `then` path, and vice versa on `else`), and NIR has no phi
+    /// node to reconcile two branches' disagreeing ownership facts at
+    /// one shared point -- so this `return`'s own cleanup+terminate
+    /// must run separately inside each branch, using that branch's own
+    /// correctly-isolated `moved_out` (see [`Self::lower_branch_moves`]).
+    /// `resourceck` already rejects every other compound-origin shape
+    /// (`match`/`handle`, or a non-`return` consuming position) this
+    /// milestone cannot yet lower soundly, so `expr` reaching here is
+    /// never one of those.
+    fn lower_return(
+        &mut self,
+        fb: &mut FnBuilder,
+        value: Option<&HirExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        let Some(value) = value else {
+            self.emit_cleanup(fb)?;
+            fb.terminate(Terminator::Return(None));
+            return Ok(LoweredExpr::Diverged);
+        };
+        let ret_ty = fb.return_ty.clone();
+        let mut finish = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+            this.emit_cleanup(fb)?;
+            fb.terminate(Terminator::Return(Some(v)));
+            Ok(LoweredExpr::Diverged)
+        };
+        // The per-branch sink is only actually needed (and only ever
+        // changes the NIR shape produced) for a resource-typed return
+        // value -- a plain value type has no ownership ambiguity a
+        // single post-merge terminator could get wrong, so it keeps
+        // the ordinary, simpler shared-slot-then-merge lowering
+        // (`rfcs/0011`, Blocker 2 is scoped to affine types only).
+        if self.is_affine(&ret_ty) {
+            self.lower_into_return_sink(fb, value, &ret_ty, &mut finish)
+        } else {
+            let v = match self.lower_expr_hinted(fb, value, &ret_ty)? {
+                LoweredExpr::Value(v) => v,
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            };
+            self.mark_moved(fb, value);
+            finish(self, fb, v)
+        }
+    }
+
+    /// Lowers `expr` in a position whose own final value must be
+    /// handed to `finish` (a `return`'s own cleanup+terminate, or the
+    /// function's own implicit-tail-return finish) separately on each
+    /// reachable leaf of a nested `if`/block wrapping `expr`, instead
+    /// of merging every branch's value into one shared slot first and
+    /// calling `finish` once, afterward. See [`Self::lower_return`]'s
+    /// own doc comment for why this is required at all.
+    fn lower_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        expr: &HirExpr,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        match expr {
+            HirExpr::Block(block) => self.lower_into_return_sink_block(fb, block, hint, finish),
+            HirExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let cond_value = match self.lower_expr(fb, condition)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                let then_block = fb.new_block();
+                let else_block = fb.new_block();
+                fb.terminate(Terminator::CondBranch {
+                    condition: cond_value,
+                    then_block,
+                    else_block,
+                });
+
+                self.begin_move_join(fb);
+                fb.switch_to(then_block);
+                self.lower_branch_moves(fb, |this, fb| {
+                    this.lower_into_return_sink_block(fb, then_branch, hint, &mut *finish)
+                })?;
+
+                fb.switch_to(else_block);
+                self.lower_branch_moves(fb, |this, fb| match else_branch {
+                    Some(HirElse::Block(b)) => {
+                        this.lower_into_return_sink_block(fb, b, hint, &mut *finish)
+                    }
+                    Some(HirElse::If(inner)) => {
+                        this.lower_into_return_sink(fb, inner, hint, &mut *finish)
+                    }
+                    None => {
+                        let v = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                        finish(this, fb, v)
+                    }
+                })?;
+                self.end_move_join(fb);
+
+                Ok(LoweredExpr::Diverged)
+            }
+            _ => {
+                let value = match self.lower_expr_hinted(fb, expr, hint)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                self.mark_moved(fb, expr);
+                finish(self, fb, value)
+            }
+        }
+    }
+
+    /// Like [`Self::lower_into_return_sink`], for one nested block's
+    /// own statements + tail directly (an `if`-branch's own body, or a
+    /// bare `{ ... }` wrapping the sink's own expression) -- scoped
+    /// exactly like [`Self::lower_scoped_block`], so a resource this
+    /// block itself declares and never moves does not leak into a
+    /// sibling branch's own cleanup list.
+    fn lower_into_return_sink_block(
+        &mut self,
+        fb: &mut FnBuilder,
+        block: &HirBlock,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        let marker = fb.cleanup_actions.len();
+        for stmt in &block.statements {
+            self.lower_stmt(fb, stmt)?;
+            if fb.current_terminated() {
+                fb.cleanup_actions.truncate(marker);
+                return Ok(LoweredExpr::Diverged);
+            }
+        }
+        let result = match &block.tail {
+            Some(tail) => self.lower_into_return_sink(fb, tail, hint, finish)?,
+            None => {
+                let v = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                finish(self, fb, v)?
+            }
+        };
+        fb.cleanup_actions.truncate(marker);
+        Ok(result)
+    }
+
     fn lower_while(
         &mut self,
         fb: &mut FnBuilder,
@@ -1710,26 +1876,7 @@ impl<'a> Lowering<'a> {
             HirExpr::RecordLiteral { record, fields, .. } => {
                 self.lower_record_literal(fb, *record, fields, expr)
             }
-            HirExpr::Return { value, .. } => {
-                let ret_ty = fb.return_ty.clone();
-                let v = match value {
-                    Some(v) => match self.lower_expr_hinted(fb, v, &ret_ty)? {
-                        LoweredExpr::Value(val) => {
-                            self.mark_moved(fb, v);
-                            Some(val)
-                        }
-                        // The value being returned already diverged
-                        // (e.g. `return return 1`); this outer `return`
-                        // never actually executes, and the block is
-                        // already terminated by the inner one.
-                        LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
-                    },
-                    None => None,
-                };
-                self.emit_cleanup(fb)?;
-                fb.terminate(Terminator::Return(v));
-                Ok(LoweredExpr::Diverged)
-            }
+            HirExpr::Return { value, .. } => self.lower_return(fb, value.as_deref()),
             HirExpr::Break { value, span, .. } => {
                 // typeck rejects any value-carrying `break` outright
                 // (T0007) regardless of the value's type, before
@@ -4037,6 +4184,93 @@ mod tests {
             "expected a drop on the `Choice.A` arm's own non-taken path and one more on the \
              whole `Choice.B` arm, neither poisoned by the nested `if`'s own move"
         );
+    }
+
+    #[test]
+    fn a_compound_return_drops_the_unchosen_take_parameter_on_each_branch() {
+        // Blocker 2: `return if cond { left } else { right }` must drop
+        // exactly the *other* parameter on each branch, and never the
+        // one it actually returns -- a single post-merge cleanup point
+        // cannot represent this (NIR has no phi node), so `lower_if`'s
+        // ordinary shared-slot-then-merge path is not used here at all;
+        // each branch gets its own `Return` terminator instead.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 return if cond { left } else { right }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 return if cond { left } else { right }; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            f.blocks.len(),
+            3,
+            "expected no shared merge block: entry, then, and else, each with their own Return"
+        );
+        let returns = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Return(Some(_))))
+            .count();
+        assert_eq!(returns, 2, "expected a distinct Return on each branch");
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected exactly one drop per branch, dropping the unchosen parameter"
+        );
+    }
+
+    #[test]
+    fn an_implicit_compound_tail_return_drops_the_unchosen_take_parameter() {
+        // Same as above, but through the function's own implicit tail
+        // return rather than an explicit `return` statement.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 if cond { left } else { right } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 if cond { left } else { right } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected exactly one drop per branch, dropping the unchosen parameter"
+        );
+    }
+
+    #[test]
+    fn a_non_resource_compound_return_still_uses_a_shared_merge_block() {
+        // The per-branch sink is only needed for resource types
+        // (Blocker 2) -- a plain value type keeps the ordinary,
+        // simpler shared-slot-then-merge shape, unchanged from before.
+        let module = lower("func f(cond: bool) -> i64 { return if cond { 1 } else { 2 }; }");
+        let f = &module.functions[0];
+        assert_eq!(
+            f.blocks.len(),
+            4,
+            "expected entry, then, else, and a shared merge block"
+        );
+        let returns = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Return(Some(_))))
+            .count();
+        assert_eq!(returns, 1, "expected exactly one shared Return");
     }
 
     #[test]

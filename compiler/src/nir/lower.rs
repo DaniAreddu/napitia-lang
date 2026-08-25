@@ -798,6 +798,16 @@ struct Lowering<'a> {
 struct LoopCtx {
     break_target: BlockId,
     continue_target: BlockId,
+    /// `fb.cleanup_actions.len()` at the point this loop's own body
+    /// began lowering (`rfcs/0011`, Blocker 5) -- every entry
+    /// registered at or after this index belongs to some scope nested
+    /// inside *this* loop's own current iteration (the body's own
+    /// top-level bindings, or any block/if/match/handle nested inside
+    /// it), so replaying `cleanup_actions[marker..]` in reverse before
+    /// a `break`/`continue` destroys exactly what this iteration owns
+    /// and nothing an enclosing scope (an outer loop, or the function
+    /// itself) still needs live.
+    cleanup_marker: usize,
 }
 
 struct PendingBlock {
@@ -1733,6 +1743,7 @@ impl<'a> Lowering<'a> {
         fb.loop_stack.push(LoopCtx {
             break_target: after,
             continue_target: header,
+            cleanup_marker: fb.cleanup_actions.len(),
         });
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
@@ -1753,6 +1764,7 @@ impl<'a> Lowering<'a> {
         fb.loop_stack.push(LoopCtx {
             break_target: after,
             continue_target: header,
+            cleanup_marker: fb.cleanup_actions.len(),
         });
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
@@ -1890,21 +1902,31 @@ impl<'a> Lowering<'a> {
                         self.unsupported(*span, "`break` with a value (loop-as-expression)")
                     );
                 }
-                let target = fb
+                let ctx = *fb
                     .loop_stack
                     .last()
-                    .map(|c| c.break_target)
                     .ok_or_else(|| self.unsupported(*span, "`break` outside a loop"))?;
-                fb.terminate(Terminator::Branch(target));
+                // Destroys exactly this iteration's own live resources
+                // (`rfcs/0011`, Blocker 5) before jumping past the loop
+                // entirely -- an enclosing scope's own cleanup (an
+                // outer loop, or the function itself) is untouched,
+                // since `ctx.cleanup_marker` only covers entries
+                // registered at or after this loop's own body started.
+                self.emit_cleanup_since(fb, ctx.cleanup_marker)?;
+                fb.terminate(Terminator::Branch(ctx.break_target));
                 Ok(LoweredExpr::Diverged)
             }
             HirExpr::Continue { span, .. } => {
-                let target = fb
+                let ctx = *fb
                     .loop_stack
                     .last()
-                    .map(|c| c.continue_target)
                     .ok_or_else(|| self.unsupported(*span, "`continue` outside a loop"))?;
-                fb.terminate(Terminator::Branch(target));
+                // Same cleanup as `break` above, before looping back to
+                // the condition instead of past it -- this iteration's
+                // own resources must still be destroyed exactly once
+                // before the next iteration freshly redeclares them.
+                self.emit_cleanup_since(fb, ctx.cleanup_marker)?;
+                fb.terminate(Terminator::Branch(ctx.continue_target));
                 Ok(LoweredExpr::Diverged)
             }
             HirExpr::Error { .. } => Ok(LoweredExpr::Value(
@@ -4840,6 +4862,243 @@ mod tests {
         let module =
             lower("func f() -> i64 { mutable x = 0; while x < 10 { x = x + 1; } return x }");
         assert!(module.functions[0].blocks.len() >= 3);
+    }
+
+    #[test]
+    fn break_drops_a_resource_declared_earlier_in_the_same_iteration() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { break; } \
+                     drop file; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { break; } \
+                     drop file; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one on the fallthrough path"
+        );
+    }
+
+    #[test]
+    fn continue_drops_a_resource_declared_earlier_in_the_same_iteration() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     continue; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     continue; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the resource to be dropped exactly once, before continue loops back"
+        );
+    }
+
+    #[test]
+    fn a_resource_declared_in_a_nested_block_inside_a_loop_is_dropped_by_break() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     { \
+                         value file = File { descriptor: 1 }; \
+                         if cond { break; } \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     { \
+                         value file = File { descriptor: 1 }; \
+                         if cond { break; } \
+                     } \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one at the nested block's own normal exit"
+        );
+    }
+
+    #[test]
+    fn break_and_a_pending_defer_both_run_in_declaration_reversed_order() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     defer touch(file); \
+                     value other = File { descriptor: 2 }; \
+                     if cond { break; } \
+                     drop other; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     defer touch(file); \
+                     value other = File { descriptor: 2 }; \
+                     if cond { break; } \
+                     drop other; \
+                 } \
+             }",
+        );
+        // Declaration order: `touch` first, `f` second. Registration
+        // order within one iteration: file, defer(file), other.
+        // Reversed cleanup on *each* exit path (break, and the
+        // fallthrough back-edge): drop(other), call(touch), drop(file)
+        // -- checked per-block, since a block-level assertion (rather
+        // than a whole-function instruction count) is the only way to
+        // confirm the ordering rather than merely the totals.
+        let f = &module.functions[1];
+        let mut saw_correct_sequence_block = false;
+        for block in &f.blocks {
+            let sequence: Vec<&str> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i {
+                    Instruction::Value {
+                        kind: crate::nir::ValueKind::Call(..),
+                        ..
+                    } => Some("call"),
+                    Instruction::Drop { .. } => Some("drop"),
+                    _ => None,
+                })
+                .collect();
+            if sequence == vec!["drop", "call", "drop"] {
+                saw_correct_sequence_block = true;
+            } else if !sequence.is_empty() {
+                panic!(
+                    "expected only the correct drop/call/drop sequence per exit block, found {sequence:?}"
+                );
+            }
+        }
+        assert!(
+            saw_correct_sequence_block,
+            "expected at least one exit block with other's own drop, then the deferred call, \
+             then file's own drop"
+        );
+    }
+
+    #[test]
+    fn break_from_an_inner_loop_does_not_clean_up_the_outer_loops_live_resource() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value outer = File { descriptor: 1 }; \
+                     while cond { \
+                         if cond { break; } \
+                     } \
+                     drop outer; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value outer = File { descriptor: 1 }; \
+                     while cond { \
+                         if cond { break; } \
+                     } \
+                     drop outer; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the inner loop's own break must not drop the outer loop's still-live resource"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_inside_branches_each_clean_up_correctly() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { \
+                         break; \
+                     } else { \
+                         continue; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { \
+                         break; \
+                     } else { \
+                         continue; \
+                     } \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one on the continue path, no duplicates"
+        );
     }
 
     #[test]

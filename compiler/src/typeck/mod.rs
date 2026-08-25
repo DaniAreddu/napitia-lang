@@ -181,6 +181,16 @@ mod codes {
     /// state to transfer at all, so this is a dedicated diagnostic
     /// rather than silently treating it like an ordinary parameter.
     pub const TAKE_OF_NON_RESOURCE: &str = "T0065";
+    /// `defer <expr>;` where `<expr>` is not a shape this milestone's
+    /// checked defer contract supports (`rfcs/0011`, Blocker 6): a
+    /// direct call to a plain, non-generic, capability-free function
+    /// that does not return a resource. `nir::lower` cannot represent
+    /// anything else (an indirect/dynamic callee, a generic
+    /// substitution, a capability requirement, or a new resource
+    /// needing an owner at cleanup time) -- rejected here, at check
+    /// time, so `check` and `ir` never disagree about which programs
+    /// this milestone actually accepts.
+    pub const UNSUPPORTED_DEFER_SHAPE: &str = "T0066";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -1158,13 +1168,14 @@ impl<'a> Checker<'a> {
                 value_ty
             }
             HirStmt::Expr(e) => self.check_expr(e),
-            HirStmt::Defer { expr, .. } => {
+            HirStmt::Defer { expr, span } => {
                 // Type-checked immediately, exactly like any other
                 // statement-expression, even though `resourceck`/NIR
                 // lowering only actually run the call later, at scope
                 // exit (`rfcs/0011`) -- there is no "check it when it
                 // eventually runs" deferred pass.
                 self.check_expr(expr);
+                self.check_defer_shape(expr, *span);
                 Ty::Unit
             }
             HirStmt::Drop { expr, span } => {
@@ -3770,6 +3781,66 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Rejects a `defer` whose own expression is not this milestone's
+    /// checked contract (`rfcs/0011`, Blocker 6) -- kept exactly in
+    /// sync with `nir::lower::Lowering::lower_defer_call`'s own
+    /// acceptance so `check`/`ir`/`run` never disagree about which
+    /// `defer` a program may use. A `defer` calling a *fallible*
+    /// function is already rejected by the general "an unhandled
+    /// fallible call's result must be `?`/`handle`d" rule (`T0048`)
+    /// this same `check_expr(expr)` call already applies -- not
+    /// re-checked a second time here.
+    fn check_defer_shape(&mut self, expr: &HirExpr, span: Span) {
+        let unsupported = |this: &mut Self, message: &str| {
+            this.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNSUPPORTED_DEFER_SHAPE,
+                    this.source,
+                    span,
+                    message.to_string(),
+                )
+                .with_primary_label("unsupported `defer` this milestone"),
+            );
+        };
+        let HirExpr::Call { callee, .. } = expr else {
+            unsupported(self, "`defer` requires a direct call to a plain function");
+            return;
+        };
+        let HirExpr::Function { item, .. } = callee.as_ref() else {
+            unsupported(
+                self,
+                "a `defer`'s own callee must be a plain function reference, not an indirect or \
+                 dynamic value",
+            );
+            return;
+        };
+        let Some(sig) = self.functions.get(item).cloned() else {
+            // An unresolved callee is already diagnosed elsewhere
+            // (resolve/typeck's own "unknown function" checks).
+            return;
+        };
+        if !sig.type_params.is_empty() {
+            unsupported(
+                self,
+                "a `defer` calling a generic function is not supported this milestone",
+            );
+        }
+        if !sig.requirements.is_empty() {
+            unsupported(
+                self,
+                "a `defer` calling a capability-requiring function is not supported this \
+                 milestone",
+            );
+        }
+        if self.is_affine_resource(&sig.ret) {
+            unsupported(
+                self,
+                "a `defer` calling a function that returns a resource is not supported this \
+                 milestone",
+            );
+        }
+    }
+
     /// `true` for a resolved type this checker can prove *no* operation
     /// is universally valid for -- specifically, one of the enclosing
     /// generic declaration's own unconstrained type parameters
@@ -4612,9 +4683,55 @@ mod tests {
     #[test]
     fn defer_statements_own_expression_is_type_checked_normally() {
         // `defer` is real as of `rfcs/0011`: its expression is
-        // type-checked exactly like an ordinary statement-expression,
-        // with no unsupported-feature diagnostic.
+        // type-checked exactly like an ordinary statement-expression.
+        let diags = check(
+            "func consume(x: i64) -> unit {} func f() { value x = 1; defer consume(x + 1); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn defer_of_an_arithmetic_expression_is_rejected() {
+        // Blocker 6: only a direct call to a plain function is a
+        // supported `defer` shape this milestone -- an arbitrary
+        // expression is rejected at check time, not silently accepted
+        // only to fail lowering later with an internal diagnostic.
         let diags = check("func f() { value x = 1; defer x + 1; }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_generic_function_call_is_rejected() {
+        let diags =
+            check("func identity[T](x: T) -> T { return x } func f() { defer identity[i64](1); }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_function_returning_a_resource_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make() -> File { return File { descriptor: 1 } } \
+             func f() { defer make(); }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_plain_function_call_returning_a_non_resource_is_accepted() {
+        let diags = check("func touch() -> i64 { return 1 } func f() { defer touch(); }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 

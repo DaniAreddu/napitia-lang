@@ -893,6 +893,27 @@ struct FnBuilder {
     /// `resourceck` already proved this is unambiguous for any program
     /// that reaches lowering at all.
     moved_out: HashSet<LocalId>,
+    /// One entry per branching construct (`if`/`match`/`handle`)
+    /// currently being lowered, innermost last (`rfcs/0011`). See
+    /// [`Lowering::begin_move_join`]/[`Lowering::lower_branch_moves`]/
+    /// [`Lowering::end_move_join`] -- isolates `moved_out` between
+    /// sibling branches/arms of the same construct, and between them
+    /// and the construct's own join/continuation, exactly like
+    /// `resourceck::flow`'s own per-branch state clone already does for
+    /// its own path-sensitive join. Without this, a resource moved only
+    /// inside one branch would leak into `moved_out` for a sibling
+    /// branch (or the code lowered after the join) lowered afterward
+    /// against the same single mutable set, wrongly skipping that
+    /// sibling's own cleanup for a resource it never actually moved.
+    move_join_stack: Vec<MoveJoin>,
+}
+
+/// One branching construct's own entry `moved_out` snapshot, and every
+/// non-diverging branch/arm's own resulting `moved_out` set collected
+/// so far. See [`FnBuilder::move_join_stack`].
+struct MoveJoin {
+    entry: HashSet<LocalId>,
+    exits: Vec<HashSet<LocalId>>,
 }
 
 impl FnBuilder {
@@ -911,6 +932,7 @@ impl FnBuilder {
             return_ty,
             cleanup_actions: Vec::new(),
             moved_out: HashSet::new(),
+            move_join_stack: Vec::new(),
         }
     }
 
@@ -1441,6 +1463,69 @@ impl<'a> Lowering<'a> {
         }
         fb.cleanup_actions.truncate(marker);
         Ok(())
+    }
+
+    /// Starts one branching construct's (`if`/`match`/`handle`) own
+    /// `moved_out` join scope (`rfcs/0011`), snapshotting the state in
+    /// effect right before any of its branches/arms runs. Must be
+    /// followed, once every branch/arm has been lowered through
+    /// [`Self::lower_branch_moves`], by exactly one matching
+    /// [`Self::end_move_join`].
+    fn begin_move_join(&self, fb: &mut FnBuilder) {
+        fb.move_join_stack.push(MoveJoin {
+            entry: fb.moved_out.clone(),
+            exits: Vec::new(),
+        });
+    }
+
+    /// Lowers one branch/arm's own body (`f`) in isolation: `moved_out`
+    /// is reset to the enclosing join's own entry snapshot first, so
+    /// this branch never sees a sibling branch's own moves, and its own
+    /// resulting `moved_out` set is recorded onto the enclosing join
+    /// afterward -- but only if it actually reaches its own normal end
+    /// (`!fb.current_terminated()`); a branch that diverges contributes
+    /// nothing to the join, exactly like `resourceck::flow::
+    /// join_branch_states` already excludes a diverging branch from its
+    /// own join. Must be called once per branch/arm, between a matching
+    /// [`Self::begin_move_join`]/[`Self::end_move_join`] pair.
+    fn lower_branch_moves<T>(
+        &mut self,
+        fb: &mut FnBuilder,
+        f: impl FnOnce(&mut Self, &mut FnBuilder) -> LowerResult<T>,
+    ) -> LowerResult<T> {
+        let entry = fb
+            .move_join_stack
+            .last()
+            .expect("internal invariant: lower_branch_moves called outside a move-join scope")
+            .entry
+            .clone();
+        fb.moved_out = entry;
+        let result = f(self, fb)?;
+        if !fb.current_terminated() {
+            let exit = fb.moved_out.clone();
+            fb.move_join_stack
+                .last_mut()
+                .expect("internal invariant: move-join scope popped during its own branch")
+                .exits
+                .push(exit);
+        }
+        Ok(result)
+    }
+
+    /// Ends the innermost `moved_out` join scope, installing its own
+    /// joined result onto `fb.moved_out` (`rfcs/0011`; mirrors
+    /// `resourceck::flow::join_branch_states`'s own join). `resourceck`
+    /// already proved that every reachable (non-diverging) branch of an
+    /// accepted program agrees exactly about every resource's own state,
+    /// so any one recorded exit is the correct joined result; if none
+    /// were recorded (every branch diverged), the join itself is
+    /// unreachable code, and the entry snapshot is used unchanged.
+    fn end_move_join(&self, fb: &mut FnBuilder) {
+        let join = fb
+            .move_join_stack
+            .pop()
+            .expect("internal invariant: end_move_join called outside a move-join scope");
+        fb.moved_out = join.exits.into_iter().next().unwrap_or(join.entry);
     }
 
     fn lower_while(
@@ -2221,6 +2306,7 @@ impl<'a> Lowering<'a> {
         // the very same arm just reuses the block already recorded here.
         let mut arm_blocks: HashMap<usize, BlockId> = HashMap::new();
 
+        self.begin_move_join(fb);
         for (variant, err_slot, dispatch_block) in err_blocks {
             let Some(layout) = self.variants.get(&variant) else {
                 return Err(self.internal_error("`handle` dispatches an unknown raised variant"));
@@ -2280,7 +2366,8 @@ impl<'a> Lowering<'a> {
                         self.bind_arm_pattern(fb, pat, v)?;
                     }
                 }
-                self.lower_arm_body(fb, &arms[arm_index].body, merge)?;
+                let body = &arms[arm_index].body;
+                self.lower_branch_moves(fb, |this, fb| this.lower_arm_body(fb, body, merge))?;
                 fb.switch_to(dispatch_block);
             }
             fb.terminate(Terminator::Switch {
@@ -2304,7 +2391,10 @@ impl<'a> Lowering<'a> {
             unreachable!("just matched Success above");
         };
         self.bind_arm_pattern(fb, pattern, ok_value)?;
-        self.lower_arm_body(fb, &success_arm.body, merge)?;
+        self.lower_branch_moves(fb, |this, fb| {
+            this.lower_arm_body(fb, &success_arm.body, merge)
+        })?;
+        self.end_move_join(fb);
 
         match merge {
             Some((slot, after)) => {
@@ -2647,20 +2737,23 @@ impl<'a> Lowering<'a> {
                 else_block,
             });
 
+            self.begin_move_join(fb);
             fb.switch_to(then_block);
-            let then_result = self.lower_scoped_block(fb, then_branch)?;
+            let then_result =
+                self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?;
 
             fb.switch_to(else_block);
-            let else_result = match else_branch {
-                Some(HirElse::Block(b)) => self.lower_scoped_block(fb, b)?,
-                Some(HirElse::If(inner)) => self.lower_expr(fb, inner)?,
+            let else_result = self.lower_branch_moves(fb, |this, fb| match else_branch {
+                Some(HirElse::Block(b)) => this.lower_scoped_block(fb, b),
+                Some(HirElse::If(inner)) => this.lower_expr(fb, inner),
                 // An else-less `if` always types as `unit` (see below),
                 // never `never` -- typeck cannot have produced this
                 // combination.
                 None => unreachable!(
                     "internal invariant: an else-less `if` is always unit-typed, not never"
                 ),
-            };
+            })?;
+            self.end_move_join(fb);
             debug_assert!(
                 matches!(then_result, LoweredExpr::Diverged)
                     && matches!(else_result, LoweredExpr::Diverged),
@@ -2686,8 +2779,11 @@ impl<'a> Lowering<'a> {
             else_block,
         });
 
+        self.begin_move_join(fb);
         fb.switch_to(then_block);
-        if let LoweredExpr::Value(then_value) = self.lower_scoped_block(fb, then_branch)? {
+        if let LoweredExpr::Value(then_value) =
+            self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?
+        {
             if else_branch.is_none() {
                 // No `else`: typeck gives the whole expression type
                 // `unit` regardless of what the then-branch's own tail
@@ -2710,23 +2806,31 @@ impl<'a> Lowering<'a> {
         fb.switch_to(else_block);
         match else_branch {
             Some(HirElse::Block(b)) => {
-                if let LoweredExpr::Value(else_value) = self.lower_scoped_block(fb, b)? {
+                if let LoweredExpr::Value(else_value) =
+                    self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, b))?
+                {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             Some(HirElse::If(inner)) => {
-                if let LoweredExpr::Value(else_value) = self.lower_expr(fb, inner)? {
+                if let LoweredExpr::Value(else_value) =
+                    self.lower_branch_moves(fb, |this, fb| this.lower_expr(fb, inner))?
+                {
                     fb.push_store(result_slot, else_value);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             None => {
-                let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                fb.push_store(result_slot, unit_value);
-                fb.terminate(Terminator::Branch(after_block));
+                self.lower_branch_moves(fb, |_, fb| {
+                    let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                    fb.push_store(result_slot, unit_value);
+                    fb.terminate(Terminator::Branch(after_block));
+                    Ok(())
+                })?;
             }
         }
+        self.end_move_join(fb);
 
         fb.switch_to(after_block);
         Ok(LoweredExpr::Value(
@@ -2781,7 +2885,9 @@ impl<'a> Lowering<'a> {
             // Every arm diverges (typeck already proved this); no
             // result slot or merge block is ever created -- each arm's
             // own terminator is already a complete CFG on its own.
+            self.begin_move_join(fb);
             self.lower_decision(fb, rows, occurrences, arms, None, 0)?;
+            self.end_move_join(fb);
             return Ok(LoweredExpr::Diverged);
         }
 
@@ -2790,6 +2896,7 @@ impl<'a> Lowering<'a> {
         // discipline `lower_if` already uses for its own result slot.
         let result_slot = fb.alloc_slot(result_ty.clone());
         let after_block = fb.new_block();
+        self.begin_move_join(fb);
         self.lower_decision(
             fb,
             rows,
@@ -2798,6 +2905,7 @@ impl<'a> Lowering<'a> {
             Some((result_slot, after_block)),
             0,
         )?;
+        self.end_move_join(fb);
 
         fb.switch_to(after_block);
         Ok(LoweredExpr::Value(
@@ -2839,16 +2947,7 @@ impl<'a> Lowering<'a> {
                     .insert(*local, LocalBinding::Direct(*value));
             }
             let arm = &arms[winner.arm_index];
-            let result = match &arm.body {
-                HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
-                HirMatchArmBody::Block(b) => self.lower_scoped_block(fb, b)?,
-            };
-            if let LoweredExpr::Value(v) = result
-                && let Some((slot, after)) = merge
-            {
-                fb.push_store(slot, v);
-                fb.terminate(Terminator::Branch(after));
-            }
+            self.lower_branch_moves(fb, |this, fb| this.lower_arm_body(fb, &arm.body, merge))?;
             return Ok(());
         }
 
@@ -3799,6 +3898,144 @@ mod tests {
             drop_count(f),
             1,
             "expected the if-branch's own resource to be dropped exactly once, inside its own arm"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_one_if_branch_does_not_skip_the_fallthrough_paths_own_cleanup() {
+        // Alpha 0.1.7 (Blocker 1): `fb.moved_out` used to be a single
+        // function-wide set with no branch isolation, so moving `file`
+        // into `sink`'s own `take` parameter inside the `then` branch
+        // leaked into the state seen while lowering the code *after*
+        // the `if` -- wrongly skipping `file`'s own drop on the
+        // fallthrough path where `cond` was false and `file` was never
+        // moved at all.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return sink(file); \
+                 } \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return sink(file); \
+                 } \
+                 return 0; \
+             }",
+        );
+        // Declaration order: `sink` first, `f` second.
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(sink),
+            1,
+            "sink's own take parameter must be dropped exactly once"
+        );
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected exactly one drop: `file` moved into `sink` on the taken branch must not \
+             be dropped there, but the fallthrough branch never moved it and must still drop it"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_the_else_branch_does_not_skip_the_thens_own_cleanup() {
+        // The reverse arrangement of the test above: the move happens in
+        // the `else` branch instead of `then`.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return 0; \
+                 } else { \
+                     return sink(file); \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return 0; \
+                 } else { \
+                     return sink(file); \
+                 } \
+             }",
+        );
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(drop_count(sink), 1);
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the `then` branch never moved `file` and must still drop it, independent of the \
+             `else` branch's own move"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_a_nested_if_branch_does_not_leak_into_a_sibling_match_arm() {
+        // A resource move nested two levels deep (an `if` inside one
+        // `match` arm) must still be isolated from a sibling arm's own
+        // cleanup, not just a directly-adjacent branch.
+        let diags = lower_and_verify(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(choice: Choice, cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 match choice { \
+                     A => { \
+                         if cond { return sink(file); } \
+                         return 1; \
+                     } \
+                     B => { return 2; } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(choice: Choice, cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 match choice { \
+                     A => { \
+                         if cond { return sink(file); } \
+                         return 1; \
+                     } \
+                     B => { return 2; } \
+                 } \
+             }",
+        );
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(drop_count(sink), 1);
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected a drop on the `Choice.A` arm's own non-taken path and one more on the \
+             whole `Choice.B` arm, neither poisoned by the nested `if`'s own move"
         );
     }
 

@@ -1073,10 +1073,12 @@ mod tests {
                     Param {
                         value: ValueId(0),
                         ty: Ty::I64,
+                        take: false,
                     },
                     Param {
                         value: ValueId(1),
                         ty: Ty::I64,
+                        take: false,
                     },
                 ],
                 return_type: Ty::I64,
@@ -1116,6 +1118,7 @@ mod tests {
                 params: vec![Param {
                     value: ValueId(0),
                     ty: Ty::I64,
+                    take: false,
                 }],
                 return_type: Ty::I64,
                 raises: Vec::new(),
@@ -1162,6 +1165,7 @@ mod tests {
                 params: vec![Param {
                     value: ValueId(0),
                     ty: Ty::I64,
+                    take: false,
                 }],
                 return_type: Ty::I64,
                 raises: Vec::new(),

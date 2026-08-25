@@ -5038,10 +5038,12 @@ mod tests {
             Param {
                 value: ValueId(0),
                 ty: Ty::I64,
+                take: false,
             },
             Param {
                 value: ValueId(0),
                 ty: Ty::Bool,
+                take: false,
             },
         ];
         let diagnostics = verify_one(function, &interner);
@@ -5076,6 +5078,7 @@ mod tests {
         function.params = vec![Param {
             value: ValueId(0),
             ty: Ty::I64,
+            take: false,
         }];
         let diagnostics = verify_one(function, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::DUPLICATE_VALUE_DEFINITION));
@@ -5624,6 +5627,7 @@ mod tests {
         callee.params = vec![crate::nir::Param {
             value: ValueId(0),
             ty: Ty::Param(TypeParamId(0), t),
+            take: false,
         }];
         callee.blocks[0].instructions.clear();
         callee.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
@@ -5663,6 +5667,7 @@ mod tests {
         callee.params = vec![crate::nir::Param {
             value: ValueId(0),
             ty: Ty::Param(TypeParamId(0), t),
+            take: false,
         }];
         callee.blocks[0].instructions.clear();
         callee.blocks[0].terminator = Terminator::Return(Some(ValueId(0)));
@@ -5828,6 +5833,7 @@ mod tests {
         function.params.push(crate::nir::Param {
             value: ValueId(1),
             ty: deeply_applied_type(record, depth),
+            take: false,
         });
         let diagnostics =
             verify_one_with_aggregates(function, vec![(record, layout)], Vec::new(), &interner);
@@ -5984,6 +5990,7 @@ mod tests {
             params: vec![crate::nir::Param {
                 value: ValueId(0),
                 ty: Ty::I64,
+                take: false,
             }],
             return_type: Ty::I64,
             raises: Vec::new(),
@@ -6400,10 +6407,12 @@ mod tests {
                 crate::nir::Param {
                     value: ValueId(0),
                     ty: Ty::I64,
+                    take: false,
                 },
                 crate::nir::Param {
                     value: ValueId(1),
                     ty: Ty::I64,
+                    take: false,
                 },
             ],
             return_type: Ty::Bool,

@@ -604,4 +604,32 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    #[test]
+    fn using_a_resource_after_registering_a_consuming_defer_is_use_after_move() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> unit {} \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+                 return inspect(file); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0001"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_consuming_defer_never_used_again_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
 }

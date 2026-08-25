@@ -839,6 +839,14 @@ struct PendingDefer {
     type_args: Vec<Ty>,
     args: Vec<ValueId>,
     evidence: Vec<Evidence>,
+    /// The deferred callee's own declared return type (Blocker 6) --
+    /// never `Ty::Unit` fabricated regardless of what the callee
+    /// actually returns: the replayed `Call` at cleanup time must
+    /// carry the same real result type an ordinary call to the same
+    /// function would, even though that result is always discarded
+    /// (a resource-returning callee is rejected outright at `defer`
+    /// registration, so this is never itself an affine type here).
+    ret_ty: Ty,
 }
 
 /// One entry in a function's own cleanup sequence (`rfcs/0011`),
@@ -1355,11 +1363,28 @@ impl<'a> Lowering<'a> {
                 "a `defer` whose callee is not a plain function reference",
             ));
         };
-        let (type_params, param_tys, _ret_ty) =
-            self.lookup_function_sig(*item, "a `defer` call")?;
+        let (type_params, param_tys, ret_ty) = self.lookup_function_sig(*item, "a `defer` call")?;
         if !type_params.is_empty() {
             return Err(self.unsupported(span, "a `defer` calling a generic function"));
         }
+        // Cleanup-time failure semantics (what happens to a `raise`
+        // reaching the *enclosing* function's own cleanup point, which
+        // may already be mid-way through unwinding for a different
+        // reason) are not implemented this milestone (Blocker 6) --
+        // rejected outright here rather than silently dropping the
+        // raised effect or miscompiling it.
+        let raises = self.lookup_function_raises(*item, "a `defer` call")?;
+        if !raises.is_empty() {
+            return Err(self.unsupported(span, "a `defer` calling a fallible function"));
+        }
+        // A deferred call whose own result is itself a resource would
+        // need a new owner lined up for it at cleanup time, which this
+        // milestone has no mechanism for at all (Blocker 6) -- rejected
+        // outright rather than silently leaking (or double-owning) it.
+        if self.is_affine(&ret_ty) {
+            return Err(self.unsupported(span, "a `defer` calling a function returning a resource"));
+        }
+        let takes = self.function_takes.get(item).cloned();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
@@ -1369,7 +1394,14 @@ impl<'a> Lowering<'a> {
                     return Err(self.unsupported(span, "a `defer` whose own argument diverges"));
                 }
             }
-            self.mark_defer_observed(fb, arg);
+            // A `take` parameter transfers ownership of this argument
+            // into the pending deferred invocation *now*, at
+            // registration time (Blocker 6) -- the enclosing scope's
+            // own cleanup must not also drop it once the deferred call
+            // actually runs and takes care of its own taken argument.
+            if takes.as_ref().and_then(|t| t.get(i)).copied() == Some(true) {
+                self.mark_moved(fb, arg);
+            }
         }
         let requirements = self.lookup_function_requirements(*item, "a `defer` call")?;
         if !requirements.is_empty() {
@@ -1380,20 +1412,9 @@ impl<'a> Lowering<'a> {
             type_args: Vec::new(),
             args: arg_values,
             evidence: Vec::new(),
+            ret_ty,
         }))
     }
-
-    /// A resource local a `defer`'s own expression merely *observes*
-    /// (an ordinary-parameter argument still owned by the enclosing
-    /// scope) is not itself moved -- unlike `mark_moved`, this never
-    /// transitions it to `Moved`. It has no further bookkeeping effect
-    /// on lowering (`resourceck`'s own `DropScheduled` protection has
-    /// already done its job at check time; by the time a sound program
-    /// reaches lowering, the local is simply still owned and will still
-    /// be cleaned up normally), so this is presently a documented no-op
-    /// call site, kept distinct from `mark_moved` for clarity at each
-    /// call site rather than conflating "observed" with "consumed".
-    fn mark_defer_observed(&self, _fb: &mut FnBuilder, _expr: &HirExpr) {}
 
     /// Replays every still-owned resource drop and every registered
     /// `defer` from the *whole* function's own cleanup list, in
@@ -1429,7 +1450,7 @@ impl<'a> Lowering<'a> {
                 }
                 CleanupAction::Defer(pending) => {
                     fb.push_value(
-                        Ty::Unit,
+                        pending.ret_ty,
                         ValueKind::Call(
                             pending.callee,
                             pending.type_args,
@@ -3967,6 +3988,78 @@ mod tests {
             sequence,
             vec!["call", "drop", "call", "drop"],
             "expected defer/drop cleanup interleaved in declaration-reversed order, got {sequence:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_moved_into_a_deferred_take_argument_is_not_also_dropped_by_its_own_scope() {
+        // Blocker 6: a resource passed to a deferred `take` parameter
+        // transfers ownership into the pending deferred invocation at
+        // registration time -- the caller's own scope-exit cleanup
+        // must not additionally drop the same resource once the
+        // deferred call (which drops its own taken argument) actually
+        // runs. This used to double-drop it.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+             }",
+        );
+        // Declaration order: `consume` first, `f` second.
+        let consume = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(consume),
+            1,
+            "consume's own take parameter must be dropped exactly once, inside consume itself"
+        );
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the deferred call"
+        );
+    }
+
+    #[test]
+    fn a_deferred_calls_own_non_unit_result_carries_its_real_type() {
+        // Blocker 6: the replayed deferred call must carry the
+        // callee's own actual return type, never a fabricated
+        // `Ty::Unit`, even though the result is always discarded.
+        let module = lower(
+            "func touch() -> i64 { return 1 } \
+             func f() { defer touch(); }",
+        );
+        // Declaration order: `touch` first, `f` second.
+        let f = &module.functions[1];
+        let call_value_ty = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Instruction::Value {
+                    ty,
+                    kind: crate::nir::ValueKind::Call(..),
+                    ..
+                } => Some(ty.clone()),
+                _ => None,
+            })
+            .expect("expected the deferred call's own Value instruction");
+        assert_eq!(
+            call_value_ty,
+            Ty::I64,
+            "expected the deferred call's own result to carry touch's real return type"
         );
     }
 

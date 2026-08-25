@@ -1082,7 +1082,11 @@ impl<'a> Lowering<'a> {
             if p.take && self.is_affine(&ty) {
                 fb.cleanup_actions.push(CleanupAction::Drop(p.local));
             }
-            params.push(Param { value, ty });
+            params.push(Param {
+                value,
+                ty,
+                take: p.take,
+            });
         }
 
         // The function's own implicit tail return is lowered through

@@ -150,4 +150,11 @@ pub struct Function {
 pub struct Param {
     pub value: ValueId,
     pub ty: Ty,
+    /// Whether this parameter was declared `take` (`rfcs/0011`) --
+    /// ownership-transferring rather than a call-scoped observation.
+    /// Carried into NIR itself (not just `nir::lower`'s own internal
+    /// bookkeeping) so a consumer independent of lowering -- the
+    /// verifier, the interpreter -- can tell the two apart without
+    /// re-deriving it from HIR.
+    pub take: bool,
 }

@@ -132,10 +132,11 @@ marker, not a file- or module-level ambient mode (RFC 0001).
 own immediately enclosing block rather than the fully general
 per-region design this section originally sketched: it schedules an
 expression to run exactly once, in LIFO order, at that block's own
-normal fallthrough, or (for the function's own top-level block) an
-explicit `return`, `raise`, or postfix `?` propagation. A `break`/
-`continue` loop exit does not yet run its own enclosing scopes'
-pending cleanup at all -- see `rfcs/0011`'s own limitations.
+normal fallthrough, an explicit `return`, `raise`, postfix `?`
+propagation, or a `break`/`continue` loop exit -- destroying exactly
+that iteration's own live resources and running that iteration's own
+pending defers before jumping past or back to the loop, never an
+enclosing scope's.
 
 ## Unresolved research questions
 

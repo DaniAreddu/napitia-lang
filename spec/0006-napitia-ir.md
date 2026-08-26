@@ -86,10 +86,17 @@ lowering emits one for every explicit `drop <expr>;`, and one more for
 every resource-typed local still owned at its own function's normal
 `return`/`raise`/postfix-`?`-propagation exit (in reverse declaration
 order, interleaved with any registered `defer` calls). The verifier
-independently checks its operand is resource-typed and, via the same
-reachability-aware forward must-dataflow analysis `Invoke`-slot
-initialization uses, that no value is ever the operand of two `Drop`s on
-any single reachable path.
+independently checks its operand is resource-typed and, via a
+reachability-aware forward *may*-dataflow analysis (joins union their
+reachable predecessors' own facts, unlike `Invoke`-slot initialization's
+must analysis, which intersects them -- a value already dropped on even
+one incoming path is enough to make a later unconditional drop of it a
+genuine double drop on that path, so a join must not require every path
+to agree first, and a value's own dropped fact is killed again at the
+instruction that redefines it, so a loop-carried temporary reusing the
+same static value id across iterations is never mistaken for still
+carrying a previous iteration's own drop forward), that no value is
+ever the operand of two `Drop`s on any single reachable path.
 
 `record.create`/`variant.create` reference fields/cases by resolved
 **declaration index**, never by name, matching how `call` already

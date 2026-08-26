@@ -3626,17 +3626,21 @@ fn invoke_slot_in_facts(
 /// function already accounts for this), but nothing crosses into it
 /// from anywhere else.
 /// Proves no value is ever the operand of two `Instruction::Drop`s on
-/// any single reachable path (`rfcs/0011`) -- the same shape of forward
-/// must-dataflow analysis as
-/// [`verify_invoke_slot_initialization`] (reachability computed the
-/// same way, the same fixed entry boundary, the same worklist over
-/// reachable non-entry blocks only, joins intersecting reachable
-/// predecessors only), simplified by having no edge-specific gen at
-/// all: unlike an `Invoke`'s own edges, which each unconditionally
-/// write a *specific* slot, a `Drop` only ever "generates" its own
-/// already-dropped fact from within the block that contains it, so
-/// every CFG edge here carries the same, unconditional meaning ordinary
-/// (non-`Invoke`) edges already do in that analysis.
+/// any single reachable path (`rfcs/0011`) -- shares its reachability
+/// computation, fixed entry boundary, and worklist-over-reachable-
+/// non-entry-blocks shape with
+/// [`verify_invoke_slot_initialization`], but is a *may* analysis, not
+/// a must one: a join here unions its reachable predecessors' facts,
+/// since "already dropped" only needs to hold on *one* incoming path
+/// for a later unconditional `Drop` past the join to be a genuine
+/// double-drop on that path -- intersecting instead would hide exactly
+/// that case behind a sibling branch that never dropped the value at
+/// all. Simplified by having no edge-specific gen at all: unlike an
+/// `Invoke`'s own edges, which each unconditionally write a *specific*
+/// slot, a `Drop` only ever "generates" its own already-dropped fact
+/// from within the block that contains it, so every CFG edge here
+/// carries the same, unconditional meaning ordinary (non-`Invoke`)
+/// edges already do in that analysis.
 fn verify_drop_state(
     function: &Function,
     source: SourceId,
@@ -3714,14 +3718,26 @@ fn verify_drop_state(
         let mut facts = in_facts.clone();
         let mut violations = Vec::new();
         for instruction in &block.instructions {
-            if let Instruction::Drop { value } = instruction
-                && dropped_values.contains(value)
-            {
-                if facts.contains(value) {
-                    violations.push(*value);
-                } else {
-                    facts.insert(*value);
+            match instruction {
+                // A loop body's own back edge can carry an already-
+                // dropped fact for %N forward into a later iteration
+                // that reuses that same static `ValueId` for a brand
+                // new instance (NIR gives a loop-carried temporary one
+                // fixed id, not a fresh one per iteration) -- so this
+                // instruction's own `result` redefining %N kills
+                // whatever the *previous* iteration left behind before
+                // this iteration's `Drop`s are considered at all.
+                Instruction::Value { result, .. } if dropped_values.contains(result) => {
+                    facts.remove(result);
                 }
+                Instruction::Drop { value } if dropped_values.contains(value) => {
+                    if facts.contains(value) {
+                        violations.push(*value);
+                    } else {
+                        facts.insert(*value);
+                    }
+                }
+                _ => {}
             }
         }
         (facts, violations)
@@ -3744,10 +3760,16 @@ fn verify_drop_state(
         let Some(first) = preds.next() else {
             return HashSet::new();
         };
+        // Union, not intersection: a value already dropped on *any*
+        // reachable predecessor path is a live double-drop hazard the
+        // moment a later `Drop` of it executes unconditionally, even
+        // though some *other* predecessor never dropped it at all --
+        // catching that requires remembering it happened on at least
+        // one path in, not only when every path agrees.
         let mut acc = out.get(first).cloned().unwrap_or_default();
         for pred in preds {
             let other = out.get(pred).cloned().unwrap_or_default();
-            acc.retain(|f| other.contains(f));
+            acc.extend(other);
         }
         acc
     }
@@ -3763,10 +3785,14 @@ fn verify_drop_state(
         .blocks
         .iter()
         .map(|b| {
+            // A may analysis starts every reachable non-entry block at
+            // bottom (nothing yet known dropped) and grows monotonically
+            // via `in_facts_for`'s own union at each join, rather than
+            // starting optimistically at the full set and shrinking --
+            // that shrinking approach only terminates soundly for a
+            // must analysis's intersection, not this one's union.
             let initial = if b.id == entry {
                 entry_out.clone()
-            } else if reachable.contains(&b.id) {
-                dropped_values.clone()
             } else {
                 HashSet::new()
             };
@@ -3811,7 +3837,7 @@ fn verify_drop_state(
                 source,
                 Span::dummy(),
                 format!(
-                    "function `{function_name}` drops %{} in bb{}, which was already dropped on every path reaching it",
+                    "function `{function_name}` drops %{} in bb{}, which was already dropped on some path reaching it",
                     value.0, block.id.0
                 ),
             ));
@@ -5224,6 +5250,79 @@ mod tests {
         };
         let diagnostics = verify_one(function, &interner);
         assert!(codes_of(&diagnostics).contains(&codes::NON_DOMINATING_DEFINITION));
+    }
+
+    #[test]
+    fn a_drop_on_only_one_branch_still_double_drops_at_an_unconditional_merge() {
+        // bb1 (the then-branch) drops %1; bb2 (the sibling else-branch)
+        // never does; bb3 (their merge) drops %1 again unconditionally
+        // regardless of which branch actually ran. A *must* analysis
+        // (dropped on every incoming path) would intersect bb1's and
+        // bb2's own out-facts down to the empty set and miss this
+        // entirely; this must be caught because the bb1-then-bb3 path
+        // genuinely drops %1 twice.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Const(Const::Bool(true)),
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let records = vec![(
+            resource,
+            RecordLayout {
+                name: resource_name,
+                type_params: Vec::new(),
+                fields: Vec::new(),
+                affine: true,
+            },
+        )];
+        let diagnostics = verify_one_with_aggregates(function, records, Vec::new(), &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::DOUBLE_DROP));
     }
 
     #[test]

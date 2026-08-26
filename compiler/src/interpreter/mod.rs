@@ -10,6 +10,7 @@
 //! Rust's debug-mode overflow checks would otherwise crash the
 //! interpreter on ordinary, valid Napitia programs.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -17,6 +18,141 @@ use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
 use crate::symbol::Interner;
 use crate::types::Evidence;
+
+/// A resource record's own identity within one [`Interpreter`]'s own
+/// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
+/// lives at, stable for that resource's entire runtime lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourceId(u32);
+
+/// A capability to observe or consume one resource record, as of a
+/// specific point in its own ownership history (`rfcs/0011`, Blocker
+/// 8) -- `Value` itself only ever carries this, never the resource's
+/// own payload directly, so an ordinary Rust `Clone` of a `Value`
+/// duplicates only this cheap `(id, generation)` pair, never the
+/// underlying resource's own identity or data. Every ownership
+/// transfer (a `take` parameter's own argument, a returned resource)
+/// bumps the table's own current generation for `id`, which makes
+/// every handle still referencing the *previous* generation stale --
+/// exactly the "invalidates the previous handle" contract this
+/// milestone's resource model promises. Observing a resource (an
+/// ordinary, non-`take` parameter; a field read) never transfers, so
+/// it never bumps the generation: many simultaneously-valid observing
+/// handles for the same still-current generation are expected and
+/// fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceHandle {
+    id: ResourceId,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResourceStatus {
+    Alive,
+    Dropped,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceRecord {
+    item: ItemId,
+    generation: u64,
+    status: ResourceStatus,
+    /// This resource's own fields, in declaration order -- may
+    /// themselves contain a `Value::Resource` handle for a nested
+    /// resource-typed field, which is never duplicated by this: it is
+    /// still just a handle into this same table, identifying its own
+    /// separate record.
+    fields: Vec<Value>,
+}
+
+/// The runtime resource table one [`Interpreter`] execution owns
+/// (`rfcs/0011`, Blocker 8): every resource ever constructed during
+/// this run, indexed by [`ResourceId`] (a plain, monotonically-growing
+/// `Vec` index -- never a `HashMap`, and never a Rust pointer address,
+/// so nothing about this table's own behavior depends on iteration
+/// order or allocator behavior). Never shrinks (a dropped record's own
+/// slot is kept, marked `Dropped`, so a stale handle referencing it
+/// later still resolves to *something* to check the generation/status
+/// of, rather than silently going out of bounds).
+#[derive(Default)]
+struct ResourceTable {
+    records: Vec<ResourceRecord>,
+}
+
+impl ResourceTable {
+    fn construct(&mut self, item: ItemId, fields: Vec<Value>) -> ResourceHandle {
+        let id = ResourceId(self.records.len() as u32);
+        self.records.push(ResourceRecord {
+            item,
+            generation: 0,
+            status: ResourceStatus::Alive,
+            fields,
+        });
+        ResourceHandle { id, generation: 0 }
+    }
+
+    fn record(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
+        let record = self
+            .records
+            .get(handle.id.0 as usize)
+            .ok_or_else(|| invalid("resource handle does not refer to any known resource"))?;
+        if record.generation != handle.generation {
+            return Err(invalid(
+                "stale resource handle: this resource's own ownership was already transferred \
+                 elsewhere",
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Observes `handle`'s own current record without transferring
+    /// ownership (Blocker 8: "observing does not transfer") -- still
+    /// rejects a stale handle or an already-dropped resource, since
+    /// neither may ever be legitimately read.
+    fn observe(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
+        let record = self.record(handle)?;
+        if record.status == ResourceStatus::Dropped {
+            return Err(invalid("use of a resource after it was already dropped"));
+        }
+        Ok(record)
+    }
+
+    /// Transfers ownership of `handle`'s own resource to a new owner
+    /// (Blocker 8: a `take` argument at registration/call time, or a
+    /// returned resource) -- bumps the table's own current generation
+    /// for this resource, invalidating `handle` (and every other
+    /// handle still referencing the generation it was minted from),
+    /// and returns the fresh handle identifying the current owner.
+    fn transfer(&mut self, handle: ResourceHandle) -> Result<ResourceHandle, InterpreterError> {
+        let id = handle.id;
+        let record = self.record(handle)?;
+        if record.status == ResourceStatus::Dropped {
+            return Err(invalid(
+                "cannot transfer ownership of a resource that was already dropped",
+            ));
+        }
+        let record = &mut self.records[id.0 as usize];
+        record.generation += 1;
+        Ok(ResourceHandle {
+            id,
+            generation: record.generation,
+        })
+    }
+
+    /// Destroys `handle`'s own resource exactly once (Blocker 8): a
+    /// stale handle, an already-dropped resource, or an unknown handle
+    /// are each their own distinct rejected case, never silently
+    /// treated as success.
+    fn drop_resource(&mut self, handle: ResourceHandle) -> Result<(), InterpreterError> {
+        let id = handle.id;
+        let record = self.record(handle)?;
+        if record.status == ResourceStatus::Dropped {
+            return Err(invalid("double drop of a resource"));
+        }
+        self.records[id.0 as usize].status = ResourceStatus::Dropped;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -40,6 +176,13 @@ pub enum Value {
         case: usize,
         payload: Vec<Value>,
     },
+    /// A `resource`-typed value (`rfcs/0011`, Blocker 8) -- unlike
+    /// `Record`, never carries its own payload directly: only a handle
+    /// into the current `Interpreter`'s own `ResourceTable`, so an
+    /// ordinary Rust `Clone` (every value read from `values` already
+    /// clones) duplicates only the cheap handle, never the resource's
+    /// own runtime identity or data.
+    Resource(ResourceHandle),
 }
 
 /// A condition the interpreter detects and reports instead of crashing:
@@ -68,11 +211,46 @@ enum Outcome {
 
 pub struct Interpreter<'a> {
     module: &'a Module,
+    /// Every resource constructed anywhere during this `Interpreter`'s
+    /// own execution (`rfcs/0011`, Blocker 8) -- shared (via interior
+    /// mutability) across every nested call frame `call_function`
+    /// recurses into, since ownership transfer crosses function-call
+    /// boundaries: a resource this frame constructs may be handed to a
+    /// callee, or one this frame's own callee returns may become this
+    /// frame's own, and both sides must observe the exact same record.
+    resources: RefCell<ResourceTable>,
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(module: &'a Module) -> Self {
-        Interpreter { module }
+        Interpreter {
+            module,
+            resources: RefCell::new(ResourceTable::default()),
+        }
+    }
+
+    /// `true` iff `item` names a declared `resource` (`rfcs/0011`) --
+    /// mirrors `nir::lower`'s/`resourceck`'s own identical check
+    /// against `nir::RecordLayout::affine`.
+    fn is_resource(&self, item: ItemId) -> bool {
+        self.module
+            .records
+            .iter()
+            .any(|(id, layout)| *id == item && layout.affine)
+    }
+
+    /// Transfers ownership of `value` if it is a resource (Blocker 8);
+    /// passes any other value through unchanged. Shared by both
+    /// directions ownership crosses a call boundary: a `take`
+    /// argument's own transfer *into* a call, and a returned value's
+    /// own transfer back *out* of one.
+    fn transfer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
+        match value {
+            Value::Resource(handle) => Ok(Value::Resource(
+                self.resources.borrow_mut().transfer(handle)?,
+            )),
+            other => Ok(other),
+        }
     }
 
     /// Calls the function named `name` with no arguments — the shape of
@@ -170,6 +348,19 @@ impl<'a> Interpreter<'a> {
         }
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
+            // A `take` parameter transfers ownership into this call
+            // (`rfcs/0011`, Blocker 8): the caller's own handle (if
+            // `arg` is a resource at all -- an ordinary value passed to
+            // a meaningless `take` on non-resource data, already
+            // rejected at check time, is left untouched here) is
+            // invalidated, and this frame receives the current owner's
+            // own fresh handle. An ordinary (observing) parameter never
+            // transfers: `arg` is bound exactly as given.
+            let arg = if param.take {
+                self.transfer_if_resource(arg)?
+            } else {
+                arg
+            };
             values.insert(param.value, arg);
         }
 
@@ -204,20 +395,41 @@ impl<'a> Interpreter<'a> {
                     }
                     crate::nir::Instruction::Drop { value } => {
                         // Destroys the resource value exactly once
-                        // (`rfcs/0011`): removed from this function's own
-                        // value map, so any use afterward -- which
-                        // `nir::verify`'s own V0075 already rejects at
-                        // compile time -- would independently fail here
-                        // too, through `get`'s own existing structured
-                        // error, rather than silently reading stale data
-                        // or panicking.
+                        // (`rfcs/0011`, Blocker 8): the resource table
+                        // itself -- not this frame's own value map --
+                        // is the single source of truth for whether
+                        // this specific resource record was already
+                        // dropped, so a double-drop reached through a
+                        // *different* `Value::Resource` handle aliasing
+                        // the same underlying record (not just the same
+                        // `ValueId`) is independently caught here too,
+                        // never silently treated as a fresh drop.
+                        match get(&values, value)? {
+                            Value::Resource(handle) => {
+                                self.resources.borrow_mut().drop_resource(handle)?;
+                            }
+                            other => {
+                                return Err(invalid(format!(
+                                    "drop of a non-resource value ({})",
+                                    kind_name(&other)
+                                )));
+                            }
+                        }
                         values.remove(value);
                     }
                 }
             }
 
             match &block.terminator {
-                Terminator::Return(Some(id)) => return Ok(Outcome::Returned(get(&values, id)?)),
+                Terminator::Return(Some(id)) => {
+                    // A returned resource transfers ownership back to
+                    // the caller (`rfcs/0011`, Blocker 8) -- the same
+                    // transfer a `take` argument gets, just on the way
+                    // out instead of in.
+                    return Ok(Outcome::Returned(
+                        self.transfer_if_resource(get(&values, id)?)?,
+                    ));
+                }
                 Terminator::Return(None) => return Ok(Outcome::Returned(Value::Unit)),
                 Terminator::Branch(target) => block_id = *target,
                 Terminator::CondBranch {
@@ -458,10 +670,22 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .map(|id| get(values, id))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::Record {
-                    item: *item,
-                    fields,
-                })
+                // A `resource` gets its own unique runtime identity
+                // (Blocker 8) rather than being represented inline the
+                // same way an ordinary, freely-copyable record is --
+                // every read of a `Value::Resource` handle (`get`
+                // already clones every value it returns) duplicates
+                // only the cheap handle, never this record's own data.
+                if self.is_resource(*item) {
+                    Ok(Value::Resource(
+                        self.resources.borrow_mut().construct(*item, fields),
+                    ))
+                } else {
+                    Ok(Value::Record {
+                        item: *item,
+                        fields,
+                    })
+                }
             }
             ValueKind::RecordField {
                 base,
@@ -472,6 +696,19 @@ impl<'a> Interpreter<'a> {
                     .get(*field)
                     .cloned()
                     .ok_or_else(|| invalid("record field index out of range")),
+                Value::Resource(handle) => {
+                    let table = self.resources.borrow();
+                    let rec = table.observe(handle)?;
+                    if rec.item != *record {
+                        return Err(invalid(
+                            "expected a resource value of the expected type, found a different resource",
+                        ));
+                    }
+                    rec.fields
+                        .get(*field)
+                        .cloned()
+                        .ok_or_else(|| invalid("resource field index out of range"))
+                }
                 other => Err(invalid(format!(
                     "expected a record value of the expected type, found {}",
                     kind_name(&other)
@@ -582,6 +819,7 @@ fn kind_name(value: &Value) -> &'static str {
         Value::Unit => "unit",
         Value::Record { .. } => "a record",
         Value::Variant { .. } => "a variant",
+        Value::Resource(_) => "a resource",
     }
 }
 
@@ -1442,6 +1680,175 @@ mod tests {
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured error, not a panic, got {outcome:?}"
+        );
+    }
+
+    // -- Runtime resource identity (`rfcs/0011`, Blocker 8) -------------
+    //
+    // `resourceck`/`nir::verify` already reject every one of these
+    // shapes before a real program's NIR reaches the interpreter at
+    // all -- these two exist to prove the interpreter's own
+    // `ResourceTable` independently refuses them too, reached here only
+    // through hand-built NIR that bypasses the checker on purpose. Each
+    // hand-builds a second local (`ValueId(1)`, via `Load`) that
+    // aliases the exact same resource record as `ValueId(0)`: an
+    // ordinary Rust `Clone` of a `Value::Resource` duplicates only the
+    // cheap handle, never the resource's own identity, so the table
+    // must still recognize both locals as the same underlying record.
+
+    #[test]
+    fn a_resource_dropped_through_two_aliased_handles_is_an_error_not_a_panic() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: ItemId(0),
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: resource_ty,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Drop { value: ValueId(0) },
+                        Instruction::Drop { value: ValueId(1) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured double-drop error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_resource_handle_left_behind_by_a_take_call_is_an_error_not_a_panic() {
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let sink_name = interner.intern("sink");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let f = ItemId(0);
+        let sink = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![
+                Function {
+                    id: f,
+                    name: f_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(0),
+                                ty: resource_ty.clone(),
+                                kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                            },
+                            // Aliases `ValueId(0)`'s own handle *before*
+                            // the call below transfers it away -- this
+                            // local's own copy is left stale the moment
+                            // the transfer happens, same as `ValueId(0)`
+                            // itself, even though nothing here re-reads
+                            // `ValueId(0)` again to prove it.
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: resource_ty.clone(),
+                                kind: ValueKind::Load(ValueId(0)),
+                            },
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: Ty::Unit,
+                                kind: ValueKind::Call(
+                                    sink,
+                                    Vec::new(),
+                                    vec![ValueId(0)],
+                                    Vec::new(),
+                                ),
+                            },
+                            Instruction::Drop { value: ValueId(1) },
+                        ],
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+                Function {
+                    id: sink,
+                    name: sink_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: resource_ty.clone(),
+                        take: true,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured stale-handle error, not a panic, got {outcome:?}"
         );
     }
 

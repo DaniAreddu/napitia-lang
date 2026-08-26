@@ -918,6 +918,11 @@ impl<'a> FlowChecker<'a> {
                     self.diverges(block.id)
                 }
             };
+            let mut locals = Vec::new();
+            Self::pattern_locals(&arm.pattern, &mut locals);
+            for local in locals {
+                self.states.remove(&local);
+            }
             branches.push((self.states.clone(), diverges));
         }
         self.states = join_branch_states(&entry, &branches);
@@ -938,13 +943,16 @@ impl<'a> FlowChecker<'a> {
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
             self.states = entry.clone();
+            let mut locals = Vec::new();
             if let HirHandleArmKind::Success(pattern) = &arm.kind {
                 self.check_pattern(pattern);
+                Self::pattern_locals(pattern, &mut locals);
             } else if let HirHandleArmKind::Failure(HirFailurePattern::Case { args, .. }) =
                 &arm.kind
             {
                 for pattern in args {
                     self.check_pattern(pattern);
+                    Self::pattern_locals(pattern, &mut locals);
                 }
             }
             let diverges = match &arm.body {
@@ -957,6 +965,9 @@ impl<'a> FlowChecker<'a> {
                     self.diverges(block.id)
                 }
             };
+            for local in locals {
+                self.states.remove(&local);
+            }
             branches.push((self.states.clone(), diverges));
         }
         self.states = join_branch_states(&entry, &branches);
@@ -979,13 +990,57 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    fn check_pattern(&mut self, _pattern: &HirPattern) {
-        // Pattern-bound locals are never resource-typed constructions in
-        // this milestone's own surface (a `match`/`handle` scrutinee is
-        // never itself a bare resource move target here): nothing to
-        // track. Kept as an explicit no-op call site, not an omission,
-        // so a future pattern-level resource binding has an obvious
-        // place to extend.
+    /// Registers every resource-typed local `pattern` binds as a fresh
+    /// owned value, `Available` from this exact point in this arm's own
+    /// scope onward (`rfcs/0011`, Blocker 4) -- in practice only ever a
+    /// `handle` `success` pattern (a `match`/ordinary `handle` failure
+    /// pattern's own bound locals come from a variant's payload, which
+    /// `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` already forbids from ever
+    /// being affine), but walked structurally rather than special-cased
+    /// to `success` specifically, so nothing here depends on that
+    /// invariant holding forever to stay sound.
+    fn check_pattern(&mut self, pattern: &HirPattern) {
+        match pattern {
+            HirPattern::Bind { local, .. } => {
+                if self.is_resource_local(*local) {
+                    self.states.insert(*local, ResourceState::Available);
+                }
+            }
+            HirPattern::Variant { args, .. } => {
+                for arg in args {
+                    self.check_pattern(arg);
+                }
+            }
+            HirPattern::Wildcard { .. }
+            | HirPattern::Int { .. }
+            | HirPattern::Str { .. }
+            | HirPattern::Char { .. }
+            | HirPattern::Bool { .. } => {}
+        }
+    }
+
+    /// Every `LocalId` `pattern` itself directly binds (Blocker 4) --
+    /// used to strip an arm-scoped pattern binding back out of that
+    /// arm's own final state snapshot before it is joined with its
+    /// siblings, exactly like a `while`/`loop` body's own internally
+    /// declared resource is never compared against loop entry: a local
+    /// that does not exist outside this one arm must never leak into
+    /// the state joined for code that runs after every arm, whichever
+    /// one actually ran.
+    fn pattern_locals(pattern: &HirPattern, out: &mut Vec<LocalId>) {
+        match pattern {
+            HirPattern::Bind { local, .. } => out.push(*local),
+            HirPattern::Variant { args, .. } => {
+                for arg in args {
+                    Self::pattern_locals(arg, out);
+                }
+            }
+            HirPattern::Wildcard { .. }
+            | HirPattern::Int { .. }
+            | HirPattern::Str { .. }
+            | HirPattern::Char { .. }
+            | HirPattern::Bool { .. } => {}
+        }
     }
 
     fn diagnose_inconsistent_join(&mut self, id: crate::hir::ExprId) {

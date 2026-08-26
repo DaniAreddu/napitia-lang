@@ -846,4 +846,103 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    // -- Resource ownership from patterns (Blocker 4) --------------------
+
+    #[test]
+    fn a_handle_success_bindings_resource_is_observed_without_consuming_it() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => file.descriptor, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_success_bindings_resource_can_be_passed_to_a_take_parameter() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => consume(file), \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn using_a_handle_success_bindings_resource_after_a_take_call_is_use_after_move() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => { \
+                         consume(file); \
+                         return inspect(file); \
+                     }, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0001"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn dropping_a_handle_success_bindings_resource_twice_is_a_double_drop() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => { \
+                         drop file; \
+                         drop file; \
+                         return 0; \
+                     }, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0003"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_handle_success_bindings_local_id_does_not_leak_past_the_handle() {
+        // A resource local elsewhere in the function, unrelated to the
+        // handle's own success pattern, must be checked exactly as if
+        // the handle weren't there at all -- the pattern-scoped local's
+        // own final state must never contaminate the join.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 value outer = File { descriptor: 9 }; \
+                 value r = handle open() { \
+                     success file => { drop file; 1 }, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+                 drop outer; \
+                 return r; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
 }

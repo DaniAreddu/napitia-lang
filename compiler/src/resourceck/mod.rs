@@ -605,6 +605,259 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
+    // -- Loop ownership edges (Blocker 2) -------------------------------
+
+    #[test]
+    fn a_direct_break_after_a_move_has_no_diagnostics() {
+        // The only reachable after-loop state has `file` moved: an
+        // unconditional `break` never re-enters the loop, so there is
+        // no second iteration to disagree with entry.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 loop { \
+                     consume(file); \
+                     break; \
+                 } \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_conditional_break_after_a_move_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 loop { \
+                     if cond { \
+                         consume(file); \
+                         break; \
+                     } \
+                 } \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_direct_continue_carrying_a_moved_resource_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(cond: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 while cond { \
+                     consume(file); \
+                     continue; \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_conditional_continue_carrying_a_moved_resource_is_rejected() {
+        // The `other` branch moves `file` and jumps straight back to the
+        // top of the loop through `continue`, skipping `inspect` on that
+        // path; the fallthrough path instead reaches `inspect` with
+        // `file` still available. Both paths feed the same backedge, so
+        // they must agree -- they don't, and a second iteration taking
+        // the `continue` path again would use-after-move.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool, other: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 while cond { \
+                     if other { \
+                         consume(file); \
+                         continue; \
+                     } \
+                     inspect(file); \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_while_conditions_own_false_edge_leaves_the_resource_available_after_the_loop() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 while cond { \
+                     inspect(file); \
+                 } \
+                 drop file; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn nested_loops_keep_independent_break_and_continue_targets() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(outer: bool, inner: bool) -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 while outer { \
+                     while inner { \
+                         if inner { \
+                             break; \
+                         } \
+                     } \
+                 } \
+                 drop file; \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn an_inner_loops_break_does_not_move_an_outer_loops_own_resource() {
+        // The inner `break` only ever exits the inner loop; it must
+        // never be mistaken for exiting the outer one, which still
+        // legitimately owns `file` after the inner loop finishes.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(outer: bool, inner: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 while outer { \
+                     while inner { \
+                         break; \
+                     } \
+                     consume(file); \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_declared_inside_a_nested_loop_body_is_not_compared_to_loop_entry() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f(outer: bool, inner: bool) { \
+                 while outer { \
+                     while inner { \
+                         value file = File { descriptor: 3 }; \
+                         drop file; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_defer_registered_before_a_conditional_break_still_protects_its_resource() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 defer inspect(file); \
+                 loop { \
+                     if cond { \
+                         break; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn code_after_an_unconditional_break_in_the_same_block_is_not_checked() {
+        // `consume(file)` after the unconditional `break` never runs;
+        // walking it anyway would wrongly report a use-after-move for
+        // the still-available `file` reaching that dead statement, since
+        // nothing before it in this same iteration ever moved it.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 loop { \
+                     break; \
+                     consume(file); \
+                     consume(file); \
+                 } \
+                 drop file; \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn reversed_branch_order_in_a_conditional_continue_produces_the_identical_diagnostic() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool, other: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 while cond { \
+                     if other { \
+                         inspect(file); \
+                     } else { \
+                         consume(file); \
+                         continue; \
+                     } \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
+    }
+
+    // -- Reachability and lexical state (Blocker 11) --------------------
+
+    #[test]
+    fn code_after_return_in_the_same_block_is_not_checked() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 consume(file); \
+                 return; \
+                 inspect(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn code_after_a_diverging_bindings_initializer_is_not_checked() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 consume(file); \
+                 value unreachable = return 0; \
+                 consume(file); \
+                 return 1; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
     #[test]
     fn using_a_resource_after_registering_a_consuming_defer_is_use_after_move() {
         let diags = check(

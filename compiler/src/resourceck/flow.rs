@@ -115,6 +115,21 @@ enum ConsumeKind {
     Other,
 }
 
+/// One `while`/`loop` statement's own accumulated exit states
+/// (`rfcs/0011`, Blocker 2): every `break`'s own live state at the
+/// point it executes (each contributes to the *after*-loop state), and
+/// every `continue`'s own live state (each contributes to the loop's
+/// own backedge, exactly like the body's ordinary fallthrough end
+/// does) -- captured separately from the body's own sequential walk
+/// since neither actually reaches "the textual end of the body," the
+/// only point the previous, single-state implementation ever compared
+/// against loop entry.
+#[derive(Default)]
+struct LoopFrame {
+    break_states: Vec<HashMap<LocalId, ResourceState>>,
+    continue_states: Vec<HashMap<LocalId, ResourceState>>,
+}
+
 pub struct FlowChecker<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<crate::hir::ExprId, Ty>,
@@ -141,6 +156,13 @@ pub struct FlowChecker<'a> {
     /// tracked separately purely to reject an attempt to move, return,
     /// store, or otherwise let it escape the call.
     observing: HashSet<LocalId>,
+    /// One [`LoopFrame`] per lexically-enclosing `while`/`loop`, innermost
+    /// last (Blocker 2) -- `break`/`continue` always targets the
+    /// innermost one, exactly like `nir::lower`'s own loop-exit lowering
+    /// already does; a nested loop's own frame is pushed/popped around
+    /// only its own body walk, so an inner `break` never contributes to
+    /// an outer loop's own accumulated exits.
+    loop_stack: Vec<LoopFrame>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -163,6 +185,7 @@ impl<'a> FlowChecker<'a> {
             diagnostics,
             states: HashMap::new(),
             observing: HashSet::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -216,9 +239,35 @@ impl<'a> FlowChecker<'a> {
     fn check_block_ctx(&mut self, block: &HirBlock, kind: ConsumeKind) {
         for stmt in &block.statements {
             self.check_stmt(stmt);
+            // Blocker 11: a statement that itself unconditionally
+            // diverges (`return`/`break`/`continue`/`raise`, or a
+            // binding whose own initializer does) makes every later
+            // statement -- and this block's own tail, if it somehow
+            // still has one -- unreachable. Not walking them at all
+            // (rather than walking them but suppressing what they'd
+            // report) is what actually matters: a mutation to
+            // `self.states` from dead code must never contaminate the
+            // reachable state that follows this block, the same
+            // "unreachable code must not mutate reachable ownership
+            // state" property `nir::verify` already independently
+            // upholds at the NIR layer.
+            if self.stmt_diverges(stmt) {
+                return;
+            }
         }
         if let Some(tail) = &block.tail {
             self.check_expr_ctx(tail, kind);
+        }
+    }
+
+    fn stmt_diverges(&self, stmt: &HirStmt) -> bool {
+        match stmt {
+            HirStmt::Expr(e) => self.diverges(e.id()),
+            HirStmt::Binding(b) => self.diverges(b.value.id()),
+            HirStmt::Drop { .. }
+            | HirStmt::Defer { .. }
+            | HirStmt::While { .. }
+            | HirStmt::Loop { .. } => false,
         }
     }
 
@@ -346,35 +395,79 @@ impl<'a> FlowChecker<'a> {
     }
 
     /// A `while`/`loop` body is checked once, from a clone of the
-    /// current entry state; if the state it produces at the body's own
-    /// end disagrees with entry for any resource local declared outside
-    /// the loop, a second iteration could not safely reuse that local,
-    /// so this is reported once, at the loop, rather than silently
-    /// picking either state. A resource local the loop body itself
-    /// *declares* is scoped to one iteration and never compared this
-    /// way (comparing against entry, where it never existed, would be
+    /// current entry state (Blocker 2). Three distinct edges can carry a
+    /// resource local's own state back into the *next* iteration's own
+    /// entry: the body's own ordinary fallthrough end, and every
+    /// `continue` reached anywhere inside it -- each must agree with
+    /// `entry` for every resource local declared outside the loop, since
+    /// a second iteration reuses that exact entry state regardless of
+    /// which of these edges actually produced it. `break` is different:
+    /// it never re-enters the loop at all, so its own live state instead
+    /// contributes directly to the state *after* the loop statement,
+    /// alongside a `while`'s own condition-false exit -- which, once the
+    /// backedge invariant above is proven, is just `entry` again (an
+    /// untaken loop, or one that already proved every iteration restores
+    /// exactly `entry`). A resource local the loop body itself
+    /// *declares* is scoped to one iteration and never compared this way
+    /// (comparing against entry, where it never existed, would be
     /// meaningless) -- excluded by only comparing keys already present
     /// on entry.
     fn check_loop_body(&mut self, body: &HirBlock) {
         let entry = self.states.clone();
+        self.loop_stack.push(LoopFrame::default());
         self.check_block(body);
+        let fallthrough_reachable = !self.diverges(body.id);
+        let fallthrough_state = std::mem::replace(&mut self.states, entry.clone());
+        let frame = self
+            .loop_stack
+            .pop()
+            .expect("this exact push is right above");
+
+        let mut backedges: Vec<&HashMap<LocalId, ResourceState>> =
+            frame.continue_states.iter().collect();
+        if fallthrough_reachable {
+            backedges.push(&fallthrough_state);
+        }
+
+        let mut poisoned: HashSet<LocalId> = HashSet::new();
         for (local, entry_state) in &entry {
-            let exit_state = self.states.get(local).copied().unwrap_or(*entry_state);
-            if exit_state != *entry_state
-                && *entry_state != ResourceState::Error
-                && exit_state != ResourceState::Error
-            {
-                self.diagnose(
-                    LOOP_CARRIED_INVALIDATION,
-                    body.span,
-                    "a resource's own state at the end of this loop body disagrees with its \
-                     state on entry; a later iteration could not safely reuse it"
-                        .to_string(),
-                    "loop-carried resource invalidation",
-                );
-                self.states.insert(*local, ResourceState::Error);
+            if *entry_state == ResourceState::Error {
+                continue;
+            }
+            let disagrees = backedges.iter().any(|backedge| {
+                let backedge_state = backedge.get(local).copied().unwrap_or(*entry_state);
+                backedge_state != *entry_state && backedge_state != ResourceState::Error
+            });
+            if disagrees {
+                poisoned.insert(*local);
             }
         }
+        for _ in &poisoned {
+            self.diagnose(
+                LOOP_CARRIED_INVALIDATION,
+                body.span,
+                "a resource's own state reaching the top of this loop again (through the body's \
+                 own fallthrough or a `continue`) disagrees with its state on entry; a later \
+                 iteration could not safely reuse it"
+                    .to_string(),
+                "loop-carried resource invalidation",
+            );
+        }
+
+        let mut after = entry;
+        for local in &poisoned {
+            after.insert(*local, ResourceState::Error);
+        }
+        for break_state in &frame.break_states {
+            for (local, current) in after.iter_mut() {
+                if poisoned.contains(local) {
+                    continue;
+                }
+                let state = break_state.get(local).copied().unwrap_or(*current);
+                *current = current.join(state);
+            }
+        }
+        self.states = after;
     }
 
     // -- Expressions -----------------------------------------------------
@@ -410,8 +503,13 @@ impl<'a> FlowChecker<'a> {
             | HirExpr::Function { .. }
             | HirExpr::CaseRef { .. }
             | HirExpr::ProtocolMethodRef { .. }
-            | HirExpr::Continue { .. }
             | HirExpr::Error { .. } => {}
+            HirExpr::Continue { .. } => {
+                let state = self.states.clone();
+                if let Some(frame) = self.loop_stack.last_mut() {
+                    frame.continue_states.push(state);
+                }
+            }
             HirExpr::Local {
                 local, name, span, ..
             } => self.check_local_use(*local, *name, *span, kind),
@@ -497,6 +595,10 @@ impl<'a> FlowChecker<'a> {
             HirExpr::Break { value, .. } => {
                 if let Some(value) = value {
                     self.check_expr_ctx(value, ConsumeKind::Other);
+                }
+                let state = self.states.clone();
+                if let Some(frame) = self.loop_stack.last_mut() {
+                    frame.break_states.push(state);
                 }
             }
             HirExpr::RecordLiteral { fields, .. } => {

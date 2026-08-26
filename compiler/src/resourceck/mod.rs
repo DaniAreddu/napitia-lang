@@ -858,6 +858,60 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
+    // -- Defer scope and capture semantics (Blocker 9) ------------------
+
+    #[test]
+    fn an_observing_defer_stops_protecting_its_resource_once_its_own_scope_exits() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> unit {} \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 { \
+                     defer inspect(file); \
+                 } \
+                 consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn an_observing_defer_still_protects_its_resource_before_its_own_scope_exits() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> unit {} \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 { \
+                     defer inspect(file); \
+                     consume(file); \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0004"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn an_outer_defers_protection_outlives_a_nested_scope_it_did_not_register_in() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> unit {} \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer inspect(file); \
+                 { \
+                     inspect(file); \
+                 } \
+                 consume(file); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0004"], "unexpected: {diags:?}");
+    }
+
     #[test]
     fn using_a_resource_after_registering_a_consuming_defer_is_use_after_move() {
         let diags = check(

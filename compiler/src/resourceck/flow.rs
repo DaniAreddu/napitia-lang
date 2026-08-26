@@ -163,6 +163,17 @@ pub struct FlowChecker<'a> {
     /// only its own body walk, so an inner `break` never contributes to
     /// an outer loop's own accumulated exits.
     loop_stack: Vec<LoopFrame>,
+    /// One entry per lexically-enclosing block, innermost last (Blocker
+    /// 9): every resource local a `defer` directly inside *that* block
+    /// promoted from `Available` to `DropScheduled` purely by observing
+    /// it (never one a *consuming* defer already moved -- that local
+    /// never re-enters `Available` at all, so releasing it here would be
+    /// a no-op, see [`Self::check_defer`]). Released back to `Available`
+    /// the moment that exact block's own [`Self::check_block_ctx`]
+    /// finishes, on every exit from it -- an observing defer's own
+    /// protection only ever lasts until the deferred call itself would
+    /// actually run.
+    defer_scopes: Vec<HashSet<LocalId>>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -186,6 +197,7 @@ impl<'a> FlowChecker<'a> {
             states: HashMap::new(),
             observing: HashSet::new(),
             loop_stack: Vec::new(),
+            defer_scopes: Vec::new(),
         }
     }
 
@@ -236,7 +248,27 @@ impl<'a> FlowChecker<'a> {
     /// own value (Blocker 2): `{ ...; tail }` used as a `return`'s own
     /// operand consumes `tail` exactly like a bare `return tail`
     /// would, not merely reads it.
+    ///
+    /// Also `block`'s own defer scope (Blocker 9): every `defer` this
+    /// exact block directly registers (not one nested inside a further
+    /// block/if/loop of its own, which already released its own defers
+    /// by the time control returns here) stops protecting whatever it
+    /// only *observes* the moment this block's own walk ends, on every
+    /// exit from it -- normal fallthrough, or an early return through
+    /// [`stmt_diverges`]'s own truncation -- exactly like the deferred
+    /// call itself would actually run at real scope exit.
     fn check_block_ctx(&mut self, block: &HirBlock, kind: ConsumeKind) {
+        self.defer_scopes.push(HashSet::new());
+        self.check_block_ctx_inner(block, kind);
+        let scope = self.defer_scopes.pop().expect("pushed immediately above");
+        for local in scope {
+            if let Some(ResourceState::DropScheduled) = self.states.get(&local) {
+                self.states.insert(local, ResourceState::Available);
+            }
+        }
+    }
+
+    fn check_block_ctx_inner(&mut self, block: &HirBlock, kind: ConsumeKind) {
         for stmt in &block.statements {
             self.check_stmt(stmt);
             // Blocker 11: a statement that itself unconditionally
@@ -316,6 +348,13 @@ impl<'a> FlowChecker<'a> {
         for local in observed {
             if let Some(ResourceState::Available) = self.states.get(&local) {
                 self.states.insert(local, ResourceState::DropScheduled);
+                // Blocker 9: remembered against *this* defer's own
+                // enclosing block so `check_block_ctx` can release this
+                // exact protection once that block's own walk ends,
+                // rather than leaving it protected indefinitely.
+                if let Some(scope) = self.defer_scopes.last_mut() {
+                    scope.insert(local);
+                }
             }
         }
     }

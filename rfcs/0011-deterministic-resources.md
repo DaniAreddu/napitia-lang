@@ -68,7 +68,13 @@ is gone" transition NIR emits, observed only through ordinary `drop`/
 are out of scope for this milestone: a `resource` used as a protocol's
 own type argument, or as an `extend` target, is rejected with a
 dedicated diagnostic rather than silently behaving like an ordinary
-value.
+value. A resource-typed field nested inside another aggregate --
+record, variant, or another resource -- is also out of scope and
+rejected with a dedicated diagnostic at the containing declaration:
+Alpha 0.1.7 implements neither transitive ownership transfer into a
+nested resource field nor recursive destruction out of one, so
+accepting the declaration at all would let the runtime destroy only
+the outer value and silently leak whatever it nested.
 
 ## Syntax
 

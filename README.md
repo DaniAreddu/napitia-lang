@@ -177,17 +177,21 @@ identity and import aliases (`rfcs/0007`).
   dedicated flow-sensitive resource checker (`resourceck/`) tracking
   every affine value's own state (`Available`/`Moved`/`DropScheduled`/
   `Dropped`) through a function body, joins that require reachable
-  branches to agree, and loop-carried invalidation detection; NIR
-  lowering inserts real `Drop`/deferred-call instructions at normal
-  return/fallthrough, `raise`, and postfix `?` propagation (a
-  `break`/`continue` loop exit does not yet get its own dedicated
-  cleanup insertion — see the RFC's own limitations); an
-  independent NIR verifier pass proves every `Drop` targets a live
-  resource value and no value is ever dropped twice on any reachable
-  path — see `rfcs/0011-deterministic-resources.md` for the full design
-  and current honest limitations (no general references, lifetimes,
-  shared ownership, reference counting, tracing GC, or native
-  allocator).
+  branches to agree, edge-sensitive loop-carried invalidation detection
+  (`break` and `continue` tracked as distinct exits from the body's own
+  fallthrough, since only `continue` and fallthrough feed the loop's own
+  backedge), a resource-typed value bound by a `handle` `success`
+  pattern, and a resource-typed temporary reaching a position nothing
+  would ever destroy it from; NIR lowering inserts real `Drop`/
+  deferred-call instructions at normal return/fallthrough, `raise`,
+  postfix `?` propagation, and `break`/`continue` (destroying exactly
+  that iteration's own live resources before jumping past or back to
+  the loop); an independent NIR verifier pass proves every `Drop`
+  targets a live resource value and no value is ever dropped twice on
+  any reachable path — see `rfcs/0011-deterministic-resources.md` for
+  the full design and current honest limitations (no general
+  references, lifetimes, shared ownership, reference counting, tracing
+  GC, native allocator, or nested resource-typed fields).
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -397,9 +401,11 @@ collector, a native heap allocator (Alpha 0.1.7's `resource` values are
 semantic runtime objects the interpreter tracks, not pointers into
 process memory — see `rfcs/0011`), generic resources, protocols over
 resource types, a user-defined destructor body attached directly to a
-`resource` declaration, cleanup insertion at a `break`/`continue` loop
-exit (see `rfcs/0011`'s own limitations), the indirection that would
-lift the recursive-aggregate restriction, structured concurrency,
+`resource` declaration, transitive ownership into a resource-typed field
+nested inside another aggregate (rejected outright at declaration
+instead -- see `rfcs/0011`'s own limitations), a resource-typed
+`match`/`handle`/non-tail `if`, the indirection that would lift the
+recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
 aliases that do exist — see above), incremental/cached compilation, an

@@ -2578,6 +2578,14 @@ impl<'a> Lowering<'a> {
                         "`handle`'s failure dispatch resolved to a non-failure arm",
                     ));
                 };
+                // Marks where this specific arm's own pattern bindings
+                // start (Blocker 4) -- a resource-typed one (never
+                // actually reachable for a failure payload today, see
+                // `bind_arm_pattern`'s own doc comment, but handled
+                // uniformly rather than assumed) still needs cleanup
+                // scheduled and released again here, exactly like a
+                // `value` binding local to this one arm's own scope.
+                let pattern_marker = fb.cleanup_actions.len();
                 if let HirFailurePattern::Case { args: payload, .. } = pattern {
                     if payload.len() != payload_tys.len() {
                         return Err(self.internal_error(&format!(
@@ -2600,7 +2608,9 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 let body = &arms[arm_index].body;
-                self.lower_branch_moves(fb, |this, fb| this.lower_arm_body(fb, body, merge))?;
+                self.lower_branch_moves(fb, |this, fb| {
+                    this.lower_arm_body(fb, body, merge, pattern_marker)
+                })?;
                 fb.switch_to(dispatch_block);
             }
             fb.terminate(Terminator::Switch {
@@ -2623,9 +2633,14 @@ impl<'a> Lowering<'a> {
         let HirHandleArmKind::Success(pattern) = &success_arm.kind else {
             unreachable!("just matched Success above");
         };
+        // Blocker 4: `success file => ...` owns the callee's returned
+        // resource -- scheduled for cleanup here, right before this
+        // marker, so leaving the arm without moving/returning/dropping
+        // `file` still destroys it exactly once instead of leaking it.
+        let pattern_marker = fb.cleanup_actions.len();
         self.bind_arm_pattern(fb, pattern, ok_value)?;
         self.lower_branch_moves(fb, |this, fb| {
-            this.lower_arm_body(fb, &success_arm.body, merge)
+            this.lower_arm_body(fb, &success_arm.body, merge, pattern_marker)
         })?;
         self.end_move_join(fb);
 
@@ -2642,7 +2657,15 @@ impl<'a> Lowering<'a> {
 
     /// Binds a `success`/failure-payload pattern -- always a bare `Bind`
     /// or `Wildcard` once resolved (`typeck` rejects anything else) -- to
-    /// an already-computed value.
+    /// an already-computed value. A resource-typed binding (only ever
+    /// possible for a `success` pattern -- a failure payload's own type
+    /// is a raised variant's case payload, which
+    /// `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` already forbids from ever
+    /// being affine) owns that value exactly like an ordinary `value`
+    /// binding does (`rfcs/0011`, Blocker 4): scheduled for cleanup the
+    /// same way, so leaving the arm without moving, returning, or
+    /// explicitly dropping it still destroys it exactly once, rather
+    /// than silently leaking it.
     fn bind_arm_pattern(
         &mut self,
         fb: &mut FnBuilder,
@@ -2653,6 +2676,10 @@ impl<'a> Lowering<'a> {
             HirPattern::Bind { local, .. } => {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(value));
+                let ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
+                if self.is_affine(&ty) {
+                    fb.cleanup_actions.push(CleanupAction::Drop(*local));
+                }
                 Ok(())
             }
             HirPattern::Wildcard { .. } => Ok(()),
@@ -2667,11 +2694,25 @@ impl<'a> Lowering<'a> {
     /// tail behavior for an ordinary `match` arm. Does nothing further
     /// when the body diverged on its own (it already terminated its
     /// block itself).
+    /// `pattern_marker` is `fb.cleanup_actions.len()` from right before
+    /// this specific arm's own pattern was bound (Blocker 4) -- every
+    /// entry from there on is this arm's own responsibility alone,
+    /// exactly like `lower_scoped_block`'s own `marker` is for an
+    /// ordinary block's own locals, and released the same unconditional
+    /// way: a diverging body (an explicit `return`/`raise`/`break`/
+    /// `continue` inside it) already replayed every entry still on the
+    /// list, including these, through its own existing cleanup
+    /// mechanism, so only the *truncate* still needs to happen here for
+    /// that case, never a second emission -- only the arm's own normal
+    /// completion, producing a value and falling through to `merge`,
+    /// needs cleanup actually emitted here too, before that value is
+    /// stored and this block branches away.
     fn lower_arm_body(
         &mut self,
         fb: &mut FnBuilder,
         body: &HirMatchArmBody,
         merge: Option<(ValueId, BlockId)>,
+        pattern_marker: usize,
     ) -> LowerResult<()> {
         let result = match body {
             HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
@@ -2680,8 +2721,12 @@ impl<'a> Lowering<'a> {
         if let LoweredExpr::Value(v) = result
             && let Some((slot, after)) = merge
         {
+            self.emit_cleanup_since(fb, pattern_marker)?;
+            fb.cleanup_actions.truncate(pattern_marker);
             fb.push_store(slot, v);
             fb.terminate(Terminator::Branch(after));
+        } else {
+            fb.cleanup_actions.truncate(pattern_marker);
         }
         Ok(())
     }
@@ -3175,12 +3220,22 @@ impl<'a> Lowering<'a> {
                     "a match's decision tree ran out of candidate arms with no winner",
                 ));
             };
+            // An ordinary match arm's own pattern bindings can never be
+            // resource-typed (a variant payload is never affine --
+            // `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` already forbids
+            // it), so this marker is always a no-op in practice; taken
+            // anyway for the same reason `lower_arm_body`'s `handle`
+            // callers do -- so nothing here depends on that invariant
+            // holding forever to stay sound.
+            let pattern_marker = fb.cleanup_actions.len();
             for (local, value) in &winner.bindings {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(*value));
             }
             let arm = &arms[winner.arm_index];
-            self.lower_branch_moves(fb, |this, fb| this.lower_arm_body(fb, &arm.body, merge))?;
+            self.lower_branch_moves(fb, |this, fb| {
+                this.lower_arm_body(fb, &arm.body, merge, pattern_marker)
+            })?;
             return Ok(());
         }
 
@@ -4152,6 +4207,82 @@ mod tests {
             "expected only the explicit drop of the first value -- the reassigned resource is \
              returned, not dropped inside f, and `source` must not be independently dropped \
              once its value moved into `target`"
+        );
+    }
+
+    // -- Resource ownership from patterns (Blocker 4) --------------------
+
+    #[test]
+    fn a_handle_success_bindings_resource_returning_a_primitive_is_still_dropped_exactly_once() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => file.descriptor, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => file.descriptor, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        // Declaration order: `open` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the success arm's own resource binding must be destroyed exactly once, even \
+             though the arm itself only ever reads a primitive field out of it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_bindings_resource_moved_into_a_take_call_is_not_also_dropped() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => consume(file), \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => consume(file), \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        // Declaration order: `open`, `consume`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "the success arm's own binding was moved into consume's own take parameter; f's \
+             own scope must not also drop it"
         );
     }
 

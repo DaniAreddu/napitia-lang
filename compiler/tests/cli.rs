@@ -913,3 +913,8 @@ fn resource_invalid_double_drop_example_is_u0003_at_every_stage() {
 fn resource_invalid_escape_example_is_u0005_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_escape.npt", "U0005");
 }
+
+#[test]
+fn resource_invalid_generic_take_example_is_t0065_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_generic_take.npt", "T0065");
+}

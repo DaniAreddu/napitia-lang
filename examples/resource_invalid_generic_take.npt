@@ -1,0 +1,13 @@
+resource File {
+    descriptor: i64,
+}
+
+// Alpha 0.1.7 has no generic resource ownership model: `take` on an
+// unconstrained type parameter is rejected at its own declaration
+// (T0065), regardless of whether this function is ever instantiated
+// with a resource type.
+func bad[T](take item: T) -> unit {}
+
+func main() -> i64 {
+    return 0;
+}

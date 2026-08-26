@@ -3,9 +3,19 @@
 //! value's own ownership state through a function body -- use-after-
 //! move, use-after-drop, double-drop, moving a value a pending `defer`
 //! still needs, an ordinary parameter's own observation escaping its
-//! call, inconsistent state across a join or loop back-edge, and (as
-//! of Blocker 2) a compound `if`/`match`/`handle`/block origin whose
-//! own underlying resource differs by branch.
+//! call, inconsistent state across a join, a compound `if`/`match`/
+//! `handle`/block origin whose own underlying resource differs by
+//! branch, a resource-typed value bound by a `handle` `success`
+//! pattern, and a resource-typed temporary reaching a position nothing
+//! would ever destroy it from.
+//!
+//! Loop ownership (`while`/`loop`) is edge-sensitive, not a single
+//! "body's own textual end" check: `break` and `continue` are tracked
+//! separately (`FlowChecker::loop_stack`) since only `continue` and the
+//! body's own reachable fallthrough feed the loop's own backedge (which
+//! must agree with entry, or a second iteration could not safely reuse
+//! it); `break`'s own live state instead joins directly into the state
+//! after the loop, alongside a `while`'s own condition-false exit.
 //!
 //! `nir::lower` never re-derives ownership from spans or names: it is
 //! only ever invoked (via `driver::check`) once this stage's own
@@ -24,16 +34,17 @@
 //!
 //! Known, honest scope limits for this milestone: only a *whole*
 //! binding may ever be moved -- moving a resource-typed value out of a
-//! record/resource field (`take other.file`) is rejected outright
-//! (`U0009`), not silently mis-tracked as a non-consuming observation;
-//! a resource-typed `match`/`handle`, or a resource-typed `if` in any
-//! consuming position other than `return`/the function's own implicit
-//! tail, is rejected outright too (`U0008`), since `nir::lower` has no
-//! per-branch sink for those yet; a `mutable` resource-typed binding's
-//! own old value is not specially validated for disposal when
-//! reassigned; a `break`/`continue` loop exit does not run any
-//! enclosing scope's pending cleanup (`nir::lower`'s own limitation,
-//! not checked/rejected here either).
+//! field is not a concern this stage tracks at all, since `typeck`'s
+//! own `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` (T0064) already rejects a
+//! resource-typed field in any aggregate -- record, variant, or another
+//! resource -- at that aggregate's own declaration; a resource-typed
+//! `match`/`handle`, or a resource-typed `if` in any consuming position
+//! other than `return`/the function's own implicit tail, is rejected
+//! outright (`U0008`), since `nir::lower` has no per-branch sink for
+//! those yet; a resource-typed temporary reaching a compound
+//! `if`/`match`/`handle` that itself constructs a genuinely fresh
+//! resource on some branch is not caught by the temporary check
+//! (`U0011`), only a direct call or literal construction is.
 
 mod flow;
 mod state;

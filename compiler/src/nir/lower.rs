@@ -2335,6 +2335,7 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
+        let takes = self.function_takes.get(item).cloned();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -2344,6 +2345,17 @@ impl<'a> Lowering<'a> {
             match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => arg_values.push(v),
                 LoweredExpr::Diverged => return Ok(None),
+            }
+            // Exactly `lower_call`'s own rule (`rfcs/0011`, Blocker 1):
+            // a `take` argument transfers ownership into the call
+            // whether that call is an ordinary `Call` or a fallible
+            // `Invoke` -- the caller's own binding is moved here, before
+            // the `Invoke` below even terminates this block, so neither
+            // the success edge nor any failure edge's own cleanup drops
+            // it again out from under the callee, which is now the one
+            // responsible for it.
+            if takes.as_ref().and_then(|t| t.get(i)).copied() == Some(true) {
+                self.mark_moved(fb, arg);
             }
         }
         let requirements = self.lookup_function_requirements(*item, context)?;
@@ -4034,6 +4046,106 @@ mod tests {
             0,
             "f's own scope must not drop a resource it already moved into the deferred call"
         );
+    }
+
+    // -- Fallible `take` transfer through Invoke (Blocker 1) ------------
+
+    #[test]
+    fn a_take_argument_to_a_postfix_try_call_is_not_also_dropped_by_the_caller() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 raises OpenError { \
+                 value file = File { descriptor: 3 }; \
+                 return consume(file)?; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 raises OpenError { \
+                 value file = File { descriptor: 3 }; \
+                 return consume(file)?; \
+             }",
+        );
+        // Declaration order: `consume` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the Invoke, on \
+             either edge"
+        );
+    }
+
+    #[test]
+    fn a_take_argument_to_a_handled_call_is_not_also_dropped_by_the_caller() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the Invoke, on \
+             either edge, and the handled failure arm never received it either"
+        );
+    }
+
+    #[test]
+    fn a_resource_taken_by_a_failing_invoke_is_not_leaked_or_double_dropped() {
+        // The callee's own failure edge is reached; the callee is the
+        // one now responsible for whatever it did with its taken
+        // argument (Blocker 1) -- the caller's own diagnostics/lowering
+        // must stay identical regardless of which edge actually runs at
+        // runtime, since both are decided the same way, at Invoke-time,
+        // before either edge exists.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File, fail: bool) -> i64 raises OpenError { \
+                 if fail { \
+                     drop file; \
+                     raise OpenError.Bad; \
+                 } \
+                 return 1; \
+             } \
+             func f(fail: bool) -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file, fail) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

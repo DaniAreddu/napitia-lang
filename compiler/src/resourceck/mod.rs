@@ -945,4 +945,124 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    // -- Resource-valued temporaries (Blocker 3) -------------------------
+
+    #[test]
+    fn a_discarded_call_returning_a_resource_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func f() { make_file(); }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_discarded_resource_literal_is_rejected() {
+        let diags = check("resource File { descriptor: i64 } func f() { File { descriptor: 1 }; }");
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_passed_to_an_ordinary_parameter_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f() -> i64 { return inspect(make_file()); }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_observed_by_a_defer_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f() { defer inspect(make_file()); }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporarys_field_read_and_discarded_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func f() -> i64 { return make_file().descriptor; }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_bound_to_a_value_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func f() { value file = make_file(); drop file; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_explicitly_dropped_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func f() { drop make_file(); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_returned_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func f() -> File { return make_file(); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_passed_to_a_take_parameter_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { return consume(make_file()); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_temporary_captured_by_a_consuming_defer_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file() -> File { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() { defer consume(make_file()); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_compound_if_wrapping_only_already_owned_locals_remains_valid() {
+        // Not itself a fresh temporary on either branch -- both arms
+        // just re-observe an already-owned local, exactly as valid here
+        // as passing that same local directly would be.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 value r = inspect(if cond { file } else { file }); \
+                 drop file; \
+                 return r; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
 }

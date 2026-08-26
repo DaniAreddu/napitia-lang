@@ -79,6 +79,20 @@ mod codes {
     /// proves the slot is provably empty (`Moved`/`Dropped`) on every
     /// incoming path.
     pub const REASSIGNMENT_OF_LIVE_RESOURCE: &str = "U0010";
+    /// A resource-typed *temporary* -- freshly constructed or returned
+    /// from a call, never itself bound to an owned local -- appears
+    /// somewhere its own value would just be discarded once evaluated
+    /// (Blocker 3): a bare discarded statement-expression, the base of
+    /// a field projection, or an argument to an ordinary (non-`take`)
+    /// parameter. Only `nir::lower`'s own `cleanup_actions` list ever
+    /// schedules a resource's destruction, and only a binding or a
+    /// pattern ever registers an entry on it -- a temporary reaching
+    /// any of these positions has no binding at all, so nothing would
+    /// ever destroy it. `value`/`mutable`/`return`/`drop`/a `take`
+    /// argument/a consuming `defer` are each their own already-correct
+    /// sink, immediately capturing or transferring the temporary; this
+    /// is every other position.
+    pub const RESOURCE_TEMPORARY_LEAK: &str = "U0011";
 }
 
 pub use codes::*;
@@ -308,7 +322,15 @@ impl<'a> FlowChecker<'a> {
     fn check_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::Binding(b) => self.check_binding(b),
-            HirStmt::Expr(e) => self.check_expr(e),
+            HirStmt::Expr(e) => {
+                self.check_expr(e);
+                // Blocker 3: a bare statement-expression's own value is
+                // always discarded (see `check_block_ctx`'s own doc
+                // comment) -- if it is itself a fresh resource temporary
+                // rather than a local reference, nothing will ever
+                // destroy it.
+                self.reject_leaked_temporary(e);
+            }
             HirStmt::Defer { expr, span } => self.check_defer(expr, *span),
             HirStmt::Drop { expr, span } => self.check_drop(expr, *span),
             HirStmt::While {
@@ -583,15 +605,29 @@ impl<'a> FlowChecker<'a> {
                             ConsumeKind::Read
                         },
                     );
+                    // Blocker 3: an ordinary (non-`take`) parameter only
+                    // ever observes for the duration of this call --
+                    // nothing keeps whatever a fresh resource temporary
+                    // argument named alive afterward, so nothing would
+                    // ever destroy it.
+                    if !takes {
+                        self.reject_leaked_temporary(arg);
+                    }
                 }
             }
             // No well-typed field projection can ever be affine-typed
             // itself (`typeck`'s own RESOURCE_FIELD_IN_ORDINARY_AGGREGATE
             // already rejects a resource-typed field in any aggregate at
             // its own declaration -- see the retired U0009 above), so
-            // there is nothing left for this arm to consume-check beyond
-            // `base` itself, regardless of `kind`.
-            HirExpr::Field { base, .. } => self.check_expr(base),
+            // there is nothing left for this arm to consume-check about
+            // the *projected field*, regardless of `kind` -- but `base`
+            // itself can still be a bare resource temporary directly
+            // (`make_file().descriptor`, Blocker 3): read once for this
+            // one field, then discarded with nothing to destroy it.
+            HirExpr::Field { base, .. } => {
+                self.check_expr(base);
+                self.reject_leaked_temporary(base);
+            }
             HirExpr::Cast { expr, .. } => self.check_expr(expr),
             HirExpr::Try { expr, .. } => self.check_expr(expr),
             HirExpr::If {
@@ -691,6 +727,38 @@ impl<'a> FlowChecker<'a> {
         self.expr_types
             .get(&id)
             .is_some_and(|ty| self.is_affine(ty))
+    }
+
+    /// Rejects `expr` with [`RESOURCE_TEMPORARY_LEAK`] (Blocker 3) if it
+    /// directly constructs a fresh, affine-typed value with no owner at
+    /// all yet -- a call, or a record/resource literal. Deliberately
+    /// narrower than "any affine expression that is not a bare local
+    /// reference": a compound `if`/`match`/`handle`/block wrapping one
+    /// or more already-owned locals (e.g. `if cond { file } else { file
+    /// }`, still valid input to an observing `defer`) merely
+    /// *re-observes* an existing binding on every branch, the same
+    /// thing a bare local reference here would -- it never brings a new,
+    /// otherwise-unreachable resource into existence the way a call or a
+    /// literal construction does, so it is not this check's concern.
+    /// Known honest gap: a compound expression that *does* construct a
+    /// genuinely fresh resource on some branch (`if cond { make_file() }
+    /// else { file }`) is not caught here.
+    fn reject_leaked_temporary(&mut self, expr: &HirExpr) {
+        if !matches!(expr, HirExpr::Call { .. } | HirExpr::RecordLiteral { .. }) {
+            return;
+        }
+        if !self.is_affine_expr(expr.id()) {
+            return;
+        }
+        self.diagnose(
+            RESOURCE_TEMPORARY_LEAK,
+            expr.span(),
+            "a resource-typed temporary here is never bound, returned, dropped, or transferred \
+             to a `take` parameter, so nothing would ever destroy it; bind it to a `value` \
+             first, or pass/return/drop it directly"
+                .to_string(),
+            "resource temporary would leak",
+        );
     }
 
     fn check_local_use(

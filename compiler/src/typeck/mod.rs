@@ -684,36 +684,49 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// An ordinary (non-affine) `record`/`variant` may never hold a
-    /// resource-typed field/payload (`rfcs/0011`): every ordinary
+    /// No `record` or `resource` may hold a resource-typed field, and no
+    /// `variant` case may carry a resource-typed payload (`rfcs/0011`,
+    /// Blocker 8's own "Nested resources" scope limit). An ordinary
     /// aggregate is freely copyable, and copying one that held a
     /// resource would duplicate it, which affine values may never
-    /// allow. Run once, after `build_aggregate_info` has every field's
-    /// own resolved type available, before any function body is
-    /// checked -- reported even for a record/variant nothing ever
-    /// constructs.
+    /// allow -- but a `resource` field nested inside *another*
+    /// `resource` has no such copying problem and is rejected for a
+    /// different reason instead: the runtime's own destruction of the
+    /// outer resource does not recurse into destroying a nested one,
+    /// so accepting this would silently leak every nested resource
+    /// forever. Alpha 0.1.7 implements neither transitive ownership
+    /// transfer into a nested field nor recursive destruction out of
+    /// one, so this is rejected symbolically at every aggregate's own
+    /// declaration, resource or not, rather than only once some
+    /// specific construction site turns out to leak. Run once, after
+    /// `build_aggregate_info` has every field's own resolved type
+    /// available, before any function body is checked -- reported even
+    /// for a record/variant/resource nothing ever constructs.
     fn check_resource_field_containment(&mut self, hir: &HirModule) {
         for r in &hir.records {
-            if r.affine {
-                continue;
-            }
             let Some(info) = self.records.get(&r.id) else {
                 continue;
             };
             for (field, (_, ty, _)) in r.fields.iter().zip(info.fields.iter()) {
                 if self.is_affine_resource(ty) {
+                    let kind = if r.affine { "resource" } else { "record" };
                     self.diagnostics.push(
                         Diagnostic::error(
                             codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
                             r.source,
                             field.span,
                             format!(
-                                "field `{}` of ordinary record `{}` cannot hold a resource; only another resource may",
+                                "field `{}` of {kind} `{}` cannot hold a resource; Alpha 0.1.7 \
+                                 has no nested resource ownership model",
                                 self.interner.resolve(field.name),
                                 self.interner.resolve(r.name),
                             ),
                         )
-                        .with_primary_label("resource field in an ordinary record"),
+                        .with_primary_label(if r.affine {
+                            "resource field nested inside another resource"
+                        } else {
+                            "resource field in an ordinary record"
+                        }),
                     );
                 }
             }
@@ -731,7 +744,8 @@ impl<'a> Checker<'a> {
                                 v.source,
                                 payload_hir_ty.span(),
                                 format!(
-                                    "case `{}` of variant `{}` cannot carry a resource payload; only a resource may hold one",
+                                    "case `{}` of variant `{}` cannot carry a resource payload; \
+                                     Alpha 0.1.7 has no nested resource ownership model",
                                     self.interner.resolve(case.name),
                                     self.interner.resolve(v.name),
                                 ),
@@ -4908,6 +4922,66 @@ mod tests {
             &text[span.start as usize..span.end as usize],
             "take item: T",
             "expected the diagnostic to span the `take` declaration itself"
+        );
+    }
+
+    // -- Nested resource fields (Blocker 8) ------------------------------
+
+    #[test]
+    fn a_resource_typed_field_in_an_ordinary_record_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { file: File }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_field_in_another_resource_is_rejected() {
+        // Alpha 0.1.7 implements neither transitive ownership transfer
+        // into a nested resource field nor recursive destruction out of
+        // one, so this is rejected the same way an ordinary record
+        // holding one already is, not silently accepted and then
+        // leaked at runtime.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Wrapper { file: File }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_variant_payload_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant Holder { Has(File) }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_field_in_another_resource_is_reported_even_if_never_constructed() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Wrapper { file: File } \
+             func main() -> i64 { return 0 }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
         );
     }
 

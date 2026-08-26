@@ -327,19 +327,16 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
-    #[test]
-    fn storing_a_resource_in_another_resources_field_moves_it() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Wrapper { file: File } \
-             func f() { \
-                 value file = File { descriptor: 3 }; \
-                 value wrapped = Wrapper { file: file }; \
-                 drop file; \
-             }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0001"], "unexpected: {diags:?}");
-    }
+    // Resource-typed field extraction (formerly U0009) is no longer
+    // reachable here at all (Blocker 8): `typeck`'s own
+    // RESOURCE_FIELD_IN_ORDINARY_AGGREGATE (T0064) now rejects a
+    // resource-typed field in any aggregate -- record, variant, or
+    // another resource -- at that aggregate's own declaration, so no
+    // well-typed HIR naming `box.file` where `file` is resource-typed
+    // can ever reach this stage. That coverage (a plain record, and a
+    // resource, each with a resource-typed field, each rejected at
+    // typeck) now lives in `typeck::tests` instead, next to
+    // `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`'s own implementation.
 
     #[test]
     fn a_compound_return_choosing_between_two_taken_resources_has_no_diagnostics() {
@@ -420,96 +417,6 @@ mod tests {
              }",
         );
         assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn returning_a_resource_typed_field_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func steal(box: Box) -> File { return box.file; }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn binding_a_resource_typed_field_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func steal(box: Box) { value file = box.file; drop file; }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn passing_a_resource_typed_field_to_a_take_parameter_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func consume(take file: File) -> unit {} \
-             func steal(box: Box) { consume(box.file); }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn assigning_a_resource_typed_field_into_a_mutable_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func f() -> File { return File { descriptor: 1 } } \
-             func steal(box: Box) { \
-                 mutable file = f(); \
-                 drop file; \
-                 file = box.file; \
-                 drop file; \
-             }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn storing_a_resource_typed_field_into_another_resources_field_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             resource Wrapper { file: File } \
-             func steal(box: Box) -> Wrapper { return Wrapper { file: box.file }; }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn scheduling_a_resource_typed_field_through_defer_is_rejected() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func consume(take file: File) -> unit {} \
-             func steal(box: Box) { defer consume(box.file); }",
-        );
-        assert_eq!(codes_of(&diags), vec!["U0009"], "unexpected: {diags:?}");
-    }
-
-    #[test]
-    fn observing_a_primitive_field_through_a_resource_field_remains_valid() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func peek(box: Box) -> i64 { return box.file.descriptor; }",
-        );
-        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
-    }
-
-    #[test]
-    fn passing_a_resource_typed_field_to_an_ordinary_parameter_remains_valid() {
-        let diags = check(
-            "resource File { descriptor: i64 } \
-             resource Box { file: File } \
-             func inspect(file: File) -> i64 { return file.descriptor } \
-             func peek(box: Box) -> i64 { return inspect(box.file); }",
-        );
-        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

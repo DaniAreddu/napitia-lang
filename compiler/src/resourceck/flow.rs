@@ -62,17 +62,15 @@ mod codes {
     /// lowering this milestone, so it is rejected here rather than
     /// silently mis-lowered into a double-drop or a leak.
     pub const UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN: &str = "U0008";
-    /// A resource-typed field projected out of its containing resource
-    /// (`box.file`) is moved, bound, assigned, passed to a `take`
-    /// parameter, stored, raised, or scheduled through `defer`
-    /// (Blocker 3). Only a *whole* resource binding may ever be moved
-    /// this milestone -- a partial/field-level move is not tracked at
-    /// all, so allowing one here would silently let `box`'s own
-    /// `file` field be read again later as if it were still owned,
-    /// double-destroying it (once through whatever the field's own
-    /// extracted value fed into, once through `box`'s own eventual
-    /// destruction).
-    pub const RESOURCE_FIELD_EXTRACTION: &str = "U0009";
+    // U0009 ("resource field extraction") retired: `typeck`'s own
+    // RESOURCE_FIELD_IN_ORDINARY_AGGREGATE (T0064) now rejects a
+    // resource-typed field in *any* aggregate -- record, variant, or
+    // another resource -- at the declaring type's own declaration
+    // (`rfcs/0011`, Blocker 8's own "Nested resources" scope limit), so
+    // no well-typed HIR can ever reach a resource-typed field projection
+    // for this stage to check in the first place. Never reused for a
+    // different diagnostic: a stale code in an old build's cached output
+    // must never silently start meaning something else.
     /// A `mutable` resource-typed binding is reassigned while it still
     /// owns an available (or `defer`-protected) value (Blocker 4) --
     /// overwriting it without first moving or dropping the old value
@@ -587,21 +585,13 @@ impl<'a> FlowChecker<'a> {
                     );
                 }
             }
-            HirExpr::Field { base, id, span, .. } => {
-                self.check_expr(base);
-                if kind != ConsumeKind::Read && self.is_affine_expr(*id) {
-                    self.diagnose(
-                        RESOURCE_FIELD_EXTRACTION,
-                        *span,
-                        "a resource-typed field cannot be moved, bound, assigned, passed to a \
-                         `take` parameter, stored, raised, or scheduled through `defer` this \
-                         milestone; only a whole resource binding may ever be moved, never a \
-                         field projected out of one"
-                            .to_string(),
-                        "resource field extraction",
-                    );
-                }
-            }
+            // No well-typed field projection can ever be affine-typed
+            // itself (`typeck`'s own RESOURCE_FIELD_IN_ORDINARY_AGGREGATE
+            // already rejects a resource-typed field in any aggregate at
+            // its own declaration -- see the retired U0009 above), so
+            // there is nothing left for this arm to consume-check beyond
+            // `base` itself, regardless of `kind`.
+            HirExpr::Field { base, .. } => self.check_expr(base),
             HirExpr::Cast { expr, .. } => self.check_expr(expr),
             HirExpr::Try { expr, .. } => self.check_expr(expr),
             HirExpr::If {

@@ -2149,6 +2149,33 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
+        // Resource reassignment (`rfcs/0011`, Blocker 5): `resourceck`
+        // already proved the target's own previous value was moved or
+        // dropped before this reassignment was ever accepted, and that
+        // a plain-local RHS (`target = source;`) is itself consumed by
+        // it exactly like any other move -- neither half of that was
+        // ever reflected in this builder's own `moved_out`, so both
+        // needed fixing here, not just one:
+        if op == AssignOp::Assign {
+            // The RHS's own source local, if it names one, must stop
+            // being this scope's responsibility -- its ownership just
+            // transferred into `local`'s own slot, exactly like a
+            // `take` argument's own source already does in `lower_call`/
+            // `lower_invoke`. Without this, `source`'s own still-
+            // scheduled cleanup would later drop the exact same
+            // resource this assignment just also installed into
+            // `local`, a real double-drop, not merely a diagnostic gap.
+            self.mark_moved(fb, value);
+            // `local` itself re-enters this scope's own responsibility:
+            // it was excluded from cleanup by whatever moved or dropped
+            // its *previous* value (which is exactly what let this
+            // reassignment be accepted in the first place), but the
+            // value it holds now is fresh and has not itself been moved
+            // or dropped by anything yet. Leaving it excluded here would
+            // leak every reassigned resource silently -- its own
+            // scope-exit sweep would skip it forever.
+            fb.moved_out.remove(local);
+        }
 
         let final_value = match op {
             AssignOp::Assign => value_value,
@@ -4045,6 +4072,86 @@ mod tests {
             drop_count(f),
             0,
             "f's own scope must not drop a resource it already moved into the deferred call"
+        );
+    }
+
+    // -- Resource reassignment (Blocker 5) -------------------------------
+
+    #[test]
+    fn reassigning_after_an_explicit_drop_destroys_the_new_value_exactly_once() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable target = first(); \
+                 drop target; \
+                 target = second(); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable target = first(); \
+                 drop target; \
+                 target = second(); \
+             }",
+        );
+        // Declaration order: `first`, `second`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected the explicit drop of the first value and the implicit scope-exit drop \
+             of the reassigned second value, got a different count entirely"
+        );
+    }
+
+    #[test]
+    fn reassigning_from_a_local_moves_the_source_and_transfers_ownership_to_the_target() {
+        // The exact regression from the review: `source`'s own binding
+        // must not also be dropped once its value moved into `target`,
+        // and `target`'s own new value must still reach exactly one
+        // `Drop` -- at the caller, once the returned resource is done
+        // with, never inside `f` itself before the `Return`.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() -> File { \
+                 mutable target = first(); \
+                 drop target; \
+                 value source = second(); \
+                 target = source; \
+                 return target; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() -> File { \
+                 mutable target = first(); \
+                 drop target; \
+                 value source = second(); \
+                 target = source; \
+                 return target; \
+             }",
+        );
+        // Declaration order: `first`, `second`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected only the explicit drop of the first value -- the reassigned resource is \
+             returned, not dropped inside f, and `source` must not be independently dropped \
+             once its value moved into `target`"
         );
     }
 

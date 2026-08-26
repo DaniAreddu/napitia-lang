@@ -3762,9 +3762,19 @@ impl<'a> Checker<'a> {
             return;
         }
         let resolved = self.ctx.resolve(ty);
-        if matches!(resolved, Ty::Error | Ty::Never | Ty::Param(..)) {
+        if matches!(resolved, Ty::Error | Ty::Never) {
             return;
         }
+        // A type parameter (Blocker 10, `rfcs/0011`) is never accepted
+        // here either, even though `is_affine_resource` below would
+        // already reject it on its own: Alpha 0.1.7 has no generic
+        // resource ownership model at all (a `T` bound to a resource at
+        // one instantiation and a primitive at another would need
+        // per-instantiation `take`-acceptance, which nothing downstream
+        // -- `resourceck`, `nir::lower`, the runtime identity model --
+        // implements), so this is rejected symbolically, at the
+        // declaration itself, rather than only once some future
+        // instantiation happens to pick a resource type.
         if !self.is_affine_resource(&resolved) {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -4835,6 +4845,68 @@ mod tests {
         assert_eq!(
             &text[span.start as usize..span.end as usize],
             "take number: i64",
+            "expected the diagnostic to span the `take` declaration itself"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_is_rejected() {
+        // Alpha 0.1.7 has no generic resource ownership model at all --
+        // rejected symbolically, at the declaration, never deferred
+        // until some future instantiation happens to pick a resource
+        // type (Blocker 10).
+        let diags = check("func bad[T](take item: T) {}");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0065"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn calling_a_generic_take_function_at_a_concrete_type_is_still_rejected() {
+        let diags = check("func bad[T](take item: T) {} func f() { bad[i64](1); }");
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_used_for_resource_instantiation_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func bad[T](take item: T) {} \
+             func f() { value file = File { descriptor: 1 }; bad[File](file); }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_extend_method_parameter_is_rejected() {
+        let diags = check(
+            "record Box { amount: i64 } \
+             protocol Bad[T] { func bad(take number: T) -> i64; } \
+             extend Bad[Box] { func bad(take number: Box) -> i64 { return number.amount } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_points_at_the_take_declaration() {
+        let diags = check("func bad[T](take item: T) {}");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        let span = diags[0].primary_span;
+        let text = "func bad[T](take item: T) {}";
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "take item: T",
             "expected the diagnostic to span the `take` declaration itself"
         );
     }

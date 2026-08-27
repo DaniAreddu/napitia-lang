@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
@@ -263,6 +263,47 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The lowest-numbered `ValueId` among `values` still holding a live,
+    /// still-current resource handle this exiting frame is itself
+    /// responsible for -- one it constructed, or received through a
+    /// `take` parameter, and never dropped or transferred away
+    /// (`rfcs/0011`, Blocker 8). `observing_params` excludes every
+    /// ordinary (non-`take`) parameter's own value: this frame never
+    /// owned it in the first place (`an ordinary parameter observes
+    /// without consuming`), so it never running a destructive action on
+    /// it is correct, not a leak. A dropped resource's own entry is
+    /// removed from `values` outright (see `Instruction::Drop`'s own
+    /// handling above), and a transferred one's entry still holds its
+    /// own now-stale handle (bumping the table's own generation never
+    /// rewrites `values` itself) -- so either one is already excluded
+    /// here without needing its own special case, purely because
+    /// [`ResourceTable::record`] rejects a stale handle.
+    /// `resourceck`/`nir::verify` already statically guarantee this can
+    /// never actually be `Some` for NIR that passed both; this is this
+    /// frame's own independent runtime backstop, not a substitute for
+    /// either.
+    fn leaked_resource(
+        &self,
+        values: &HashMap<ValueId, Value>,
+        observing_params: &HashSet<ValueId>,
+    ) -> Option<ValueId> {
+        let resources = self.resources.borrow();
+        let mut leaked: Vec<ValueId> = values
+            .iter()
+            .filter(|(id, _)| !observing_params.contains(id))
+            .filter_map(|(id, value)| match value {
+                Value::Resource(handle) => resources
+                    .record(*handle)
+                    .ok()
+                    .filter(|record| record.status == ResourceStatus::Alive)
+                    .map(|_| *id),
+                _ => None,
+            })
+            .collect();
+        leaked.sort();
+        leaked.into_iter().next()
+    }
+
     /// Calls the function named `name` with no arguments — the shape of
     /// `napitia run`'s entry point (`func main() -> ...`).
     pub fn run(&self, name: &str, interner: &Interner) -> Result<Value, InterpreterError> {
@@ -364,6 +405,12 @@ impl<'a> Interpreter<'a> {
                 evidence.len()
             )));
         }
+        let observing_params: HashSet<ValueId> = function
+            .params
+            .iter()
+            .filter(|p| !p.take)
+            .map(|p| p.value)
+            .collect();
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
             // A `take` parameter transfers ownership into this call
@@ -447,12 +494,27 @@ impl<'a> Interpreter<'a> {
                     // A returned resource transfers ownership back to
                     // the caller (`rfcs/0011`, Blocker 8) -- the same
                     // transfer a `take` argument gets, just on the way
-                    // out instead of in.
-                    return Ok(Outcome::Returned(
-                        self.transfer_if_resource(get(&values, id)?)?,
-                    ));
+                    // out instead of in. Transferred first, so its own
+                    // now-stale entry in `values` is already excluded by
+                    // the leak check that follows.
+                    let returned = self.transfer_if_resource(get(&values, id)?)?;
+                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                        return Err(invalid(format!(
+                            "function returned while still owning an undestroyed resource (%{})",
+                            leaked.0
+                        )));
+                    }
+                    return Ok(Outcome::Returned(returned));
                 }
-                Terminator::Return(None) => return Ok(Outcome::Returned(Value::Unit)),
+                Terminator::Return(None) => {
+                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                        return Err(invalid(format!(
+                            "function returned while still owning an undestroyed resource (%{})",
+                            leaked.0
+                        )));
+                    }
+                    return Ok(Outcome::Returned(Value::Unit));
+                }
                 Terminator::Branch(target) => block_id = *target,
                 Terminator::CondBranch {
                     condition,
@@ -532,7 +594,14 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 Terminator::Raise { value } => {
-                    return Ok(Outcome::Raised(get(&values, value)?));
+                    let raised = get(&values, value)?;
+                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                        return Err(invalid(format!(
+                            "function raised while still owning an undestroyed resource (%{})",
+                            leaked.0
+                        )));
+                    }
+                    return Ok(Outcome::Raised(raised));
                 }
             }
         }
@@ -1992,6 +2061,128 @@ mod tests {
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured stale-handle error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_returns_while_still_owning_a_resource_is_an_error_not_a_panic() {
+        // This function constructs a resource and returns without ever
+        // dropping or transferring it away -- `resourceck`/`nir::verify`
+        // both already statically forbid a well-typed source program
+        // from reaching this shape at all, so this hand-built module
+        // exercises the interpreter's own independent frame-exit
+        // backstop directly, never relying on either static guarantee.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let f = ItemId(0);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: f,
+                name: f_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                    }],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured frame-exit leak error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_parameters_own_observation_is_never_a_frame_exit_leak() {
+        // `file` is an ordinary (non-`take`) parameter: this frame never
+        // owns it, so returning without dropping or transferring it is
+        // entirely correct -- proving `leaked_resource`'s own exclusion
+        // of observing parameters actually holds, not just that a
+        // constructed-and-abandoned resource is caught.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Param, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let f = ItemId(0);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: f,
+                name: f_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: resource_ty.clone(),
+                    take: false,
+                }],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(resource, Vec::new());
+        let outcome = interpreter.call_function(
+            &module.functions[0],
+            vec![Value::Resource(handle)],
+            Vec::new(),
+        );
+        assert!(
+            matches!(outcome, Ok(Outcome::Returned(Value::Unit))),
+            "an ordinary parameter's own observation must never be a frame-exit leak"
         );
     }
 

@@ -742,21 +742,23 @@ impl<'a> FlowChecker<'a> {
                 then_branch,
                 else_branch,
                 id,
+                span,
                 ..
             } => {
                 self.check_expr(condition);
-                let kind = self.check_compound_origin(*id, kind, "if");
-                self.check_if(*id, then_branch, else_branch.as_ref(), kind);
+                let kind = self.check_compound_origin(*id, *span, kind, "if");
+                self.check_if(*id, *span, then_branch, else_branch.as_ref(), kind);
             }
             HirExpr::Match {
                 scrutinee,
                 arms,
                 id,
+                span,
                 ..
             } => {
                 self.check_expr(scrutinee);
-                let kind = self.check_compound_origin(*id, kind, "match");
-                self.check_match_arms(*id, arms, kind);
+                let kind = self.check_compound_origin(*id, *span, kind, "match");
+                self.check_match_arms(*id, *span, arms, kind);
             }
             HirExpr::Block(block) => self.check_block_ctx(block, kind),
             HirExpr::Return { value, .. } => {
@@ -782,11 +784,15 @@ impl<'a> FlowChecker<'a> {
                 self.check_expr_ctx(operand, ConsumeKind::Other);
             }
             HirExpr::Handle {
-                operand, arms, id, ..
+                operand,
+                arms,
+                id,
+                span,
+                ..
             } => {
                 self.check_expr(operand);
-                let kind = self.check_compound_origin(*id, kind, "handle");
-                self.check_handle_arms(*id, arms, kind);
+                let kind = self.check_compound_origin(*id, *span, kind, "handle");
+                self.check_handle_arms(*id, *span, arms, kind);
             }
         }
     }
@@ -805,6 +811,7 @@ impl<'a> FlowChecker<'a> {
     fn check_compound_origin(
         &mut self,
         id: crate::hir::ExprId,
+        span: Span,
         kind: ConsumeKind,
         construct: &'static str,
     ) -> ConsumeKind {
@@ -818,7 +825,7 @@ impl<'a> FlowChecker<'a> {
         }
         self.diagnose(
             UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN,
-            Span::dummy(),
+            span,
             format!(
                 "a resource-typed `{construct}` cannot be directly moved, bound, assigned, \
                  passed to a `take` parameter, stored, or raised this milestone; consume each \
@@ -1024,6 +1031,7 @@ impl<'a> FlowChecker<'a> {
     fn check_if(
         &mut self,
         if_id: crate::hir::ExprId,
+        span: Span,
         then_branch: &HirBlock,
         else_branch: Option<&HirElse>,
         kind: ConsumeKind,
@@ -1068,13 +1076,14 @@ impl<'a> FlowChecker<'a> {
             && self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
-            self.diagnose_inconsistent_join(if_id);
+            self.diagnose_inconsistent_join(if_id, span);
         }
     }
 
     fn check_match_arms(
         &mut self,
         match_id: crate::hir::ExprId,
+        span: Span,
         arms: &[HirMatchArm],
         kind: ConsumeKind,
     ) {
@@ -1104,13 +1113,14 @@ impl<'a> FlowChecker<'a> {
         if self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
-            self.diagnose_inconsistent_join(match_id);
+            self.diagnose_inconsistent_join(match_id, span);
         }
     }
 
     fn check_handle_arms(
         &mut self,
         handle_id: crate::hir::ExprId,
+        span: Span,
         arms: &[HirHandleArm],
         kind: ConsumeKind,
     ) {
@@ -1149,7 +1159,7 @@ impl<'a> FlowChecker<'a> {
         if self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
-            self.diagnose_inconsistent_join(handle_id);
+            self.diagnose_inconsistent_join(handle_id, span);
         }
     }
 
@@ -1218,11 +1228,11 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    fn diagnose_inconsistent_join(&mut self, id: crate::hir::ExprId) {
+    fn diagnose_inconsistent_join(&mut self, id: crate::hir::ExprId, span: Span) {
         let _ = id;
         self.diagnose(
             INCONSISTENT_BRANCH_STATE,
-            Span::dummy(),
+            span,
             "reachable branches disagree about a resource's own state; a later use has no \
              single state to check against"
                 .to_string(),

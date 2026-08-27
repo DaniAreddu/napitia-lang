@@ -297,6 +297,53 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_branch_state_points_at_the_if_not_a_dummy_span() {
+        let text = "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(cond: bool) { \
+                 value file = File { descriptor: 3 }; \
+                 if cond { \
+                     consume(file); \
+                 } else { \
+                 } \
+                 drop file; \
+             }";
+        let diags = check(text);
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        let span = diags[0].primary_span;
+        assert!(
+            span.end > span.start,
+            "expected a real, non-empty span, got {span:?}"
+        );
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "if cond { consume(file); } else { }",
+            "expected the diagnostic to span the `if` itself, not a dummy span"
+        );
+    }
+
+    #[test]
+    fn unsupported_compound_resource_origin_points_at_the_construct_not_a_dummy_span() {
+        let text = "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> i64 { \
+                 value picked = if cond { left } else { right }; \
+                 return 1; \
+             }";
+        let diags = check(text);
+        assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
+        let span = diags[0].primary_span;
+        assert!(
+            span.end > span.start,
+            "expected a real, non-empty span, got {span:?}"
+        );
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "if cond { left } else { right }",
+            "expected the diagnostic to span the `if` itself, not a dummy span"
+        );
+    }
+
+    #[test]
     fn a_branch_that_diverges_never_poisons_the_join() {
         let diags = check(
             "resource File { descriptor: i64 } \

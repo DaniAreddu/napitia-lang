@@ -742,6 +742,129 @@ mod tests {
         assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
     }
 
+    #[test]
+    fn a_while_condition_that_consumes_a_resource_is_rejected() {
+        // The condition runs again on every iteration; a take-consuming
+        // condition call would use-after-move the second time it runs.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume_as_bool(take file: File) -> bool { \
+                 drop file; \
+                 return true; \
+             } \
+             func f() { \
+                 value file = File { descriptor: 1 }; \
+                 while consume_as_bool(file) { \
+                 } \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0007"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_conditional_break_after_a_move_followed_by_a_later_use_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if cond { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+                 return inspect(file); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0001"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn two_break_states_disagreeing_about_a_resource_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func f(a: bool, b: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if a { \
+                         sink(file); \
+                         break; \
+                     } \
+                     if b { \
+                         break; \
+                     } \
+                 } \
+                 drop file; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0006"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn two_break_states_agreeing_about_a_resource_has_no_diagnostics() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func f(a: bool, b: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if a { \
+                         sink(file); \
+                         break; \
+                     } \
+                     if b { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_while_condition_false_edge_disagreeing_with_a_break_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func f(cond: bool, inner: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 while cond { \
+                     if inner { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+                 drop file; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0006"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_loop_with_no_reachable_break_produces_an_unreachable_after_state() {
+        // `loop {}` with no break never falls through -- `finish_loop`
+        // must fall back to its own harmless "unreachable" placeholder
+        // (returning `entry` unchanged) rather than panicking or
+        // fabricating a state, even though nothing can actually observe
+        // it here.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 1 }; \
+                 sink(file); \
+                 loop { \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
     // -- Reachability and lexical state (Blocker 11) --------------------
 
     #[test]

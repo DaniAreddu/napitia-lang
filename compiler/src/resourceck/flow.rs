@@ -46,6 +46,9 @@ mod codes {
     /// Two reachable branches of an `if`/`match`/`handle` disagree about
     /// a resource binding's own state (one moves it, another does not);
     /// a later unconditional use has no single state to check against.
+    /// Also reported when two reachable `break` exits of the same loop
+    /// disagree the same way: whatever runs after the loop has no
+    /// single state to check either of them against.
     pub const INCONSISTENT_BRANCH_STATE: &str = "U0006";
     /// A `while`/`loop` body's own end state for a resource binding
     /// declared outside the loop disagrees with its state on entry --
@@ -335,10 +338,7 @@ impl<'a> FlowChecker<'a> {
             HirStmt::Drop { expr, span } => self.check_drop(expr, *span),
             HirStmt::While {
                 condition, body, ..
-            } => {
-                self.check_expr(condition);
-                self.check_loop_body(body);
-            }
+            } => self.check_while_loop(condition, body),
             HirStmt::Loop { body, .. } => self.check_loop_body(body),
         }
     }
@@ -453,24 +453,14 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    /// A `while`/`loop` body is checked once, from a clone of the
-    /// current entry state (Blocker 2). Three distinct edges can carry a
-    /// resource local's own state back into the *next* iteration's own
-    /// entry: the body's own ordinary fallthrough end, and every
-    /// `continue` reached anywhere inside it -- each must agree with
-    /// `entry` for every resource local declared outside the loop, since
-    /// a second iteration reuses that exact entry state regardless of
-    /// which of these edges actually produced it. `break` is different:
-    /// it never re-enters the loop at all, so its own live state instead
-    /// contributes directly to the state *after* the loop statement,
-    /// alongside a `while`'s own condition-false exit -- which, once the
-    /// backedge invariant above is proven, is just `entry` again (an
-    /// untaken loop, or one that already proved every iteration restores
-    /// exactly `entry`). A resource local the loop body itself
-    /// *declares* is scoped to one iteration and never compared this way
-    /// (comparing against entry, where it never existed, would be
-    /// meaningless) -- excluded by only comparing keys already present
-    /// on entry.
+    /// A bare `loop` body is checked once, from a clone of the current
+    /// entry state (Blocker 2) -- `loop` has no condition, and therefore
+    /// no zero-iteration exit at all: the state *after* the loop is
+    /// formed purely from `break`'s own reachable states (`entry` itself
+    /// if there are none reachable, which is correct exactly because
+    /// nothing after an always-looping `loop` is itself reachable
+    /// either). See [`Self::finish_loop`] for the shared backedge
+    /// invariant this shares with [`Self::check_while_loop`].
     fn check_loop_body(&mut self, body: &HirBlock) {
         let entry = self.states.clone();
         self.loop_stack.push(LoopFrame::default());
@@ -481,7 +471,93 @@ impl<'a> FlowChecker<'a> {
             .loop_stack
             .pop()
             .expect("this exact push is right above");
+        self.states = self.finish_loop(
+            entry,
+            None,
+            frame,
+            fallthrough_reachable,
+            fallthrough_state,
+            body.span,
+        );
+    }
 
+    /// A `while` loop's own condition is evaluated fresh on *every*
+    /// visit to the loop header -- the very first one, and again after
+    /// every `continue`/fallthrough backedge -- so it cannot be checked
+    /// only once, from `entry`, and then forgotten (Blocker: loop
+    /// condition re-evaluation). Folded into the exact same repeating
+    /// region the body itself already is: `entry` is the state each
+    /// fresh evaluation of `condition` actually starts from, so a
+    /// backedge that leaves a resource in a state a *second* evaluation
+    /// of `condition` could not safely reuse (moving it, say) is exactly
+    /// as much a loop-carried invalidation as the body doing the same
+    /// thing would be, and is caught by the identical
+    /// [`Self::finish_loop`] check. The state *after* the loop is
+    /// `condition`'s own state immediately once evaluated (its own
+    /// side effects/consumption already happened whether it returned
+    /// `true` or `false`), joined with every reachable `break`.
+    fn check_while_loop(&mut self, condition: &HirExpr, body: &HirBlock) {
+        let entry = self.states.clone();
+        self.loop_stack.push(LoopFrame::default());
+        self.check_expr(condition);
+        let after_condition = self.states.clone();
+        self.check_block(body);
+        let fallthrough_reachable = !self.diverges(body.id);
+        let fallthrough_state = std::mem::replace(&mut self.states, entry.clone());
+        let frame = self
+            .loop_stack
+            .pop()
+            .expect("this exact push is right above");
+        self.states = self.finish_loop(
+            entry,
+            Some(after_condition),
+            frame,
+            fallthrough_reachable,
+            fallthrough_state,
+            body.span,
+        );
+    }
+
+    /// Shared backedge-invariant check and after-loop state computation
+    /// for both loop forms (Blocker 2 / loop condition re-evaluation).
+    /// Three distinct edges can carry a resource local's own state back
+    /// into the *next* visit to the loop header: the body's own ordinary
+    /// fallthrough end, and every `continue` reached anywhere inside it
+    /// -- each must agree with `entry` for every resource local declared
+    /// outside the loop, since the header (a `while`'s own condition, or
+    /// a bare `loop`'s own body start) reuses that exact entry state
+    /// regardless of which edge produced it. `break` is different: it
+    /// never re-enters the loop at all, so its own live state instead
+    /// joins directly into the state *after* the loop, alongside
+    /// `after_base` -- `None` for a bare `loop` (it has no
+    /// zero-iteration exit at all: if nothing inside it ever reaches a
+    /// reachable `break`, the code after it is itself unreachable, and
+    /// `entry` is returned as an unobserved placeholder), or `Some` of a
+    /// `while`'s own state immediately after evaluating `condition`
+    /// (which always finishes evaluating, and so always has whatever
+    /// side effect it has, regardless of which way it comes out) -- a
+    /// genuinely reachable edge into "after the loop" in its own right,
+    /// competing with every `break`'s own state exactly the way two
+    /// sibling `if` branches compete in [`join_branch_states`]. Two
+    /// reachable exits disagreeing is reported once, the same
+    /// [`INCONSISTENT_BRANCH_STATE`] an `if`/`match`/`handle` join
+    /// already reports, rather than silently becoming
+    /// [`ResourceState::Error`] and suppressing every later check
+    /// against it. A resource local the loop body itself *declares* is
+    /// scoped to one iteration and never compared this way (comparing
+    /// against entry, where it never existed, would be meaningless) --
+    /// excluded by only ever producing a state for a key already
+    /// present on `entry`, the same discipline [`join_branch_states`]
+    /// already follows.
+    fn finish_loop(
+        &mut self,
+        entry: HashMap<LocalId, ResourceState>,
+        after_base: Option<HashMap<LocalId, ResourceState>>,
+        frame: LoopFrame,
+        fallthrough_reachable: bool,
+        fallthrough_state: HashMap<LocalId, ResourceState>,
+        span: Span,
+    ) -> HashMap<LocalId, ResourceState> {
         let mut backedges: Vec<&HashMap<LocalId, ResourceState>> =
             frame.continue_states.iter().collect();
         if fallthrough_reachable {
@@ -504,29 +580,60 @@ impl<'a> FlowChecker<'a> {
         for _ in &poisoned {
             self.diagnose(
                 LOOP_CARRIED_INVALIDATION,
-                body.span,
-                "a resource's own state reaching the top of this loop again (through the body's \
-                 own fallthrough or a `continue`) disagrees with its state on entry; a later \
-                 iteration could not safely reuse it"
+                span,
+                "a resource's own state reaching the top of this loop again (through the \
+                 body's own fallthrough, a `continue`, or a `while` condition evaluated again) \
+                 disagrees with its state on entry; a later iteration could not safely reuse it"
                     .to_string(),
                 "loop-carried resource invalidation",
             );
         }
 
-        let mut after = entry;
+        let mut edges: Vec<&HashMap<LocalId, ResourceState>> = frame.break_states.iter().collect();
+        if let Some(base) = &after_base {
+            edges.push(base);
+        }
+        let Some((first, rest)) = edges.split_first() else {
+            // No `break` reaches here, and a bare `loop` has no other
+            // exit either -- "after the loop" is itself unreachable.
+            return entry;
+        };
+        let mut after: HashMap<LocalId, ResourceState> = entry
+            .keys()
+            .map(|local| {
+                let state = first.get(local).copied().unwrap_or(entry[local]);
+                (*local, state)
+            })
+            .collect();
         for local in &poisoned {
             after.insert(*local, ResourceState::Error);
         }
-        for break_state in &frame.break_states {
+        let mut disagreements: HashSet<LocalId> = HashSet::new();
+        for other in rest {
             for (local, current) in after.iter_mut() {
                 if poisoned.contains(local) {
                     continue;
                 }
-                let state = break_state.get(local).copied().unwrap_or(*current);
-                *current = current.join(state);
+                let other_state = other.get(local).copied().unwrap_or(entry[local]);
+                let joined = current.join(other_state);
+                if joined == ResourceState::Error && *current != ResourceState::Error {
+                    disagreements.insert(*local);
+                }
+                *current = joined;
             }
         }
-        self.states = after;
+        for _ in &disagreements {
+            self.diagnose(
+                INCONSISTENT_BRANCH_STATE,
+                span,
+                "two reachable exits of this loop (a `break`, or a `while` condition's own \
+                 false edge) disagree about a resource's own state; whatever runs after the \
+                 loop has no single state to check it against"
+                    .to_string(),
+                "inconsistent resource state across loop exits",
+            );
+        }
+        after
     }
 
     // -- Expressions -----------------------------------------------------

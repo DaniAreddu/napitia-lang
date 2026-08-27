@@ -1130,6 +1130,14 @@ impl<'a> FlowChecker<'a> {
 /// contributing to an ordinary type join. If every branch diverges, the
 /// join itself is unreachable code; `entry` is returned unchanged (there
 /// is no reachable use past this point for it to matter).
+/// Only ever produces a state for a local already present in `entry`
+/// (Blocker 11): a local one specific branch/arm declares fresh --
+/// an ordinary binding local to its own block, or a `handle` pattern's
+/// own binding -- does not exist outside that branch/arm at all, and
+/// must never leak into the state checked for whichever one actually
+/// ran. Built by iterating `entry`'s own keys, never a branch's, so a
+/// branch-local key present only in `first` can never survive into
+/// `joined` even by accident.
 fn join_branch_states(
     entry: &HashMap<LocalId, ResourceState>,
     branches: &[(HashMap<LocalId, ResourceState>, bool)],
@@ -1142,10 +1150,16 @@ fn join_branch_states(
     let Some((first, rest)) = reachable.split_first() else {
         return entry.clone();
     };
-    let mut joined = (*first).clone();
+    let mut joined: HashMap<LocalId, ResourceState> = entry
+        .keys()
+        .map(|local| {
+            let state = first.get(local).copied().unwrap_or(entry[local]);
+            (*local, state)
+        })
+        .collect();
     for other in rest {
         for (local, state) in joined.iter_mut() {
-            let other_state = other.get(local).copied().unwrap_or(*state);
+            let other_state = other.get(local).copied().unwrap_or(entry[local]);
             *state = state.join(other_state);
         }
     }
@@ -1267,5 +1281,45 @@ fn collect_observed_locals_block(block: &HirBlock, out: &mut HashSet<LocalId>) {
     }
     if let Some(tail) = &block.tail {
         collect_observed_locals(tail, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_branch_local_key_absent_from_every_other_branch_is_dropped_from_the_join() {
+        // Blocker 11: a local one specific branch declares fresh (an
+        // ordinary block-scoped binding, or a `handle` pattern's own
+        // binding after `check_handle_arms`'s own explicit strip) must
+        // never survive into the state checked for code after every
+        // branch, regardless of which branch actually ran.
+        let entry: HashMap<LocalId, ResourceState> =
+            HashMap::from([(LocalId(0), ResourceState::Available)]);
+        let first: HashMap<LocalId, ResourceState> = HashMap::from([
+            (LocalId(0), ResourceState::Moved),
+            (LocalId(1), ResourceState::Available), // branch-local, absent from entry
+        ]);
+        let second: HashMap<LocalId, ResourceState> =
+            HashMap::from([(LocalId(0), ResourceState::Moved)]);
+        let joined = join_branch_states(&entry, &[(first, false), (second, false)]);
+        assert_eq!(
+            joined,
+            HashMap::from([(LocalId(0), ResourceState::Moved)]),
+            "a branch-local key must not appear in the joined state at all"
+        );
+    }
+
+    #[test]
+    fn every_reachable_branchs_own_state_for_an_entry_local_still_agrees_or_joins_to_error() {
+        let entry: HashMap<LocalId, ResourceState> =
+            HashMap::from([(LocalId(0), ResourceState::Available)]);
+        let agreeing: HashMap<LocalId, ResourceState> =
+            HashMap::from([(LocalId(0), ResourceState::Moved)]);
+        let disagreeing: HashMap<LocalId, ResourceState> =
+            HashMap::from([(LocalId(0), ResourceState::Available)]);
+        let joined = join_branch_states(&entry, &[(agreeing, false), (disagreeing, false)]);
+        assert_eq!(joined.get(&LocalId(0)), Some(&ResourceState::Error));
     }
 }

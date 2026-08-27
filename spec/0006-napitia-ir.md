@@ -395,8 +395,33 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   nested node. `Extension` evidence is rejected outright (`V0060`) if the
   required arguments are still symbolic -- only an exact `Forwarded`
   match is legal until every argument is concrete.
+- **Raises and `Invoke`** (Alpha 0.1.6, `rfcs/0010`): a function's own
+  declared `raises` set names only real, non-generic-parameter variant
+  types with no duplicate entry; only a fallible callee (non-empty
+  `raises`) may be the target of `Terminator::Invoke`, and only an
+  infallible one may be an ordinary `Call`; an `Invoke`'s own success
+  slot/type and every `InvokeErrTarget`'s own slot/type match the
+  callee's substituted return type/that raised variant exactly, its
+  error targets cover the callee's own `raises` set exactly once each,
+  and every value a `Terminator::Raise` produces is itself one of the
+  current function's own declared `raises` entries; an extend's own
+  method must itself be infallible. A raised/success slot is only ever
+  read from a block every incoming edge actually guarantees was
+  written (`V0073`), the same "re-derived from the CFG's actual
+  predecessors" discipline aggregates/generics already get.
+- **Resource ownership** (Alpha 0.1.7, `rfcs/0011`): `Drop`'s own
+  operand must be resource-typed (`V0074`); the exact same `ValueId` is
+  never the operand of `Drop` twice on any reachable path (`V0075`);
+  and, independently of both `resourceck` and the check above, a
+  resource's own underlying identity -- unified across every `Load` of
+  the same slot, not only one bare `ValueId` -- is never used again
+  (read, stored, passed as any call argument, dropped, or transferred)
+  once already consumed by a `Drop`, a `take` argument/`Invoke`
+  argument, or a `return` (`V0076`). Both reuse the same reachable-union
+  worklist shape `V0073` already established, and neither trusts that
+  the NIR being checked ever passed through `resourceck` at all.
 
-It reports structured diagnostics (`V0001`–`V0060` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0076` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

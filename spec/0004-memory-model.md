@@ -48,11 +48,20 @@ the reasoning and the open questions this raises.
   declaration order; `defer` registers a call that runs exactly once,
   in LIFO order, interleaved with implicit destruction. NIR represents
   destruction explicitly (`Instruction::Drop`), independently verified
-  (no value is ever read or dropped twice on any reachable path) by the
-  same forward must-dataflow analysis Alpha 0.1.6's own `Invoke`-slot
-  verification uses. This is a real, if deliberately narrow, memory-
-  safety layer -- not the universal region-inference design sketched
-  below, which remains unimplemented.
+  by `nir::verify` (never trusting `resourceck`'s own acceptance of the
+  source): the exact same `ValueId` is never the operand of `Drop` twice
+  on any reachable path (`V0075`), and separately, a resource's own
+  underlying identity -- unified across every `Load` of the same slot,
+  not just one bare `ValueId` -- is never read, stored, passed as an
+  argument, dropped, or transferred again once already consumed by a
+  `Drop`, a `take` argument, or a `return` (`V0076`). Both reuse the
+  same reachable-union worklist shape Alpha 0.1.6's own `Invoke`-slot
+  verification established. This is a real, if deliberately narrow,
+  memory-safety layer -- not the universal region-inference design
+  sketched below, which remains unimplemented, and it does not (yet)
+  trace a resource's own identity through a `Store` into a *different*
+  slot (a move by rebinding to a new local), only through repeated
+  `Load`s of one slot.
 
 ## Accepted design direction
 

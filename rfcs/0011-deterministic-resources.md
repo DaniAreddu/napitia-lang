@@ -150,8 +150,15 @@ root violation" discipline (`rfcs/0009`, `rfcs/0010`).
 - `return`ing a resource-typed value moves it out of the function; the
   returning function's own local no longer owns it, so it is not also
   destroyed at scope exit.
-- Storing a resource-typed value as a field of a record, variant case,
-  or another resource being constructed moves it into that container.
+- A resource-typed field is rejected outright at its own containing
+  record/variant/resource's own *declaration* (`typeck`'s
+  `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`, `T0064`) -- there is no
+  partial move of one field out of a resource, and no record, variant,
+  or other resource may ever nest one as a field, so no well-typed
+  program can reach a "storing a resource into a container field"
+  moment at all. Reading a resource's own *primitive*-typed field
+  (`file.descriptor`) remains valid and does not move the resource
+  itself, exactly like a record.
 - Passing a resource-typed value to a `take` parameter moves it into the
   call; the caller's own local becomes `Moved`.
 - Passing a resource-typed value to an ordinary (non-`take`) parameter
@@ -161,10 +168,15 @@ root violation" discipline (`rfcs/0009`, `rfcs/0010`).
 - Primitives, `str`, and ordinary (non-`resource`) record/variant values
   are entirely unaffected by any of this and keep their existing copy
   semantics (`spec/0002`) -- only a value whose static type is a
-  declared `resource` (or an aggregate that itself contains one,
-  transitively) is affine.
-- Reading a resource's own field (`file.descriptor`) does not move the
-  resource itself; it observes the field, exactly like a record.
+  declared `resource` is affine (never transitively through a field,
+  per the point above).
+- Reassigning a `mutable` resource-typed binding while it still owns a
+  live value (`Available`) is a compile-time diagnostic (`U0010`): the
+  old value would otherwise be silently orphaned with nothing left to
+  destroy it. Reassignment is only accepted once that binding is
+  `Moved` or `Dropped` on every path reaching the assignment -- an
+  explicit `drop` first, or moving the old value away first, both make
+  a later reassignment valid.
 - Using a binding after it becomes `Moved` or `Dropped` is a
   compile-time diagnostic (`resourceck`, not a runtime failure).
 - Dropping (explicitly or implicitly) a value already `Moved` or

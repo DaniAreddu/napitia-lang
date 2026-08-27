@@ -191,6 +191,20 @@ mod codes {
     /// time, so `check` and `ir` never disagree about which programs
     /// this milestone actually accepts.
     pub const UNSUPPORTED_DEFER_SHAPE: &str = "T0066";
+    /// An `extend` method declares a `take` parameter (`rfcs/0011`,
+    /// `rfcs/0009`, Section 11 protocol dispatch audit) -- rejected
+    /// regardless of what the protocol itself declares (a protocol
+    /// method can never declare `take` at all, see `hir::lower`'s own
+    /// `TAKE_IN_PROTOCOL_METHOD`), because an extend method is only
+    /// ever reachable through `Protocol[Args].method(...)` dispatch,
+    /// which resolves which concrete extend actually runs only at
+    /// evidence-resolution time: `resourceck`'s own static
+    /// `take_flags_for_callee` treats every `ProtocolMethodRef` callee
+    /// as having no `take` parameters at all, so a `take` parameter
+    /// here would silently let a protocol call transfer ownership at
+    /// runtime while the caller's own resource checker still thinks it
+    /// only observed.
+    pub const TAKE_IN_EXTEND_METHOD: &str = "T0067";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -834,6 +848,7 @@ impl<'a> Checker<'a> {
                     .collect();
                 for (p, ty) in m.params.iter().zip(&params) {
                     self.check_take_target(p, ty);
+                    self.check_extend_method_take(p);
                 }
                 let ret = m
                     .return_type
@@ -3805,6 +3820,38 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Rejects `take` on an `extend` method's own parameter outright
+    /// (Section 11 protocol dispatch audit) -- independent of
+    /// `check_take_target`'s own resource-ness check, and regardless of
+    /// what the protocol itself declares (which can never declare
+    /// `take` at all -- see `hir::lower`'s own
+    /// `TAKE_IN_PROTOCOL_METHOD`). An extend method is only ever
+    /// reachable through `Protocol[Args].method(...)` dispatch, and
+    /// `resourceck::flow::FlowChecker::take_flags_for_callee` treats
+    /// every such callee as having no `take` parameters at all, since
+    /// which concrete extend actually runs is resolved only at
+    /// evidence-resolution time -- a `take` parameter here would
+    /// silently let a protocol call transfer ownership at runtime while
+    /// the caller's own resource checker still thinks it only observed.
+    fn check_extend_method_take(&mut self, param: &crate::hir::HirParam) {
+        if !param.take {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::TAKE_IN_EXTEND_METHOD,
+                self.source,
+                param.span,
+                "a `take` parameter is not supported on an extend method this milestone: which \
+                 concrete extend a protocol call actually dispatches to is resolved only at \
+                 evidence-resolution time, so the caller's own resource checker can never know \
+                 whether such a call transfers ownership"
+                    .to_string(),
+            )
+            .with_primary_label("`take` not supported on a protocol implementation"),
+        );
+    }
+
     /// Rejects a `defer` whose own expression is not this milestone's
     /// checked contract (`rfcs/0011`, Blocker 6) -- kept exactly in
     /// sync with `nir::lower::Lowering::lower_defer_call`'s own
@@ -4893,12 +4940,11 @@ mod tests {
     fn take_on_a_non_resource_extend_method_parameter_is_rejected() {
         let diags = check(
             "record Box { amount: i64 } \
-             protocol Bad[T] { func bad(take number: i64) -> i64; } \
+             protocol Bad[T] { func bad(number: i64) -> i64; } \
              extend Bad[Box] { func bad(take number: i64) -> i64 { return number } }",
         );
-        assert_eq!(
-            codes_of(&diags),
-            vec!["T0065"],
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
             "unexpected diagnostics: {diags:?}"
         );
     }
@@ -4956,7 +5002,7 @@ mod tests {
     fn take_on_a_generic_extend_method_parameter_is_rejected() {
         let diags = check(
             "record Box { amount: i64 } \
-             protocol Bad[T] { func bad(take number: T) -> i64; } \
+             protocol Bad[T] { func bad(number: T) -> i64; } \
              extend Bad[Box] { func bad(take number: Box) -> i64 { return number.amount } }",
         );
         assert!(
@@ -5049,6 +5095,48 @@ mod tests {
             codes_of(&diags).contains(&"T0062"),
             "unexpected diagnostics: {diags:?}"
         );
+    }
+
+    // -- Protocol dispatch take audit (Section 11) -----------------------
+    //
+    // Rejecting `take` on a protocol method's own declaration
+    // (TAKE_IN_PROTOCOL_METHOD, R0033) is a resolve-stage check --
+    // covered by `hir::lower`'s own test module instead, since this
+    // module's `check()` helper asserts resolve diagnostics are already
+    // empty before ever reaching typeck.
+
+    #[test]
+    fn take_on_an_extend_methods_own_parameter_is_rejected_even_when_the_protocol_lacks_it() {
+        // The protocol itself never declares `take`; the extend adding
+        // it on its own implementation is exactly as unsound, since
+        // resourceck can never statically know which extend a protocol
+        // call dispatches to.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { amount: i64 } \
+             protocol Closer[T] { func close(target: T, item: File) -> unit; } \
+             extend Closer[Box] { \
+                 func close(target: Box, take item: File) -> unit { drop item; } \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0067"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_resource_parameter_on_a_protocol_method_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { amount: i64 } \
+             protocol Inspector[T] { func inspect(target: T, item: File) -> i64; } \
+             extend Inspector[Box] { \
+                 func inspect(target: Box, item: File) -> i64 { return item.descriptor } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

@@ -84,6 +84,19 @@ mod codes {
     /// it had zero type parameters would let `rfcs/0010`'s own explicit
     /// non-goal (generic error variants) reach NIR undetected.
     pub const RAISES_VARIANT_METADATA_MISSING: &str = "R0032";
+    /// A `protocol` method declares a `take` parameter (`rfcs/0011`,
+    /// `rfcs/0009`) -- rejected because `HirProtocolMethod::params`
+    /// itself has no room to carry per-parameter ownership mode at all
+    /// (only a resolved `HirType`), so it would otherwise be silently
+    /// discarded right here. `typeck` independently rejects `take` on
+    /// an implementing `extend` method's own parameter for the same
+    /// underlying reason: a `Protocol[Args].method(...)` call site
+    /// resolves which concrete extend actually runs only at evidence-
+    /// resolution time, so `resourceck`'s own static
+    /// `take_flags_for_callee` can never know whether such a call
+    /// transfers ownership, and silently treating it as an ordinary
+    /// observation is unsound.
+    pub const TAKE_IN_PROTOCOL_METHOD: &str = "R0033";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -1285,6 +1298,24 @@ impl<'a> Lowering<'a> {
                 );
             } else {
                 seen_methods.insert(member.name.symbol, member.name.span);
+            }
+            for prm in &member.params {
+                if prm.take {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::TAKE_IN_PROTOCOL_METHOD,
+                            self.source,
+                            prm.span,
+                            "a `take` parameter is not supported in a protocol method \
+                             declaration this milestone: which extend a protocol call \
+                             actually dispatches to is resolved only at evidence-resolution \
+                             time, so the caller's own resource checker can never know \
+                             whether such a call transfers ownership"
+                                .to_string(),
+                        )
+                        .with_primary_label("`take` not supported in a protocol method"),
+                    );
+                }
             }
             let params = member
                 .params
@@ -2568,6 +2599,28 @@ mod tests {
             "unexpected parser diagnostics: {parse_diags:?}"
         );
         lower_module(&module, id, &interner)
+    }
+
+    #[test]
+    fn take_on_a_protocol_methods_own_parameter_is_rejected() {
+        let (_, diags) = lower(
+            "resource File { descriptor: i64 } \
+             protocol Closer[T] { func close(target: T, take item: File) -> unit; }",
+        );
+        assert_eq!(
+            diags.iter().map(|d| d.code).collect::<Vec<_>>(),
+            vec!["R0033"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_protocol_method_with_no_take_parameter_has_no_diagnostics() {
+        let (_, diags) = lower(
+            "resource File { descriptor: i64 } \
+             protocol Closer[T] { func close(target: T, item: File) -> unit; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

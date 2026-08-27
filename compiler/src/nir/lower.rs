@@ -2667,7 +2667,7 @@ impl<'a> Lowering<'a> {
                                 index: i,
                             },
                         );
-                        self.bind_arm_pattern(fb, pat, v)?;
+                        self.bind_arm_pattern(fb, pat, v, ty)?;
                     }
                 }
                 let body = &arms[arm_index].body;
@@ -2684,7 +2684,7 @@ impl<'a> Lowering<'a> {
         }
 
         fb.switch_to(ok_target);
-        let ok_value = fb.push_value(ok_ty, ValueKind::Load(ok_slot));
+        let ok_value = fb.push_value(ok_ty.clone(), ValueKind::Load(ok_slot));
         let Some(success_arm) = arms
             .iter()
             .find(|a| matches!(a.kind, HirHandleArmKind::Success(_)))
@@ -2701,7 +2701,7 @@ impl<'a> Lowering<'a> {
         // marker, so leaving the arm without moving/returning/dropping
         // `file` still destroys it exactly once instead of leaking it.
         let pattern_marker = fb.cleanup_actions.len();
-        self.bind_arm_pattern(fb, pattern, ok_value)?;
+        self.bind_arm_pattern(fb, pattern, ok_value, &ok_ty)?;
         self.lower_branch_moves(fb, |this, fb| {
             this.lower_arm_body(fb, &success_arm.body, merge, pattern_marker)
         })?;
@@ -2734,6 +2734,7 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         pattern: &HirPattern,
         value: ValueId,
+        value_ty: &Ty,
     ) -> LowerResult<()> {
         match pattern {
             HirPattern::Bind { local, .. } => {
@@ -2745,7 +2746,19 @@ impl<'a> Lowering<'a> {
                 }
                 Ok(())
             }
-            HirPattern::Wildcard { .. } => Ok(()),
+            // A `_` pattern names nothing a later expression could ever
+            // refer to, so a resource-typed value bound this way (only
+            // ever a `success` pattern -- see `bind_arm_pattern`'s own
+            // doc comment) can never be moved, returned, or explicitly
+            // dropped through it either. There is no local to schedule
+            // ordinary cleanup for, so it is destroyed immediately,
+            // right here, rather than silently discarded and leaked.
+            HirPattern::Wildcard { .. } => {
+                if self.is_affine(value_ty) {
+                    fb.push_instruction(crate::nir::Instruction::Drop { value });
+                }
+                Ok(())
+            }
             other => Err(self.internal_error(&format!(
                 "a `handle` arm's pattern other than a bare bind or wildcard reached lowering: {other:?}"
             ))),
@@ -4449,6 +4462,62 @@ mod tests {
             0,
             "the success arm's own binding was moved into consume's own take parameter; f's \
              own scope must not also drop it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_wildcards_resource_is_destroyed_immediately() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func make_file() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle make_file() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func make_file() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle make_file() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        // Declaration order: `make_file` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the success value bound by `_` must still be destroyed exactly once, immediately, \
+             since no local exists to schedule ordinary cleanup for it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_wildcard_for_a_non_resource_result_emits_no_drop() {
+        let module = lower(
+            "variant OpenError { Invalid } \
+             func make_number() -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 return handle make_number() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "a non-resource success value must never be dropped, even when wildcard-bound"
         );
     }
 

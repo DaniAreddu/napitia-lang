@@ -219,6 +219,14 @@ pub struct Interpreter<'a> {
     /// callee, or one this frame's own callee returns may become this
     /// frame's own, and both sides must observe the exact same record.
     resources: RefCell<ResourceTable>,
+    /// Test-only record of every function call entered and every
+    /// resource actually destroyed, in the exact order this execution
+    /// performed them -- the one place a test can observe that deferred
+    /// calls and resource drops actually interleave in real, deterministic
+    /// LIFO order at runtime, rather than merely inferring it from a
+    /// program's own final return value.
+    #[cfg(test)]
+    event_log: RefCell<Vec<String>>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -226,6 +234,8 @@ impl<'a> Interpreter<'a> {
         Interpreter {
             module,
             resources: RefCell::new(ResourceTable::default()),
+            #[cfg(test)]
+            event_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -257,6 +267,14 @@ impl<'a> Interpreter<'a> {
     /// `napitia run`'s entry point (`func main() -> ...`).
     pub fn run(&self, name: &str, interner: &Interner) -> Result<Value, InterpreterError> {
         self.call(name, interner, Vec::new())
+    }
+
+    /// This execution's own call/drop event log, in the exact order they
+    /// actually happened (test-only: see [`Self::event_log`]'s own doc
+    /// comment).
+    #[cfg(test)]
+    fn event_log(&self) -> Vec<String> {
+        self.event_log.borrow().clone()
     }
 
     pub fn call(
@@ -407,6 +425,10 @@ impl<'a> Interpreter<'a> {
                         match get(&values, value)? {
                             Value::Resource(handle) => {
                                 self.resources.borrow_mut().drop_resource(handle)?;
+                                #[cfg(test)]
+                                self.event_log
+                                    .borrow_mut()
+                                    .push(format!("drop:{}", handle.id.0));
                             }
                             other => {
                                 return Err(invalid(format!(
@@ -601,6 +623,8 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .map(|e| resolve_evidence(current_evidence, e))
                     .collect::<Result<Vec<_>, _>>()?;
+                #[cfg(test)]
+                self.event_log.borrow_mut().push(format!("call:{}", item.0));
                 // An ordinary `Call` never targets a fallible function
                 // (`rfcs/0010`) -- that always lowers to `Invoke` instead
                 // (the verifier's job to guarantee). A `Raised` outcome
@@ -978,6 +1002,67 @@ mod tests {
         )
         .expect("expected lowering to succeed");
         Interpreter::new(&nir).run("main", &interner)
+    }
+
+    /// Like [`run`], but also returns the exact call/drop event order
+    /// this specific execution performed -- proving actual runtime
+    /// cleanup order (deferred calls, resource drops) rather than only
+    /// each test's own final return value.
+    fn run_with_log(text: &str) -> (Result<Value, InterpreterError>, Vec<String>) {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let nir = lower_nir(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &interner,
+            id,
+        )
+        .expect("expected lowering to succeed");
+        let interpreter = Interpreter::new(&nir);
+        let outcome = interpreter.run("main", &interner);
+        // Resolves every `call:<ItemId>` entry to the callee's own
+        // source name, so an assertion against this log reads (and stays
+        // correct) independent of whichever raw numeric ids this
+        // particular compilation happened to assign.
+        let log = interpreter
+            .event_log()
+            .into_iter()
+            .map(|event| match event.strip_prefix("call:") {
+                Some(id) => {
+                    let id: u32 = id.parse().expect("call event carries a numeric ItemId");
+                    let name = nir
+                        .functions
+                        .iter()
+                        .find(|f| f.id.0 == id)
+                        .map(|f| interner.resolve(f.name))
+                        .expect("call event names a function present in this module");
+                    format!("call:{name}")
+                }
+                None => event,
+            })
+            .collect();
+        (outcome, log)
     }
 
     #[test]
@@ -1680,6 +1765,64 @@ mod tests {
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured error, not a panic, got {outcome:?}"
+        );
+    }
+
+    // -- Deterministic cleanup order (`rfcs/0011`) -----------------------
+
+    #[test]
+    fn multiple_defers_run_in_reverse_registration_order_interleaved_with_drops() {
+        // `rfcs/0011`'s own LIFO rule ("Multiple `defer`s in one scope
+        // run in LIFO order... the same reverse-declaration-order
+        // discipline implicit resource destruction itself follows, so
+        // the two interleave in exactly the declaration-reversed order")
+        // is only exercised end-to-end when a `defer` sits *between* two
+        // resource declarations, not after both: the declaration order
+        // here is `a`, `defer(a)`, `b`, `defer(b)`, so its exact reverse
+        // is `defer(b)`, `b`'s own implicit drop, `defer(a)`, `a`'s own
+        // implicit drop.
+        let text = "resource File { descriptor: i64 } \
+                     func inspect(file: File) -> i64 { return file.descriptor } \
+                     func main() -> i64 { \
+                         value a = File { descriptor: 1 }; \
+                         defer inspect(a); \
+                         value b = File { descriptor: 2 }; \
+                         defer inspect(b); \
+                         return 0; \
+                     }";
+        let (outcome, log) = run_with_log(text);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+        assert_eq!(
+            log,
+            vec!["call:inspect", "drop:1", "call:inspect", "drop:0"],
+            "expected declaration-reversed interleaving of defers and drops, \
+             not defers and drops running as two separate groups"
+        );
+    }
+
+    #[test]
+    fn a_consuming_defer_runs_exactly_once_at_scope_exit() {
+        // `consume`'s own `take file` parameter is never explicitly
+        // dropped in its body, so it is implicitly dropped exactly once
+        // inside `consume`'s own frame (matching
+        // `an_unmoved_resource_local_is_implicitly_dropped_at_function_exit`
+        // in `nir::lower`'s tests) -- the caller's frame performs no
+        // destruction of its own for `file`, since the `defer` already
+        // moved it out at registration time.
+        let text = "resource File { descriptor: i64 } \
+                     func consume(take file: File) -> i64 { return file.descriptor } \
+                     func main() -> i64 { \
+                         value file = File { descriptor: 7 }; \
+                         defer consume(file); \
+                         return 0; \
+                     }";
+        let (outcome, log) = run_with_log(text);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+        assert_eq!(
+            log,
+            vec!["call:consume", "drop:0"],
+            "consume's own take parameter must be dropped exactly once, inside \
+             consume itself, with no separate drop in the caller's own frame"
         );
     }
 

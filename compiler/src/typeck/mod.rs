@@ -1238,7 +1238,21 @@ impl<'a> Checker<'a> {
                 self.loop_depth += 1;
                 self.check_block(body);
                 self.loop_depth -= 1;
-                Ty::Unit
+                // A bare `loop` has no condition at all, so the only way
+                // it can ever fall through to whatever follows it is a
+                // `break` somewhere in its own body -- with none
+                // anywhere (`loop_has_reachable_break`, deliberately not
+                // entering a nested loop/while of its own, whose own
+                // `break` targets only that inner loop), this statement
+                // itself never produces a value at all, the same as any
+                // other genuinely divergent statement: `func f() -> i64
+                // { loop {} }` must type-check, not report an unrelated
+                // "body doesn't match declared return type" mismatch.
+                if loop_has_reachable_break(body) {
+                    Ty::Unit
+                } else {
+                    Ty::Never
+                }
             }
         }
     }
@@ -4042,6 +4056,89 @@ impl<'a> Checker<'a> {
             );
         }
     }
+}
+
+/// Whether `body` -- a bare `loop`'s own body -- contains a `break`
+/// anywhere within it that targets *this* loop, structurally: every
+/// nested `if`/`match`/`handle`/block is walked, but a nested
+/// `while`/`loop` of its own is not, since a `break` inside it targets
+/// only that inner loop. Deliberately conservative rather than a full
+/// reachability analysis (unlike `resourceck`'s own equivalent, which
+/// runs after this and can afford one): a `break` inside code this
+/// function still counts as unreachable dead code (after an
+/// unconditional `return`, say) is harmless to still count here, since
+/// whatever already made that code unreachable already gives the
+/// enclosing block its own real divergence independently of this loop's
+/// own type.
+fn loop_has_reachable_break(body: &HirBlock) -> bool {
+    fn in_block(block: &HirBlock) -> bool {
+        block.statements.iter().any(in_stmt) || block.tail.as_deref().is_some_and(in_expr)
+    }
+    fn in_stmt(stmt: &HirStmt) -> bool {
+        match stmt {
+            HirStmt::Binding(b) => in_expr(&b.value),
+            HirStmt::Expr(e) => in_expr(e),
+            HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => in_expr(expr),
+            // A nested loop's own `break` never targets this outer one.
+            HirStmt::While { .. } | HirStmt::Loop { .. } => false,
+        }
+    }
+    fn in_expr(expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::Break { .. } => true,
+            HirExpr::Int { .. }
+            | HirExpr::Float { .. }
+            | HirExpr::Str { .. }
+            | HirExpr::Char { .. }
+            | HirExpr::Bool { .. }
+            | HirExpr::Function { .. }
+            | HirExpr::CaseRef { .. }
+            | HirExpr::ProtocolMethodRef { .. }
+            | HirExpr::Local { .. }
+            | HirExpr::Continue { .. }
+            | HirExpr::Error { .. } => false,
+            HirExpr::Unary { operand, .. }
+            | HirExpr::Cast { expr: operand, .. }
+            | HirExpr::Try { expr: operand, .. } => in_expr(operand),
+            HirExpr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
+            HirExpr::Assign { target, value, .. } => in_expr(target) || in_expr(value),
+            HirExpr::Call { callee, args, .. } => {
+                in_expr(callee) || args.iter().any(in_expr)
+            }
+            HirExpr::Field { base, .. } => in_expr(base),
+            HirExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                in_expr(condition)
+                    || in_block(then_branch)
+                    || match else_branch {
+                        Some(HirElse::Block(block)) => in_block(block),
+                        Some(HirElse::If(inner)) => in_expr(inner),
+                        None => false,
+                    }
+            }
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => in_expr(scrutinee) || arms.iter().any(|arm| in_arm_body(&arm.body)),
+            HirExpr::Block(block) => in_block(block),
+            HirExpr::Return { value, .. } => value.as_deref().is_some_and(in_expr),
+            HirExpr::RecordLiteral { fields, .. } => fields.iter().any(|f| in_expr(&f.value)),
+            HirExpr::Raise { operand, .. } => in_expr(operand),
+            HirExpr::Handle { operand, arms, .. } => {
+                in_expr(operand) || arms.iter().any(|arm| in_arm_body(&arm.body))
+            }
+        }
+    }
+    fn in_arm_body(body: &HirMatchArmBody) -> bool {
+        match body {
+            HirMatchArmBody::Expr(e) => in_expr(e),
+            HirMatchArmBody::Block(block) => in_block(block),
+        }
+    }
+    in_block(body)
 }
 
 #[cfg(test)]
@@ -7693,5 +7790,38 @@ mod tests {
             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Loop divergence (`rfcs/0011`, infinite-loop reachability) ------
+
+    #[test]
+    fn a_break_less_loop_as_a_functions_own_body_satisfies_any_return_type() {
+        // A bare `loop {}` with no reachable `break` never produces a
+        // value at all -- its own type must be `Ty::Never`, not
+        // `Ty::Unit`, or this would wrongly report a return-type
+        // mismatch against `i64` even though the function's own body
+        // never actually falls through with the wrong type (it never
+        // falls through at all).
+        let diags = check("func f() -> i64 { loop { } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_loop_with_a_reachable_break_still_needs_a_real_tail_value() {
+        // Once a `break` makes the loop's own fallthrough reachable
+        // again, it reverts to `Ty::Unit` as before -- this function's
+        // own declared `i64` return type is still unsatisfied by a
+        // `loop` statement with no further tail expression.
+        let diags = check("func f(cond: bool) -> i64 { loop { if cond { break } } }");
+        assert!(!diags.is_empty(), "expected a return-type mismatch");
+    }
+
+    #[test]
+    fn a_break_nested_in_an_inner_loop_does_not_make_the_outer_loop_reachable() {
+        let diags = check("func f() -> i64 { loop { loop { break } } }");
+        assert!(
+            diags.is_empty(),
+            "an inner loop's own break must not affect the outer loop's own divergence: {diags:?}"
+        );
     }
 }

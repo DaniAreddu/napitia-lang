@@ -3826,10 +3826,27 @@ impl<'a> Checker<'a> {
                 .with_primary_label("unsupported `defer` this milestone"),
             );
         };
-        let HirExpr::Call { callee, .. } = expr else {
+        let HirExpr::Call { callee, args, .. } = expr else {
             unsupported(self, "`defer` requires a direct call to a plain function");
             return;
         };
+        // A diverging argument (`raise`/`return`/`break`/`continue`
+        // nested inside it) never actually produces the value the
+        // deferred call would need to capture at registration time --
+        // `nir::lower` has no way to represent "this defer never
+        // actually registers" as anything but an internal lowering
+        // error, so it is rejected symbolically here instead, before
+        // that point is ever reached.
+        for arg in args {
+            if matches!(self.expr_types.get(&arg.id()), Some(Ty::Never)) {
+                unsupported(
+                    self,
+                    "a `defer`'s own argument cannot diverge (`raise`/`return`/`break`/\
+                     `continue`): registration would never actually happen",
+                );
+                return;
+            }
+        }
         let HirExpr::Function { item, .. } = callee.as_ref() else {
             unsupported(
                 self,
@@ -4764,6 +4781,42 @@ mod tests {
         let diags = check("func f() { defer true + 1; }");
         assert!(
             diags.iter().any(|d| d.code == "T0001"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_defer_argument_that_raises_is_rejected_at_check() {
+        // Registration would never actually happen on this path --
+        // `nir::lower` has no way to represent that, so it must be
+        // rejected here, not surfaced as an internal lowering error.
+        let diags = check(
+            "variant OpenError { Invalid } \
+             func touch(x: i64) -> unit {} \
+             func f() -> i64 raises OpenError { \
+                 defer touch(raise OpenError.Invalid); \
+                 return 0; \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_defer_argument_that_returns_is_rejected_at_check() {
+        let diags = check(
+            "func touch(x: i64) -> unit {} \
+             func f() -> i64 { \
+                 defer touch(return 0); \
+                 return 1; \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
             "unexpected diagnostics: {diags:?}"
         );
     }

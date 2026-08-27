@@ -912,6 +912,28 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
+    #[test]
+    fn code_after_a_loop_with_no_reachable_break_is_not_checked() {
+        // A bare `loop` with no reachable `break` anywhere inside it
+        // genuinely never falls through, exactly like `return`/`raise` --
+        // `sink(file)` below is unreachable dead code, and must not be
+        // checked as if it were live: it would otherwise wrongly report a
+        // use-after-move for a resource this same statement already moved
+        // before the loop.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 1 }; \
+                 sink(file); \
+                 loop { \
+                 } \
+                 sink(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
     // -- Reachability and lexical state (Blocker 11) --------------------
 
     #[test]

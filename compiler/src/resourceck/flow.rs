@@ -189,6 +189,16 @@ pub struct FlowChecker<'a> {
     /// protection only ever lasts until the deferred call itself would
     /// actually run.
     defer_scopes: Vec<HashSet<LocalId>>,
+    /// Every bare `loop`'s own body block id (Blocker: infinite-loop
+    /// reachability) for which [`Self::finish_loop`] found no reachable
+    /// `break` at all -- a `loop` with no exit of its own genuinely never
+    /// falls through, exactly like `return`/`raise`, so [`Self::
+    /// stmt_diverges`] must treat it the same way: nothing lexically
+    /// after it in the same block is reachable either. A `while` is
+    /// never a member (its own condition-false edge always reaches
+    /// after it, regardless of `break`), and a nested loop's own body id
+    /// never collides with an enclosing one's.
+    diverging_loops: HashSet<crate::hir::ExprId>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -213,6 +223,7 @@ impl<'a> FlowChecker<'a> {
             observing: HashSet::new(),
             loop_stack: Vec::new(),
             defer_scopes: Vec::new(),
+            diverging_loops: HashSet::new(),
         }
     }
 
@@ -311,10 +322,8 @@ impl<'a> FlowChecker<'a> {
         match stmt {
             HirStmt::Expr(e) => self.diverges(e.id()),
             HirStmt::Binding(b) => self.diverges(b.value.id()),
-            HirStmt::Drop { .. }
-            | HirStmt::Defer { .. }
-            | HirStmt::While { .. }
-            | HirStmt::Loop { .. } => false,
+            HirStmt::Drop { .. } | HirStmt::Defer { .. } | HirStmt::While { .. } => false,
+            HirStmt::Loop { body, .. } => self.diverging_loops.contains(&body.id),
         }
     }
 
@@ -471,6 +480,9 @@ impl<'a> FlowChecker<'a> {
             .loop_stack
             .pop()
             .expect("this exact push is right above");
+        if frame.break_states.is_empty() {
+            self.diverging_loops.insert(body.id);
+        }
         self.states = self.finish_loop(
             entry,
             None,

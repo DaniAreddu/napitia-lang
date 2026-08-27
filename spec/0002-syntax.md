@@ -296,7 +296,8 @@ Block = "{" { Statement } [ Expression ] "}" ;
 
 Statement = BindingStmt
           | ExprStmt
-          | "defer" Expression ";"
+          | DropStmt
+          | DeferStmt
           | WhileStmt
           | LoopStmt
           ;
@@ -327,9 +328,12 @@ version of this grammar modeled them as semicolon-mandatory statements,
 which contradicted that same example; this is a correction, not a
 redesign of intent.
 
-`defer` is parsed, but using it is a checked, reported error in this
-milestone rather than being lowered or executed (no backend runs
-deferred cleanup yet); see `spec/0004`.
+`defer`/`drop` are fully lowered and executed as of Alpha 0.1.7
+(`rfcs/0011`): a `defer` registers a call that runs exactly once, in
+LIFO order, when its own enclosing lexical scope exits by any path
+(fallthrough, `return`, `raise`, postfix `?`, `handle`, `break`, or
+`continue`); `drop` destroys a live resource immediately. See
+`spec/0004`/`rfcs/0011` for the full ownership semantics.
 
 ### Expressions
 

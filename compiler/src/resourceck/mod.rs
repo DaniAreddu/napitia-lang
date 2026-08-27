@@ -361,6 +361,31 @@ mod tests {
     }
 
     #[test]
+    fn a_join_with_every_arm_diverging_contributes_nothing_and_leaves_no_after_state() {
+        // Both arms of this `if` return, disagreeing with each other
+        // about `file`'s own state (one moves it, one drops it) -- that
+        // must never be reported as an inconsistent join, since a join
+        // with no reachable contributing branch at all carries nothing
+        // forward for anything after it to disagree about (matching
+        // typeck's own `Ty::Never` handling of a fully-diverging `if`).
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 if cond { \
+                     consume(file); \
+                     return 1; \
+                 } else { \
+                     drop file; \
+                     return 2; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn loop_carried_resource_invalidation_is_rejected() {
         let diags = check(
             "resource File { descriptor: i64 } \

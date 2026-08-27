@@ -901,8 +901,12 @@ struct FnBuilder {
     /// remove a block's own entries again once that block's own normal
     /// exit has replayed them, so an enclosing scope's later cleanup
     /// never sees (and never re-replays) them. A `break`/`continue`
-    /// loop exit does not run any enclosing scope's pending cleanup at
-    /// all yet (`rfcs/0011`'s own limitations).
+    /// runs exactly the entries registered since its own loop's
+    /// `LoopCtx::cleanup_marker` -- everything this specific iteration
+    /// owns, nested blocks included, since they were all appended after
+    /// that marker -- and deliberately nothing from any enclosing scope
+    /// (an outer loop, or the function itself), which still needs its
+    /// own resources live past this loop.
     cleanup_actions: Vec<CleanupAction>,
     /// Every resource local already moved out (by `return`, a `take`
     /// argument, storage in a constructed aggregate, or an explicit
@@ -911,6 +915,20 @@ struct FnBuilder {
     /// `resourceck` already proved this is unambiguous for any program
     /// that reaches lowering at all.
     moved_out: HashSet<LocalId>,
+    /// One entry per currently-active loop, innermost last -- every
+    /// reachable `break`'s own `moved_out` snapshot at the exact point
+    /// it branches to that loop's own exit block. `lower_while`/
+    /// `lower_loop` join these (with the condition-false edge's own
+    /// snapshot, for `while`) once the loop finishes, exactly like
+    /// `move_join_stack` already joins an if/match/handle's own sibling
+    /// branches -- code appended after the loop, into that same shared
+    /// exit block, must see every resource a *reachable* break already
+    /// moved, not just whatever `moved_out` happens to be left as by the
+    /// loop's own unrelated normal-continuation path. Without this, a
+    /// resource a break-path already transferred into a `take` call
+    /// gets dropped a second time by whatever cleanup runs after the
+    /// loop, since that cleanup never saw the break's own move at all.
+    loop_break_moved_out: Vec<Vec<HashSet<LocalId>>>,
     /// One entry per branching construct (`if`/`match`/`handle`)
     /// currently being lowered, innermost last (`rfcs/0011`). See
     /// [`Lowering::begin_move_join`]/[`Lowering::lower_branch_moves`]/
@@ -950,6 +968,7 @@ impl FnBuilder {
             return_ty,
             cleanup_actions: Vec::new(),
             moved_out: HashSet::new(),
+            loop_break_moved_out: Vec::new(),
             move_join_stack: Vec::new(),
         }
     }
@@ -1755,6 +1774,12 @@ impl<'a> Lowering<'a> {
             // reachable, so they are never created at all.
             LoweredExpr::Diverged => return Ok(()),
         };
+        // The condition-false edge into `after` never runs the body at
+        // all, so `after`'s own moved_out baseline is whatever the
+        // condition itself already did -- not whatever the body's own
+        // (entirely separate, possibly break-touched) path leaves
+        // behind. Snapshotted now, before the body can change it.
+        let condition_false_moved_out = fb.moved_out.clone();
 
         let loop_body = fb.new_block();
         let after = fb.new_block();
@@ -1770,10 +1795,25 @@ impl<'a> Lowering<'a> {
             continue_target: header,
             cleanup_marker: fb.cleanup_actions.len(),
         });
+        fb.loop_break_moved_out.push(Vec::new());
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
+        let break_moved_out = fb
+            .loop_break_moved_out
+            .pop()
+            .expect("pushed immediately above");
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
+        }
+
+        // `after` is reached either through the condition-false edge or
+        // through some reachable `break`; `resourceck` already proved
+        // every one of those agrees about any resource still live here,
+        // so their union is exactly that single agreed-upon truth (see
+        // `FnBuilder::loop_break_moved_out`'s own doc comment).
+        fb.moved_out = condition_false_moved_out;
+        for state in break_moved_out {
+            fb.moved_out.extend(state);
         }
 
         fb.switch_to(after);
@@ -1791,11 +1831,26 @@ impl<'a> Lowering<'a> {
             continue_target: header,
             cleanup_marker: fb.cleanup_actions.len(),
         });
+        fb.loop_break_moved_out.push(Vec::new());
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
+        let break_moved_out = fb
+            .loop_break_moved_out
+            .pop()
+            .expect("pushed immediately above");
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
         }
+
+        // A bare `loop` has no condition-false edge at all -- only a
+        // reachable `break` can ever reach `after`. If none exist,
+        // `after` is itself unreachable and this empty set is never
+        // observed by anything.
+        let mut moved_out = HashSet::new();
+        for state in break_moved_out {
+            moved_out.extend(state);
+        }
+        fb.moved_out = moved_out;
 
         fb.switch_to(after);
         Ok(())
@@ -1938,6 +1993,14 @@ impl<'a> Lowering<'a> {
                 // since `ctx.cleanup_marker` only covers entries
                 // registered at or after this loop's own body started.
                 self.emit_cleanup_since(fb, ctx.cleanup_marker)?;
+                // Recorded so the loop's own lowering can join this
+                // break's own moved_out against every other reachable
+                // exit once the loop finishes -- see
+                // `FnBuilder::loop_break_moved_out`'s own doc comment.
+                fb.loop_break_moved_out
+                    .last_mut()
+                    .expect("pushed by lower_while/lower_loop alongside loop_stack")
+                    .push(fb.moved_out.clone());
                 fb.terminate(Terminator::Branch(ctx.break_target));
                 Ok(LoweredExpr::Diverged)
             }
@@ -3976,6 +4039,109 @@ mod tests {
             .flat_map(|b| &b.instructions)
             .filter(|i| matches!(i, Instruction::Drop { .. }))
             .count()
+    }
+
+    // -- Loop break moved_out join (loop condition re-evaluation fix) ---
+
+    #[test]
+    fn a_resource_taken_on_a_conditional_break_path_is_not_dropped_again_after_the_loop() {
+        // The exact regression: sink's own take call already destroyed
+        // file on the break path; whatever runs after the loop (here,
+        // the function's own implicit end-of-scope cleanup, sharing the
+        // same exit block break itself branches to) must not drop it a
+        // second time.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func conditional_break(cond: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if cond { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func conditional_break(cond: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if cond { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+             }",
+        );
+        // Declaration order: `sink` first, `conditional_break` second.
+        let sink = &module.functions[0];
+        let conditional_break = &module.functions[1];
+        assert_eq!(
+            drop_count(sink),
+            1,
+            "sink's own take parameter must be dropped exactly once, inside sink itself"
+        );
+        assert_eq!(
+            drop_count(conditional_break),
+            0,
+            "conditional_break's own scope must not drop a resource the break path already \
+             moved into sink's own take parameter"
+        );
+    }
+
+    #[test]
+    fn a_while_conditions_own_moved_out_state_applies_after_the_loop() {
+        // Each evaluation of the condition take-consumes `file`; the
+        // body reassigns it before looping back, which is exactly what
+        // makes the backedge agree with entry again (Moved -> Available
+        // is a legal reassignment). Every reachable exit -- there is no
+        // `break` here, only the condition's own false edge -- leaves
+        // `file` Moved, since the condition itself always runs last.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func consume_as_bool(take file: File) -> bool { \
+                 drop file; \
+                 return false; \
+             } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = File { descriptor: 1 }; \
+                 while consume_as_bool(file) { \
+                     file = second(); \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func consume_as_bool(take file: File) -> bool { \
+                 drop file; \
+                 return false; \
+             } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = File { descriptor: 1 }; \
+                 while consume_as_bool(file) { \
+                     file = second(); \
+                 } \
+             }",
+        );
+        // Declaration order: `consume_as_bool`, `second`, `f`.
+        let consume_as_bool = &module.functions[0];
+        let f = &module.functions[2];
+        assert_eq!(drop_count(consume_as_bool), 1);
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource the condition's own last take call \
+             already consumed"
+        );
     }
 
     #[test]

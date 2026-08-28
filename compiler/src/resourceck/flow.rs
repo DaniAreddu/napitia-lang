@@ -116,10 +116,10 @@ enum ConsumeKind {
     Read,
     /// Consumed by `return`, or the function's own implicit tail
     /// return. `nir::lower` pushes this sink into each reachable
-    /// branch/arm of a nested `if`/`match`/block separately (Blocker
-    /// 2), so a resource-typed `if`/`match` is accepted here even when
-    /// its branches/arms resolve to different underlying locals;
-    /// `handle` is still not supported even in this position.
+    /// branch/arm of a nested `if`/`match`/`handle`/block separately
+    /// (Blocker 2), so a resource-typed compound origin is accepted
+    /// here even when its branches/arms resolve to different underlying
+    /// locals.
     Return,
     /// Consumed by anything else that transfers ownership: a `value`/
     /// `mutable` binding's own initializer, an assignment's own value,
@@ -1055,7 +1055,7 @@ impl<'a> FlowChecker<'a> {
     ) -> ConsumeKind {
         let supported = match kind {
             ConsumeKind::Read => true,
-            ConsumeKind::Return => matches!(construct, "if" | "match"),
+            ConsumeKind::Return => matches!(construct, "if" | "match" | "handle"),
             ConsumeKind::Other => false,
         };
         if supported || !self.is_affine_expr(id) {
@@ -1421,8 +1421,20 @@ impl<'a> FlowChecker<'a> {
                     // arm-local-marker version below, which shares this
                     // exact same id (an Expr body's own id) for a bare
                     // arm -- recording both would let whichever ran
-                    // second silently overwrite the other's entry.
-                    let return_leaf_recorded = kind == ConsumeKind::Return;
+                    // second silently overwrite the other's entry. Only
+                    // when this whole `match` is itself the resource
+                    // actually being return-sunk (`is_affine_expr`):
+                    // `kind` alone is not enough to tell apart "this
+                    // exact leaf is a compound-return-sink leaf" from "a
+                    // `match` producing some unrelated, non-affine value
+                    // merely sits inside a `return`'s own operand, and
+                    // `kind` propagates through it for some *other*,
+                    // unrelated resource nested inside one of its arms"
+                    // -- the latter must never let this override the
+                    // arm-local entry `nir::lower`'s own ordinary
+                    // (non-sink) `lower_arm_body` still depends on.
+                    let return_leaf_recorded =
+                        kind == ConsumeKind::Return && self.is_affine_expr(match_id);
                     if return_leaf_recorded && !diverges {
                         self.record_exit(e.id(), 0);
                     }
@@ -1499,17 +1511,30 @@ impl<'a> FlowChecker<'a> {
                     Self::pattern_locals(pattern, &mut locals);
                 }
             }
-            let (body_id, diverges) = match &arm.body {
+            let (body_id, diverges, return_leaf_recorded) = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
                     self.check_expr_ctx(e, kind);
-                    (e.id(), self.diverges(e.id()))
+                    let diverges = self.diverges(e.id());
+                    // See `check_match_arms`'s own identical handling
+                    // (including the `is_affine_expr` guard: `kind`
+                    // alone does not tell apart this whole `handle`
+                    // itself being return-sunk from it merely sitting,
+                    // non-affine, inside a `return`'s own operand while
+                    // some *other* resource nested in one of its arms is
+                    // what `kind` actually still needs to reach).
+                    let return_leaf_recorded =
+                        kind == ConsumeKind::Return && self.is_affine_expr(handle_id);
+                    if return_leaf_recorded && !diverges {
+                        self.record_exit(e.id(), 0);
+                    }
+                    (e.id(), diverges, return_leaf_recorded)
                 }
                 HirMatchArmBody::Block(block) => {
                     self.check_block_ctx_body(block, kind);
-                    (block.id, self.diverges(block.id))
+                    (block.id, self.diverges(block.id), false)
                 }
             };
-            if !diverges {
+            if !diverges && !return_leaf_recorded {
                 self.record_exit(body_id, marker);
             }
             self.pending_cleanup.truncate(marker);
@@ -1519,7 +1544,9 @@ impl<'a> FlowChecker<'a> {
             branches.push((self.states.clone(), diverges));
         }
         self.states = join_branch_states(&entry, &branches);
-        if self.states.values().any(|s| *s == ResourceState::Error)
+        // See `check_if`'s identical guard.
+        if kind != ConsumeKind::Return
+            && self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
             self.diagnose_inconsistent_join(handle_id, span);

@@ -687,6 +687,8 @@ mod tests {
             &typeck_result.call_evidence,
             &typeck_result.protocol_call_evidence,
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )

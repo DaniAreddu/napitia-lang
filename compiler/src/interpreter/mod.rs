@@ -1184,6 +1184,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -1234,6 +1236,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -1522,6 +1526,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -1559,6 +1565,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             id,

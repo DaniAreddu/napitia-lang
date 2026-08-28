@@ -832,7 +832,43 @@ impl<'a> FlowChecker<'a> {
         self.check_expr_ctx(expr, ConsumeKind::Read);
     }
 
-    /// Checks `expr` in `kind`'s own context (`rfcs/0011`, Blocker 2).
+    /// Checks `expr` in `kind`'s own context (`rfcs/0011`, Blocker 2),
+    /// then -- if `expr` is itself a direct (non-compound) leaf a
+    /// `return` consumes -- records its own whole-function cleanup
+    /// snapshot under its own id, exactly like [`Self::
+    /// check_block_ctx_inner`]'s identical tail special-case already
+    /// does for a block's own tail, and [`Self::check_match_arms`]/
+    /// [`Self::check_handle_arms`] already do for a bare arm body: a
+    /// direct `return`'s own leaf value (a bare local, a fresh call, a
+    /// literal construction -- anything that is not itself one of the
+    /// handful of forms already handled below) is exactly the id
+    /// `nir::lower`'s own `lower_into_return_sink`'s catch-all looks
+    /// this exact snapshot up by. Without this, a function returning a
+    /// direct (non-compound) resource value leaked every *other*
+    /// resource it still owned at that exact exit (an unrelated `take`
+    /// parameter, say) -- nothing ever recorded that they needed
+    /// cleaning up there at all.
+    fn check_expr_ctx(&mut self, expr: &HirExpr, kind: ConsumeKind) {
+        self.check_expr_ctx_inner(expr, kind);
+        if kind == ConsumeKind::Return
+            && !matches!(
+                expr,
+                HirExpr::Block(_)
+                    | HirExpr::If { .. }
+                    | HirExpr::Match { .. }
+                    | HirExpr::Handle { .. }
+                    | HirExpr::Return { .. }
+                    | HirExpr::Raise { .. }
+                    | HirExpr::Try { .. }
+                    | HirExpr::Break { .. }
+                    | HirExpr::Continue { .. }
+            )
+            && !self.diverges(expr.id())
+        {
+            self.record_exit(expr.id(), 0);
+        }
+    }
+
     /// `kind` is only ever actually consulted at a leaf: a bare
     /// `Local` (transitions its own state when consumed, merely
     /// validates it when read) or a resource-typed `match`/`handle`/
@@ -849,7 +885,7 @@ impl<'a> FlowChecker<'a> {
     /// constructed field, `raise`'s own operand -- always at least
     /// `ConsumeKind::Other`, since each of these really does transfer
     /// ownership no matter what encloses it).
-    fn check_expr_ctx(&mut self, expr: &HirExpr, kind: ConsumeKind) {
+    fn check_expr_ctx_inner(&mut self, expr: &HirExpr, kind: ConsumeKind) {
         match expr {
             HirExpr::Int { .. }
             | HirExpr::Float { .. }

@@ -660,6 +660,17 @@ mod tests {
             "{:?}",
             typeck_result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &typeck_result.local_types,
+            &typeck_result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "{:?}",
+            resourceck_result.diagnostics
+        );
         let nir = lower_module(
             &hir,
             &typeck_result.local_types,
@@ -668,6 +679,7 @@ mod tests {
             &typeck_result.call_type_args,
             &typeck_result.call_evidence,
             &typeck_result.protocol_call_evidence,
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )

@@ -1031,6 +1031,8 @@ fn ord(a: &Value, b: &Value) -> Result<Ordering, InterpreterError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::hir::lower_module as lower_hir;
     use crate::lexer::tokenize;
@@ -1058,6 +1060,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -1066,6 +1079,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )
@@ -1096,6 +1110,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -1104,6 +1129,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )
@@ -1391,6 +1417,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -1428,6 +1455,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )

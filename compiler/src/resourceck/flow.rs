@@ -98,6 +98,28 @@ mod codes {
     /// sink, immediately capturing or transferring the temporary; this
     /// is every other position.
     pub const RESOURCE_TEMPORARY_LEAK: &str = "U0011";
+    /// A `defer <call>;`'s own callee has a recorded per-parameter
+    /// `take` flag count that does not match this exact call's own
+    /// argument count (`rfcs/0011`) -- always unreachable for a program
+    /// that actually passed `typeck`'s own arity check first (a direct
+    /// caller feeding hand-built, never-type-checked HIR straight to
+    /// this stage is the only way to reach it). Never silently treated
+    /// as "every argument merely observes": a checked plan is not
+    /// recorded for this exact `defer` at all when this fires, so
+    /// `nir::lower` independently rejects it too, with its own
+    /// missing-plan internal error.
+    pub const MALFORMED_DEFER_CALLEE_SIGNATURE: &str = "U0012";
+    /// An ordinary call's own callee resolves directly to a declared
+    /// function/extend-method (`HirExpr::Function`), but this module's
+    /// own `take_flags` table has no entry for it at all, or that
+    /// entry's own length disagrees with this exact call's argument
+    /// count (`rfcs/0011`) -- always unreachable for HIR that actually
+    /// passed `hir::lower`'s own name resolution and `typeck`'s own
+    /// arity check first; reachable only through hand-built HIR fed
+    /// straight to this stage. Never silently treated as "every
+    /// argument merely observes": no `consume_sites` entries are
+    /// recorded for this call's own arguments at all when this fires.
+    pub const MALFORMED_CALLEE_TAKE_FLAGS: &str = "U0013";
 }
 
 pub use codes::*;
@@ -251,6 +273,12 @@ pub struct FlowChecker<'a> {
     /// Every `defer` statement's own checked plan -- see
     /// [`super::plan::ResourceCheckResult::defer_plans`].
     defer_plans: BTreeMap<ExprId, CheckedDeferPlan>,
+    /// The next `CheckedDeferPlan::registration_order` value to hand
+    /// out, incremented once per `defer` actually recorded -- this
+    /// function's own `defer`s are numbered in the exact order this
+    /// walk encounters them, matching `pending_cleanup`'s own append
+    /// order (`rfcs/0011`).
+    next_defer_registration: u32,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -280,6 +308,7 @@ impl<'a> FlowChecker<'a> {
             cleanup_edges: BTreeMap::new(),
             consume_sites: BTreeMap::new(),
             defer_plans: BTreeMap::new(),
+            next_defer_registration: 0,
         }
     }
 
@@ -566,7 +595,7 @@ impl<'a> FlowChecker<'a> {
     /// still owns it and will still drop it at scope exit, but may no
     /// longer move it away or drop it early out from under the deferred
     /// call that still needs to observe it.
-    fn check_defer(&mut self, expr: &HirExpr, _span: Span) {
+    fn check_defer(&mut self, expr: &HirExpr, span: Span) {
         self.check_expr(expr);
         // `nir::lower`'s own `lower_defer_call` independently re-checks
         // that `expr` is structurally a direct call to a plain function
@@ -578,27 +607,68 @@ impl<'a> FlowChecker<'a> {
         // `nir::lower` reports its own diagnostic for it as today.
         if let HirExpr::Call { callee, args, .. } = expr
             && let HirExpr::Function { item, .. } = callee.as_ref()
+            && let Some(take_flags) = self.take_flags_for_callee(callee)
         {
-            let take_flags = self.take_flags_for_callee(callee);
-            let arg_modes = args
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let takes = take_flags.and_then(|f| f.get(i)).copied().unwrap_or(false);
-                    if takes {
-                        ConsumeInfo::Transfer
-                    } else {
-                        ConsumeInfo::Observe
-                    }
-                })
-                .collect();
-            self.defer_plans.insert(
-                expr.id(),
-                CheckedDeferPlan {
-                    callee: *item,
-                    arg_modes,
-                },
-            );
+            // The callee's own recorded `take` flags must match this
+            // exact call's own argument count -- always true for a
+            // program that actually passed `typeck`'s own arity check
+            // first; reachable only through hand-built, never-type-
+            // checked HIR fed straight to this stage. Diagnosed
+            // explicitly here (`MALFORMED_DEFER_CALLEE_SIGNATURE`)
+            // rather than silently recording every argument as a mere
+            // observation -- no plan is recorded for this `defer` at
+            // all when this fires, so `nir::lower` independently
+            // rejects it too, with its own missing-plan internal error.
+            if take_flags.len() != args.len() {
+                self.diagnose(
+                    MALFORMED_DEFER_CALLEE_SIGNATURE,
+                    span,
+                    format!(
+                        "this `defer`'s own callee declares {} parameter(s) but is called with {} argument(s)",
+                        take_flags.len(),
+                        args.len()
+                    ),
+                    "argument count disagrees with the callee's own declared parameters",
+                );
+            } else if let Some(return_type) = self.expr_types.get(&expr.id()).cloned()
+                && let Some(arg_types) = args
+                    .iter()
+                    .map(|a| self.expr_types.get(&a.id()).cloned())
+                    .collect::<Option<Vec<Ty>>>()
+            {
+                // Every other field this plan needs is actually
+                // resolvable: this exact call expression's own resolved
+                // return type, and every argument's own resolved type.
+                // Either missing means `expr` was never actually type-
+                // checked by a real `typeck` pass at all (the same
+                // hand-built-HIR scenario as above) -- `nir::lower`'s
+                // own "no checked plan recorded" internal error already
+                // exists precisely to catch a `defer` reaching it with
+                // no plan here, so this never falls back to fabricating
+                // one from incomplete information either.
+                let arg_modes = take_flags
+                    .iter()
+                    .map(|&takes| {
+                        if takes {
+                            ConsumeInfo::Transfer
+                        } else {
+                            ConsumeInfo::Observe
+                        }
+                    })
+                    .collect();
+                let registration_order = self.next_defer_registration;
+                self.next_defer_registration += 1;
+                self.defer_plans.insert(
+                    expr.id(),
+                    CheckedDeferPlan {
+                        callee: *item,
+                        arg_modes,
+                        arg_types,
+                        return_type,
+                        registration_order,
+                    },
+                );
+            }
         }
         // Registered by this exact call's own callee-expression id
         // (`rfcs/0011`): `nir::lower` looks its own already-lowered
@@ -1011,10 +1081,59 @@ impl<'a> FlowChecker<'a> {
                     self.check_expr(target);
                 }
             }
-            HirExpr::Call { callee, args, .. } => {
+            HirExpr::Call {
+                callee, args, span, ..
+            } => {
                 self.check_expr(callee);
+                // A callee that resolves directly to a declared function
+                // (`HirExpr::Function`) must have a real, correctly-sized
+                // `take_flags` entry -- always true for HIR that actually
+                // passed `hir::lower`'s own name resolution and
+                // `typeck`'s own arity check first. A callee that is
+                // *not* a direct function reference at all (a variant
+                // case constructor, a protocol method) legitimately has
+                // none: `take_flags_for_callee` already returns `None`
+                // for exactly that shape, never for a resolved one
+                // that's merely missing.
+                if let HirExpr::Function { item, .. } = callee.as_ref() {
+                    match self.take_flags.get(item) {
+                        Some(flags) if flags.len() == args.len() => {}
+                        Some(flags) => {
+                            self.diagnose(
+                                MALFORMED_CALLEE_TAKE_FLAGS,
+                                *span,
+                                format!(
+                                    "this call's own callee declares {} parameter(s) but is called with {} argument(s)",
+                                    flags.len(),
+                                    args.len()
+                                ),
+                                "argument count disagrees with the callee's own declared parameters",
+                            );
+                            return;
+                        }
+                        None => {
+                            self.diagnose(
+                                MALFORMED_CALLEE_TAKE_FLAGS,
+                                *span,
+                                "this call's own callee has no take-flag metadata recorded for it"
+                                    .to_string(),
+                                "unresolved callee signature",
+                            );
+                            return;
+                        }
+                    }
+                }
                 let take_flags = self.take_flags_for_callee(callee);
                 for (index, arg) in args.iter().enumerate() {
+                    // `false` here only ever means "this callee is not a
+                    // direct function reference at all" (a variant case
+                    // constructor, a protocol method -- `take_flags_for_
+                    // callee` itself returns `None` for exactly that
+                    // shape, correctly, since neither has a `take`
+                    // parameter to speak of); for a resolved
+                    // `HirExpr::Function` callee specifically, the guard
+                    // above already proved a same-length entry exists,
+                    // so `flags.get(index)` can never actually miss here.
                     let takes = take_flags
                         .and_then(|flags| flags.get(index))
                         .copied()
@@ -1948,5 +2067,106 @@ mod tests {
             HashMap::from([(LocalId(0), ResourceState::Available)]);
         let joined = join_branch_states(&entry, &[(agreeing, false), (disagreeing, false)]);
         assert_eq!(joined.get(&LocalId(0)), Some(&ResourceState::Error));
+    }
+
+    /// A call whose own callee resolves directly to a declared function
+    /// (`HirExpr::Function`), but this checker's own `take_flags` table
+    /// has no entry for it at all -- always unreachable for HIR that
+    /// actually passed `hir::lower`'s own name resolution first (every
+    /// declared function gets an entry); reachable only through
+    /// hand-built HIR fed straight to this stage, exactly as
+    /// constructed here. Must be diagnosed (`MALFORMED_CALLEE_TAKE_
+    /// FLAGS`), never silently treated as "every argument observes".
+    #[test]
+    fn a_resolved_callee_missing_from_take_flags_is_diagnosed_not_silently_observed() {
+        let local_types: HashMap<LocalId, Ty> = HashMap::new();
+        let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
+        let affine_items: HashSet<ItemId> = HashSet::new();
+        let take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
+        let mut map = crate::source::SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let g_name = interner.intern("g");
+        let mut diagnostics = Vec::new();
+        let mut checker = FlowChecker::new(
+            &local_types,
+            &expr_types,
+            &affine_items,
+            &take_flags,
+            source,
+            &interner,
+            &mut diagnostics,
+        );
+        let callee = HirExpr::Function {
+            id: crate::hir::ExprId(0),
+            item: ItemId(0),
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        let call_expr = HirExpr::Call {
+            id: crate::hir::ExprId(1),
+            callee: Box::new(callee),
+            args: Vec::new(),
+            span: Span::dummy(),
+        };
+        checker.check_expr_ctx(&call_expr, ConsumeKind::Read);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == MALFORMED_CALLEE_TAKE_FLAGS),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Same shape as above, but the callee *does* have a `take_flags`
+    /// entry -- just the wrong length for this exact call's own
+    /// argument count.
+    #[test]
+    fn a_take_flags_length_disagreeing_with_the_call_arity_is_diagnosed() {
+        let local_types: HashMap<LocalId, Ty> = HashMap::new();
+        let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
+        let affine_items: HashSet<ItemId> = HashSet::new();
+        let mut take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
+        take_flags.insert(ItemId(0), vec![false, false]);
+        let mut map = crate::source::SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut interner = Interner::new();
+        let g_name = interner.intern("g");
+        let mut diagnostics = Vec::new();
+        let mut checker = FlowChecker::new(
+            &local_types,
+            &expr_types,
+            &affine_items,
+            &take_flags,
+            source,
+            &interner,
+            &mut diagnostics,
+        );
+        let callee = HirExpr::Function {
+            id: crate::hir::ExprId(0),
+            item: ItemId(0),
+            name: g_name,
+            type_args: Vec::new(),
+            span: Span::dummy(),
+        };
+        // Only one argument, but `take_flags` above declares two.
+        let call_expr = HirExpr::Call {
+            id: crate::hir::ExprId(1),
+            callee: Box::new(callee),
+            args: vec![HirExpr::Bool {
+                id: crate::hir::ExprId(2),
+                value: true,
+                span: Span::dummy(),
+            }],
+            span: Span::dummy(),
+        };
+        checker.check_expr_ctx(&call_expr, ConsumeKind::Read);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == MALFORMED_CALLEE_TAKE_FLAGS),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 }

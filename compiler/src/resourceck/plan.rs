@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ExprId, ItemId, LocalId};
+use crate::types::Ty;
 
 /// Whether one specific expression's own value, at the exact syntactic
 /// position `resourceck::flow` checked it in, observes its underlying
@@ -25,15 +26,25 @@ pub enum ConsumeInfo {
 
 /// `resourceck`'s own checked plan for one `defer <expr>;` statement,
 /// keyed by that exact call expression's own [`ExprId`] (`rfcs/0011`):
-/// the resolved callee, and each argument's own already-decided
-/// [`ConsumeInfo`], in declaration order. `nir::lower` consumes this
-/// directly when it emits the deferred call's own capture/replay
-/// instructions, rather than re-resolving the callee's `take` flags a
-/// second time from the module's own function signatures.
+/// the resolved callee, each argument's own already-decided
+/// [`ConsumeInfo`] and resolved type (in declaration order), the
+/// callee's own resolved return type, and this exact `defer`'s own
+/// registration order among every `defer` in its enclosing function
+/// (lower numbers registered earlier -- LIFO replay processes
+/// *decreasing* order). `nir::lower` consumes this directly when it
+/// emits the deferred call's own capture/replay instructions, rather
+/// than re-resolving the callee's `take` flags or signature a second
+/// time from the module's own function signatures -- and independently
+/// validates every field against what it resolves on its own, since a
+/// plan this internally inconsistent is a bug in one stage or the
+/// other, never something to silently paper over.
 #[derive(Debug, Clone)]
 pub struct CheckedDeferPlan {
     pub callee: ItemId,
     pub arg_modes: Vec<ConsumeInfo>,
+    pub arg_types: Vec<Ty>,
+    pub return_type: Ty,
+    pub registration_order: u32,
 }
 
 /// One entry in a checked cleanup sequence, in the exact order

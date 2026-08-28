@@ -7,7 +7,34 @@
 use std::collections::BTreeMap;
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{ExprId, LocalId};
+use crate::hir::{ExprId, ItemId, LocalId};
+
+/// Whether one specific expression's own value, at the exact syntactic
+/// position `resourceck::flow` checked it in, observes its underlying
+/// resource for the duration of that use, or transfers ownership of it
+/// away (`rfcs/0011`) -- `nir::lower` looks this up directly rather
+/// than re-deriving it from the expression's own AST shape or a
+/// callee's declared `take` flags a second time. Meaningless (and never
+/// recorded) for a non-resource-typed expression: an ordinary value has
+/// no ownership to speak of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeInfo {
+    Observe,
+    Transfer,
+}
+
+/// `resourceck`'s own checked plan for one `defer <expr>;` statement,
+/// keyed by that exact call expression's own [`ExprId`] (`rfcs/0011`):
+/// the resolved callee, and each argument's own already-decided
+/// [`ConsumeInfo`], in declaration order. `nir::lower` consumes this
+/// directly when it emits the deferred call's own capture/replay
+/// instructions, rather than re-resolving the callee's `take` flags a
+/// second time from the module's own function signatures.
+#[derive(Debug, Clone)]
+pub struct CheckedDeferPlan {
+    pub callee: ItemId,
+    pub arg_modes: Vec<ConsumeInfo>,
+}
 
 /// One entry in a checked cleanup sequence, in the exact order
 /// [`super::flow::FlowChecker`] already validated is sound: a resource
@@ -51,4 +78,20 @@ pub struct ResourceCheckResult {
     /// to clean up, so an absent key always means "unreachable", never
     /// "nothing to do").
     pub cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>>,
+    /// Every checked observe-vs-transfer decision this module's own
+    /// resource check actually made, keyed by the exact expression's
+    /// own [`ExprId`] (`rfcs/0011`): a `value`/`mutable` binding's own
+    /// initializer, an assignment's own value, a call/`Invoke`
+    /// argument, a `defer` argument, or a `return`/`raise` operand.
+    /// `nir::lower` reads this back directly rather than re-deriving
+    /// the same verdict from the expression's own HIR shape or a
+    /// callee's declared `take` flags a second time -- a key absent
+    /// here for an expression `nir::lower` expects one for is always a
+    /// bug in one stage or the other, never silently treated as
+    /// `Observe`.
+    pub consume_sites: BTreeMap<ExprId, ConsumeInfo>,
+    /// Every `defer <expr>;` statement's own checked plan, keyed by
+    /// that exact call expression's own [`ExprId`] -- see
+    /// [`CheckedDeferPlan`].
+    pub defer_plans: BTreeMap<ExprId, CheckedDeferPlan>,
 }

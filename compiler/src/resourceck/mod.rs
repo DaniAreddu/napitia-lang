@@ -48,7 +48,7 @@ mod flow;
 mod plan;
 mod state;
 
-pub use plan::{CleanupAction, ResourceCheckResult};
+pub use plan::{CheckedDeferPlan, CleanupAction, ConsumeInfo, ResourceCheckResult};
 pub use state::ResourceState;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -91,6 +91,8 @@ pub fn check_module(
 
     let mut diagnostics = Vec::new();
     let mut cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>> = BTreeMap::new();
+    let mut consume_sites: BTreeMap<ExprId, ConsumeInfo> = BTreeMap::new();
+    let mut defer_plans: BTreeMap<ExprId, CheckedDeferPlan> = BTreeMap::new();
     for f in &hir.functions {
         let mut checker = flow::FlowChecker::new(
             local_types,
@@ -102,7 +104,10 @@ pub fn check_module(
             &mut diagnostics,
         );
         checker.check_function(f);
-        cleanup_edges.extend(checker.into_cleanup_edges());
+        let (edges, consumes, defers) = checker.into_plan();
+        cleanup_edges.extend(edges);
+        consume_sites.extend(consumes);
+        defer_plans.extend(defers);
     }
     for e in &hir.extends {
         for m in &e.methods {
@@ -116,12 +121,17 @@ pub fn check_module(
                 &mut diagnostics,
             );
             checker.check_function(m);
-            cleanup_edges.extend(checker.into_cleanup_edges());
+            let (edges, consumes, defers) = checker.into_plan();
+            cleanup_edges.extend(edges);
+            consume_sites.extend(consumes);
+            defer_plans.extend(defers);
         }
     }
     ResourceCheckResult {
         diagnostics,
         cleanup_edges,
+        consume_sites,
+        defer_plans,
     }
 }
 
@@ -171,6 +181,135 @@ mod tests {
 
     fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&str> {
         diagnostics.iter().map(|d| d.code).collect()
+    }
+
+    /// Like [`check`], but returns the whole [`ResourceCheckResult`]
+    /// rather than only its diagnostics -- for tests that need to
+    /// directly inspect `consume_sites`/`defer_plans` themselves,
+    /// rather than only the source-level diagnostics they helped
+    /// produce.
+    fn check_result(text: &str) -> ResourceCheckResult {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let typeck_result = typeck::check_module(&hir, id, &interner, typeck::EntryMain::ByName);
+        assert!(
+            typeck_result.diagnostics.is_empty(),
+            "unexpected typeck diagnostics: {:?}",
+            typeck_result.diagnostics
+        );
+        let result = check_module(
+            &hir,
+            &typeck_result.local_types,
+            &typeck_result.expr_types,
+            &interner,
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected resource diagnostics: {:?}",
+            result.diagnostics
+        );
+        result
+    }
+
+    #[test]
+    fn a_take_argument_is_recorded_as_a_checked_transfer() {
+        let result = check_result(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; consume(file); }",
+        );
+        let transfers = result
+            .consume_sites
+            .values()
+            .filter(|c| matches!(c, ConsumeInfo::Transfer))
+            .count();
+        // One for `file`'s own binding initializer, one for the `consume`
+        // call argument -- both genuinely checked transfers.
+        assert_eq!(
+            transfers, 2,
+            "unexpected consume_sites: {:?}",
+            result.consume_sites
+        );
+        assert!(
+            result
+                .consume_sites
+                .values()
+                .all(|c| matches!(c, ConsumeInfo::Transfer)),
+            "unexpected consume_sites: {:?}",
+            result.consume_sites
+        );
+    }
+
+    #[test]
+    fn an_ordinary_argument_is_recorded_as_a_checked_observation() {
+        let result = check_result(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; inspect(file); drop file; }",
+        );
+        // `file`'s own binding initializer is a checked transfer; the
+        // `inspect` call argument -- an ordinary, non-`take` parameter
+        // -- is a checked observation, not a transfer.
+        let observes = result
+            .consume_sites
+            .values()
+            .filter(|c| matches!(c, ConsumeInfo::Observe))
+            .count();
+        assert_eq!(
+            observes, 1,
+            "unexpected consume_sites: {:?}",
+            result.consume_sites
+        );
+    }
+
+    #[test]
+    fn a_consuming_defer_argument_is_recorded_in_its_own_checked_plan() {
+        let result = check_result(
+            "resource File { descriptor: i64 } \
+             func close(take file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; defer close(file); }",
+        );
+        assert_eq!(
+            result.defer_plans.len(),
+            1,
+            "unexpected defer_plans: {:?}",
+            result.defer_plans
+        );
+        let plan = result.defer_plans.values().next().unwrap();
+        assert_eq!(plan.arg_modes, vec![ConsumeInfo::Transfer]);
+    }
+
+    #[test]
+    fn an_observing_defer_argument_is_recorded_in_its_own_checked_plan() {
+        let result = check_result(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; defer inspect(file); }",
+        );
+        assert_eq!(
+            result.defer_plans.len(),
+            1,
+            "unexpected defer_plans: {:?}",
+            result.defer_plans
+        );
+        let plan = result.defer_plans.values().next().unwrap();
+        assert_eq!(plan.arg_modes, vec![ConsumeInfo::Observe]);
     }
 
     #[test]

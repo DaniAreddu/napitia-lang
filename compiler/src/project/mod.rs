@@ -242,14 +242,14 @@ pub fn compile_project(
         return Err(typeck_result.diagnostics);
     }
 
-    let resourceck_diagnostics = crate::resourceck::check_module(
+    let resourceck_result = crate::resourceck::check_module(
         &merged,
         &typeck_result.local_types,
         &typeck_result.expr_types,
         interner,
     );
-    if !resourceck_diagnostics.is_empty() {
-        return Err(resourceck_diagnostics);
+    if !resourceck_result.diagnostics.is_empty() {
+        return Err(resourceck_result.diagnostics);
     }
 
     let nir_module = nir::lower_module_with_paths(
@@ -260,6 +260,7 @@ pub fn compile_project(
         &typeck_result.call_type_args,
         &typeck_result.call_evidence,
         &typeck_result.protocol_call_evidence,
+        &resourceck_result.cleanup_edges,
         interner,
         loaded.manifest_source,
         &module_path_of,

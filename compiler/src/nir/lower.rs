@@ -17,7 +17,7 @@
 //! never reference a function that lowering silently left out, because
 //! there is no way to leave one out and still get a `Module` back.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
@@ -71,6 +71,7 @@ pub fn lower_module(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -82,6 +83,7 @@ pub fn lower_module(
         call_type_args,
         call_evidence,
         protocol_call_evidence,
+        cleanup_edges,
         interner,
         source,
         ModulePathMode::SingleFile,
@@ -106,6 +108,7 @@ pub fn lower_module_with_paths(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
@@ -118,6 +121,7 @@ pub fn lower_module_with_paths(
         call_type_args,
         call_evidence,
         protocol_call_evidence,
+        cleanup_edges,
         interner,
         source,
         ModulePathMode::Project(module_path_of),
@@ -133,6 +137,7 @@ fn lower_module_impl(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     interner: &Interner,
     source: SourceId,
     module_path_mode: ModulePathMode<'_>,
@@ -205,7 +210,6 @@ fn lower_module_impl(
     let mut function_sigs = HashMap::new();
     let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
     let mut function_raises: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
-    let mut function_takes: HashMap<ItemId, Vec<bool>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -219,7 +223,6 @@ fn lower_module_impl(
             .unwrap_or(Ty::Unit);
         let type_params = f.type_params.iter().map(|p| p.id).collect();
         function_sigs.insert(f.id, (type_params, params, ret));
-        function_takes.insert(f.id, f.params.iter().map(|p| p.take).collect());
         function_requirements.insert(
             f.id,
             f.requirements
@@ -324,7 +327,6 @@ fn lower_module_impl(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
-            function_takes.insert(m.id, m.params.iter().map(|p| p.take).collect());
             let method_raises = match canonical_raises(
                 m.raises.iter().map(|r| r.variant).collect(),
                 &variant_layouts,
@@ -386,7 +388,7 @@ fn lower_module_impl(
         function_requirements,
         function_raises,
         function_named_type_params,
-        function_takes,
+        cleanup_edges,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -782,32 +784,21 @@ struct Lowering<'a> {
     /// `ItemId`. Absent (falls back to `f.type_params` directly) for an
     /// ordinary function, which owns its parameters itself.
     function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>>,
-    /// Every function/extend method's own per-parameter `take` flags, by
-    /// `ItemId`, in declared order (`rfcs/0011`) -- read back to decide
-    /// whether a call argument transfers ownership (and so must not
-    /// also be implicitly dropped by its own former scope) or merely
-    /// observes. Mirrors `resourceck`'s own identically-built table;
-    /// `resourceck` already proved this program's ownership is sound
-    /// before lowering ever runs, so this copy only needs to decide
-    /// *where* to place a `Drop`/deferred call, never to re-diagnose
-    /// anything.
-    function_takes: HashMap<ItemId, Vec<bool>>,
+    /// `resourceck`'s own authoritative, checked cleanup plan
+    /// (`rfcs/0011`), keyed by the exiting HIR node's own stable id --
+    /// the single source of truth for which locals still need
+    /// destroying and which `defer`s still need running at any given
+    /// reachable exit. Lowering never independently decides this itself
+    /// (no `moved_out`/per-branch join bookkeeping of its own): it
+    /// looks the already-checked answer up here and simply materializes
+    /// it as real instructions, in the order given.
+    cleanup_edges: &'a BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
 }
 
 #[derive(Copy, Clone)]
 struct LoopCtx {
     break_target: BlockId,
     continue_target: BlockId,
-    /// `fb.cleanup_actions.len()` at the point this loop's own body
-    /// began lowering (`rfcs/0011`, Blocker 5) -- every entry
-    /// registered at or after this index belongs to some scope nested
-    /// inside *this* loop's own current iteration (the body's own
-    /// top-level bindings, or any block/if/match/handle nested inside
-    /// it), so replaying `cleanup_actions[marker..]` in reverse before
-    /// a `break`/`continue` destroys exactly what this iteration owns
-    /// and nothing an enclosing scope (an outer loop, or the function
-    /// itself) still needs live.
-    cleanup_marker: usize,
 }
 
 struct PendingBlock {
@@ -849,19 +840,6 @@ struct PendingDefer {
     ret_ty: Ty,
 }
 
-/// One entry in a function's own cleanup sequence (`rfcs/0011`),
-/// recorded in the exact order `resourceck` already validated is sound:
-/// a resource local's own declaration, or a `defer`'s own registration.
-/// Replayed in *reverse* at a cleanup point -- last declared/registered,
-/// first destroyed/run -- which is what makes resource drops and
-/// deferred calls interleave in the declaration-reversed order
-/// `rfcs/0011` specifies.
-#[derive(Clone)]
-enum CleanupAction {
-    Drop(LocalId),
-    Defer(PendingDefer),
-}
-
 /// The result of lowering one expression: either a real value the
 /// current (still-open) block can keep building on, or proof that
 /// control already left this block. `return`/`break`/`continue` lower
@@ -892,64 +870,16 @@ struct FnBuilder {
     /// bare literal in `return <literal>` to the right type instead of
     /// the usual i64/f64 default.
     return_ty: Ty,
-    /// Every resource local's own declaration, and every `defer`'s own
-    /// registration, in the exact order lowering encountered them
-    /// (`rfcs/0011`) -- see [`CleanupAction`]. A single flat, function-
-    /// wide list: a nested block's own entries are appended onto the
-    /// same list as its enclosing scopes' (never a separate stack), but
-    /// [`Lowering::lower_scoped_block`]/[`Lowering::lower_scoped_block_void`]
-    /// remove a block's own entries again once that block's own normal
-    /// exit has replayed them, so an enclosing scope's later cleanup
-    /// never sees (and never re-replays) them. A `break`/`continue`
-    /// runs exactly the entries registered since its own loop's
-    /// `LoopCtx::cleanup_marker` -- everything this specific iteration
-    /// owns, nested blocks included, since they were all appended after
-    /// that marker -- and deliberately nothing from any enclosing scope
-    /// (an outer loop, or the function itself), which still needs its
-    /// own resources live past this loop.
-    cleanup_actions: Vec<CleanupAction>,
-    /// Every resource local already moved out (by `return`, a `take`
-    /// argument, storage in a constructed aggregate, or an explicit
-    /// `drop`) -- excluded from `cleanup_actions`' own replay, since its
-    /// new owner (or its own explicit `drop`) is already responsible.
-    /// `resourceck` already proved this is unambiguous for any program
-    /// that reaches lowering at all.
-    moved_out: HashSet<LocalId>,
-    /// One entry per currently-active loop, innermost last -- every
-    /// reachable `break`'s own `moved_out` snapshot at the exact point
-    /// it branches to that loop's own exit block. `lower_while`/
-    /// `lower_loop` join these (with the condition-false edge's own
-    /// snapshot, for `while`) once the loop finishes, exactly like
-    /// `move_join_stack` already joins an if/match/handle's own sibling
-    /// branches -- code appended after the loop, into that same shared
-    /// exit block, must see every resource a *reachable* break already
-    /// moved, not just whatever `moved_out` happens to be left as by the
-    /// loop's own unrelated normal-continuation path. Without this, a
-    /// resource a break-path already transferred into a `take` call
-    /// gets dropped a second time by whatever cleanup runs after the
-    /// loop, since that cleanup never saw the break's own move at all.
-    loop_break_moved_out: Vec<Vec<HashSet<LocalId>>>,
-    /// One entry per branching construct (`if`/`match`/`handle`)
-    /// currently being lowered, innermost last (`rfcs/0011`). See
-    /// [`Lowering::begin_move_join`]/[`Lowering::lower_branch_moves`]/
-    /// [`Lowering::end_move_join`] -- isolates `moved_out` between
-    /// sibling branches/arms of the same construct, and between them
-    /// and the construct's own join/continuation, exactly like
-    /// `resourceck::flow`'s own per-branch state clone already does for
-    /// its own path-sensitive join. Without this, a resource moved only
-    /// inside one branch would leak into `moved_out` for a sibling
-    /// branch (or the code lowered after the join) lowered afterward
-    /// against the same single mutable set, wrongly skipping that
-    /// sibling's own cleanup for a resource it never actually moved.
-    move_join_stack: Vec<MoveJoin>,
-}
-
-/// One branching construct's own entry `moved_out` snapshot, and every
-/// non-diverging branch/arm's own resulting `moved_out` set collected
-/// so far. See [`FnBuilder::move_join_stack`].
-struct MoveJoin {
-    entry: HashSet<LocalId>,
-    exits: Vec<HashSet<LocalId>>,
+    /// Every `defer` statement's own already-lowered callee/arguments,
+    /// keyed by that exact statement's own callee-expression id
+    /// (`rfcs/0011`) -- populated once, when lowering first reaches
+    /// that `defer` statement itself, and read back (never re-lowered)
+    /// every time a checked cleanup action from `resourceck`'s own
+    /// `ResourceCheckResult::cleanup_edges` replays it. Argument
+    /// evaluation happens exactly once, here, at registration time,
+    /// matching `defer`'s own "never delays argument evaluation, only
+    /// the call's own side effect" rule.
+    defer_calls: HashMap<ExprId, PendingDefer>,
 }
 
 impl FnBuilder {
@@ -966,10 +896,7 @@ impl FnBuilder {
             current: entry,
             loop_stack: Vec::new(),
             return_ty,
-            cleanup_actions: Vec::new(),
-            moved_out: HashSet::new(),
-            loop_break_moved_out: Vec::new(),
-            move_join_stack: Vec::new(),
+            defer_calls: HashMap::new(),
         }
     }
 
@@ -1092,15 +1019,6 @@ impl<'a> Lowering<'a> {
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
-            // A `take` parameter transfers ownership into this call
-            // (`rfcs/0011`): this function's own scope now owns it,
-            // exactly like a `value` binding, and must destroy it at
-            // exit unless it is itself moved onward first. An ordinary
-            // parameter is a call-scoped observation, never owned here,
-            // so it is never entered into the cleanup sequence at all.
-            if p.take && self.is_affine(&ty) {
-                fb.cleanup_actions.push(CleanupAction::Drop(p.local));
-            }
             params.push(Param {
                 value,
                 ty,
@@ -1115,8 +1033,7 @@ impl<'a> Lowering<'a> {
         // explicit `return` at all) needs exactly the same per-branch
         // cleanup+terminate, not a single post-merge guess.
         let return_type_for_tail = return_type.clone();
-        let mut finish_tail = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
-            this.emit_cleanup(fb)?;
+        let mut finish_tail = |_this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
             if matches!(return_type_for_tail, Ty::Unit) {
                 fb.terminate(Terminator::Return(None));
             } else {
@@ -1137,9 +1054,7 @@ impl<'a> Lowering<'a> {
                         "internal invariant: a Diverged result always already terminated its block"
                     );
                 };
-                if let Some(tail) = f.body.tail.as_deref() {
-                    self.mark_moved(&mut fb, tail);
-                }
+                self.emit_checked_cleanup(&mut fb, f.body.id)?;
                 finish_tail(self, &mut fb, body_value)?;
             }
         }
@@ -1272,7 +1187,6 @@ impl<'a> Lowering<'a> {
                     // there is nothing left to allocate or store into.
                     LoweredExpr::Diverged => return Ok(()),
                 };
-                self.mark_moved(fb, &b.value);
                 let binding = if b.mutable {
                     let slot = fb.alloc_slot(ty.clone());
                     fb.push_store(slot, value);
@@ -1281,9 +1195,6 @@ impl<'a> Lowering<'a> {
                     LocalBinding::Direct(value)
                 };
                 fb.local_bindings.insert(b.local, binding);
-                if self.is_affine(&ty) {
-                    fb.cleanup_actions.push(CleanupAction::Drop(b.local));
-                }
                 Ok(())
             }
             HirStmt::Expr(e) => {
@@ -1294,7 +1205,7 @@ impl<'a> Lowering<'a> {
                 let Some(pending) = self.lower_defer_call(fb, expr, *span)? else {
                     return Ok(());
                 };
-                fb.cleanup_actions.push(CleanupAction::Defer(pending));
+                fb.defer_calls.insert(expr.id(), pending);
                 Ok(())
             }
             HirStmt::Drop { expr, .. } => {
@@ -1311,9 +1222,6 @@ impl<'a> Lowering<'a> {
                     LoweredExpr::Diverged => return Ok(()),
                 };
                 fb.push_instruction(crate::nir::Instruction::Drop { value });
-                if let HirExpr::Local { local, .. } = expr {
-                    fb.moved_out.insert(*local);
-                }
                 Ok(())
             }
             HirStmt::While {
@@ -1327,26 +1235,6 @@ impl<'a> Lowering<'a> {
     /// (`rfcs/0011`), mirroring `resourceck`'s own identical check.
     fn is_affine(&self, ty: &Ty) -> bool {
         matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|r| r.affine))
-    }
-
-    /// Marks `expr`'s own source local `Moved` (`rfcs/0011`) if it is a
-    /// bare local reference -- the only shape an existing owned resource
-    /// binding can be consumed *from*. Mirrors `resourceck::flow`'s own
-    /// `check_consume`; `resourceck` already proved this is always
-    /// unambiguous for a program that reaches lowering at all, so unlike
-    /// that pass this is pure bookkeeping, never a diagnostic.
-    fn mark_moved(&mut self, fb: &mut FnBuilder, expr: &HirExpr) {
-        if let HirExpr::Local { local, .. } = expr
-            && self.is_resource_local(*local)
-        {
-            fb.moved_out.insert(*local);
-        }
-    }
-
-    fn is_resource_local(&self, local: LocalId) -> bool {
-        self.local_types
-            .get(&local)
-            .is_some_and(|ty| self.is_affine(ty))
     }
 
     /// The current NIR value behind `local`'s own binding: its value
@@ -1407,7 +1295,6 @@ impl<'a> Lowering<'a> {
         if self.is_affine(&ret_ty) {
             return Err(self.unsupported(span, "a `defer` calling a function returning a resource"));
         }
-        let takes = self.function_takes.get(item).cloned();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
@@ -1419,12 +1306,14 @@ impl<'a> Lowering<'a> {
             }
             // A `take` parameter transfers ownership of this argument
             // into the pending deferred invocation *now*, at
-            // registration time (Blocker 6) -- the enclosing scope's
-            // own cleanup must not also drop it once the deferred call
-            // actually runs and takes care of its own taken argument.
-            if takes.as_ref().and_then(|t| t.get(i)).copied() == Some(true) {
-                self.mark_moved(fb, arg);
-            }
+            // registration time (Blocker 6): `resourceck` already
+            // decided this (`checker::flow::check_defer` running the
+            // call through the same move-checking `check_expr` any
+            // other call gets), so the enclosing scope's own checked
+            // cleanup (`ResourceCheckResult::cleanup_edges`) already
+            // excludes this argument's own source local wherever it
+            // would otherwise be dropped again -- lowering does not
+            // separately decide or record this itself.
         }
         let requirements = self.lookup_function_requirements(*item, "a `defer` call")?;
         if !requirements.is_empty() {
@@ -1439,39 +1328,37 @@ impl<'a> Lowering<'a> {
         }))
     }
 
-    /// Replays every still-owned resource drop and every registered
-    /// `defer` from the *whole* function's own cleanup list, in
-    /// declaration-reversed order (`rfcs/0011`), before a function-level
-    /// cleanup point's own terminator (`return`, `raise`, a postfix `?`
-    /// propagation edge). See [`Self::emit_cleanup_since`] for the
-    /// nested-scope version this delegates to.
-    fn emit_cleanup(&mut self, fb: &mut FnBuilder) -> LowerResult<()> {
-        self.emit_cleanup_since(fb, 0)
-    }
-
-    /// Replays every entry in `fb.cleanup_actions[marker..]` (a single
-    /// scope's own resource drops and registered `defer`s, never a
-    /// shallower enclosing scope's), in reverse. Used both by
-    /// `emit_cleanup` (`marker == 0`, the whole function) and by
-    /// [`Self::lower_scoped_block`] (a nested block's own slice, run
-    /// once at that block's own normal exit, before its own entries are
-    /// removed from the function-wide list so an enclosing scope's own
-    /// later cleanup never replays them again).
-    fn emit_cleanup_since(&mut self, fb: &mut FnBuilder, marker: usize) -> LowerResult<()> {
-        let actions: Vec<CleanupAction> = fb.cleanup_actions[marker..].to_vec();
-        for action in actions.into_iter().rev() {
+    /// Replays `resourceck`'s own checked cleanup list for `exit_id`
+    /// (`ResourceCheckResult::cleanup_edges`, already in replay order --
+    /// last declared/registered first), materializing each entry as a
+    /// real `Drop` instruction or a replayed deferred `Call` (`rfcs/0011`).
+    /// Lowering does not decide *whether* a local still needs dropping
+    /// here (`resourceck` already excluded anything `Moved`/`Dropped`
+    /// from this exact list) -- only *how* to materialize each entry
+    /// this stage already proved is owed. A missing `exit_id` means
+    /// `resourceck` proved this exact exit unreachable; nothing is
+    /// emitted (this can only happen for a program `resourceck` itself
+    /// rejects, which never reaches lowering in the ordinary pipeline --
+    /// see `lower_module_impl`'s own resourceck-diagnostics gate).
+    fn emit_checked_cleanup(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        let Some(actions) = self.cleanup_edges.get(&exit_id).cloned() else {
+            return Ok(());
+        };
+        for action in actions {
             match action {
-                CleanupAction::Drop(local) => {
-                    if fb.moved_out.contains(&local) {
-                        continue;
-                    }
+                crate::resourceck::CleanupAction::Drop(local) => {
                     let Some(binding) = fb.local_bindings.get(&local).copied() else {
                         continue;
                     };
                     let value = self.load_current(fb, local, binding);
                     fb.push_instruction(crate::nir::Instruction::Drop { value });
                 }
-                CleanupAction::Defer(pending) => {
+                crate::resourceck::CleanupAction::Defer(defer_id) => {
+                    let Some(pending) = fb.defer_calls.get(&defer_id).cloned() else {
+                        return Err(self.internal_error(
+                            "a checked cleanup action replays a `defer` this frame never lowered",
+                        ));
+                    };
                     fb.push_value(
                         pending.ret_ty,
                         ValueKind::Call(
@@ -1509,12 +1396,10 @@ impl<'a> Lowering<'a> {
         fb: &mut FnBuilder,
         block: &HirBlock,
     ) -> LowerResult<LoweredExpr> {
-        let marker = fb.cleanup_actions.len();
         let result = self.lower_block_value(fb, block)?;
         if !fb.current_terminated() {
-            self.emit_cleanup_since(fb, marker)?;
+            self.emit_checked_cleanup(fb, block.id)?;
         }
-        fb.cleanup_actions.truncate(marker);
         Ok(result)
     }
 
@@ -1525,76 +1410,31 @@ impl<'a> Lowering<'a> {
     /// header), never left for the function-wide list to replay after
     /// the loop, where its own value would not dominate at all.
     fn lower_scoped_block_void(&mut self, fb: &mut FnBuilder, block: &HirBlock) -> LowerResult<()> {
-        let marker = fb.cleanup_actions.len();
         self.lower_block_void(fb, block)?;
         if !fb.current_terminated() {
-            self.emit_cleanup_since(fb, marker)?;
+            self.emit_checked_cleanup(fb, block.id)?;
         }
-        fb.cleanup_actions.truncate(marker);
         Ok(())
     }
 
-    /// Starts one branching construct's (`if`/`match`/`handle`) own
-    /// `moved_out` join scope (`rfcs/0011`), snapshotting the state in
-    /// effect right before any of its branches/arms runs. Must be
-    /// followed, once every branch/arm has been lowered through
-    /// [`Self::lower_branch_moves`], by exactly one matching
-    /// [`Self::end_move_join`].
-    fn begin_move_join(&self, fb: &mut FnBuilder) {
-        fb.move_join_stack.push(MoveJoin {
-            entry: fb.moved_out.clone(),
-            exits: Vec::new(),
-        });
-    }
-
-    /// Lowers one branch/arm's own body (`f`) in isolation: `moved_out`
-    /// is reset to the enclosing join's own entry snapshot first, so
-    /// this branch never sees a sibling branch's own moves, and its own
-    /// resulting `moved_out` set is recorded onto the enclosing join
-    /// afterward -- but only if it actually reaches its own normal end
-    /// (`!fb.current_terminated()`); a branch that diverges contributes
-    /// nothing to the join, exactly like `resourceck::flow::
-    /// join_branch_states` already excludes a diverging branch from its
-    /// own join. Must be called once per branch/arm, between a matching
-    /// [`Self::begin_move_join`]/[`Self::end_move_join`] pair.
+    /// Lowers one branch/arm's own body (`f`) (`rfcs/0011`). Historically
+    /// this isolated a per-branch `moved_out` snapshot so a sibling
+    /// branch's own moves couldn't leak into this one -- lowering no
+    /// longer maintains any such cross-branch mutable ownership state at
+    /// all: `resourceck::flow`'s own per-branch state clone already
+    /// isolates each branch when it builds `ResourceCheckResult::
+    /// cleanup_edges`, so every exit `f` reaches looks its own already-
+    /// correctly-isolated cleanup list up directly, with nothing left
+    /// here to isolate a second time. Kept as a named seam (rather than
+    /// inlining every one of its call sites) purely so each branch/arm
+    /// of a branching construct's own lowering reads the same way it
+    /// always has.
     fn lower_branch_moves<T>(
         &mut self,
         fb: &mut FnBuilder,
         f: impl FnOnce(&mut Self, &mut FnBuilder) -> LowerResult<T>,
     ) -> LowerResult<T> {
-        let entry = fb
-            .move_join_stack
-            .last()
-            .expect("internal invariant: lower_branch_moves called outside a move-join scope")
-            .entry
-            .clone();
-        fb.moved_out = entry;
-        let result = f(self, fb)?;
-        if !fb.current_terminated() {
-            let exit = fb.moved_out.clone();
-            fb.move_join_stack
-                .last_mut()
-                .expect("internal invariant: move-join scope popped during its own branch")
-                .exits
-                .push(exit);
-        }
-        Ok(result)
-    }
-
-    /// Ends the innermost `moved_out` join scope, installing its own
-    /// joined result onto `fb.moved_out` (`rfcs/0011`; mirrors
-    /// `resourceck::flow::join_branch_states`'s own join). `resourceck`
-    /// already proved that every reachable (non-diverging) branch of an
-    /// accepted program agrees exactly about every resource's own state,
-    /// so any one recorded exit is the correct joined result; if none
-    /// were recorded (every branch diverged), the join itself is
-    /// unreachable code, and the entry snapshot is used unchanged.
-    fn end_move_join(&self, fb: &mut FnBuilder) {
-        let join = fb
-            .move_join_stack
-            .pop()
-            .expect("internal invariant: end_move_join called outside a move-join scope");
-        fb.moved_out = join.exits.into_iter().next().unwrap_or(join.entry);
+        f(self, fb)
     }
 
     /// `return <expr>;`/`return;` (`rfcs/0011`, Blocker 2). A
@@ -1617,16 +1457,16 @@ impl<'a> Lowering<'a> {
     fn lower_return(
         &mut self,
         fb: &mut FnBuilder,
+        id: ExprId,
         value: Option<&HirExpr>,
     ) -> LowerResult<LoweredExpr> {
         let Some(value) = value else {
-            self.emit_cleanup(fb)?;
+            self.emit_checked_cleanup(fb, id)?;
             fb.terminate(Terminator::Return(None));
             return Ok(LoweredExpr::Diverged);
         };
         let ret_ty = fb.return_ty.clone();
-        let mut finish = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
-            this.emit_cleanup(fb)?;
+        let mut finish = |_this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
             fb.terminate(Terminator::Return(Some(v)));
             Ok(LoweredExpr::Diverged)
         };
@@ -1635,7 +1475,11 @@ impl<'a> Lowering<'a> {
         // value -- a plain value type has no ownership ambiguity a
         // single post-merge terminator could get wrong, so it keeps
         // the ordinary, simpler shared-slot-then-merge lowering
-        // (`rfcs/0011`, Blocker 2 is scoped to affine types only).
+        // (`rfcs/0011`, Blocker 2 is scoped to affine types only). Each
+        // compound leaf calls `emit_checked_cleanup` itself, keyed by
+        // its own id (see `lower_into_return_sink`'s own catch-all); a
+        // direct, non-compound return value has no leaf of its own, so
+        // it is keyed by this `return`'s own id instead, right here.
         if self.is_affine(&ret_ty) {
             self.lower_into_return_sink(fb, value, &ret_ty, &mut finish)
         } else {
@@ -1643,7 +1487,7 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             };
-            self.mark_moved(fb, value);
+            self.emit_checked_cleanup(fb, id)?;
             finish(self, fb, v)
         }
     }
@@ -1682,7 +1526,6 @@ impl<'a> Lowering<'a> {
                     else_block,
                 });
 
-                self.begin_move_join(fb);
                 fb.switch_to(then_block);
                 self.lower_branch_moves(fb, |this, fb| {
                     this.lower_into_return_sink_block(fb, then_branch, hint, &mut *finish)
@@ -1701,7 +1544,6 @@ impl<'a> Lowering<'a> {
                         finish(this, fb, v)
                     }
                 })?;
-                self.end_move_join(fb);
 
                 Ok(LoweredExpr::Diverged)
             }
@@ -1710,7 +1552,13 @@ impl<'a> Lowering<'a> {
                     LoweredExpr::Value(v) => v,
                     LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
                 };
-                self.mark_moved(fb, expr);
+                // This exact leaf is one branch's own return value
+                // (`rfcs/0011`, Blocker 2): `resourceck::flow`'s own
+                // `check_block_ctx_inner` records this leaf's own
+                // checked cleanup under this same id, using that
+                // branch's own state before any join with a sibling
+                // branch runs.
+                self.emit_checked_cleanup(fb, expr.id())?;
                 finish(self, fb, value)
             }
         }
@@ -1729,23 +1577,19 @@ impl<'a> Lowering<'a> {
         hint: &Ty,
         finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
     ) -> LowerResult<LoweredExpr> {
-        let marker = fb.cleanup_actions.len();
         for stmt in &block.statements {
             self.lower_stmt(fb, stmt)?;
             if fb.current_terminated() {
-                fb.cleanup_actions.truncate(marker);
                 return Ok(LoweredExpr::Diverged);
             }
         }
-        let result = match &block.tail {
-            Some(tail) => self.lower_into_return_sink(fb, tail, hint, finish)?,
+        match &block.tail {
+            Some(tail) => self.lower_into_return_sink(fb, tail, hint, finish),
             None => {
                 let v = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                finish(self, fb, v)?
+                finish(self, fb, v)
             }
-        };
-        fb.cleanup_actions.truncate(marker);
-        Ok(result)
+        }
     }
 
     fn lower_while(
@@ -1774,13 +1618,6 @@ impl<'a> Lowering<'a> {
             // reachable, so they are never created at all.
             LoweredExpr::Diverged => return Ok(()),
         };
-        // The condition-false edge into `after` never runs the body at
-        // all, so `after`'s own moved_out baseline is whatever the
-        // condition itself already did -- not whatever the body's own
-        // (entirely separate, possibly break-touched) path leaves
-        // behind. Snapshotted now, before the body can change it.
-        let condition_false_moved_out = fb.moved_out.clone();
-
         let loop_body = fb.new_block();
         let after = fb.new_block();
         fb.terminate(Terminator::CondBranch {
@@ -1793,29 +1630,19 @@ impl<'a> Lowering<'a> {
         fb.loop_stack.push(LoopCtx {
             break_target: after,
             continue_target: header,
-            cleanup_marker: fb.cleanup_actions.len(),
         });
-        fb.loop_break_moved_out.push(Vec::new());
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
-        let break_moved_out = fb
-            .loop_break_moved_out
-            .pop()
-            .expect("pushed immediately above");
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
         }
 
         // `after` is reached either through the condition-false edge or
-        // through some reachable `break`; `resourceck` already proved
-        // every one of those agrees about any resource still live here,
-        // so their union is exactly that single agreed-upon truth (see
-        // `FnBuilder::loop_break_moved_out`'s own doc comment).
-        fb.moved_out = condition_false_moved_out;
-        for state in break_moved_out {
-            fb.moved_out.extend(state);
-        }
-
+        // through some reachable `break`; `resourceck::flow`'s own
+        // `finish_loop` already joined every one of those into a single
+        // agreed-upon state before recording whatever comes lexically
+        // after this loop's own checked cleanup -- nothing further to
+        // reconcile here.
         fb.switch_to(after);
         Ok(())
     }
@@ -1829,29 +1656,18 @@ impl<'a> Lowering<'a> {
         fb.loop_stack.push(LoopCtx {
             break_target: after,
             continue_target: header,
-            cleanup_marker: fb.cleanup_actions.len(),
         });
-        fb.loop_break_moved_out.push(Vec::new());
         self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
-        let break_moved_out = fb
-            .loop_break_moved_out
-            .pop()
-            .expect("pushed immediately above");
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
         }
 
         // A bare `loop` has no condition-false edge at all -- only a
         // reachable `break` can ever reach `after`. If none exist,
-        // `after` is itself unreachable and this empty set is never
-        // observed by anything.
-        let mut moved_out = HashSet::new();
-        for state in break_moved_out {
-            moved_out.extend(state);
-        }
-        fb.moved_out = moved_out;
-
+        // `after` is itself unreachable, and nothing lexically after
+        // this loop is either (`resourceck`'s own `stmt_diverges`
+        // already treats such a loop as divergent).
         fb.switch_to(after);
         Ok(())
     }
@@ -1943,8 +1759,10 @@ impl<'a> Lowering<'a> {
             // unpropagated inner value would let either "succeed" while
             // lying about what it does.
             HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
-            HirExpr::Try { expr: inner, .. } => self.lower_try(fb, inner),
-            HirExpr::Raise { operand, .. } => self.lower_raise(fb, operand),
+            HirExpr::Try {
+                expr: inner, id, ..
+            } => self.lower_try(fb, *id, inner),
+            HirExpr::Raise { operand, id, .. } => self.lower_raise(fb, *id, operand),
             HirExpr::Handle { operand, arms, .. } => {
                 let result_ty = self.expr_ty(expr);
                 self.lower_handle(fb, operand, arms, result_ty)
@@ -1968,8 +1786,10 @@ impl<'a> Lowering<'a> {
             HirExpr::RecordLiteral { record, fields, .. } => {
                 self.lower_record_literal(fb, *record, fields, expr)
             }
-            HirExpr::Return { value, .. } => self.lower_return(fb, value.as_deref()),
-            HirExpr::Break { value, span, .. } => {
+            HirExpr::Return { value, id, .. } => self.lower_return(fb, *id, value.as_deref()),
+            HirExpr::Break {
+                value, id, span, ..
+            } => {
                 // typeck rejects any value-carrying `break` outright
                 // (T0007) regardless of the value's type, before
                 // lowering ever runs in the normal pipeline. A direct
@@ -1988,23 +1808,16 @@ impl<'a> Lowering<'a> {
                     .ok_or_else(|| self.unsupported(*span, "`break` outside a loop"))?;
                 // Destroys exactly this iteration's own live resources
                 // (`rfcs/0011`, Blocker 5) before jumping past the loop
-                // entirely -- an enclosing scope's own cleanup (an
-                // outer loop, or the function itself) is untouched,
-                // since `ctx.cleanup_marker` only covers entries
-                // registered at or after this loop's own body started.
-                self.emit_cleanup_since(fb, ctx.cleanup_marker)?;
-                // Recorded so the loop's own lowering can join this
-                // break's own moved_out against every other reachable
-                // exit once the loop finishes -- see
-                // `FnBuilder::loop_break_moved_out`'s own doc comment.
-                fb.loop_break_moved_out
-                    .last_mut()
-                    .expect("pushed by lower_while/lower_loop alongside loop_stack")
-                    .push(fb.moved_out.clone());
+                // entirely -- `resourceck::flow` already recorded this
+                // exact `break`'s own checked cleanup list, covering
+                // only what this loop's own current iteration owns
+                // (nested scopes included), never an enclosing scope's
+                // (an outer loop, or the function itself).
+                self.emit_checked_cleanup(fb, *id)?;
                 fb.terminate(Terminator::Branch(ctx.break_target));
                 Ok(LoweredExpr::Diverged)
             }
-            HirExpr::Continue { span, .. } => {
+            HirExpr::Continue { id, span, .. } => {
                 let ctx = *fb
                     .loop_stack
                     .last()
@@ -2013,7 +1826,7 @@ impl<'a> Lowering<'a> {
                 // the condition instead of past it -- this iteration's
                 // own resources must still be destroyed exactly once
                 // before the next iteration freshly redeclares them.
-                self.emit_cleanup_since(fb, ctx.cleanup_marker)?;
+                self.emit_checked_cleanup(fb, *id)?;
                 fb.terminate(Terminator::Branch(ctx.continue_target));
                 Ok(LoweredExpr::Diverged)
             }
@@ -2216,30 +2029,14 @@ impl<'a> Lowering<'a> {
         // already proved the target's own previous value was moved or
         // dropped before this reassignment was ever accepted, and that
         // a plain-local RHS (`target = source;`) is itself consumed by
-        // it exactly like any other move -- neither half of that was
-        // ever reflected in this builder's own `moved_out`, so both
-        // needed fixing here, not just one:
-        if op == AssignOp::Assign {
-            // The RHS's own source local, if it names one, must stop
-            // being this scope's responsibility -- its ownership just
-            // transferred into `local`'s own slot, exactly like a
-            // `take` argument's own source already does in `lower_call`/
-            // `lower_invoke`. Without this, `source`'s own still-
-            // scheduled cleanup would later drop the exact same
-            // resource this assignment just also installed into
-            // `local`, a real double-drop, not merely a diagnostic gap.
-            self.mark_moved(fb, value);
-            // `local` itself re-enters this scope's own responsibility:
-            // it was excluded from cleanup by whatever moved or dropped
-            // its *previous* value (which is exactly what let this
-            // reassignment be accepted in the first place), but the
-            // value it holds now is fresh and has not itself been moved
-            // or dropped by anything yet. Leaving it excluded here would
-            // leak every reassigned resource silently -- its own
-            // scope-exit sweep would skip it forever.
-            fb.moved_out.remove(local);
-        }
-
+        // it exactly like any other move. `resourceck::flow`'s own
+        // checked cleanup plan already reflects both halves of that on
+        // its own -- `local`'s own `Drop` entry is only ever included
+        // in a cleanup snapshot taken while `resourceck` still
+        // considers it `Available`/`DropScheduled`, and `source`'s own
+        // is excluded from any snapshot taken after this reassignment,
+        // since `resourceck` already transitioned it to `Moved` -- so
+        // lowering has nothing further of its own to update here.
         let final_value = match op {
             AssignOp::Assign => value_value,
             _ => {
@@ -2317,7 +2114,6 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
-        let takes = self.function_takes.get(item).cloned();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -2329,12 +2125,10 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
             // A `take` parameter transfers ownership of this argument
-            // into the call (`rfcs/0011`): the caller's own binding, if
-            // it named one, is moved and must not also be dropped by
-            // its own former scope.
-            if takes.as_ref().and_then(|t| t.get(i)).copied() == Some(true) {
-                self.mark_moved(fb, arg);
-            }
+            // into the call (`rfcs/0011`): `resourceck` already decided
+            // this, so its own checked cleanup plan already excludes
+            // this argument's own source local from its former scope's
+            // cleanup wherever it would otherwise be dropped again.
         }
         let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
@@ -2425,7 +2219,6 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
-        let takes = self.function_takes.get(item).cloned();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -2439,14 +2232,9 @@ impl<'a> Lowering<'a> {
             // Exactly `lower_call`'s own rule (`rfcs/0011`, Blocker 1):
             // a `take` argument transfers ownership into the call
             // whether that call is an ordinary `Call` or a fallible
-            // `Invoke` -- the caller's own binding is moved here, before
-            // the `Invoke` below even terminates this block, so neither
-            // the success edge nor any failure edge's own cleanup drops
-            // it again out from under the callee, which is now the one
-            // responsible for it.
-            if takes.as_ref().and_then(|t| t.get(i)).copied() == Some(true) {
-                self.mark_moved(fb, arg);
-            }
+            // `Invoke` -- `resourceck` already decided this, and its
+            // own checked cleanup plan already reflects it on every
+            // edge (the success edge, and every failure edge alike).
         }
         let requirements = self.lookup_function_requirements(*item, context)?;
         let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
@@ -2495,7 +2283,12 @@ impl<'a> Lowering<'a> {
     /// function's own `Terminator::Raise` -- `typeck`'s own
     /// `PROPAGATION_NOT_DECLARED` check already proved every one of
     /// those effects is also a member of this function's own `raises`.
-    fn lower_try(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+    fn lower_try(
+        &mut self,
+        fb: &mut FnBuilder,
+        id: ExprId,
+        operand: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
         let Some((ret_ty, ok_slot, ok_target, err_blocks, _)) =
             self.lower_invoke(fb, operand, "postfix `?`", None)?
         else {
@@ -2510,10 +2303,11 @@ impl<'a> Lowering<'a> {
             let loaded = fb.push_value(Ty::Named(variant, name), ValueKind::Load(err_slot));
             // Propagating out via `?` leaves this function's own scope
             // exactly like an explicit `raise`/`return` does
-            // (`rfcs/0011`): each failure dispatch block gets its own
-            // copy of this function's own cleanup sequence, since it is
-            // its own distinct exit path.
-            self.emit_cleanup(fb)?;
+            // (`rfcs/0011`): every failure dispatch block replays this
+            // exact `?`'s own checked cleanup (looked up once by its
+            // own id, since the state at the point of the `?` does not
+            // depend on which raised variant actually propagated).
+            self.emit_checked_cleanup(fb, id)?;
             fb.terminate(Terminator::Raise { value: loaded });
         }
         fb.switch_to(ok_target);
@@ -2526,7 +2320,12 @@ impl<'a> Lowering<'a> {
     /// `return`/`break`: `operand` is evaluated exactly once, then the
     /// current block ends with `Terminator::Raise` instead of falling
     /// through to anything else.
-    fn lower_raise(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+    fn lower_raise(
+        &mut self,
+        fb: &mut FnBuilder,
+        id: ExprId,
+        operand: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
         let value = match self.lower_expr(fb, operand)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -2536,7 +2335,7 @@ impl<'a> Lowering<'a> {
         // own top-level scope owns, and every registered `defer`, must
         // still run before control actually transfers to the caller's
         // own failure edge.
-        self.emit_cleanup(fb)?;
+        self.emit_checked_cleanup(fb, id)?;
         fb.terminate(Terminator::Raise { value });
         Ok(LoweredExpr::Diverged)
     }
@@ -2602,7 +2401,6 @@ impl<'a> Lowering<'a> {
         // the very same arm just reuses the block already recorded here.
         let mut arm_blocks: HashMap<usize, BlockId> = HashMap::new();
 
-        self.begin_move_join(fb);
         for (variant, err_slot, dispatch_block) in err_blocks {
             let Some(layout) = self.variants.get(&variant) else {
                 return Err(self.internal_error("`handle` dispatches an unknown raised variant"));
@@ -2641,14 +2439,6 @@ impl<'a> Lowering<'a> {
                         "`handle`'s failure dispatch resolved to a non-failure arm",
                     ));
                 };
-                // Marks where this specific arm's own pattern bindings
-                // start (Blocker 4) -- a resource-typed one (never
-                // actually reachable for a failure payload today, see
-                // `bind_arm_pattern`'s own doc comment, but handled
-                // uniformly rather than assumed) still needs cleanup
-                // scheduled and released again here, exactly like a
-                // `value` binding local to this one arm's own scope.
-                let pattern_marker = fb.cleanup_actions.len();
                 if let HirFailurePattern::Case { args: payload, .. } = pattern {
                     if payload.len() != payload_tys.len() {
                         return Err(self.internal_error(&format!(
@@ -2671,8 +2461,12 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 let body = &arms[arm_index].body;
+                let body_id = match body {
+                    HirMatchArmBody::Expr(e) => e.id(),
+                    HirMatchArmBody::Block(b) => b.id,
+                };
                 self.lower_branch_moves(fb, |this, fb| {
-                    this.lower_arm_body(fb, body, merge, pattern_marker)
+                    this.lower_arm_body(fb, body, merge, body_id)
                 })?;
                 fb.switch_to(dispatch_block);
             }
@@ -2697,15 +2491,17 @@ impl<'a> Lowering<'a> {
             unreachable!("just matched Success above");
         };
         // Blocker 4: `success file => ...` owns the callee's returned
-        // resource -- scheduled for cleanup here, right before this
-        // marker, so leaving the arm without moving/returning/dropping
-        // `file` still destroys it exactly once instead of leaking it.
-        let pattern_marker = fb.cleanup_actions.len();
+        // resource -- `resourceck` already scheduled it for cleanup, so
+        // leaving the arm without moving/returning/dropping `file`
+        // still destroys it exactly once instead of leaking it.
         self.bind_arm_pattern(fb, pattern, ok_value, &ok_ty)?;
+        let success_body_id = match &success_arm.body {
+            HirMatchArmBody::Expr(e) => e.id(),
+            HirMatchArmBody::Block(b) => b.id,
+        };
         self.lower_branch_moves(fb, |this, fb| {
-            this.lower_arm_body(fb, &success_arm.body, merge, pattern_marker)
+            this.lower_arm_body(fb, &success_arm.body, merge, success_body_id)
         })?;
-        self.end_move_join(fb);
 
         match merge {
             Some((slot, after)) => {
@@ -2740,10 +2536,6 @@ impl<'a> Lowering<'a> {
             HirPattern::Bind { local, .. } => {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(value));
-                let ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
-                if self.is_affine(&ty) {
-                    fb.cleanup_actions.push(CleanupAction::Drop(*local));
-                }
                 Ok(())
             }
             // A `_` pattern names nothing a later expression could ever
@@ -2765,44 +2557,42 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Lowers one `handle` arm's body, storing its value into `merge`'s
-    /// slot and branching to its block -- exactly `lower_decision`'s own
-    /// tail behavior for an ordinary `match` arm. Does nothing further
-    /// when the body diverged on its own (it already terminated its
-    /// block itself).
-    /// `pattern_marker` is `fb.cleanup_actions.len()` from right before
-    /// this specific arm's own pattern was bound (Blocker 4) -- every
-    /// entry from there on is this arm's own responsibility alone,
-    /// exactly like `lower_scoped_block`'s own `marker` is for an
-    /// ordinary block's own locals, and released the same unconditional
-    /// way: a diverging body (an explicit `return`/`raise`/`break`/
-    /// `continue` inside it) already replayed every entry still on the
-    /// list, including these, through its own existing cleanup
-    /// mechanism, so only the *truncate* still needs to happen here for
-    /// that case, never a second emission -- only the arm's own normal
-    /// completion, producing a value and falling through to `merge`,
-    /// needs cleanup actually emitted here too, before that value is
-    /// stored and this block branches away.
+    /// Lowers one `handle`/`match` arm's body, storing its value into
+    /// `merge`'s slot and branching to its block. Does nothing further
+    /// when the body diverged on its own (it already replayed its own
+    /// checked cleanup through whichever exit -- `return`/`raise`/
+    /// `break`/`continue` -- it actually terminated through).
+    /// `resourceck::flow` records this arm's own combined
+    /// pattern-binding-plus-body cleanup under this exact body's own id
+    /// (`body_id` -- `block.id` for a block body, the tail expression's
+    /// own id for a bare one -- see `resourceck::flow::
+    /// check_match_arms`/`check_handle_arms`), so a normal completion
+    /// looks it up by that same id, once, right here.
     fn lower_arm_body(
         &mut self,
         fb: &mut FnBuilder,
         body: &HirMatchArmBody,
         merge: Option<(ValueId, BlockId)>,
-        pattern_marker: usize,
+        body_id: ExprId,
     ) -> LowerResult<()> {
+        // `lower_block_value`, not `lower_scoped_block`: this arm's own
+        // wider cleanup lookup below (keyed by `body_id`) already covers
+        // a block body's own internal locals combined with this arm's
+        // own pattern binding, exactly mirroring `resourceck::flow`'s
+        // own `check_block_ctx_body` bypass -- calling the ordinary,
+        // self-cleaning `lower_scoped_block` here as well would look
+        // the identical `block.id` entry up (and replay it) a second
+        // time.
         let result = match body {
             HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
-            HirMatchArmBody::Block(b) => self.lower_scoped_block(fb, b)?,
+            HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
         };
         if let LoweredExpr::Value(v) = result
             && let Some((slot, after)) = merge
         {
-            self.emit_cleanup_since(fb, pattern_marker)?;
-            fb.cleanup_actions.truncate(pattern_marker);
+            self.emit_checked_cleanup(fb, body_id)?;
             fb.push_store(slot, v);
             fb.terminate(Terminator::Branch(after));
-        } else {
-            fb.cleanup_actions.truncate(pattern_marker);
         }
         Ok(())
     }
@@ -2993,10 +2783,11 @@ impl<'a> Lowering<'a> {
             match self.lower_expr_hinted(fb, &f.value, &hint)? {
                 LoweredExpr::Value(v) => {
                     by_index[f.field_index] = Some(v);
-                    // Storing a resource-typed value as a field moves it
-                    // in (`rfcs/0011`): the source binding, if any, is no
-                    // longer owned by its old scope.
-                    self.mark_moved(fb, &f.value);
+                    // A resource-typed field is rejected outright at its
+                    // own containing aggregate's declaration
+                    // (`RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`, T0064),
+                    // so no well-typed program ever reaches this point
+                    // with an affine `f.value` at all.
                 }
                 // A diverging initializer means the whole construction
                 // never completes; no field written after it in source
@@ -3091,7 +2882,6 @@ impl<'a> Lowering<'a> {
                 else_block,
             });
 
-            self.begin_move_join(fb);
             fb.switch_to(then_block);
             let then_result =
                 self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?;
@@ -3107,7 +2897,6 @@ impl<'a> Lowering<'a> {
                     "internal invariant: an else-less `if` is always unit-typed, not never"
                 ),
             })?;
-            self.end_move_join(fb);
             debug_assert!(
                 matches!(then_result, LoweredExpr::Diverged)
                     && matches!(else_result, LoweredExpr::Diverged),
@@ -3133,7 +2922,6 @@ impl<'a> Lowering<'a> {
             else_block,
         });
 
-        self.begin_move_join(fb);
         fb.switch_to(then_block);
         if let LoweredExpr::Value(then_value) =
             self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?
@@ -3184,7 +2972,6 @@ impl<'a> Lowering<'a> {
                 })?;
             }
         }
-        self.end_move_join(fb);
 
         fb.switch_to(after_block);
         Ok(LoweredExpr::Value(
@@ -3239,9 +3026,7 @@ impl<'a> Lowering<'a> {
             // Every arm diverges (typeck already proved this); no
             // result slot or merge block is ever created -- each arm's
             // own terminator is already a complete CFG on its own.
-            self.begin_move_join(fb);
             self.lower_decision(fb, rows, occurrences, arms, None, 0)?;
-            self.end_move_join(fb);
             return Ok(LoweredExpr::Diverged);
         }
 
@@ -3250,7 +3035,6 @@ impl<'a> Lowering<'a> {
         // discipline `lower_if` already uses for its own result slot.
         let result_slot = fb.alloc_slot(result_ty.clone());
         let after_block = fb.new_block();
-        self.begin_move_join(fb);
         self.lower_decision(
             fb,
             rows,
@@ -3259,7 +3043,6 @@ impl<'a> Lowering<'a> {
             Some((result_slot, after_block)),
             0,
         )?;
-        self.end_move_join(fb);
 
         fb.switch_to(after_block);
         Ok(LoweredExpr::Value(
@@ -3296,21 +3079,17 @@ impl<'a> Lowering<'a> {
                     "a match's decision tree ran out of candidate arms with no winner",
                 ));
             };
-            // An ordinary match arm's own pattern bindings can never be
-            // resource-typed (a variant payload is never affine --
-            // `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` already forbids
-            // it), so this marker is always a no-op in practice; taken
-            // anyway for the same reason `lower_arm_body`'s `handle`
-            // callers do -- so nothing here depends on that invariant
-            // holding forever to stay sound.
-            let pattern_marker = fb.cleanup_actions.len();
             for (local, value) in &winner.bindings {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(*value));
             }
             let arm = &arms[winner.arm_index];
+            let body_id = match &arm.body {
+                HirMatchArmBody::Expr(e) => e.id(),
+                HirMatchArmBody::Block(b) => b.id,
+            };
             self.lower_branch_moves(fb, |this, fb| {
-                this.lower_arm_body(fb, &arm.body, merge, pattern_marker)
+                this.lower_arm_body(fb, &arm.body, merge, body_id)
             })?;
             return Ok(());
         }
@@ -3958,6 +3737,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         lower_module(
             &hir,
             &result.local_types,
@@ -3966,6 +3756,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )
@@ -3995,6 +3786,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         lower_module(
             &hir,
             &result.local_types,
@@ -4003,6 +3805,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )
@@ -4031,6 +3834,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         let module = lower_module(
             &hir,
             &result.local_types,
@@ -4039,6 +3853,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
             &interner,
             id,
         )
@@ -5934,6 +5749,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -5987,6 +5803,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         );
@@ -6170,6 +5987,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6216,6 +6034,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6278,6 +6097,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6363,6 +6183,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -6453,6 +6274,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -6521,6 +6343,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &HashMap::new(),
@@ -6561,6 +6384,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6603,6 +6427,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6645,6 +6470,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6684,6 +6510,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6725,6 +6552,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6777,6 +6605,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &BTreeMap::new(),
                 &interner,
                 source,
             )
@@ -6832,7 +6661,7 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
-            function_takes: HashMap::new(),
+            cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -6869,7 +6698,7 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
-            function_takes: HashMap::new(),
+            cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -7922,6 +7751,7 @@ mod tests {
             &call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8077,6 +7907,7 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         );

@@ -47,27 +47,34 @@
 //! (`U0011`), only a direct call or literal construction is.
 
 mod flow;
+mod plan;
 mod state;
 
+pub use plan::{CleanupAction, ResourceCheckResult};
 pub use state::ResourceState;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::diagnostics::Diagnostic;
-use crate::hir::{HirModule, ItemId, LocalId};
+use crate::hir::{ExprId, HirModule, ItemId, LocalId};
 use crate::symbol::Interner;
 use crate::types::Ty;
 
 /// Checks every function and extend-method body in `hir` for affine
-/// ownership violations (`rfcs/0011`). `local_types`/`expr_types` are
-/// `typeck`'s own already-computed results -- this stage never re-infers
-/// a type, only reads one back, exactly like `nir::lower` already does.
+/// ownership violations (`rfcs/0011`), returning the authoritative,
+/// structured [`ResourceCheckResult`] -- not merely a `Vec<Diagnostic>`
+/// -- so `nir::lower` can consume its own checked `cleanup_edges` as the
+/// single source of truth for resource cleanup, rather than
+/// independently re-inferring which locals are still live at a given
+/// exit by re-walking the HIR a second time. `local_types`/`expr_types`
+/// are `typeck`'s own already-computed results -- this stage never
+/// re-infers a type, only reads one back, exactly like `nir::lower`
+/// already does.
 pub fn check_module(
     hir: &HirModule,
     local_types: &HashMap<LocalId, Ty>,
-    expr_types: &HashMap<crate::hir::ExprId, Ty>,
+    expr_types: &HashMap<ExprId, Ty>,
     interner: &Interner,
-) -> Vec<Diagnostic> {
+) -> ResourceCheckResult {
     let affine_items: HashSet<ItemId> = hir
         .records
         .iter()
@@ -85,6 +92,7 @@ pub fn check_module(
     }
 
     let mut diagnostics = Vec::new();
+    let mut cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>> = BTreeMap::new();
     for f in &hir.functions {
         let mut checker = flow::FlowChecker::new(
             local_types,
@@ -96,6 +104,7 @@ pub fn check_module(
             &mut diagnostics,
         );
         checker.check_function(f);
+        cleanup_edges.extend(checker.into_cleanup_edges());
     }
     for e in &hir.extends {
         for m in &e.methods {
@@ -109,14 +118,19 @@ pub fn check_module(
                 &mut diagnostics,
             );
             checker.check_function(m);
+            cleanup_edges.extend(checker.into_cleanup_edges());
         }
     }
-    diagnostics
+    ResourceCheckResult {
+        diagnostics,
+        cleanup_edges,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::Diagnostic;
     use crate::hir::lower_module;
     use crate::lexer::tokenize;
     use crate::parser::Parser;
@@ -154,6 +168,7 @@ mod tests {
             &typeck_result.expr_types,
             &interner,
         )
+        .diagnostics
     }
 
     fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&str> {

@@ -12,17 +12,18 @@
 //! way) -- there is no separate depth limit to enforce here that
 //! parsing didn't already enforce on the input that produced this tree.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
-    HirBinding, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
+    ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirPattern, HirStmt, ItemId, LocalId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::Ty;
 
+use super::plan::CleanupAction;
 use super::state::ResourceState;
 
 mod codes {
@@ -143,6 +144,14 @@ enum ConsumeKind {
 struct LoopFrame {
     break_states: Vec<HashMap<LocalId, ResourceState>>,
     continue_states: Vec<HashMap<LocalId, ResourceState>>,
+    /// `pending_cleanup.len()` at the point this loop's own body began
+    /// being checked -- every entry registered at or after this index
+    /// is this exact iteration's own responsibility (the body's own
+    /// top-level bindings/defers, or any nested scope's), so a
+    /// `break`/`continue` reached inside it only ever needs to record
+    /// `pending_cleanup[cleanup_marker..]`, mirroring `nir::lower`'s
+    /// own `LoopCtx::cleanup_marker`.
+    cleanup_marker: usize,
 }
 
 pub struct FlowChecker<'a> {
@@ -198,7 +207,28 @@ pub struct FlowChecker<'a> {
     /// never a member (its own condition-false edge always reaches
     /// after it, regardless of `break`), and a nested loop's own body id
     /// never collides with an enclosing one's.
-    diverging_loops: HashSet<crate::hir::ExprId>,
+    diverging_loops: HashSet<ExprId>,
+    /// Every resource local's own implicit destruction, and every
+    /// `defer`'s own registration, in the exact order this walk
+    /// encountered them -- the authoritative source `nir::lower` builds
+    /// its own cleanup instructions from (`rfcs/0011`; see
+    /// `resourceck::plan::CleanupAction`). A single flat, function-wide
+    /// list mirroring `nir::lower`'s own (soon to be retired)
+    /// `cleanup_actions`: a nested scope's own entries are appended onto
+    /// the same list as its enclosing scopes', and truncated back off
+    /// again once that exact scope's own snapshot has been recorded
+    /// (see [`Self::record_exit`]), so an enclosing scope's later
+    /// snapshot never includes (and never re-records) them.
+    pending_cleanup: Vec<CleanupAction>,
+    /// Every reachable exit's own checked, ordered cleanup list, keyed
+    /// by the stable id of whatever HIR node *is* that exit (an
+    /// explicit `return`/`raise`/`break`/`continue` expression's own
+    /// id, a plain block's own id for its normal fallthrough, or a
+    /// `match`/`handle` arm's own body id for that arm's own normal
+    /// completion). This is `ResourceCheckResult::cleanup_edges` in
+    /// progress -- exported once this function's own check finishes
+    /// (see [`Self::into_cleanup_edges`]).
+    cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -224,7 +254,17 @@ impl<'a> FlowChecker<'a> {
             loop_stack: Vec::new(),
             defer_scopes: Vec::new(),
             diverging_loops: HashSet::new(),
+            pending_cleanup: Vec::new(),
+            cleanup_edges: BTreeMap::new(),
         }
+    }
+
+    /// Consumes this checker, handing its own checked cleanup plan to
+    /// [`super::check_module`] for merging into the module-wide
+    /// [`super::ResourceCheckResult`]. Called once this checker's own
+    /// function/extend-method has been fully checked.
+    pub fn into_cleanup_edges(self) -> BTreeMap<ExprId, Vec<CleanupAction>> {
+        self.cleanup_edges
     }
 
     pub fn check_function(&mut self, f: &HirFunction) {
@@ -234,11 +274,55 @@ impl<'a> FlowChecker<'a> {
             }
             if param.take {
                 self.states.insert(param.local, ResourceState::Available);
+                self.pending_cleanup.push(CleanupAction::Drop(param.local));
             } else {
                 self.observing.insert(param.local);
             }
         }
-        self.check_block_ctx(&f.body, ConsumeKind::Return);
+        // The function's own top-level scope is *always* a marker-0
+        // exit (`rfcs/0011`): every `take` parameter's own implicit
+        // destruction above must be visible to this exact snapshot,
+        // exactly like `nir::lower`'s own `emit_cleanup` (as opposed to
+        // `emit_cleanup_since`) always replays the *whole* flat list
+        // from the very start, not just whatever this one block's own
+        // marker would otherwise cover.
+        self.check_block_ctx_body(&f.body, ConsumeKind::Return);
+        if !self.diverges(f.body.id) {
+            self.record_exit(f.body.id, 0);
+        }
+    }
+
+    /// Filters `self.pending_cleanup[marker..]` down to what is still
+    /// actually owed at this exact point -- a `Drop` for a local this
+    /// exit's own `self.states` proves is still `Available`/
+    /// `DropScheduled` (still needs destroying), never one already
+    /// `Moved`/`Dropped`/`Error` (someone else's responsibility, or
+    /// already diagnosed) -- reversed, since cleanup replays last
+    /// registered first. A `Defer` entry is always kept: its own
+    /// presence here already means its scope has not released it yet.
+    fn snapshot_cleanup(&self, marker: usize) -> Vec<CleanupAction> {
+        self.pending_cleanup[marker..]
+            .iter()
+            .rev()
+            .filter(|action| match action {
+                CleanupAction::Drop(local) => matches!(
+                    self.states.get(local),
+                    Some(ResourceState::Available | ResourceState::DropScheduled)
+                ),
+                CleanupAction::Defer(_) => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Records `id`'s own checked cleanup list (`rfcs/0011`) -- an
+    /// empty list is recorded just the same as a non-empty one, so a
+    /// reachable exit with nothing to clean up is still distinguishable
+    /// from one that is simply unreachable (absent from the map
+    /// entirely).
+    fn record_exit(&mut self, id: ExprId, marker: usize) {
+        let actions = self.snapshot_cleanup(marker);
+        self.cleanup_edges.insert(id, actions);
     }
 
     fn is_resource_local(&self, local: LocalId) -> bool {
@@ -284,6 +368,31 @@ impl<'a> FlowChecker<'a> {
     /// [`stmt_diverges`]'s own truncation -- exactly like the deferred
     /// call itself would actually run at real scope exit.
     fn check_block_ctx(&mut self, block: &HirBlock, kind: ConsumeKind) {
+        let marker = self.pending_cleanup.len();
+        self.check_block_ctx_body(block, kind);
+        // Recorded only when this block's own normal end is genuinely
+        // reachable (Blocker 11): a block that itself diverges (every
+        // path through it ends in `return`/`raise`/`break`/`continue`)
+        // has no real fallthrough for anything to replay here at all --
+        // whatever exit it actually took already recorded its own
+        // cleanup list separately.
+        if !self.diverges(block.id) {
+            self.record_exit(block.id, marker);
+        }
+        self.pending_cleanup.truncate(marker);
+    }
+
+    /// Like [`Self::check_block_ctx`], but manages neither
+    /// `pending_cleanup`'s own marker nor its own recorded exit --
+    /// only this block's own defer-scope release. Used by a caller that
+    /// already owns a wider marker of its own spanning more than just
+    /// this one block (a `match`/`handle` arm's own pattern binding
+    /// plus its block body, recorded together as that arm's own single
+    /// combined exit -- see [`Self::check_match_arms`]/[`Self::
+    /// check_handle_arms`]), and by [`Self::check_function`] (the
+    /// function's own top-level scope is always a marker-0 exit, never
+    /// a fresh one of its own).
+    fn check_block_ctx_body(&mut self, block: &HirBlock, kind: ConsumeKind) {
         self.defer_scopes.push(HashSet::new());
         self.check_block_ctx_inner(block, kind);
         let scope = self.defer_scopes.pop().expect("pushed immediately above");
@@ -315,6 +424,20 @@ impl<'a> FlowChecker<'a> {
         }
         if let Some(tail) = &block.tail {
             self.check_expr_ctx(tail, kind);
+            // A compound `return`'s own per-branch cleanup (Blocker 2):
+            // `kind == Return` here means this exact tail's own value
+            // *is* the enclosing `return`'s operand, one leaf of
+            // (possibly) a nested `if`, each of whose branches disagree
+            // about which underlying resource is even being returned --
+            // `self.states` right here, before any join with a sibling
+            // branch runs, is this one leaf's own unambiguous truth.
+            // `nir::lower`'s own `lower_into_return_sink` looks this up
+            // by this exact tail's own id at the matching leaf, rather
+            // than by the outer `return`'s id (which only a *direct*,
+            // non-compound return value would ever be looked up by).
+            if kind == ConsumeKind::Return && !self.diverges(tail.id()) {
+                self.record_exit(tail.id(), 0);
+            }
         }
     }
 
@@ -356,6 +479,7 @@ impl<'a> FlowChecker<'a> {
         self.check_expr_ctx(&b.value, ConsumeKind::Other);
         if self.is_resource_local(b.local) {
             self.states.insert(b.local, ResourceState::Available);
+            self.pending_cleanup.push(CleanupAction::Drop(b.local));
         }
     }
 
@@ -372,6 +496,12 @@ impl<'a> FlowChecker<'a> {
     /// call that still needs to observe it.
     fn check_defer(&mut self, expr: &HirExpr, _span: Span) {
         self.check_expr(expr);
+        // Registered by this exact call's own callee-expression id
+        // (`rfcs/0011`): `nir::lower` looks its own already-lowered
+        // callee/arguments back up by this same id when it later
+        // replays this cleanup action, rather than this stage trying
+        // to describe a NIR-level call itself.
+        self.pending_cleanup.push(CleanupAction::Defer(expr.id()));
         let mut observed = HashSet::new();
         collect_observed_locals(expr, &mut observed);
         for local in observed {
@@ -472,7 +602,10 @@ impl<'a> FlowChecker<'a> {
     /// invariant this shares with [`Self::check_while_loop`].
     fn check_loop_body(&mut self, body: &HirBlock) {
         let entry = self.states.clone();
-        self.loop_stack.push(LoopFrame::default());
+        self.loop_stack.push(LoopFrame {
+            cleanup_marker: self.pending_cleanup.len(),
+            ..LoopFrame::default()
+        });
         self.check_block(body);
         let fallthrough_reachable = !self.diverges(body.id);
         let fallthrough_state = std::mem::replace(&mut self.states, entry.clone());
@@ -510,7 +643,10 @@ impl<'a> FlowChecker<'a> {
     /// `true` or `false`), joined with every reachable `break`.
     fn check_while_loop(&mut self, condition: &HirExpr, body: &HirBlock) {
         let entry = self.states.clone();
-        self.loop_stack.push(LoopFrame::default());
+        self.loop_stack.push(LoopFrame {
+            cleanup_marker: self.pending_cleanup.len(),
+            ..LoopFrame::default()
+        });
         self.check_expr(condition);
         let after_condition = self.states.clone();
         self.check_block(body);
@@ -682,8 +818,11 @@ impl<'a> FlowChecker<'a> {
             | HirExpr::CaseRef { .. }
             | HirExpr::ProtocolMethodRef { .. }
             | HirExpr::Error { .. } => {}
-            HirExpr::Continue { .. } => {
+            HirExpr::Continue { id, .. } => {
                 let state = self.states.clone();
+                if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
+                    self.record_exit(*id, marker);
+                }
                 if let Some(frame) = self.loop_stack.last_mut() {
                     frame.continue_states.push(state);
                 }
@@ -748,7 +887,17 @@ impl<'a> FlowChecker<'a> {
                 self.reject_leaked_temporary(base);
             }
             HirExpr::Cast { expr, .. } => self.check_expr(expr),
-            HirExpr::Try { expr, .. } => self.check_expr(expr),
+            HirExpr::Try { expr, id, .. } => {
+                self.check_expr(expr);
+                // Postfix `?` unwinds this whole function on its own
+                // implicit failure edge, exactly like an explicit
+                // `raise` (`rfcs/0010`) -- recorded here, at marker 0,
+                // so `nir::lower`'s own `lower_try` can look this exact
+                // propagation's own checked cleanup up by this same
+                // `Try` expression's id, the same way `lower_raise`
+                // looks an explicit `raise` up by its own.
+                self.record_exit(*id, 0);
+            }
             HirExpr::If {
                 condition,
                 then_branch,
@@ -773,14 +922,22 @@ impl<'a> FlowChecker<'a> {
                 self.check_match_arms(*id, *span, arms, kind);
             }
             HirExpr::Block(block) => self.check_block_ctx(block, kind),
-            HirExpr::Return { value, .. } => {
+            HirExpr::Return { value, id, .. } => {
                 if let Some(value) = value {
                     self.check_expr_ctx(value, ConsumeKind::Return);
                 }
+                // A `return` always unwinds the *whole* function, from
+                // the very start (`rfcs/0011`) -- marker 0, mirroring
+                // `nir::lower`'s own `emit_cleanup` (as opposed to
+                // `emit_cleanup_since`).
+                self.record_exit(*id, 0);
             }
-            HirExpr::Break { value, .. } => {
+            HirExpr::Break { value, id, .. } => {
                 if let Some(value) = value {
                     self.check_expr_ctx(value, ConsumeKind::Other);
+                }
+                if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
+                    self.record_exit(*id, marker);
                 }
                 let state = self.states.clone();
                 if let Some(frame) = self.loop_stack.last_mut() {
@@ -792,8 +949,9 @@ impl<'a> FlowChecker<'a> {
                     self.check_expr_ctx(&field.value, ConsumeKind::Other);
                 }
             }
-            HirExpr::Raise { operand, .. } => {
+            HirExpr::Raise { operand, id, .. } => {
                 self.check_expr_ctx(operand, ConsumeKind::Other);
+                self.record_exit(*id, 0);
             }
             HirExpr::Handle {
                 operand,
@@ -1103,17 +1261,35 @@ impl<'a> FlowChecker<'a> {
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
             self.states = entry.clone();
+            // One marker spans the pattern's own binding(s) *and* the
+            // body (Blocker 4): recorded together, under the body's own
+            // id, as this arm's one combined normal-completion exit --
+            // reverse replay drains the body's own nested scope first
+            // (already truncated away by its own `check_block_ctx`, if
+            // it is a block) and the pattern's own binding(s) after,
+            // exactly matching declaration order reversed.
+            let marker = self.pending_cleanup.len();
             self.check_pattern(&arm.pattern);
-            let diverges = match &arm.body {
+            let (body_id, diverges) = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
                     self.check_expr_ctx(e, kind);
-                    self.diverges(e.id())
+                    (e.id(), self.diverges(e.id()))
                 }
                 HirMatchArmBody::Block(block) => {
-                    self.check_block_ctx(block, kind);
-                    self.diverges(block.id)
+                    // `check_block_ctx_body`, not `check_block_ctx`:
+                    // this block's own scope is not recorded/truncated
+                    // separately under its own id -- this arm's own
+                    // wider marker (opened above, before the pattern)
+                    // already spans it, so it is recorded once, below,
+                    // combined with the pattern's own binding(s).
+                    self.check_block_ctx_body(block, kind);
+                    (block.id, self.diverges(block.id))
                 }
             };
+            if !diverges {
+                self.record_exit(body_id, marker);
+            }
+            self.pending_cleanup.truncate(marker);
             let mut locals = Vec::new();
             Self::pattern_locals(&arm.pattern, &mut locals);
             for local in locals {
@@ -1140,6 +1316,11 @@ impl<'a> FlowChecker<'a> {
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
             self.states = entry.clone();
+            // See `check_match_arms`'s own equivalent comment: one
+            // marker spans every pattern this arm binds *and* its own
+            // body, recorded together as this arm's one combined
+            // normal-completion exit.
+            let marker = self.pending_cleanup.len();
             let mut locals = Vec::new();
             if let HirHandleArmKind::Success(pattern) = &arm.kind {
                 self.check_pattern(pattern);
@@ -1152,16 +1333,20 @@ impl<'a> FlowChecker<'a> {
                     Self::pattern_locals(pattern, &mut locals);
                 }
             }
-            let diverges = match &arm.body {
+            let (body_id, diverges) = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
                     self.check_expr_ctx(e, kind);
-                    self.diverges(e.id())
+                    (e.id(), self.diverges(e.id()))
                 }
                 HirMatchArmBody::Block(block) => {
-                    self.check_block_ctx(block, kind);
-                    self.diverges(block.id)
+                    self.check_block_ctx_body(block, kind);
+                    (block.id, self.diverges(block.id))
                 }
             };
+            if !diverges {
+                self.record_exit(body_id, marker);
+            }
+            self.pending_cleanup.truncate(marker);
             for local in locals {
                 self.states.remove(&local);
             }
@@ -1201,6 +1386,7 @@ impl<'a> FlowChecker<'a> {
             HirPattern::Bind { local, .. } => {
                 if self.is_resource_local(*local) {
                     self.states.insert(*local, ResourceState::Available);
+                    self.pending_cleanup.push(CleanupAction::Drop(*local));
                 }
             }
             HirPattern::Variant { args, .. } => {

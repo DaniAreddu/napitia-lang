@@ -3951,6 +3951,119 @@ fn verify_drop_state(
     }
 }
 
+/// Whether a value/slot currently grants owning or merely observing
+/// access to its own underlying resource (`rfcs/0011`) -- tracked
+/// flow-sensitively, per value/slot, entirely independently of
+/// `resourceck`: an ordinary non-`take` parameter, or anything ever
+/// loaded from a `store.observe`'d slot, is `Observed` and must never
+/// be silently treated as an owner. Module-level (not nested inside
+/// `verify_resource_ownership`) specifically so `merge_location`/
+/// `merge_provenance`, below, are directly unit-testable on their own,
+/// independently of the rest of that function's own closures.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    Owned,
+    Observed,
+}
+
+/// A value/slot's own current provenance, once definitely initialized:
+/// every resource identity it might currently denote (more than one
+/// only just past a join where reachable predecessors disagree), and
+/// whether *every* predecessor agrees it is currently `Owned` --
+/// downgraded to `Observed` the moment even one disagrees, since an
+/// `Observed` role must never be silently widened into an owner.
+type Provenance = (BTreeSet<ValueId>, Role);
+
+/// A value/slot's own current definite-initialization state
+/// (`rfcs/0011`) -- deliberately has *no* variant that silently grants
+/// ownership: a location this pass never otherwise recorded anything
+/// for is `Uninitialized`, never a lenient fresh `Owned` guess. `Alloc`
+/// starts a resource-typed slot here; every other resource-producing
+/// value goes straight to `Initialized` at its own definition, since it
+/// is never itself a slot with its own separate write-then-read
+/// lifecycle.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum LocationState {
+    /// Never written on this exact path -- reading it is always
+    /// unsound, regardless of what some *other* path might have done,
+    /// since this is the path actually taken.
+    Uninitialized,
+    /// Written, with a definite resolved provenance, on *every*
+    /// reachable path reaching this point.
+    Initialized(Provenance),
+    /// Written on *some* but not *every* reachable path reaching this
+    /// point -- reading it is still unsound: the specific path actually
+    /// taken at runtime might be one of the ones that never wrote it.
+    /// (A role/origin disagreement between two paths that *both* wrote
+    /// it is not this state at all -- it stays `Initialized`, with
+    /// `Provenance`'s own union-origins/conservative-role merge already
+    /// representing it soundly, the same way `RESOURCE_LEAKED_ON_EXIT`'s
+    /// own reachable-union dataflow already tolerates disagreement
+    /// without needing a distinct "conflict" state of its own.)
+    MaybeUninitialized,
+}
+
+/// Merges two predecessors' own `LocationState`s for the *same* value/
+/// slot at a CFG join (`rfcs/0011`). Symmetric, associative, and
+/// idempotent by construction (a plain match over an unordered pair of
+/// cases, with `Initialized`'s own payload merge itself built from
+/// unordered set union and a commutative role reduction) -- so the
+/// three-argument fold `merge_provenance` performs never depends on
+/// which predecessor is visited first, directly or transitively.
+fn merge_location(a: LocationState, b: LocationState) -> LocationState {
+    match (a, b) {
+        (LocationState::Uninitialized, LocationState::Uninitialized) => {
+            LocationState::Uninitialized
+        }
+        (LocationState::MaybeUninitialized, _) | (_, LocationState::MaybeUninitialized) => {
+            LocationState::MaybeUninitialized
+        }
+        (LocationState::Initialized(_), LocationState::Uninitialized)
+        | (LocationState::Uninitialized, LocationState::Initialized(_)) => {
+            LocationState::MaybeUninitialized
+        }
+        (
+            LocationState::Initialized((a_ids, a_role)),
+            LocationState::Initialized((b_ids, b_role)),
+        ) => {
+            let ids = a_ids.union(&b_ids).copied().collect();
+            let role = if a_role == Role::Owned && b_role == Role::Owned {
+                Role::Owned
+            } else {
+                Role::Observed
+            };
+            LocationState::Initialized((ids, role))
+        }
+    }
+}
+
+/// Merges two predecessors' own location-state maps at a join,
+/// reachable predecessors only (the caller already filters unreachable
+/// ones out before calling this) -- symmetric over the *union* of both
+/// maps' own keys, never iterating only one side's: a key present in
+/// only one predecessor is treated as `Uninitialized` on the other (a
+/// location never touched at all on a path is exactly as uninitialized
+/// there as one explicitly never stored into), so it still correctly
+/// downgrades to `MaybeUninitialized` rather than being copied through
+/// unmerged as if that side had no opinion at all. The key set is
+/// collected into a `BTreeSet` -- sorted, not raw `HashMap` iteration
+/// order -- so the result depends only on the two states actually being
+/// merged, never on either map's own hashing, predecessor order, or
+/// block-vector order.
+fn merge_provenance(
+    a: &HashMap<ValueId, LocationState>,
+    b: &HashMap<ValueId, LocationState>,
+) -> HashMap<ValueId, LocationState> {
+    let keys: BTreeSet<ValueId> = a.keys().chain(b.keys()).copied().collect();
+    keys.into_iter()
+        .map(|key| {
+            let left = a.get(&key).cloned().unwrap_or(LocationState::Uninitialized);
+            let right = b.get(&key).cloned().unwrap_or(LocationState::Uninitialized);
+            (key, merge_location(left, right))
+        })
+        .collect()
+}
+
 /// Independently reconstructs two `rfcs/0011` invariants over every
 /// resource-typed value in `function`, in one combined forward dataflow
 /// walk (see `State`, below): that it is used at most once after its
@@ -4069,56 +4182,9 @@ fn verify_resource_ownership(
         }
     };
 
-    // Whether a value/slot currently grants owning or merely observing
-    // access to its own underlying resource (`rfcs/0011`) -- tracked
-    // flow-sensitively, per value/slot, entirely independently of
-    // `resourceck`: an ordinary non-`take` parameter, or anything ever
-    // loaded from a `store.observe`'d slot, is `Observed` and must
-    // never be silently treated as an owner.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Role {
-        Owned,
-        Observed,
-    }
-
-    /// A value/slot's own current provenance, once definitely
-    /// initialized: every resource identity it might currently denote
-    /// (more than one only just past a join where reachable
-    /// predecessors disagree), and whether *every* predecessor agrees
-    /// it is currently `Owned` -- downgraded to `Observed` the moment
-    /// even one disagrees, since an `Observed` role must never be
-    /// silently widened into an owner.
-    type Provenance = (BTreeSet<ValueId>, Role);
-
-    /// A value/slot's own current definite-initialization state
-    /// (`rfcs/0011`) -- deliberately has *no* variant that silently
-    /// grants ownership: a location this pass never otherwise recorded
-    /// anything for is `Uninitialized`, never a lenient fresh `Owned`
-    /// guess. `Alloc` starts a resource-typed slot here; every other
-    /// resource-producing value goes straight to `Initialized` at its
-    /// own definition, since it is never itself a slot with its own
-    /// separate write-then-read lifecycle.
-    #[derive(Clone, PartialEq, Eq)]
-    enum LocationState {
-        /// Never written on this exact path -- reading it is always
-        /// unsound, regardless of what some *other* path might have
-        /// done, since this is the path actually taken.
-        Uninitialized,
-        /// Written, with a definite resolved provenance, on *every*
-        /// reachable path reaching this point.
-        Initialized(Provenance),
-        /// Written on *some* but not *every* reachable path reaching
-        /// this point -- reading it is still unsound: the specific path
-        /// actually taken at runtime might be one of the ones that
-        /// never wrote it. (A role/origin disagreement between two
-        /// paths that *both* wrote it is not this state at all -- it
-        /// stays `Initialized`, with `Provenance`'s own union-origins/
-        /// conservative-role merge already representing it soundly, the
-        /// same way `RESOURCE_LEAKED_ON_EXIT`'s own reachable-union
-        /// dataflow already tolerates disagreement without needing a
-        /// distinct "conflict" state of its own.)
-        MaybeUninitialized,
-    }
+    // `Role`, `Provenance`, and `LocationState` are module-level (see
+    // above `verify_resource_ownership`'s own doc comment) -- this
+    // function only ever consumes them, never redefines them.
 
     // Resolves `raw`'s own current state, defaulting a location this
     // pass never otherwise recorded anything for to `Uninitialized` --
@@ -4376,63 +4442,8 @@ fn verify_resource_ownership(
         }
     }
 
-    // Merges two predecessors' own location-state maps at a join,
-    // reachable predecessors only (the caller already filters
-    // unreachable ones out before calling this): a key present in only
-    // one predecessor is treated as `Uninitialized` on the other (a
-    // location never touched at all on a path is exactly as
-    // uninitialized there as one explicitly never stored into), so it
-    // still correctly downgrades to `MaybeUninitialized` rather than
-    // being copied through as if both sides agreed. A key present as
-    // `Initialized` on both unions their possible identities (either
-    // could be the one actually reached) and keeps `Owned` only if
-    // *both* predecessors already agree it is -- downgraded to
-    // `Observed` the moment even one disagrees, matching
-    // `RESOURCE_LEAKED_ON_EXIT`'s own "union, not intersection" rule for
-    // `facts`/`live` below. This one combined lattice merge is what
-    // `RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`'s own definite-
-    // initialization analysis and `RESOURCE_ORIGIN_CONFLICT`'s own
-    // identity/role tracking both run on, together.
-    fn merge_location(a: LocationState, b: LocationState) -> LocationState {
-        match (a, b) {
-            (LocationState::Uninitialized, LocationState::Uninitialized) => {
-                LocationState::Uninitialized
-            }
-            (LocationState::MaybeUninitialized, _) | (_, LocationState::MaybeUninitialized) => {
-                LocationState::MaybeUninitialized
-            }
-            (LocationState::Initialized(_), LocationState::Uninitialized)
-            | (LocationState::Uninitialized, LocationState::Initialized(_)) => {
-                LocationState::MaybeUninitialized
-            }
-            (
-                LocationState::Initialized((a_ids, a_role)),
-                LocationState::Initialized((b_ids, b_role)),
-            ) => {
-                let ids = a_ids.union(&b_ids).copied().collect();
-                let role = if a_role == Role::Owned && b_role == Role::Owned {
-                    Role::Owned
-                } else {
-                    Role::Observed
-                };
-                LocationState::Initialized((ids, role))
-            }
-        }
-    }
-
-    fn merge_provenance(
-        mut a: HashMap<ValueId, LocationState>,
-        b: &HashMap<ValueId, LocationState>,
-    ) -> HashMap<ValueId, LocationState> {
-        for (k, v) in b {
-            a.entry(*k)
-                .and_modify(|existing| {
-                    *existing = merge_location(existing.clone(), v.clone());
-                })
-                .or_insert_with(|| merge_location(LocationState::Uninitialized, v.clone()));
-        }
-        a
-    }
+    // `merge_location`/`merge_provenance` are module-level too (see
+    // above `verify_resource_ownership`'s own doc comment).
 
     // `State` pairs `facts` (`RESOURCE_USE_AFTER_CONSUME`'s own already-
     // consumed set), `live` (`RESOURCE_LEAKED_ON_EXIT`'s own currently-
@@ -4809,10 +4820,15 @@ fn verify_resource_ownership(
         entry: BlockId,
         entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, LocationState>),
         incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
-        reachable: &HashSet<BlockId>,
+        // `(reachable, computed)`: bundled into one tuple (matching
+        // `entry_seed`, above) purely to stay under clippy's
+        // `too_many_arguments` limit -- see each set's own doc comment
+        // below for what it actually means.
+        reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
         out: &HashMap<BlockId, State>,
         is_resource: &impl Fn(ValueId) -> bool,
     ) -> State {
+        let (reachable, computed) = reachable_and_computed;
         if block_id == entry {
             // Every `take`-flagged resource parameter is already live the
             // moment this function begins -- an entry block that itself
@@ -4832,7 +4848,26 @@ fn verify_resource_ownership(
         let Some(edges) = incoming_edges.get(&block_id) else {
             return State::default();
         };
-        let mut edges = edges.iter().filter(|(pred, _)| reachable.contains(pred));
+        // A predecessor the worklist has never actually run `transfer`
+        // on yet contributes nothing to this merge at all -- not the
+        // same thing as a *computed* predecessor definitively lacking a
+        // given key (`Uninitialized`, correctly downgrading a join to
+        // `MaybeUninitialized`). Conflating the two would corrupt the
+        // fixpoint irrecoverably: `LocationState::MaybeUninitialized` is
+        // an absorbing state `merge_location` never upgrades back out
+        // of, so treating an as-yet-unprocessed loop back-edge as if it
+        // had already *proven* a key uninitialized -- purely because the
+        // worklist has not reached it yet -- would permanently poison
+        // every block downstream of it, regardless of what that
+        // predecessor's own eventually-computed state actually turns
+        // out to be. Excluding an uncomputed predecessor here instead
+        // (and unconditionally re-queuing every successor the very
+        // first time any block *becomes* computed, see below) lets the
+        // fixpoint converge on each edge's own real contribution once,
+        // and only once, it is actually known.
+        let mut edges = edges
+            .iter()
+            .filter(|(pred, _)| reachable.contains(pred) && computed.contains(pred));
         let Some((first_pred, first_extra)) = edges.next() else {
             return State::default();
         };
@@ -4869,7 +4904,7 @@ fn verify_resource_ownership(
             acc.0.extend(other_facts);
             acc.1.extend(other_live);
             acc.2.extend(other_dropped);
-            acc.3 = merge_provenance(acc.3, &other_prov);
+            acc.3 = merge_provenance(&acc.3, &other_prov);
         }
         acc
     }
@@ -4930,6 +4965,14 @@ fn verify_resource_ownership(
         })
         .collect();
 
+    // Every block whose `out` entry has actually been produced by
+    // `transfer` at least once -- `entry` always starts in this set,
+    // since `entry_out` is already fully computed above; every other
+    // reachable block joins it the first time the worklist processes
+    // it. `in_state_for` only ever merges a predecessor edge once its
+    // own source block is in this set (see its own doc comment).
+    let mut computed: HashSet<BlockId> = HashSet::from([entry]);
+
     let mut worklist: VecDeque<BlockId> = function
         .blocks
         .iter()
@@ -4947,12 +4990,21 @@ fn verify_resource_ownership(
             entry,
             (&entry_live, &entry_provenance),
             &incoming_edges,
-            &reachable,
+            (&reachable, &computed),
             &out,
             &is_resource,
         );
         let (new_out, ..) = transfer(block, &in_state);
-        if out.get(&id) != Some(&new_out) {
+        // `computed.insert(id)` becoming newly true here means this is
+        // the very first time `id` has ever been computed -- its own
+        // successors must be re-queued regardless of whether `new_out`
+        // happens to coincide with the placeholder `State::default()`
+        // they were already seeded with, since what changed is *not*
+        // `id`'s own value but whether `in_state_for` may now finally
+        // merge `id`'s own real (if otherwise unremarkable) edge in at
+        // all, rather than skipping it as not-yet-computed.
+        let first_time = computed.insert(id);
+        if first_time || out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
                 if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
@@ -4969,7 +5021,7 @@ fn verify_resource_ownership(
                 entry,
                 (&entry_live, &entry_provenance),
                 &incoming_edges,
-                &reachable,
+                (&reachable, &computed),
                 &out,
                 &is_resource,
             )
@@ -5306,6 +5358,152 @@ mod tests {
     use crate::nir::{BasicBlock, CaseLayout, InvokeErrTarget, Param, ProtocolMethodLayout};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
+
+    // -- `merge_location`/`merge_provenance` lattice laws (`rfcs/0011`) --
+
+    #[test]
+    fn a_key_initialized_only_on_the_left_becomes_maybe_uninitialized() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        let b: HashMap<ValueId, LocationState> = HashMap::new();
+        let merged = merge_provenance(&a, &b);
+        assert_eq!(
+            merged.get(&ValueId(0)),
+            Some(&LocationState::MaybeUninitialized),
+            "unexpected merge result: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_initialized_only_on_the_right_becomes_maybe_uninitialized() {
+        let a: HashMap<ValueId, LocationState> = HashMap::new();
+        let mut b: HashMap<ValueId, LocationState> = HashMap::new();
+        b.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        let merged = merge_provenance(&a, &b);
+        assert_eq!(
+            merged.get(&ValueId(0)),
+            Some(&LocationState::MaybeUninitialized),
+            "unexpected merge result: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn merge_provenance_is_commutative() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        a.insert(ValueId(1), LocationState::Uninitialized);
+        let mut b: HashMap<ValueId, LocationState> = HashMap::new();
+        b.insert(
+            ValueId(1),
+            LocationState::Initialized((BTreeSet::from([ValueId(1)]), Role::Observed)),
+        );
+        b.insert(
+            ValueId(2),
+            LocationState::Initialized((BTreeSet::from([ValueId(2)]), Role::Owned)),
+        );
+        let ab = merge_provenance(&a, &b);
+        let ba = merge_provenance(&b, &a);
+        assert_eq!(ab, ba, "merge_provenance(a, b) != merge_provenance(b, a)");
+    }
+
+    #[test]
+    fn merge_provenance_is_idempotent() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        a.insert(ValueId(1), LocationState::Uninitialized);
+        a.insert(ValueId(2), LocationState::MaybeUninitialized);
+        let merged = merge_provenance(&a, &a);
+        assert_eq!(merged, a, "merging a state with itself must not change it");
+    }
+
+    #[test]
+    fn merge_provenance_is_associative() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        let mut b: HashMap<ValueId, LocationState> = HashMap::new();
+        b.insert(ValueId(0), LocationState::Uninitialized);
+        b.insert(
+            ValueId(1),
+            LocationState::Initialized((BTreeSet::from([ValueId(1)]), Role::Owned)),
+        );
+        let mut c: HashMap<ValueId, LocationState> = HashMap::new();
+        c.insert(
+            ValueId(1),
+            LocationState::Initialized((BTreeSet::from([ValueId(9)]), Role::Observed)),
+        );
+        c.insert(
+            ValueId(2),
+            LocationState::Initialized((BTreeSet::from([ValueId(2)]), Role::Owned)),
+        );
+        let ab_c = merge_provenance(&merge_provenance(&a, &b), &c);
+        let a_bc = merge_provenance(&a, &merge_provenance(&b, &c));
+        assert_eq!(ab_c, a_bc, "(a merge b) merge c != a merge (b merge c)");
+    }
+
+    #[test]
+    fn differing_initialized_identities_are_unioned_deterministically() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(10)]), Role::Owned)),
+        );
+        let mut b: HashMap<ValueId, LocationState> = HashMap::new();
+        b.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(20)]), Role::Owned)),
+        );
+        let merged = merge_provenance(&a, &b);
+        assert_eq!(
+            merged.get(&ValueId(0)),
+            Some(&LocationState::Initialized((
+                BTreeSet::from([ValueId(10), ValueId(20)]),
+                Role::Owned
+            ))),
+            "unexpected merge result: {merged:?}"
+        );
+        // Order-independent: merging the other way round produces the
+        // identical union.
+        let merged_swapped = merge_provenance(&b, &a);
+        assert_eq!(merged, merged_swapped);
+    }
+
+    #[test]
+    fn an_owned_observed_disagreement_merges_to_the_conservative_observed_role() {
+        let mut a: HashMap<ValueId, LocationState> = HashMap::new();
+        a.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+        );
+        let mut b: HashMap<ValueId, LocationState> = HashMap::new();
+        b.insert(
+            ValueId(0),
+            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Observed)),
+        );
+        let merged = merge_provenance(&a, &b);
+        assert_eq!(
+            merged.get(&ValueId(0)),
+            Some(&LocationState::Initialized((
+                BTreeSet::from([ValueId(0)]),
+                Role::Observed
+            ))),
+            "an Owned/Observed disagreement must resolve to the conservative Observed role: {merged:?}"
+        );
+    }
 
     /// `func f() -> i64 { return 1 }`, built directly (bypassing
     /// `nir::lower`) so each test can mutate exactly one thing about an
@@ -11683,6 +11881,198 @@ mod tests {
                     terminator: Terminator::Return(None),
                 },
             ],
+        }
+    }
+
+    /// `%1 = const.bool true; condbranch %1, then_target, else_target`
+    /// (entry) -- exactly one of the two successor blocks
+    /// (`resource_block`) allocates *and fully initializes* a fresh `%0`
+    /// before branching to the join (`BlockId(3)`); the other successor
+    /// never mentions `%0` at all, so -- unlike `uninit_join_caller`,
+    /// above, whose entry-block `Alloc` seeds `%0` (if only as
+    /// `Uninitialized`) on *both* paths -- that other branch's own
+    /// out-state genuinely has no map entry for the key at all. This is
+    /// the one-sided-key shape `merge_provenance` iterating only one
+    /// map's own keys could miss entirely, which an `Alloc`-in-entry
+    /// join cannot exercise (`%0` is present, merely uninitialized, on
+    /// both sides there). The join (`BlockId(3)`) loads `%0` and
+    /// returns. `then_target`/`else_target` let a caller swap which
+    /// physical block the `then` edge reaches independently of which
+    /// block (`resource_block`) is the one that actually holds the
+    /// resource; `block_order` lets a caller independently control both
+    /// predecessor-discovery order (`incoming_edges` is populated by
+    /// iterating `function.blocks` in order) and the literal block
+    /// vector order.
+    fn one_sided_key_join_caller(
+        name: Symbol,
+        resource: ItemId,
+        resource_ty: Ty,
+        then_target: BlockId,
+        else_target: BlockId,
+        resource_block: BlockId,
+        block_order: &[BlockId],
+    ) -> Function {
+        let empty_block = if resource_block == BlockId(1) {
+            BlockId(2)
+        } else {
+            BlockId(1)
+        };
+        let by_id: HashMap<BlockId, BasicBlock> = HashMap::from([
+            (
+                BlockId(0),
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    }],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: then_target,
+                        else_block: else_target,
+                    },
+                },
+            ),
+            (
+                resource_block,
+                BasicBlock {
+                    id: resource_block,
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: crate::nir::OwnershipMode::Transfer,
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+            ),
+            (
+                empty_block,
+                BasicBlock {
+                    id: empty_block,
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+            ),
+            (
+                BlockId(3),
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ),
+        ]);
+        Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: block_order.iter().map(|id| by_id[id].clone()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_one_sided_provenance_key_is_rejected_regardless_of_order() {
+        // Every configuration below diagnoses the exact same underlying
+        // program; only presentation order (which branch is "then",
+        // which predecessor is discovered first, the literal block
+        // vector order, where the entry block sits in that vector)
+        // differs. A merge that iterates only one map's own keys (the
+        // bug this fix corrects) is order-sensitive; the fix must not
+        // be.
+        fn diagnose(
+            then_target: BlockId,
+            else_target: BlockId,
+            block_order: &[BlockId],
+        ) -> Vec<String> {
+            let mut interner = Interner::new();
+            let name = interner.intern("f");
+            let resource_name = interner.intern("File");
+            let resource = ItemId(1);
+            let resource_ty = Ty::Named(resource, resource_name);
+            let function = one_sided_key_join_caller(
+                name,
+                resource,
+                resource_ty,
+                then_target,
+                else_target,
+                BlockId(1),
+                block_order,
+            );
+            let diagnostics = verify_one_with_aggregates(
+                function,
+                leaked_resource_records(resource, resource_name),
+                Vec::new(),
+                &interner,
+            );
+            let mut codes: Vec<String> = codes_of(&diagnostics)
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect();
+            codes.sort_unstable();
+            codes
+        }
+
+        let block = |ids: [u32; 4]| -> Vec<BlockId> { ids.into_iter().map(BlockId).collect() };
+
+        let entry_first = block([0, 1, 2, 3]);
+        let reversed_predecessor_discovery = block([0, 2, 1, 3]);
+        let reversed_block_vector = block([3, 2, 1, 0]);
+        let entry_last = block([1, 2, 3, 0]);
+
+        let baseline = diagnose(BlockId(1), BlockId(2), &entry_first);
+        assert!(
+            baseline
+                .iter()
+                .any(|c| c == codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "expected V0082 on the baseline one-sided-key join: {baseline:?}"
+        );
+
+        let reversed_branch_targets = diagnose(BlockId(2), BlockId(1), &entry_first);
+        let reordered_predecessors =
+            diagnose(BlockId(1), BlockId(2), &reversed_predecessor_discovery);
+        let reversed_vector = diagnose(BlockId(1), BlockId(2), &reversed_block_vector);
+        let entry_at_end = diagnose(BlockId(1), BlockId(2), &entry_last);
+
+        for (label, codes) in [
+            ("reversed branch targets", &reversed_branch_targets),
+            (
+                "reversed predecessor discovery order",
+                &reordered_predecessors,
+            ),
+            ("reversed block vector", &reversed_vector),
+            ("entry block last", &entry_at_end),
+        ] {
+            assert!(
+                codes
+                    .iter()
+                    .any(|c| c == codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+                "expected V0082 with {label}: {codes:?}"
+            );
+            assert_eq!(
+                &baseline, codes,
+                "diagnostic multiset changed under {label}: baseline {baseline:?} vs. {codes:?}"
+            );
         }
     }
 

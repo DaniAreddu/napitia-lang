@@ -1732,9 +1732,17 @@ impl<'a> Lowering<'a> {
                 fb.push_value(Ty::Bool, ValueKind::Const(Const::Bool(*value))),
             )),
             HirExpr::Local { local, .. } => {
-                let binding = *fb.local_bindings.get(local).expect(
-                    "internal invariant: a resolved local is always bound by the time it's read",
-                );
+                // A hand-built HIR module can name a `LocalId` this
+                // function never actually bound (no matching parameter
+                // or `let`-style statement) -- `hir::lower`'s own name
+                // resolution already rules this out for the ordinary
+                // pipeline, but this module never trusts that a direct
+                // caller bypassing it did too.
+                let Some(&binding) = fb.local_bindings.get(local) else {
+                    return Err(self.internal_error(&format!(
+                        "local {local:?} is read before it was ever bound"
+                    )));
+                };
                 match binding {
                     LocalBinding::Direct(value) => Ok(LoweredExpr::Value(value)),
                     LocalBinding::Slot(slot) => {
@@ -2053,12 +2061,17 @@ impl<'a> Lowering<'a> {
         };
         // typeck rejects assigning to a binding that isn't `mutable`
         // before NIR lowering ever runs, so a well-typed program's
-        // assignment target always has a real slot here.
+        // assignment target always has a real slot here -- but a direct
+        // caller hand-building HIR past that gate could still name an
+        // unbound, or immutable (`LocalBinding::Direct`), local as an
+        // assignment's own target.
         let slot = match fb.local_bindings.get(local) {
             Some(LocalBinding::Slot(slot)) => *slot,
-            other => panic!(
-                "internal invariant: assignment target must be a mutable local's slot, found {other:?}"
-            ),
+            other => {
+                return Err(self.internal_error(&format!(
+                    "assignment target {local:?} must be a mutable local's slot, found {other:?}"
+                )));
+            }
         };
         let target_ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
         let value_value = match self.lower_expr_hinted(fb, value, &target_ty)? {
@@ -2954,12 +2967,16 @@ impl<'a> Lowering<'a> {
             let else_result = self.lower_branch_moves(fb, |this, fb| match else_branch {
                 Some(HirElse::Block(b)) => this.lower_scoped_block(fb, b),
                 Some(HirElse::If(inner)) => this.lower_expr(fb, inner),
-                // An else-less `if` always types as `unit` (see below),
-                // never `never` -- typeck cannot have produced this
-                // combination.
-                None => unreachable!(
-                    "internal invariant: an else-less `if` is always unit-typed, not never"
-                ),
+                // An else-less `if` always types as `unit` in the
+                // ordinary pipeline (see below), never `never` -- but
+                // `expr_types` is caller-supplied data a direct caller
+                // hand-building HIR controls directly, and could name
+                // an else-less `if` as `Ty::Never` with no HIR-level
+                // else branch to actually justify it.
+                None => Err(this.internal_error(
+                    "an else-less `if` was typed as `never`, which requires a diverging else \
+                     branch that does not exist",
+                )),
             })?;
             debug_assert!(
                 matches!(then_result, LoweredExpr::Diverged)
@@ -6084,6 +6101,192 @@ mod tests {
             },
             span: Span::dummy(),
         }
+    }
+
+    #[test]
+    fn a_local_never_bound_by_a_param_or_a_let_fails_lowering_not_a_panic() {
+        // `local` names no parameter and no preceding `let`-style
+        // statement in this function's own body -- `hir::lower`'s own
+        // name resolution already rules this out for the ordinary
+        // pipeline, but a direct caller hand-building HIR bypasses it.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let x = interner.intern("x");
+        let unbound_local = LocalId(0);
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                HirExpr::Local {
+                    id: ExprId(0),
+                    local: unbound_local,
+                    name: x,
+                    span: Span::dummy(),
+                },
+                source,
+            )],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::I64);
+        let (local_types, _, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for a read of a never-bound local")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn assigning_to_an_immutable_local_fails_lowering_not_a_panic() {
+        // typeck rejects assigning to a binding that isn't `mutable`
+        // before the ordinary pipeline ever reaches lowering, but a
+        // direct caller hand-building HIR can still construct one --
+        // `x` here is bound as an ordinary (immutable) parameter, never
+        // given a slot to assign into.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let x = interner.intern("x");
+        let x_local = LocalId(0);
+        let mut function = function_with_tail(
+            ItemId(1),
+            f,
+            HirExpr::Assign {
+                id: ExprId(0),
+                target: Box::new(HirExpr::Local {
+                    id: ExprId(1),
+                    local: x_local,
+                    name: x,
+                    span: Span::dummy(),
+                }),
+                op: AssignOp::Assign,
+                value: Box::new(HirExpr::Int {
+                    id: ExprId(2),
+                    value: 1,
+                    base: crate::lexer::IntBase::Decimal,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+            source,
+        );
+        function.params = vec![crate::hir::HirParam {
+            local: x_local,
+            name: x,
+            span: Span::dummy(),
+            ty: crate::hir::HirType::Unresolved {
+                name: interner.intern("i64"),
+                span: Span::dummy(),
+            },
+            take: false,
+        }];
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut local_types = HashMap::new();
+        local_types.insert(x_local, Ty::I64);
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Unit);
+        expr_types.insert(ExprId(1), Ty::I64);
+        expr_types.insert(ExprId(2), Ty::I64);
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for an assignment to an immutable local")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn an_else_less_if_typed_as_never_fails_lowering_not_a_panic() {
+        // `expr_types` is caller-supplied data a direct caller controls
+        // directly -- an else-less `if` can never actually type as
+        // `Ty::Never` through the ordinary pipeline (there is no
+        // diverging else branch to justify it), but nothing stops a
+        // hand-built caller from claiming it does anyway.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let if_expr = HirExpr::If {
+            id: ExprId(0),
+            condition: Box::new(HirExpr::Bool {
+                id: ExprId(1),
+                value: true,
+                span: Span::dummy(),
+            }),
+            then_branch: HirBlock {
+                id: ExprId(2),
+                statements: vec![],
+                tail: None,
+                span: Span::dummy(),
+            },
+            else_branch: None,
+            span: Span::dummy(),
+        };
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function_with_tail(ItemId(1), f, if_expr, source)],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Never);
+        expr_types.insert(ExprId(1), Ty::Bool);
+        let (local_types, _, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for an else-less if wrongly typed as never")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
     }
 
     fn case_ref(variant: ItemId, case: usize, name: Symbol) -> HirExpr {

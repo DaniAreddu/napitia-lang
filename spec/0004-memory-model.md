@@ -76,9 +76,28 @@ the reasoning and the open questions this raises.
   resource-typed is independently rejected, since both exist only to
   represent a transfer (`V0078`). All of these reuse the same
   reachable-union worklist shape Alpha 0.1.6's own `Invoke`-slot
-  verification established. This is a real memory-safety layer -- not
-  the universal region-inference design sketched below, which remains
-  unimplemented.
+  verification established.
+
+  `nir::verify` also tracks, flow-sensitively, whether each value/slot
+  currently grants owning or merely *observing* access: an ordinary
+  (non-`take`) parameter, and anything ever loaded from a
+  `store.observe`'d slot, is an observation, and is rejected outright
+  if used anywhere only an owner may be (`V0079`; `V0080` for
+  `store.transfer` specifically) -- an observation can never be
+  silently promoted into an owner, however it is used. A value/slot's
+  own true resource identity is also unified across an observing
+  `store`/`load` pair, not only a slot's own repeated loads, so a
+  `Drop` reaching one alias poisons every other alias of that same
+  resource for any later use, consuming or not (`V0081`) -- this is
+  what actually catches a double-free reached through two different
+  aliases of one resource, which identity unified only through
+  repeated loads of one shared slot could not. The runtime
+  independently enforces the same owner/observer distinction on every
+  `ResourceHandle`: an ordinary parameter binding and an observing
+  store both mint a handle that can never `Drop`/transfer the resource
+  it points to, regardless of what role the value it was built from
+  had. This is a real memory-safety layer -- not the universal
+  region-inference design sketched below, which remains unimplemented.
 
 ## Accepted design direction
 

@@ -445,8 +445,31 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   non-resource source is always malformed, never merely a no-op. None
   of this trusts that the NIR being checked ever passed through
   `resourceck` at all.
+- **Ownership roles and aliasing** (Alpha 0.1.7, `rfcs/0011`): every
+  value/slot is additionally tracked, flow-sensitively, as either
+  `Owned` or merely `Observed` -- an ordinary (non-`take`) parameter,
+  and anything ever loaded from a `store.observe`'d slot, is
+  `Observed`, and is rejected outright if used as a `Drop`/`Move`/
+  `DeferCapture` operand, a `take`/`Invoke` argument, a
+  `store.transfer` value, or a `return`/`raise` operand (`V0079`;
+  `V0080` for `store.transfer` specifically, since its own diagnostic
+  names the slot). Separately, a value/slot's own true resource
+  identity is unified across an observing `store`/`load` pair, not
+  only a slot's own repeated loads: a `Drop` reaching a given point
+  through *any* alias of a resource poisons every other alias of that
+  same identity for every later use there, consuming or not (`V0081`)
+  -- an observation created before a drop, still nominally in scope,
+  can never be used again as though nothing happened. `Move`/
+  `DeferCapture` relocate ownership to a fresh `ValueId` while still
+  sharing the same resolved identity as their own `source` (so a drop
+  reachable through either is recognized as the same resource), but
+  `V0075`/`V0076`'s own identity bookkeeping deliberately keeps
+  treating a `Move`/`DeferCapture` result as a fresh, decoupled
+  identity of its own -- unifying *that* bookkeeping through a move
+  too would make a legitimate later use of the new owner collide with
+  its own now-permanently-consumed `source`.
 
-It reports structured diagnostics (`V0001`–`V0078` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0081` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

@@ -417,11 +417,21 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   the same slot, not only one bare `ValueId` -- is never used again
   (read, stored, passed as any call argument, dropped, or transferred)
   once already consumed by a `Drop`, a `take` argument/`Invoke`
-  argument, or a `return` (`V0076`). Both reuse the same reachable-union
-  worklist shape `V0073` already established, and neither trusts that
-  the NIR being checked ever passed through `resourceck` at all.
+  argument, or a `return` (`V0076`); and a resource this function itself
+  created, or received through a `take` parameter, is never still owned
+  -- never `Drop`ped, moved into a `take`/`Invoke` argument, or
+  transferred out through `return`/`raise` -- at a reachable `return`/
+  `raise` (`V0077`; deliberately narrower than every ownership-
+  transferring shape this milestone supports -- a resource transferred
+  in through an `Invoke`'s own success slot is not tracked by this
+  specific check, since which of its several edges actually wrote that
+  slot is exactly the per-edge distinction `V0073` exists to make, which
+  a single reachable-union set per block cannot also represent). All
+  three reuse the same reachable-union worklist shape `V0073` already
+  established, and none trusts that the NIR being checked ever passed
+  through `resourceck` at all.
 
-It reports structured diagnostics (`V0001`–`V0076` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0077` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

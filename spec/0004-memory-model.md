@@ -54,14 +54,23 @@ the reasoning and the open questions this raises.
   underlying identity -- unified across every `Load` of the same slot,
   not just one bare `ValueId` -- is never read, stored, passed as an
   argument, dropped, or transferred again once already consumed by a
-  `Drop`, a `take` argument, or a `return` (`V0076`). Both reuse the
-  same reachable-union worklist shape Alpha 0.1.6's own `Invoke`-slot
-  verification established. This is a real, if deliberately narrow,
-  memory-safety layer -- not the universal region-inference design
-  sketched below, which remains unimplemented, and it does not (yet)
-  trace a resource's own identity through a `Store` into a *different*
-  slot (a move by rebinding to a new local), only through repeated
-  `Load`s of one slot.
+  `Drop`, a `take` argument, or a `return` (`V0076`); separately again, a
+  resource this function itself created, or received through a `take`
+  parameter, is never still owned at a reachable `return`/`raise`
+  without having been destroyed or transferred out (`V0077` -- narrower
+  than the others: a resource transferred in through an `Invoke`'s own
+  success slot is not tracked by this specific check, since that would
+  require the same per-edge distinction `V0073`'s own Alpha 0.1.6
+  verification exists to make). All three reuse the same reachable-union
+  worklist shape Alpha 0.1.6's own `Invoke`-slot verification
+  established. This is a real, if deliberately narrow, memory-safety
+  layer -- not the universal region-inference design sketched below,
+  which remains unimplemented, and `V0075`/`V0076` do not (yet) trace a
+  resource's own identity through a `Store` into a *different* slot (a
+  move by rebinding to a new local), only through repeated `Load`s of
+  one slot -- `V0077`'s own leak tracking does follow a value through a
+  `Store` into a fresh slot, since it must to recognize a resource
+  dropped only after being rebound as still destroyed.
 
 ## Accepted design direction
 

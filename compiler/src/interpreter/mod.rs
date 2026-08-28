@@ -454,8 +454,19 @@ impl<'a> Interpreter<'a> {
                         let value = self.eval(kind, &values, &evidence)?;
                         values.insert(*result, value);
                     }
-                    crate::nir::Instruction::Store { slot, value } => {
+                    crate::nir::Instruction::Store { slot, value, mode } => {
                         let v = get(&values, value)?;
+                        let v = match mode {
+                            // A transferring store immediately
+                            // invalidates `value`'s own prior identity
+                            // (`rfcs/0011`): any later read through that
+                            // same `ValueId` now fails the resource
+                            // table's own generation check, exactly
+                            // like a `take` argument's or a `return`'s
+                            // own transfer already does.
+                            crate::nir::OwnershipMode::Transfer => self.transfer_if_resource(v)?,
+                            crate::nir::OwnershipMode::Observe => v,
+                        };
                         values.insert(*slot, v);
                     }
                     crate::nir::Instruction::Drop { value } => {
@@ -617,6 +628,17 @@ impl<'a> Interpreter<'a> {
             ValueKind::Alloc => Ok(Value::Unit),
             ValueKind::Const(c) => Ok(const_value(c)),
             ValueKind::Load(id) => get(values, id),
+            // Both explicitly transfer ownership (`rfcs/0011`): the
+            // source's own handle is immediately stale (any later read
+            // of its own `ValueId` fails the resource table's own
+            // generation check), and this instruction's own result is
+            // the fresh, current owner. `transfer_if_resource` passes a
+            // non-resource value through unchanged, matching
+            // `nir::verify`'s own requirement that `Move`/`DeferCapture`
+            // only ever appear on a resource-typed value in the first
+            // place -- defended here too, rather than trusted blindly.
+            ValueKind::Move { source } => self.transfer_if_resource(get(values, source)?),
+            ValueKind::DeferCapture { source } => self.transfer_if_resource(get(values, source)?),
             ValueKind::Add(a, b) => arith(
                 get(values, a)?,
                 get(values, b)?,

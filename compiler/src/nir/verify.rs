@@ -341,6 +341,14 @@ mod codes {
     /// doc comment), so a leak reachable only through that exact shape
     /// still depends on the interpreter's own frame-exit check.
     pub const RESOURCE_LEAKED_ON_EXIT: &str = "V0077";
+    /// `Move`/`DeferCapture`'s own `source` operand is not resource-
+    /// typed (`rfcs/0011`) -- only a resource may ever be moved; an
+    /// ordinary value is always freely observed/copied instead, and
+    /// never needs (or is permitted) an explicit transfer instruction
+    /// of its own. `nir::lower` never produces this shape (both are
+    /// only ever emitted for an already-affine value); only a
+    /// hand-built module can.
+    pub const MOVE_SOURCE_NOT_RESOURCE: &str = "V0078";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1136,7 +1144,7 @@ fn verify_function(
                         &mut require_value,
                     );
                 }
-                Instruction::Store { slot, value } => {
+                Instruction::Store { slot, value, .. } => {
                     require_value(*slot, diagnostics);
                     require_value(*value, diagnostics);
                     if !alloc_slots.contains(slot) {
@@ -1709,7 +1717,7 @@ fn verify_dominance(
                         check_use(operand, block.id, idx, diagnostics);
                     }
                 }
-                Instruction::Store { slot, value } => {
+                Instruction::Store { slot, value, .. } => {
                     check_use(*slot, block.id, idx, diagnostics);
                     check_use(*value, block.id, idx, diagnostics);
                 }
@@ -1786,6 +1794,7 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         ValueKind::VariantCreate { payload, .. } => payload.clone(),
         ValueKind::VariantPayload { base, .. } => vec![*base],
         ValueKind::ProtocolCall { args, .. } => args.clone(),
+        ValueKind::Move { source } | ValueKind::DeferCapture { source } => vec![*source],
     }
 }
 
@@ -3404,6 +3413,21 @@ fn verify_value_kind(
                 ));
             }
         }
+        ValueKind::Move { source: from } | ValueKind::DeferCapture { source: from } => {
+            require_value(*from, diagnostics);
+            if let Some(source_ty) = ty_of(*from)
+                && source_ty != *result_ty
+            {
+                operand_mismatch(
+                    diagnostics,
+                    format!(
+                        "transfers a value declared `{}` but is itself declared `{}`",
+                        ty_name(&source_ty),
+                        ty_name(result_ty)
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -3969,55 +3993,31 @@ fn verify_resource_ownership(
     }
     let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
 
-    // How many times each `ValueId` is used as an operand anywhere in
-    // `function` -- computed once, up front, purely to decide whether a
-    // `Store`'s own leak-tracking relocation (below) is sound. A value
-    // stored and never used again by anything else (the common shape of
-    // initializing a `mutable` resource local's own slot, or of an
-    // ownership-transferring reassignment `resourceck` already proved
-    // legal) has no other future consumer of its own raw identity, so
-    // relocating its own live obligation onto the slot it was stored
-    // into is exactly right. A value used again *after* also being
-    // stored -- an `if`/`match`'s own internal merge slot, fed one
-    // already-owned local's own value on each branch purely to unify a
-    // *read*, never a move (`resourceck`'s own `ConsumeKind::Read`) --
-    // is not relocated at all: it remains independently live (and
-    // independently droppable) through its own original identity, since
-    // NIR alone -- unlike `resourceck`'s own `ConsumeKind` -- cannot yet
-    // distinguish an ownership-transferring `Store` from a merely
-    // value-copying one (`rfcs/0011`; this is exactly the ambiguity an
-    // explicit NIR move/store-mode representation would resolve).
-    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
-    let mut count_use = |v: ValueId| *use_count.entry(v).or_insert(0) += 1;
+    // Every `Move`/`DeferCapture` whose own `source` is not even
+    // resource-typed (`rfcs/0011`): a structural malformation `nir::
+    // lower` never produces (both are only ever emitted for an
+    // already-affine value), but a hand-built module could still
+    // construct. `check_use` alone would silently ignore this (it
+    // returns immediately for a non-resource operand), so it is
+    // checked here instead, independently of the ownership dataflow
+    // below.
+    let mut non_resource_moves: Vec<(ValueId, &'static str)> = Vec::new();
     for block in &function.blocks {
         for instruction in &block.instructions {
-            match instruction {
-                Instruction::Value { kind, .. } => {
-                    for operand in operands_of(kind) {
-                        count_use(operand);
-                    }
-                }
-                Instruction::Store { slot, value } => {
-                    count_use(*slot);
-                    count_use(*value);
-                }
-                Instruction::Drop { value } => count_use(*value),
-            }
-        }
-        match &block.terminator {
-            Terminator::Return(Some(value)) | Terminator::Raise { value } => count_use(*value),
-            Terminator::CondBranch { condition, .. } => count_use(*condition),
-            Terminator::Switch { scrutinee, .. } => count_use(*scrutinee),
-            Terminator::Invoke { args, .. } => {
-                for arg in args {
-                    count_use(*arg);
+            if let Instruction::Value { result, kind, .. } = instruction {
+                let source = match kind {
+                    ValueKind::Move { source } => Some((*source, "Move")),
+                    ValueKind::DeferCapture { source } => Some((*source, "DeferCapture")),
+                    _ => None,
+                };
+                if let Some((source, label)) = source
+                    && !is_resource(source)
+                {
+                    non_resource_moves.push((*result, label));
                 }
             }
-            Terminator::Return(None) | Terminator::Branch(_) => {}
         }
     }
-    let used_more_than_once_as_a_store_source =
-        |v: ValueId| -> bool { use_count.get(&v).is_some_and(|count| *count > 1) };
 
     let entry = BlockId(0);
     if !function.blocks.iter().any(|b| b.id == entry) {
@@ -4139,6 +4139,28 @@ fn verify_resource_ownership(
                                 );
                             }
                         }
+                        // Always an unconditional transfer (`rfcs/0011`)
+                        // -- unlike a `Call` argument, whose own
+                        // consumption depends on the callee's own
+                        // declared `take` flag, `Move`/`DeferCapture`
+                        // exist *only* to represent "this exact operand
+                        // is consumed here," so there is no non-
+                        // consuming shape of either to fall back to.
+                        // `non_resource_moves` (below) independently
+                        // rejects the malformed shape where `source`
+                        // isn't even resource-typed, which `check_use`
+                        // itself would otherwise just silently ignore.
+                        ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                            check_use(
+                                *source,
+                                &is_resource,
+                                &origin,
+                                &mut facts,
+                                &mut live,
+                                &mut violations,
+                                true,
+                            );
+                        }
                         _ => {
                             for operand in operands_of(kind) {
                                 check_use(
@@ -4175,7 +4197,8 @@ fn verify_resource_ownership(
                         live.insert(*result);
                     }
                 }
-                Instruction::Store { slot, value } => {
+                Instruction::Store { slot, value, mode } => {
+                    let transfers = matches!(mode, crate::nir::OwnershipMode::Transfer);
                     check_use(
                         *value,
                         &is_resource,
@@ -4183,7 +4206,7 @@ fn verify_resource_ownership(
                         &mut facts,
                         &mut live,
                         &mut violations,
-                        false,
+                        transfers,
                     );
                     // A fresh value now occupies `slot`; whatever
                     // consumption/liveness its own prior occupant
@@ -4192,22 +4215,23 @@ fn verify_resource_ownership(
                     // resource).
                     facts.remove(slot);
                     live.remove(slot);
-                    // A resource-typed value stored *and never used
-                    // again by anything else* relocates its own leak-
-                    // tracking identity onto the slot it now occupies --
-                    // every later `Load` of this exact slot already
-                    // shares that slot's own identity (`origin`, above),
-                    // so its own obligation must live there too, not
-                    // stay pinned to wherever it was first defined. A
-                    // value used again after this exact store keeps its
-                    // own original identity instead (see
-                    // `used_more_than_once_as_a_store_source`'s own doc
-                    // comment) -- relocating it too would wrongly let
-                    // whichever one is consumed second look like a
-                    // brand new, still-owed obligation of its own.
-                    if is_resource(*value) && !used_more_than_once_as_a_store_source(origin(*value))
-                    {
-                        live.remove(&origin(*value));
+                    // A transferring store relocates its own value's
+                    // leak-tracking identity onto the slot it now
+                    // occupies -- every later `Load` of this exact slot
+                    // already shares that slot's own identity (`origin`,
+                    // above), so its own obligation must live there too,
+                    // not stay pinned to wherever it was first defined
+                    // (`check_use`, just above, already removed it from
+                    // `live` as part of consuming it). An *observing*
+                    // store never relocates anything: `value` remains
+                    // independently live (and independently droppable)
+                    // through its own original identity, and the slot
+                    // itself never becomes an owner of anything -- the
+                    // explicit `mode` on `Store` is `resourceck`'s own
+                    // already-checked decision, never a guess `nir::
+                    // verify` derives from how many times `value` is
+                    // used elsewhere.
+                    if transfers && is_resource(*value) {
                         live.insert(*slot);
                     }
                 }
@@ -4411,6 +4435,18 @@ fn verify_resource_ownership(
                 ),
             ));
         }
+    }
+
+    for (result, label) in non_resource_moves {
+        diagnostics.push(Diagnostic::error(
+            codes::MOVE_SOURCE_NOT_RESOURCE,
+            source,
+            Span::dummy(),
+            format!(
+                "function `{function_name}`: %{} is a `{label}` of a value that is not resource-typed; only a resource may be moved",
+                result.0
+            ),
+        ));
     }
 }
 
@@ -4884,6 +4920,7 @@ mod tests {
             Instruction::Store {
                 slot: ValueId(0),
                 value: ValueId(1),
+                mode: crate::nir::OwnershipMode::Observe,
             },
         ];
         function.blocks[0].terminator = Terminator::Return(Some(ValueId(1)));
@@ -5795,6 +5832,7 @@ mod tests {
                         Instruction::Store {
                             slot: ValueId(1),
                             value: ValueId(2),
+                            mode: crate::nir::OwnershipMode::Observe,
                         },
                     ],
                     terminator: Terminator::Branch(BlockId(3)),
@@ -5931,6 +5969,7 @@ mod tests {
                     Instruction::Store {
                         slot: ValueId(0),
                         value: ValueId(1),
+                        mode: crate::nir::OwnershipMode::Transfer,
                     },
                     Instruction::Value {
                         result: ValueId(2),
@@ -6077,6 +6116,7 @@ mod tests {
                         },
                         Instruction::Store {
                             slot: ValueId(0),
+                            mode: crate::nir::OwnershipMode::Observe,
                             value: ValueId(1),
                         },
                     ],
@@ -6127,6 +6167,7 @@ mod tests {
                         },
                         Instruction::Store {
                             slot: ValueId(0),
+                            mode: crate::nir::OwnershipMode::Observe,
                             value: ValueId(7),
                         },
                     ],
@@ -6198,6 +6239,7 @@ mod tests {
                         },
                         Instruction::Store {
                             slot: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
                             value: ValueId(2),
                         },
                     ],
@@ -6213,6 +6255,7 @@ mod tests {
                         },
                         Instruction::Store {
                             slot: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
                             value: ValueId(3),
                         },
                     ],
@@ -9267,6 +9310,7 @@ mod tests {
                 },
                 Instruction::Store {
                     slot: ValueId(0),
+                    mode: crate::nir::OwnershipMode::Observe,
                     value: ValueId(2),
                 },
             ],
@@ -9355,6 +9399,7 @@ mod tests {
                 },
                 Instruction::Store {
                     slot: ValueId(0),
+                    mode: crate::nir::OwnershipMode::Observe,
                     value: ValueId(3),
                 },
                 Instruction::Value {
@@ -9545,6 +9590,7 @@ mod tests {
                 },
                 Instruction::Store {
                     slot: ValueId(0),
+                    mode: crate::nir::OwnershipMode::Observe,
                     value: ValueId(11),
                 },
             ],
@@ -9696,6 +9742,7 @@ mod tests {
                 },
                 Instruction::Store {
                     slot: ValueId(0),
+                    mode: crate::nir::OwnershipMode::Observe,
                     value: ValueId(3),
                 },
             ],
@@ -9768,6 +9815,7 @@ mod tests {
             entry_instructions.push(Instruction::Store {
                 slot: ValueId(0),
                 value: ValueId(8),
+                mode: crate::nir::OwnershipMode::Observe,
             });
         }
         entry_instructions.push(Instruction::Value {
@@ -9979,6 +10027,7 @@ mod tests {
             entry_instructions.push(Instruction::Store {
                 slot: ValueId(0),
                 value: ValueId(8),
+                mode: crate::nir::OwnershipMode::Observe,
             });
         }
         entry_instructions.push(Instruction::Value {
@@ -10053,6 +10102,7 @@ mod tests {
             bb20_instructions.push(Instruction::Store {
                 slot: ValueId(0),
                 value: ValueId(21),
+                mode: crate::nir::OwnershipMode::Observe,
             });
         }
         let bb20 = BasicBlock {
@@ -10384,6 +10434,7 @@ mod tests {
                     Instruction::Store {
                         slot: ValueId(0),
                         value: ValueId(1),
+                        mode: crate::nir::OwnershipMode::Transfer,
                     },
                     Instruction::Value {
                         result: ValueId(2),
@@ -10447,6 +10498,7 @@ mod tests {
                     Instruction::Store {
                         slot: ValueId(0),
                         value: ValueId(1),
+                        mode: crate::nir::OwnershipMode::Observe,
                     },
                     Instruction::Drop { value: ValueId(1) },
                 ],

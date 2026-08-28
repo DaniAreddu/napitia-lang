@@ -120,6 +120,50 @@ pub enum ValueKind {
         evidence: Evidence,
         args: Vec<ValueId>,
     },
+    /// Explicitly transfers ownership of a resource value into a fresh
+    /// one, with no intervening slot (`rfcs/0011`): a `take` argument, a
+    /// `return`/`raise` operand, or a `value`/`mutable` binding rebound
+    /// directly from another already-owned local. `source` is invalid
+    /// immediately afterward; this instruction's own result is the
+    /// resource's one current owner from this point on. `nir::verify`
+    /// never infers this from syntax or use counts -- it is always an
+    /// explicit instruction, emitted by `nir::lower` exactly where
+    /// `resourceck`'s own checked `consume_sites` already decided a
+    /// transfer (never an observation) occurs.
+    Move {
+        source: ValueId,
+    },
+    /// Transfers a `take`-flagged `defer` argument's ownership into a
+    /// dedicated, hidden capture *at the `defer` statement's own
+    /// lexical position* (`rfcs/0011`) -- not later, when the deferred
+    /// call this capture eventually feeds actually replays. `source` is
+    /// invalid immediately afterward; this instruction's own result is
+    /// the resource's one current owner until whichever single
+    /// reachable cleanup replay consumes it (an ordinary `Call`
+    /// argument, exactly like any other `take` transfer).
+    DeferCapture {
+        source: ValueId,
+    },
+}
+
+/// Whether a `Store` (or, by extension, any other place a value flows
+/// into another location) transfers ownership of its own operand, or
+/// merely observes/copies it onward (`rfcs/0011`). Carried explicitly
+/// on the instruction itself -- never re-derived by `nir::verify` from
+/// how many times a value happens to be used elsewhere, a record of
+/// `resourceck`'s own already-checked decision (`ConsumeInfo`) that
+/// `nir::lower` threads through unchanged. Meaningless (but always
+/// `Observe`) for a non-resource-typed value: ownership has nothing to
+/// track there, and an ordinary value is always freely copyable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OwnershipMode {
+    /// `value` remains independently valid after this instruction --
+    /// its own underlying resource (if any) is not consumed here.
+    Observe,
+    /// `value`'s own underlying resource is consumed here: the
+    /// destination becomes its one current owner, and `value`'s own
+    /// prior identity is invalid immediately afterward.
+    Transfer,
 }
 
 /// One NIR instruction. `Value` produces a result (`%d = ...`); `Store`
@@ -134,13 +178,12 @@ pub enum Instruction {
     Store {
         slot: ValueId,
         value: ValueId,
+        mode: OwnershipMode,
     },
     /// Destroys a resource value (`rfcs/0011`): an explicit `drop`, or a
     /// scope's own implicit end-of-scope destruction of a still-owned
     /// resource local. `value` must be resource-typed and must not
     /// already have been the operand of another `Drop` on any path
     /// reaching this one (`nir::verify`'s own job, not lowering's).
-    Drop {
-        value: ValueId,
-    },
+    Drop { value: ValueId },
 }

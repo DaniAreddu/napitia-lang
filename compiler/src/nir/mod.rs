@@ -13,7 +13,7 @@ pub mod printer;
 pub mod verify;
 
 pub use block::{BasicBlock, BlockId, InvokeErrTarget, Terminator};
-pub use instruction::{Const, FunctionRef, Instruction, ValueId, ValueKind};
+pub use instruction::{Const, FunctionRef, Instruction, OwnershipMode, ValueId, ValueKind};
 pub use lower::{lower_module, lower_module_with_paths};
 pub use printer::print_module;
 pub use verify::verify_module;

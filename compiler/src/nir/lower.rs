@@ -210,6 +210,13 @@ fn lower_module_impl(
     let mut function_sigs = HashMap::new();
     let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
     let mut function_raises: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+    // Every function/extend method's own per-parameter `take` flags, by
+    // declared order (`rfcs/0011`) -- a plain fact of the callee's own
+    // signature, read back here purely to decide *where* to place an
+    // explicit `Move` for a transferred argument, never to decide
+    // *whether* one transfers at all (`resourceck`/`typeck` already
+    // settled that; this module only ever materializes it).
+    let mut function_takes: HashMap<ItemId, Vec<bool>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -223,6 +230,7 @@ fn lower_module_impl(
             .unwrap_or(Ty::Unit);
         let type_params = f.type_params.iter().map(|p| p.id).collect();
         function_sigs.insert(f.id, (type_params, params, ret));
+        function_takes.insert(f.id, f.params.iter().map(|p| p.take).collect());
         function_requirements.insert(
             f.id,
             f.requirements
@@ -327,6 +335,7 @@ fn lower_module_impl(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
+            function_takes.insert(m.id, m.params.iter().map(|p| p.take).collect());
             let method_raises = match canonical_raises(
                 m.raises.iter().map(|r| r.variant).collect(),
                 &variant_layouts,
@@ -388,6 +397,7 @@ fn lower_module_impl(
         function_requirements,
         function_raises,
         function_named_type_params,
+        function_takes,
         cleanup_edges,
     };
     let mut functions = Vec::new();
@@ -784,6 +794,13 @@ struct Lowering<'a> {
     /// `ItemId`. Absent (falls back to `f.type_params` directly) for an
     /// ordinary function, which owns its parameters itself.
     function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>>,
+    /// Every function/extend method's own per-parameter `take` flags, by
+    /// `ItemId`, in declared order (`rfcs/0011`) -- read back only to
+    /// decide *where* an explicit `Move` belongs (a `take` argument
+    /// transfers into the call right there); `resourceck` has already
+    /// independently proved this program's ownership sound before
+    /// lowering ever runs.
+    function_takes: HashMap<ItemId, Vec<bool>>,
     /// `resourceck`'s own authoritative, checked cleanup plan
     /// (`rfcs/0011`), keyed by the exiting HIR node's own stable id --
     /// the single source of truth for which locals still need
@@ -983,7 +1000,7 @@ impl FnBuilder {
         result
     }
 
-    fn push_store(&mut self, slot: ValueId, value: ValueId) {
+    fn push_store(&mut self, slot: ValueId, value: ValueId, mode: crate::nir::OwnershipMode) {
         debug_assert!(
             !self.current_terminated(),
             "internal invariant: appended a store to block {:?} after it was already terminated",
@@ -991,7 +1008,7 @@ impl FnBuilder {
         );
         self.current_block_mut()
             .instructions
-            .push(crate::nir::Instruction::Store { slot, value });
+            .push(crate::nir::Instruction::Store { slot, value, mode });
     }
 
     /// Appends any non-value-producing instruction (currently only
@@ -1070,10 +1087,11 @@ impl<'a> Lowering<'a> {
         // explicit `return` at all) needs exactly the same per-branch
         // cleanup+terminate, not a single post-merge guess.
         let return_type_for_tail = return_type.clone();
-        let mut finish_tail = |_this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+        let mut finish_tail = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
             if matches!(return_type_for_tail, Ty::Unit) {
                 fb.terminate(Terminator::Return(None));
             } else {
+                let v = this.move_if_transferred(fb, v, &return_type_for_tail, true);
                 fb.terminate(Terminator::Return(Some(v)));
             }
             Ok(LoweredExpr::Diverged)
@@ -1226,8 +1244,26 @@ impl<'a> Lowering<'a> {
                 };
                 let binding = if b.mutable {
                     let slot = fb.alloc_slot(ty.clone());
-                    fb.push_store(slot, value);
+                    // A `value`/`mutable` binding's own initializer is
+                    // always checked with `ConsumeKind::Other`
+                    // (`resourceck::flow::check_binding`) -- never a
+                    // mere observation -- so a resource-typed one always
+                    // transfers ownership into this fresh slot.
+                    let mode = if self.is_affine(&ty) {
+                        crate::nir::OwnershipMode::Transfer
+                    } else {
+                        crate::nir::OwnershipMode::Observe
+                    };
+                    fb.push_store(slot, value, mode);
                     LocalBinding::Slot(slot)
+                } else if self.is_affine(&ty) && matches!(b.value, HirExpr::Local { .. }) {
+                    // Rebinding a resource directly from another
+                    // already-owned local (`value b = a;`) transfers
+                    // ownership explicitly, even with no slot involved:
+                    // `a`'s own prior identity must not remain
+                    // independently usable after this point.
+                    let moved = fb.push_value(ty.clone(), ValueKind::Move { source: value });
+                    LocalBinding::Direct(moved)
                 } else {
                     LocalBinding::Direct(value)
                 };
@@ -1332,25 +1368,36 @@ impl<'a> Lowering<'a> {
         if self.is_affine(&ret_ty) {
             return Err(self.unsupported(span, "a `defer` calling a function returning a resource"));
         }
+        let takes = self
+            .lookup_function_takes(*item, "a `defer` call")?
+            .to_vec();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
-            match self.lower_expr_hinted(fb, arg, &hint)? {
-                LoweredExpr::Value(v) => arg_values.push(v),
+            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => {
                     return Err(self.unsupported(span, "a `defer` whose own argument diverges"));
                 }
-            }
+            };
             // A `take` parameter transfers ownership of this argument
-            // into the pending deferred invocation *now*, at
-            // registration time (Blocker 6): `resourceck` already
-            // decided this (`checker::flow::check_defer` running the
-            // call through the same move-checking `check_expr` any
-            // other call gets), so the enclosing scope's own checked
-            // cleanup (`ResourceCheckResult::cleanup_edges`) already
-            // excludes this argument's own source local wherever it
-            // would otherwise be dropped again -- lowering does not
-            // separately decide or record this itself.
+            // into a dedicated, hidden capture *right here, at
+            // registration time* (`rfcs/0011`, Blocker 6) -- not later,
+            // when the deferred call this capture feeds actually
+            // replays. `resourceck` already decided this argument
+            // transfers (`checker::flow::check_defer` running the call
+            // through the same move-checking `check_expr` any other
+            // call gets); this `DeferCapture` only ever materializes
+            // that decision, immediately, so the replayed `Call` later
+            // consumes the already-captured owner, never the caller's
+            // own (by then long-invalid) original argument value.
+            let transfers = takes.get(i).copied().unwrap_or(false);
+            let captured = if transfers && self.is_affine(&hint) {
+                fb.push_value(hint.clone(), ValueKind::DeferCapture { source: v })
+            } else {
+                v
+            };
+            arg_values.push(captured);
         }
         let requirements = self.lookup_function_requirements(*item, "a `defer` call")?;
         if !requirements.is_empty() {
@@ -1384,8 +1431,18 @@ impl<'a> Lowering<'a> {
         for action in actions {
             match action {
                 crate::resourceck::CleanupAction::Drop(local) => {
+                    // `resourceck` only ever schedules a `Drop` for a
+                    // local it already proved `Available`/
+                    // `DropScheduled` at this exact exit -- which itself
+                    // already means this exact local was bound on
+                    // whichever path reached here. A missing binding
+                    // means this checked plan and what lowering actually
+                    // built have disagreed, not that there is nothing
+                    // to clean up here.
                     let Some(binding) = fb.local_bindings.get(&local).copied() else {
-                        continue;
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup action drops local {local:?}, which this frame never bound"
+                        )));
                     };
                     let value = self.load_current(fb, local, binding);
                     fb.push_instruction(crate::nir::Instruction::Drop { value });
@@ -1503,7 +1560,16 @@ impl<'a> Lowering<'a> {
             return Ok(LoweredExpr::Diverged);
         };
         let ret_ty = fb.return_ty.clone();
-        let mut finish = |_this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+        let ret_ty_for_finish = ret_ty.clone();
+        let mut finish = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+            // Transfers ownership out to the caller explicitly
+            // (`rfcs/0011`) -- a no-op for a non-affine `ret_ty`. Applied
+            // uniformly here, in `finish` itself, so every leaf that
+            // reaches it (a direct return value, or one compound branch
+            // of a nested `if`/`match`/`handle`/block) gets the exact
+            // same treatment without each call site needing to remember
+            // to.
+            let v = this.move_if_transferred(fb, v, &ret_ty_for_finish, true);
             fb.terminate(Terminator::Return(Some(v)));
             Ok(LoweredExpr::Diverged)
         };
@@ -2016,7 +2082,7 @@ impl<'a> Lowering<'a> {
         let after_block = fb.new_block();
         let result_slot = fb.alloc_slot(Ty::Bool);
 
-        fb.push_store(result_slot, left_value);
+        fb.push_store(result_slot, left_value, crate::nir::OwnershipMode::Observe);
         let (then_block, else_block) = if short_on_true {
             (after_block, right_block)
         } else {
@@ -2034,7 +2100,7 @@ impl<'a> Lowering<'a> {
         // no value to store and no `after_block` branch to add on top
         // of that.
         if let LoweredExpr::Value(right_value) = self.lower_expr(fb, right)? {
-            fb.push_store(result_slot, right_value);
+            fb.push_store(result_slot, right_value, crate::nir::OwnershipMode::Observe);
             fb.terminate(Terminator::Branch(after_block));
         }
 
@@ -2113,7 +2179,16 @@ impl<'a> Lowering<'a> {
                 fb.push_value(target_ty.clone(), kind)
             }
         };
-        fb.push_store(slot, final_value);
+        // A plain reassignment (`target = source;`) is itself a move,
+        // exactly like a `value`/`mutable` binding's own initializer
+        // (`ConsumeKind::Other`); a compound assignment (`target +=
+        // ...`) is always numeric/bitwise, never affine.
+        let mode = if op == AssignOp::Assign && self.is_affine(&target_ty) {
+            crate::nir::OwnershipMode::Transfer
+        } else {
+            crate::nir::OwnershipMode::Observe
+        };
+        fb.push_store(slot, final_value, mode);
         Ok(LoweredExpr::Value(
             fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
         ))
@@ -2170,21 +2245,26 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
+        let takes = self.lookup_function_takes(*item, "a call")?.to_vec();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
                 .get(i)
                 .map(|t| crate::types::substitute(t, &subst))
                 .unwrap_or(Ty::Error);
-            match self.lower_expr_hinted(fb, arg, &hint)? {
-                LoweredExpr::Value(v) => arg_values.push(v),
+            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
-            }
+            };
             // A `take` parameter transfers ownership of this argument
             // into the call (`rfcs/0011`): `resourceck` already decided
             // this, so its own checked cleanup plan already excludes
             // this argument's own source local from its former scope's
-            // cleanup wherever it would otherwise be dropped again.
+            // cleanup wherever it would otherwise be dropped again --
+            // this explicit `Move` only ever materializes that already-
+            // checked decision, never makes it.
+            let transfers = takes.get(i).copied().unwrap_or(false);
+            arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
@@ -2275,22 +2355,26 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
+        let takes = self.lookup_function_takes(*item, context)?.to_vec();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
                 .get(i)
                 .map(|t| crate::types::substitute(t, &subst))
                 .unwrap_or(Ty::Error);
-            match self.lower_expr_hinted(fb, arg, &hint)? {
-                LoweredExpr::Value(v) => arg_values.push(v),
+            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(None),
-            }
+            };
             // Exactly `lower_call`'s own rule (`rfcs/0011`, Blocker 1):
             // a `take` argument transfers ownership into the call
             // whether that call is an ordinary `Call` or a fallible
             // `Invoke` -- `resourceck` already decided this, and its
             // own checked cleanup plan already reflects it on every
-            // edge (the success edge, and every failure edge alike).
+            // edge (the success edge, and every failure edge alike);
+            // this explicit `Move` only ever materializes it.
+            let transfers = takes.get(i).copied().unwrap_or(false);
+            arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, context)?;
         let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
@@ -2392,6 +2476,16 @@ impl<'a> Lowering<'a> {
         // still run before control actually transfers to the caller's
         // own failure edge.
         self.emit_checked_cleanup(fb, id)?;
+        // A no-op today (a raised value is always a declared error
+        // variant, and `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`/T0064
+        // already forbids an affine field in any aggregate, so `operand`
+        // itself is never actually resource-typed) -- kept for the same
+        // reason `lower_raise` still calls `emit_checked_cleanup` at
+        // all: an explicit transfer out through `raise`, wherever the
+        // accepted language ever does permit one, must never depend on
+        // this call site remembering to add it later.
+        let ty = self.expr_ty(operand);
+        let value = self.move_if_transferred(fb, value, &ty, true);
         fb.terminate(Terminator::Raise { value });
         Ok(LoweredExpr::Diverged)
     }
@@ -2709,7 +2803,12 @@ impl<'a> Lowering<'a> {
             && let Some((slot, after)) = merge
         {
             self.emit_checked_cleanup(fb, body_id)?;
-            fb.push_store(slot, v);
+            // A resource-typed match/handle arm only ever reaches this
+            // ordinary merge-into-slot path in an observing (`Read`)
+            // context -- any consuming (`return`) context is instead
+            // routed through `lower_arm_body_into_return_sink`, which
+            // never allocates a merge slot at all (`rfcs/0011`).
+            fb.push_store(slot, v, crate::nir::OwnershipMode::Observe);
             fb.terminate(Terminator::Branch(after));
         }
         Ok(())
@@ -3107,9 +3206,14 @@ impl<'a> Lowering<'a> {
                 // of the wrong type into it.
                 let _ = then_value;
                 let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                fb.push_store(result_slot, unit_value);
+                fb.push_store(result_slot, unit_value, crate::nir::OwnershipMode::Observe);
             } else {
-                fb.push_store(result_slot, then_value);
+                // A resource-typed `if` only ever reaches this ordinary
+                // merge-into-slot path in an observing (`Read`) context
+                // -- any consuming (`return`) context is instead routed
+                // through `lower_into_return_sink`, which never
+                // allocates a merge slot at all (`rfcs/0011`).
+                fb.push_store(result_slot, then_value, crate::nir::OwnershipMode::Observe);
             }
             fb.terminate(Terminator::Branch(after_block));
         }
@@ -3120,7 +3224,7 @@ impl<'a> Lowering<'a> {
                 if let LoweredExpr::Value(else_value) =
                     self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, b))?
                 {
-                    fb.push_store(result_slot, else_value);
+                    fb.push_store(result_slot, else_value, crate::nir::OwnershipMode::Observe);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
@@ -3128,14 +3232,14 @@ impl<'a> Lowering<'a> {
                 if let LoweredExpr::Value(else_value) =
                     self.lower_branch_moves(fb, |this, fb| this.lower_expr(fb, inner))?
                 {
-                    fb.push_store(result_slot, else_value);
+                    fb.push_store(result_slot, else_value, crate::nir::OwnershipMode::Observe);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             None => {
                 self.lower_branch_moves(fb, |_, fb| {
                     let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                    fb.push_store(result_slot, unit_value);
+                    fb.push_store(result_slot, unit_value, crate::nir::OwnershipMode::Observe);
                     fb.terminate(Terminator::Branch(after_block));
                     Ok(())
                 })?;
@@ -3823,6 +3927,44 @@ impl<'a> Lowering<'a> {
                 "{context} targets a function this module never resolved a raised-effect set for"
             ))
         })
+    }
+
+    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
+    /// missing-vs-legitimately-empty distinction, for a callee's own
+    /// per-parameter `take` flags (`rfcs/0011`).
+    fn lookup_function_takes(&self, item: ItemId, context: &str) -> LowerResult<&[bool]> {
+        self.function_takes
+            .get(&item)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                self.internal_error(&format!(
+                    "{context} targets a function this module never resolved `take` flags for"
+                ))
+            })
+    }
+
+    /// Emits an explicit ownership transfer for a call/`return`/`raise`
+    /// operand `resourceck` already proved consumes its own source
+    /// (`rfcs/0011`) -- `value`'s own prior identity is invalid
+    /// immediately afterward; the returned `ValueId` is the resource's
+    /// one current owner from this point on. A no-op (`value` passed
+    /// straight through) for a non-affine type, or when `transfers` is
+    /// `false` (an ordinary, non-`take` argument's own observation):
+    /// `nir::verify` never accepts a `Move` whose own source isn't
+    /// resource-typed, and there is nothing to transfer when this exact
+    /// operand doesn't consume anything in the first place.
+    fn move_if_transferred(
+        &mut self,
+        fb: &mut FnBuilder,
+        value: ValueId,
+        ty: &Ty,
+        transfers: bool,
+    ) -> ValueId {
+        if transfers && self.is_affine(ty) {
+            fb.push_value(ty.clone(), ValueKind::Move { source: value })
+        } else {
+            value
+        }
     }
 
     /// Reads `expr_id`'s already-resolved type arguments back from
@@ -5659,7 +5801,7 @@ mod tests {
         let slot = fb.alloc_slot(Ty::I64);
         let value = fb.push_value(Ty::I64, ValueKind::Const(Const::Int(1)));
         fb.terminate(Terminator::Return(None));
-        fb.push_store(slot, value);
+        fb.push_store(slot, value, crate::nir::OwnershipMode::Observe);
     }
 
     #[test]
@@ -7163,6 +7305,7 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
+            function_takes: HashMap::new(),
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
         }
     }
@@ -7200,6 +7343,7 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
+            function_takes: HashMap::new(),
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
         }
     }
@@ -7507,6 +7651,7 @@ mod tests {
             .function_requirements
             .insert(callee_item, Vec::new());
         lowering.function_raises.insert(callee_item, Vec::new());
+        lowering.function_takes.insert(callee_item, Vec::new());
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),
@@ -7733,6 +7878,7 @@ mod tests {
         lowering
             .function_raises
             .insert(callee_item, vec![error_item]);
+        lowering.function_takes.insert(callee_item, vec![false]);
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),

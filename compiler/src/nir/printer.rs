@@ -379,7 +379,12 @@ fn format_instruction(
                 format_value_kind(kind, ty, value_types, interner, registry)
             )
         }
-        Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
+        Instruction::Store { slot, value, mode } => match mode {
+            crate::nir::OwnershipMode::Observe => format!("store %{}, %{}", slot.0, value.0),
+            crate::nir::OwnershipMode::Transfer => {
+                format!("store.transfer %{}, %{}", slot.0, value.0)
+            }
+        },
         Instruction::Drop { value } => format!("drop %{}", value.0),
     }
 }
@@ -543,6 +548,8 @@ fn format_value_kind(
             qualified_ref(*variant, registry, interner),
             base.0
         ),
+        ValueKind::Move { source } => format!("move %{}", source.0),
+        ValueKind::DeferCapture { source } => format!("defer.capture %{}", source.0),
     }
 }
 

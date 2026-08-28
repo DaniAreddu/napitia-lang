@@ -1135,8 +1135,6 @@ fn ord(a: &Value, b: &Value) -> Result<Ordering, InterpreterError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::hir::lower_module as lower_hir;
     use crate::lexer::tokenize;
@@ -1517,6 +1515,12 @@ mod tests {
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
         let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -1525,9 +1529,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -1557,6 +1561,12 @@ mod tests {
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
         let (hir, _) = lower_hir(&module, id, &interner);
         let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
         let nir = lower_nir(
             &hir,
             &result.local_types,
@@ -1565,9 +1575,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )

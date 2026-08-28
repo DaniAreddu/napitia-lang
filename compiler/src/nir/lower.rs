@@ -1445,14 +1445,20 @@ impl<'a> Lowering<'a> {
     /// Lowering does not decide *whether* a local still needs dropping
     /// here (`resourceck` already excluded anything `Moved`/`Dropped`
     /// from this exact list) -- only *how* to materialize each entry
-    /// this stage already proved is owed. A missing `exit_id` means
-    /// `resourceck` proved this exact exit unreachable; nothing is
-    /// emitted (this can only happen for a program `resourceck` itself
-    /// rejects, which never reaches lowering in the ordinary pipeline --
-    /// see `lower_module_impl`'s own resourceck-diagnostics gate).
+    /// this stage already proved is owed. Every call site only ever
+    /// reaches this for an exit lowering itself has already independently
+    /// determined is reachable (an unreachable one is never lowered at
+    /// all -- see e.g. `LoweredExpr::Diverged` short-circuiting before
+    /// any of these call sites), so a missing `exit_id` here is never a
+    /// legitimate "unreachable" case: it means resourceck recorded no
+    /// plan for an exit lowering still reached, a structural mismatch
+    /// between the two stages -- reported as an internal error, never
+    /// silently treated as "nothing to clean up".
     fn emit_checked_cleanup(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
         let Some(actions) = self.cleanup_edges.get(&exit_id).cloned() else {
-            return Ok(());
+            return Err(self.internal_error(&format!(
+                "exit {exit_id:?} is reachable but resourceck recorded no checked cleanup plan for it"
+            )));
         };
         for action in actions {
             match action {
@@ -4395,6 +4401,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_missing_reachable_cleanup_plan_is_an_internal_error_not_a_silent_no_op() {
+        // Same shape as the two regressions above, but for
+        // `cleanup_edges` itself (`rfcs/0011`): a reachable exit
+        // resourceck genuinely recorded a plan for, with its own entry
+        // discarded before lowering ever sees it, simulating the two
+        // stages disagreeing about whether anything needs cleaning up.
+        let text = "resource File { descriptor: i64 } \
+                     func f() { value file = File { descriptor: 3 }; drop file; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.cleanup_edges.is_empty(),
+            "expected resourceck to have actually recorded a cleanup plan"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            // Deliberately empty, discarding resourceck's own real
+            // cleanup plan for this function's own reachable exit.
+            &BTreeMap::new(),
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("no checked cleanup plan"),
+            "expected a missing-cleanup-plan internal error, got: {}",
+            diagnostics[0].message
+        );
+    }
+
     /// Like `lower`, but also runs the module through the NIR verifier
     /// (using the same interner/source lowering itself used, unlike a
     /// fresh throwaway one) and returns its diagnostics -- for tests
@@ -7031,6 +7110,8 @@ mod tests {
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
+        let resourceck_result =
+            crate::resourceck::check_module(&module, &local_types, &expr_types, &interner);
         let result = lower_module_with_paths(
             &module,
             &local_types,
@@ -7039,9 +7120,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             manifest_source,
             &module_path_of,

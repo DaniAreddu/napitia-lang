@@ -54,7 +54,10 @@ value is a real, typed value, not an absence of one.
 %d = alloc.<ty>                       ; reserve a local slot of type ty
 %d = const.<ty> <literal>              ; materialize a literal constant
 %d = load <local>                      ; read a local slot
-      store <local>, %s                ; write a local slot (no result)
+      store <local>, %s                ; write a local slot, observing (no result)
+      store.transfer <local>, %s       ; write a local slot, transferring ownership (rfcs/0011)
+%d = move %s                           ; transfer ownership into a fresh value, no slot (rfcs/0011)
+%d = defer.capture %s                  ; transfer a take-flagged defer argument at registration (rfcs/0011)
 %d = add.<ty> %a, %b
 %d = sub.<ty> %a, %b
 %d = mul.<ty> %a, %b
@@ -409,29 +412,41 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   read from a block every incoming edge actually guarantees was
   written (`V0073`), the same "re-derived from the CFG's actual
   predecessors" discipline aggregates/generics already get.
-- **Resource ownership** (Alpha 0.1.7, `rfcs/0011`): `Drop`'s own
-  operand must be resource-typed (`V0074`); the exact same `ValueId` is
-  never the operand of `Drop` twice on any reachable path (`V0075`);
-  and, independently of both `resourceck` and the check above, a
-  resource's own underlying identity -- unified across every `Load` of
-  the same slot, not only one bare `ValueId` -- is never used again
-  (read, stored, passed as any call argument, dropped, or transferred)
-  once already consumed by a `Drop`, a `take` argument/`Invoke`
-  argument, or a `return` (`V0076`); and a resource this function itself
-  created, or received through a `take` parameter, is never still owned
-  -- never `Drop`ped, moved into a `take`/`Invoke` argument, or
-  transferred out through `return`/`raise` -- at a reachable `return`/
-  `raise` (`V0077`; deliberately narrower than every ownership-
-  transferring shape this milestone supports -- a resource transferred
-  in through an `Invoke`'s own success slot is not tracked by this
-  specific check, since which of its several edges actually wrote that
-  slot is exactly the per-edge distinction `V0073` exists to make, which
-  a single reachable-union set per block cannot also represent). All
-  three reuse the same reachable-union worklist shape `V0073` already
-  established, and none trusts that the NIR being checked ever passed
-  through `resourceck` at all.
+- **Resource ownership** (Alpha 0.1.7, `rfcs/0011`): ownership is
+  explicit in the instruction stream itself, never re-derived from how
+  many times a value happens to be used elsewhere -- `store`'s own
+  `OwnershipMode` (`Observe` or `Transfer`), and the dedicated `Move`/
+  `DeferCapture` value kinds, are `resourceck`'s own already-checked
+  decision, threaded through unchanged by `nir::lower`. The verifier
+  never re-infers a transfer; it only checks that these explicit
+  markers are themselves used consistently. `Drop`'s own operand must
+  be resource-typed (`V0074`); the exact same `ValueId` is never the
+  operand of `Drop` twice on any reachable path (`V0075`); and,
+  independently of both `resourceck` and the check above, a resource's
+  own underlying identity -- unified across every `Load` of the same
+  slot, not only one bare `ValueId` -- is never used again (read,
+  stored, passed as any call argument, dropped, moved, captured, or
+  transferred) once already consumed by a `Drop`, a `store.transfer`, a
+  `Move`/`DeferCapture`, a `take` argument/`Invoke` argument, or a
+  `return`/`raise` (`V0076`); and a resource this function itself
+  created, received through a `take` parameter, or received through a
+  fallible `Invoke`'s own success slot, is never still owned -- never
+  `Drop`ped, moved into a `take`/`Invoke` argument, or transferred out
+  through `return`/`raise` -- at a reachable `return`/`raise` (`V0077`).
+  An `Invoke`'s own success slot is seeded as newly owned specifically
+  on the block reached through its own `ok_target` edge, never on a
+  block reached only through one of its `err_targets` -- the same
+  per-edge distinction `V0073` already needs when an `Invoke`'s
+  `ok_target` and one of its `err_targets`' own `target` coincide on the
+  same block, adapted to this check's own reachable-*union* (not
+  must-intersection) dataflow. A `Move`/`DeferCapture` whose own
+  `source` is not itself resource-typed is independently rejected
+  (`V0078`) -- both exist only to represent an ownership transfer, so a
+  non-resource source is always malformed, never merely a no-op. None
+  of this trusts that the NIR being checked ever passed through
+  `resourceck` at all.
 
-It reports structured diagnostics (`V0001`–`V0077` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0078` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no
@@ -453,12 +468,12 @@ interpreter partially lowered or unverified.
 
 ## Accepted design direction
 
-- **Ownership/effect metadata on values and calls**: the `Instruction` and
-  `Function` representations are structured so an ownership state (moved /
-  borrowed / owned) or an effect set (`spec/0005`) can be attached to a
-  value or a call instruction as additional fields, without changing the
-  shape of the control-flow graph itself. Nothing reads or enforces this
-  metadata yet.
+- **Effect metadata on calls**: the `Instruction`/`Function`
+  representations are structured so an effect set (`spec/0005`) can be
+  attached to a call instruction as an additional field, without
+  changing the shape of the control-flow graph itself. Nothing reads or
+  enforces this yet. (Ownership metadata on values, by contrast, is
+  already implemented and enforced -- see "Resource ownership" above.)
 - **Array/collection types** as NIR-level values, once the type checker
   supports them (record/variant aggregates are implemented as of
   Alpha 0.1.1 — see "Instructions implemented" above).

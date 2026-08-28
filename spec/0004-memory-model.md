@@ -47,30 +47,38 @@ the reasoning and the open questions this raises.
   its own function's exit is destroyed implicitly, in reverse
   declaration order; `defer` registers a call that runs exactly once,
   in LIFO order, interleaved with implicit destruction. NIR represents
-  destruction explicitly (`Instruction::Drop`), independently verified
-  by `nir::verify` (never trusting `resourceck`'s own acceptance of the
-  source): the exact same `ValueId` is never the operand of `Drop` twice
-  on any reachable path (`V0075`), and separately, a resource's own
-  underlying identity -- unified across every `Load` of the same slot,
-  not just one bare `ValueId` -- is never read, stored, passed as an
-  argument, dropped, or transferred again once already consumed by a
-  `Drop`, a `take` argument, or a `return` (`V0076`); separately again, a
-  resource this function itself created, or received through a `take`
-  parameter, is never still owned at a reachable `return`/`raise`
-  without having been destroyed or transferred out (`V0077` -- narrower
-  than the others: a resource transferred in through an `Invoke`'s own
-  success slot is not tracked by this specific check, since that would
-  require the same per-edge distinction `V0073`'s own Alpha 0.1.6
-  verification exists to make). All three reuse the same reachable-union
-  worklist shape Alpha 0.1.6's own `Invoke`-slot verification
-  established. This is a real, if deliberately narrow, memory-safety
-  layer -- not the universal region-inference design sketched below,
-  which remains unimplemented, and `V0075`/`V0076` do not (yet) trace a
-  resource's own identity through a `Store` into a *different* slot (a
-  move by rebinding to a new local), only through repeated `Load`s of
-  one slot -- `V0077`'s own leak tracking does follow a value through a
-  `Store` into a fresh slot, since it must to recognize a resource
-  dropped only after being rebound as still destroyed.
+  every ownership transfer explicitly, never re-derived from how many
+  times a value happens to be used elsewhere: `Instruction::Drop` for
+  destruction, `store`'s own `OwnershipMode` (`Observe` vs. `Transfer`)
+  for a move through a slot, and dedicated `Move`/`DeferCapture` value
+  kinds for a move with no intervening slot (a `take` argument, a
+  `return`/`raise` operand, a `defer` argument captured at its own
+  registration point, or a rebind to a different local) -- in every
+  case, `resourceck`'s own already-checked decision, threaded through
+  unchanged by `nir::lower`. `nir::verify` independently checks these
+  markers are used consistently (never trusting `resourceck`'s own
+  acceptance of the source): the exact same `ValueId` is never the
+  operand of `Drop` twice on any reachable path (`V0075`); a resource's
+  own underlying identity -- unified across every `Load` of the same
+  slot, not just one bare `ValueId` -- is never read, stored, passed as
+  an argument, dropped, moved, captured, or transferred again once
+  already consumed by a `Drop`, a `store.transfer`, a `Move`/
+  `DeferCapture`, a `take` argument, or a `return` (`V0076`); a resource
+  this function itself created, received through a `take` parameter, or
+  received through a fallible `Invoke`'s own success slot, is never
+  still owned at a reachable `return`/`raise` without having been
+  destroyed or transferred out (`V0077` -- the `Invoke` success case is
+  seeded as owned specifically on the block reached through its own
+  success edge, never a sibling failure edge that happens to share a
+  block, the same per-edge distinction `V0073`'s own Alpha 0.1.6
+  verification needs, adapted to this check's own reachable-union
+  dataflow); and a `Move`/`DeferCapture` whose own source is not itself
+  resource-typed is independently rejected, since both exist only to
+  represent a transfer (`V0078`). All of these reuse the same
+  reachable-union worklist shape Alpha 0.1.6's own `Invoke`-slot
+  verification established. This is a real memory-safety layer -- not
+  the universal region-inference design sketched below, which remains
+  unimplemented.
 
 ## Accepted design direction
 

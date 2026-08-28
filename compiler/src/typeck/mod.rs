@@ -4102,9 +4102,7 @@ fn loop_has_reachable_break(body: &HirBlock) -> bool {
             | HirExpr::Try { expr: operand, .. } => in_expr(operand),
             HirExpr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
             HirExpr::Assign { target, value, .. } => in_expr(target) || in_expr(value),
-            HirExpr::Call { callee, args, .. } => {
-                in_expr(callee) || args.iter().any(in_expr)
-            }
+            HirExpr::Call { callee, args, .. } => in_expr(callee) || args.iter().any(in_expr),
             HirExpr::Field { base, .. } => in_expr(base),
             HirExpr::If {
                 condition,

@@ -17,20 +17,21 @@
 //! it); `break`'s own live state instead joins directly into the state
 //! after the loop, alongside a `while`'s own condition-false exit.
 //!
-//! `nir::lower` never re-derives ownership from spans or names: it is
-//! only ever invoked (via `driver::check`) once this stage's own
-//! diagnostics are empty, at which point it performs its own,
-//! independent bookkeeping (`nir::lower`'s own `FnBuilder::
-//! cleanup_actions`/`moved_out`, isolated per branch through
-//! `FnBuilder::move_join_stack`) to decide where to insert `Drop`/
-//! deferred-call instructions -- trusting that a program this stage
-//! accepted can never make that bookkeeping ambiguous, without needing
-//! this stage to export a full cross-referenced ownership map of its
-//! own. A resource-typed `return`/tail value that is itself a compound
-//! `if`/block is the one shape `nir::lower` handles by pushing that
-//! `return`'s own cleanup into each branch separately
-//! (`Lowering::lower_into_return_sink`), rather than by this
-//! bookkeeping alone.
+//! `nir::lower` never re-derives ownership from spans or names, and
+//! never re-infers *whether* a resource is still live at a given exit:
+//! it is only ever invoked (via `driver::check`/`project::
+//! compile_project`) once this stage's own diagnostics are empty, and
+//! it consumes this stage's own [`ResourceCheckResult::cleanup_edges`]
+//! directly as the authoritative plan for every `Drop`/deferred-call
+//! instruction it places -- a checked, per-exit, already-ordered
+//! cleanup list keyed by the stable [`crate::hir::ExprId`] of whatever
+//! HIR node *is* that exit, rather than lowering independently
+//! re-walking branches/loop back-edges to guess the same answer a
+//! second time. A resource-typed `return`/tail value that is itself a
+//! compound `if`/block is the one shape `nir::lower` handles by pushing
+//! that `return`'s own cleanup into each branch separately
+//! (`Lowering::lower_into_return_sink`), each branch's own leaf looked
+//! up by its own `ExprId` in `cleanup_edges`.
 //!
 //! Known, honest scope limits for this milestone: only a *whole*
 //! binding may ever be moved -- moving a resource-typed value out of a

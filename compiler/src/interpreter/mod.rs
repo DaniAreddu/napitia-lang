@@ -40,10 +40,25 @@ struct ResourceId(u32);
 /// it never bumps the generation: many simultaneously-valid observing
 /// handles for the same still-current generation are expected and
 /// fine.
+/// Whether a [`ResourceHandle`] currently grants owning or merely
+/// observing access to its own resource (`rfcs/0011`) -- carried on the
+/// handle itself, independently of `nir::verify`'s own static role
+/// tracking, so the interpreter never has to trust that a module it is
+/// running actually passed verification: an owning operation (`take`,
+/// `Move`/`DeferCapture`, `store.transfer`, `Drop`, `return`) attempted
+/// through an `Observer` handle is rejected here too, as a structured
+/// error, not merely a diagnosed-away compile-time concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeOwnershipRole {
+    Owner,
+    Observer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceHandle {
     id: ResourceId,
     generation: u64,
+    role: RuntimeOwnershipRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +103,11 @@ impl ResourceTable {
             status: ResourceStatus::Alive,
             fields,
         });
-        ResourceHandle { id, generation: 0 }
+        ResourceHandle {
+            id,
+            generation: 0,
+            role: RuntimeOwnershipRole::Owner,
+        }
     }
 
     fn record(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
@@ -108,7 +127,10 @@ impl ResourceTable {
     /// Observes `handle`'s own current record without transferring
     /// ownership (Blocker 8: "observing does not transfer") -- still
     /// rejects a stale handle or an already-dropped resource, since
-    /// neither may ever be legitimately read.
+    /// neither may ever be legitimately read. Deliberately independent
+    /// of `handle`'s own `role`: both an owner and an observer may
+    /// always read (`rfcs/0011`) -- only *consuming* operations
+    /// (`transfer`/`drop_resource`, below) are role-gated.
     fn observe(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
         let record = self.record(handle)?;
         if record.status == ResourceStatus::Dropped {
@@ -117,13 +139,40 @@ impl ResourceTable {
         Ok(record)
     }
 
+    /// Downgrades `handle` to a merely-observing reference to the same
+    /// current record (`rfcs/0011`): every ordinary (non-`take`)
+    /// parameter binding, and every `store.observe`'d value, produces
+    /// one of these rather than reusing the original handle as-is --
+    /// otherwise an owner passed into an observing context would still
+    /// carry owning access there, letting a merely-observing reference
+    /// illegally `Drop`/transfer the very resource it was only supposed
+    /// to observe. Still rejects a stale handle or an already-dropped
+    /// resource, exactly like [`Self::observe`].
+    fn to_observer(&self, handle: ResourceHandle) -> Result<ResourceHandle, InterpreterError> {
+        self.observe(handle)?;
+        Ok(ResourceHandle {
+            id: handle.id,
+            generation: handle.generation,
+            role: RuntimeOwnershipRole::Observer,
+        })
+    }
+
     /// Transfers ownership of `handle`'s own resource to a new owner
     /// (Blocker 8: a `take` argument at registration/call time, or a
     /// returned resource) -- bumps the table's own current generation
     /// for this resource, invalidating `handle` (and every other
     /// handle still referencing the generation it was minted from),
     /// and returns the fresh handle identifying the current owner.
+    /// Rejects `handle` outright if it is only an `Observer`: an
+    /// observation must never be silently promoted into an owner, no
+    /// matter what `nir::verify` already statically guarantees about
+    /// the module this frame happens to be executing.
     fn transfer(&mut self, handle: ResourceHandle) -> Result<ResourceHandle, InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot transfer ownership through a merely-observing resource handle",
+            ));
+        }
         let id = handle.id;
         let record = self.record(handle)?;
         if record.status == ResourceStatus::Dropped {
@@ -136,14 +185,21 @@ impl ResourceTable {
         Ok(ResourceHandle {
             id,
             generation: record.generation,
+            role: RuntimeOwnershipRole::Owner,
         })
     }
 
     /// Destroys `handle`'s own resource exactly once (Blocker 8): a
     /// stale handle, an already-dropped resource, or an unknown handle
     /// are each their own distinct rejected case, never silently
-    /// treated as success.
+    /// treated as success. Rejects `handle` outright if it is only an
+    /// `Observer`, for the same reason [`Self::transfer`] does.
     fn drop_resource(&mut self, handle: ResourceHandle) -> Result<(), InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot drop a resource through a merely-observing resource handle",
+            ));
+        }
         let id = handle.id;
         let record = self.record(handle)?;
         if record.status == ResourceStatus::Dropped {
@@ -263,6 +319,19 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Downgrades `value` to a merely-observing handle if it is a
+    /// resource at all (`rfcs/0011`) -- every ordinary (non-`take`)
+    /// parameter binding, and every `store.observe`, goes through this
+    /// rather than binding the caller's own handle as-is.
+    fn to_observer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
+        match value {
+            Value::Resource(handle) => Ok(Value::Resource(
+                self.resources.borrow().to_observer(handle)?,
+            )),
+            other => Ok(other),
+        }
+    }
+
     /// The lowest-numbered `ValueId` among `values` still holding a live,
     /// still-current resource handle this exiting frame is itself
     /// responsible for -- one it constructed, or received through a
@@ -292,7 +361,12 @@ impl<'a> Interpreter<'a> {
             .iter()
             .filter(|(id, _)| !observing_params.contains(id))
             .filter_map(|(id, value)| match value {
-                Value::Resource(handle) => resources
+                // A merely-observing handle never counts as owned here
+                // regardless of `observing_params` -- which only ever
+                // lists this frame's own *parameters* -- since a value
+                // downgraded mid-function (`store.observe`) is exactly
+                // as much a non-owner as an ordinary parameter is.
+                Value::Resource(handle) if handle.role == RuntimeOwnershipRole::Owner => resources
                     .record(*handle)
                     .ok()
                     .filter(|record| record.status == ResourceStatus::Alive)
@@ -424,7 +498,7 @@ impl<'a> Interpreter<'a> {
             let arg = if param.take {
                 self.transfer_if_resource(arg)?
             } else {
-                arg
+                self.to_observer_if_resource(arg)?
             };
             values.insert(param.value, arg);
         }
@@ -465,7 +539,15 @@ impl<'a> Interpreter<'a> {
                             // like a `take` argument's or a `return`'s
                             // own transfer already does.
                             crate::nir::OwnershipMode::Transfer => self.transfer_if_resource(v)?,
-                            crate::nir::OwnershipMode::Observe => v,
+                            // An observing store never transfers -- and
+                            // must never let the slot's own later reads
+                            // inherit owning access either, even when
+                            // `value` itself is presently an owner: the
+                            // slot is always a merely-observing window
+                            // (`rfcs/0011`).
+                            crate::nir::OwnershipMode::Observe => {
+                                self.to_observer_if_resource(v)?
+                            }
                         };
                         values.insert(*slot, v);
                     }
@@ -2190,6 +2272,155 @@ mod tests {
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured stale-handle error, not a panic, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn dropping_an_observing_store_loaded_alias_is_an_error_not_a_panic() {
+        // `nir::verify`'s own RESOURCE_OBSERVER_CONSUMED already
+        // statically rejects this exact shape -- this hand-built module
+        // bypasses verification entirely to prove the *runtime* itself
+        // independently distinguishes an owner from an observer: `%2`
+        // is loaded from a `store.observe`'d slot, so its own handle is
+        // downgraded to a mere observer, and dropping it must fail as a
+        // structured error rather than actually destroying `%0`'s own
+        // resource out from under it.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let f = ItemId(0);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: f,
+                name: f_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Store {
+                            slot: ValueId(1),
+                            value: ValueId(0),
+                            mode: crate::nir::OwnershipMode::Observe,
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty,
+                            kind: ValueKind::Load(ValueId(1)),
+                        },
+                        Instruction::Drop { value: ValueId(2) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured observer-drop error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn transferring_an_ordinary_parameters_own_handle_is_an_error_not_a_panic() {
+        // `f`'s own `file` parameter is an ordinary (non-`take`)
+        // parameter -- bound as a mere observer at the call boundary --
+        // yet this hand-built body still attempts to `Move` it (an
+        // unconditional transfer). `nir::verify`'s own
+        // RESOURCE_OBSERVER_CONSUMED already statically rejects this;
+        // bypassing verification entirely proves the runtime's own
+        // parameter-binding role downgrade independently blocks it too.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let f = ItemId(0);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: f,
+                name: f_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: resource_ty.clone(),
+                    take: false,
+                }],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: resource_ty,
+                            kind: ValueKind::Move { source: ValueId(0) },
+                        },
+                        Instruction::Drop { value: ValueId(1) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+        let arg = interpreter
+            .resources
+            .borrow_mut()
+            .construct(resource, Vec::new());
+        let outcome =
+            interpreter.call_function(&module.functions[0], vec![Value::Resource(arg)], Vec::new());
+        match outcome {
+            Err(InterpreterError::InvalidOperation(_)) => {}
+            Err(other) => panic!("expected a structured observer-move error, got {other:?}"),
+            Ok(_) => panic!("expected a structured observer-move error, but the call succeeded"),
+        }
     }
 
     #[test]

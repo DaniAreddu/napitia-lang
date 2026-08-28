@@ -4051,6 +4051,24 @@ fn verify_resource_ownership(
         })
     };
 
+    // Whether a `Call`/`Invoke` argument at index `i` transfers
+    // ownership, given `take`'s own declared flags (`rfcs/0011`) --
+    // structural malformation (`UNKNOWN_FUNCTION_REF`/argument-count
+    // mismatches, already independently diagnosed elsewhere in this
+    // module) is handled *conservatively*: every argument is treated as
+    // consumed rather than merely observed, since wrongly assuming a
+    // transfer only ever causes an over-eager "already consumed" report
+    // on some later use, while wrongly assuming an observation could
+    // let a resource an unknown callee actually took ownership of be
+    // silently treated as still live and usable afterward -- unsound in
+    // the dangerous direction. Never a silent `false` default.
+    let consumes_arg = |take: Option<&[bool]>, args_len: usize, i: usize| -> bool {
+        match take {
+            Some(flags) if flags.len() == args_len => flags.get(i).copied().unwrap_or(true),
+            _ => true,
+        }
+    };
+
     // Whether a value/slot currently grants owning or merely observing
     // access to its own underlying resource (`rfcs/0011`) -- tracked
     // flow-sensitively, per value/slot, entirely independently of
@@ -4492,8 +4510,7 @@ fn verify_resource_ownership(
                         ValueKind::Call(callee, _, args, _) => {
                             let take = known_functions.get(callee).map(|f| f.take.as_slice());
                             for (i, arg) in args.iter().enumerate() {
-                                let consumes =
-                                    take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                                let consumes = consumes_arg(take, args.len(), i);
                                 let legal = alias_safe!(*arg, consumes, false);
                                 check_use(
                                     *arg,
@@ -4740,7 +4757,7 @@ fn verify_resource_ownership(
             Terminator::Invoke { callee, args, .. } => {
                 let take = known_functions.get(callee).map(|f| f.take.as_slice());
                 for (i, arg) in args.iter().enumerate() {
-                    let consumes = take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                    let consumes = consumes_arg(take, args.len(), i);
                     let legal = alias_safe!(*arg, consumes, false);
                     check_use(
                         *arg,
@@ -12256,6 +12273,71 @@ mod tests {
         let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(
             codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- A malformed call's own resource argument is never silently
+    // treated as a mere observation (`rfcs/0011`) --------------------------
+
+    #[test]
+    fn a_resource_argument_to_an_unknown_callee_is_treated_as_consumed_not_observed() {
+        // `unknown` is never registered as a known function at all --
+        // `%0`'s own status after this call must be conservatively
+        // "already consumed" (so a later use of it is independently
+        // rejected), never "merely observed" (which would let it be
+        // used, or leaked, without complaint).
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(
+                            ItemId(999),
+                            Vec::new(),
+                            vec![ValueId(0)],
+                            Vec::new(),
+                        ),
+                    },
+                    Instruction::Drop { value: ValueId(0) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        // Conservatively consumed by the unknown call: the `Drop`
+        // afterward is a genuine use-after-consume, and nothing about
+        // this shape leaks (the call already discharged the obligation).
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_USE_AFTER_CONSUME),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
             "unexpected diagnostics: {diagnostics:?}"
         );
     }

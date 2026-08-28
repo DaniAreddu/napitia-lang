@@ -804,3 +804,137 @@ fn raises_extend_method_example_is_r0031_at_every_stage_with_no_leaked_internal_
         );
     }
 }
+
+/// Every valid resource example (`rfcs/0011`) must `check`, `ir`, and
+/// `run` cleanly, leaking no internal `Vxxxx` diagnostic, and return
+/// exactly the given value.
+fn assert_resource_example_runs(name: &str, expected_run_output: &str) {
+    let path = example(name);
+
+    let checked = napitia(&["check", &path]);
+    assert!(
+        checked.status.success(),
+        "check failed for {name}: {}",
+        stderr(&checked)
+    );
+
+    let ired = napitia(&["ir", &path]);
+    assert!(
+        ired.status.success(),
+        "ir failed for {name}: {}",
+        stderr(&ired)
+    );
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "{name} leaked an internal diagnostic: {}",
+        stdout(&ired)
+    );
+    // Two independent `ir` runs must produce byte-identical output.
+    let ired_again = napitia(&["ir", &path]);
+    assert_eq!(
+        stdout(&ired),
+        stdout(&ired_again),
+        "{name}'s own NIR is not deterministic across repeated runs"
+    );
+
+    let ran = napitia(&["run", &path]);
+    assert!(
+        ran.status.success(),
+        "run failed for {name}: {}",
+        stderr(&ran)
+    );
+    assert_eq!(stdout(&ran).trim(), expected_run_output);
+}
+
+#[test]
+fn resource_basic_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_basic.npt", "3");
+}
+
+#[test]
+fn resource_move_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_move.npt", "7");
+}
+
+#[test]
+fn resource_defer_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_defer.npt", "9");
+}
+
+#[test]
+fn resource_match_return_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_match_return.npt", "4");
+}
+
+#[test]
+fn resource_defer_break_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_defer_break.npt", "6");
+}
+
+#[test]
+fn resource_if_observed_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_if_observed.npt", "5");
+}
+
+#[test]
+fn resource_handle_return_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_handle_return.npt", "99");
+}
+
+#[test]
+fn resource_raise_cleanup_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_raise_cleanup.npt", "5");
+}
+
+#[test]
+fn resource_handle_cleanup_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_handle_cleanup.npt", "4");
+}
+
+/// Each invalid resource example is rejected at `check` with its own
+/// exact code, and every stage that runs it agrees, with no leaked
+/// internal (`Ixxxx`/`Vxxxx`) diagnostic and no panic.
+fn assert_resource_example_rejected(name: &str, code: &str) {
+    let path = example(name);
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should fail with exit code 1 for {name}"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains(&format!("error[{code}]")),
+            "`{cmd}` should report {code} for {name}: {err}"
+        );
+        assert!(
+            !err.contains("I0") && !err.contains("V0"),
+            "`{cmd}` leaked an internal diagnostic for {name}: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked instead of reporting a diagnostic for {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn resource_invalid_use_after_move_example_is_u0001_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_use_after_move.npt", "U0001");
+}
+
+#[test]
+fn resource_invalid_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_double_drop.npt", "U0003");
+}
+
+#[test]
+fn resource_invalid_escape_example_is_u0005_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_escape.npt", "U0005");
+}
+
+#[test]
+fn resource_invalid_generic_take_example_is_t0065_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_generic_take.npt", "T0065");
+}

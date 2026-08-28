@@ -261,6 +261,12 @@ fn format_value(value: &Value) -> String {
                 format!("<case {case}>({})", rendered.join(", "))
             }
         }
+        // A resource's own fields live in the interpreter's resource
+        // table, not inline in the `Value` (`rfcs/0011`, Blocker 8),
+        // and `format_value` has no handle to that table here -- so,
+        // like a variant's own case number, this only names the shape,
+        // never fabricates field data it cannot see.
+        Value::Resource(_) => "<resource>".to_string(),
     }
 }
 

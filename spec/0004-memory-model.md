@@ -1,13 +1,25 @@
 # Spec 0004: Memory Model
 
-- Status: Design direction only. Not implemented in Alpha 0.1.
+- Status: Partially implemented as of Alpha 0.1.7 (`resource`/`take`/
+  `drop`/`defer`, `rfcs/0011-deterministic-resources.md`). The rest of
+  this document (universal ownership inference over every type,
+  automatic region inference, `owned`/`borrow`/`shared` boundary
+  annotations, `unsafe`) remains design direction only, not implemented.
 
-Alpha 0.1 has no `unsafe` blocks, no `owned`/`borrow`/`shared` boundary
-annotations, and no ownership enforcement — the NIR interpreter executes
-only primitive values and stack-local storage. This spec exists so later
-milestones build ownership/regions against a written-down design rather
-than an ad hoc one, and so nothing here is mistaken for already being
-enforced by the compiler.
+Alpha 0.1.7 adds a first, deliberately narrower memory-safety layer than
+the universal ownership-inference design this document originally
+sketched: rather than inferring move-vs-copy for *every* type, it
+introduces one new nominal kind, `resource`, that is *always* affine and
+non-copyable, tracked by a dedicated compiler stage (`resourceck/`).
+Every other type (primitives, `record`, `variant`) keeps its existing,
+unconditional copy semantics — this spec's own "value semantics by
+default" section describing implicit move-vs-copy *inference* for every
+type, and its "compiler-inferred memory regions"/`owned`/`borrow` API
+vocabulary, are not what Alpha 0.1.7 implements; see
+`rfcs/0011-deterministic-resources.md` for the actual design (`resource`
+declarations, `take` parameters, `drop`, `defer`) and its own explicit
+non-goals. The sections below describe the original, broader design
+direction this narrower feature does not (yet) fully realize.
 
 The vocabulary below (`owned`, `borrow`, `shared`, `region`) is the
 provisional set accepted in `rfcs/0004-language-independence.md`. It
@@ -23,8 +35,83 @@ the reasoning and the open questions this raises.
 
 - **Local storage in NIR**: NIR functions have named local slots
   (`spec/0006-napitia-ir.md`) that are simple value storage with no
-  ownership metadata attached yet. This is the only "memory model" that
-  actually exists in the current compiler.
+  ownership metadata attached for ordinary (non-`resource`) types.
+- **Affine `resource` values** (`rfcs/0011`, Alpha 0.1.7): a `resource`
+  declaration is a non-copyable nominal aggregate with exactly one
+  owner at a time. `resourceck/` tracks each owned resource-typed
+  local's own state (`Available`/`Moved`/`DropScheduled`/`Dropped`)
+  through a function body; assigning, returning, storing in a field, or
+  passing to a `take` parameter moves ownership; an ordinary parameter
+  is a call-scoped observation that can never escape its call. `drop`
+  destroys a live resource immediately; every resource still owned at
+  its own function's exit is destroyed implicitly, in reverse
+  declaration order; `defer` registers a call that runs exactly once,
+  in LIFO order, interleaved with implicit destruction. NIR represents
+  every ownership transfer explicitly, never re-derived from how many
+  times a value happens to be used elsewhere: `Instruction::Drop` for
+  destruction, `store`'s own `OwnershipMode` (`Observe` vs. `Transfer`)
+  for a move through a slot, and dedicated `Move`/`DeferCapture` value
+  kinds for a move with no intervening slot (a `take` argument, a
+  `return`/`raise` operand, a `defer` argument captured at its own
+  registration point, or a rebind to a different local) -- in every
+  case, `resourceck`'s own already-checked decision, threaded through
+  unchanged by `nir::lower`. `nir::verify` independently checks these
+  markers are used consistently (never trusting `resourceck`'s own
+  acceptance of the source): the exact same `ValueId` is never the
+  operand of `Drop` twice on any reachable path (`V0075`); a resource's
+  own underlying identity -- unified across every `Load` of the same
+  slot, not just one bare `ValueId` -- is never read, stored, passed as
+  an argument, dropped, moved, captured, or transferred again once
+  already consumed by a `Drop`, a `store.transfer`, a `Move`/
+  `DeferCapture`, a `take` argument, or a `return` (`V0076`); a resource
+  this function itself created, received through a `take` parameter, or
+  received through a fallible `Invoke`'s own success slot, is never
+  still owned at a reachable `return`/`raise` without having been
+  destroyed or transferred out (`V0077` -- the `Invoke` success case is
+  seeded as owned specifically on the block reached through its own
+  success edge, never a sibling failure edge that happens to share a
+  block, the same per-edge distinction `V0073`'s own Alpha 0.1.6
+  verification needs, adapted to this check's own reachable-union
+  dataflow); and a `Move`/`DeferCapture` whose own source is not itself
+  resource-typed is independently rejected, since both exist only to
+  represent a transfer (`V0078`). All of these reuse the same
+  reachable-union worklist shape Alpha 0.1.6's own `Invoke`-slot
+  verification established.
+
+  `nir::verify` also tracks, flow-sensitively, whether each value/slot
+  currently grants owning or merely *observing* access: an ordinary
+  (non-`take`) parameter, and anything ever loaded from a
+  `store.observe`'d slot, is an observation, and is rejected outright
+  if used anywhere only an owner may be (`V0079`; `V0080` for
+  `store.transfer` specifically) -- an observation can never be
+  silently promoted into an owner, however it is used. A value/slot's
+  own true resource identity is also unified across an observing
+  `store`/`load` pair, not only a slot's own repeated loads, so a
+  `Drop` reaching one alias poisons every other alias of that same
+  resource for any later use, consuming or not (`V0081`) -- this is
+  what actually catches a double-free reached through two different
+  aliases of one resource, which identity unified only through
+  repeated loads of one shared slot could not. The runtime
+  independently enforces the same owner/observer distinction on every
+  `ResourceHandle`: an ordinary parameter binding and an observing
+  store both mint a handle that can never `Drop`/transfer the resource
+  it points to, regardless of what role the value it was built from
+  had. A value/slot's own role/identity is only ever meaningful once it
+  is definitely initialized on every reachable path reaching its own
+  use: a missing location resolves to `Uninitialized`, never a lenient
+  fresh `Owned` guess, and a join where even one reachable predecessor
+  never wrote it downgrades to `MaybeUninitialized` -- either is
+  independently rejected (`V0082`) before role/origin checks even run.
+  `resourceck`'s own checked metadata (`consume_sites`, and each
+  `defer`'s own `CheckedDeferPlan` -- callee, argument modes/types,
+  return type, and LIFO registration order) is read back by `nir::
+  lower` directly rather than re-derived from a callee's own `take`
+  flags or a binding's own AST shape a second time, and is validated
+  field-by-field against what lowering resolves on its own; missing or
+  disagreeing metadata is a structured internal error, never a silent
+  fallback to `Ty::Error`, `false`, or treating an argument as merely
+  observing. This is a real memory-safety layer -- not the universal
+  region-inference design sketched below, which remains unimplemented.
 
 ## Accepted design direction
 
@@ -100,12 +187,15 @@ marker, not a file- or module-level ambient mode (RFC 0001).
 
 ### `defer`
 
-The `defer` statement (parsed today; using it is a checked, reported
-error rather than being executed — `spec/0002`) is intended to schedule
-an expression to run when the enclosing region ends,
-in reverse order of the `defer` statements encountered, independent of
-whether the region ends via normal control flow or an early
-error/`return`.
+`defer` is implemented as of Alpha 0.1.7 (`rfcs/0011`), scoped to its
+own immediately enclosing block rather than the fully general
+per-region design this section originally sketched: it schedules an
+expression to run exactly once, in LIFO order, at that block's own
+normal fallthrough, an explicit `return`, `raise`, postfix `?`
+propagation, or a `break`/`continue` loop exit -- destroying exactly
+that iteration's own live resources and running that iteration's own
+pending defers before jumping past or back to the loop, never an
+enclosing scope's.
 
 ## Unresolved research questions
 

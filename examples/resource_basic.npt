@@ -1,0 +1,18 @@
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func main() -> i64 {
+    value file = open(3);
+    value result = inspect(file);
+    drop file;
+    return result;
+}

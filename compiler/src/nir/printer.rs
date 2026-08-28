@@ -379,7 +379,13 @@ fn format_instruction(
                 format_value_kind(kind, ty, value_types, interner, registry)
             )
         }
-        Instruction::Store { slot, value } => format!("store %{}, %{}", slot.0, value.0),
+        Instruction::Store { slot, value, mode } => match mode {
+            crate::nir::OwnershipMode::Observe => format!("store %{}, %{}", slot.0, value.0),
+            crate::nir::OwnershipMode::Transfer => {
+                format!("store.transfer %{}, %{}", slot.0, value.0)
+            }
+        },
+        Instruction::Drop { value } => format!("drop %{}", value.0),
     }
 }
 
@@ -542,6 +548,8 @@ fn format_value_kind(
             qualified_ref(*variant, registry, interner),
             base.0
         ),
+        ValueKind::Move { source } => format!("move %{}", source.0),
+        ValueKind::DeferCapture { source } => format!("defer.capture %{}", source.0),
     }
 }
 
@@ -659,6 +667,17 @@ mod tests {
             "{:?}",
             typeck_result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &typeck_result.local_types,
+            &typeck_result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "{:?}",
+            resourceck_result.diagnostics
+        );
         let nir = lower_module(
             &hir,
             &typeck_result.local_types,
@@ -667,6 +686,9 @@ mod tests {
             &typeck_result.call_type_args,
             &typeck_result.call_evidence,
             &typeck_result.protocol_call_evidence,
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )

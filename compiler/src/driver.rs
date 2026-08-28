@@ -60,6 +60,15 @@ pub struct CheckOutput {
     pub call_evidence: HashMap<hir::ExprId, Vec<Evidence>>,
     /// See [`typeck::TypeckResult::protocol_call_evidence`].
     pub protocol_call_evidence: HashMap<hir::ExprId, Evidence>,
+    /// `resourceck`'s own authoritative cleanup plan (`rfcs/0011`) --
+    /// `nir::lower` consumes this directly as the single source of
+    /// truth for resource cleanup, rather than re-inferring it.
+    pub cleanup_edges:
+        std::collections::BTreeMap<hir::ExprId, Vec<crate::resourceck::CleanupAction>>,
+    /// See [`crate::resourceck::ResourceCheckResult::consume_sites`].
+    pub consume_sites: std::collections::BTreeMap<hir::ExprId, crate::resourceck::ConsumeInfo>,
+    /// See [`crate::resourceck::ResourceCheckResult::defer_plans`].
+    pub defer_plans: std::collections::BTreeMap<hir::ExprId, crate::resourceck::CheckedDeferPlan>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -70,6 +79,13 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
     diagnostics.extend(resolve_diags);
     let typeck_result = typeck::check_module(&hir, source, interner, typeck::EntryMain::ByName);
     diagnostics.extend(typeck_result.diagnostics);
+    let resourceck_result = crate::resourceck::check_module(
+        &hir,
+        &typeck_result.local_types,
+        &typeck_result.expr_types,
+        interner,
+    );
+    diagnostics.extend(resourceck_result.diagnostics);
     CheckOutput {
         hir,
         local_types: typeck_result.local_types,
@@ -78,6 +94,9 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         call_type_args: typeck_result.call_type_args,
         call_evidence: typeck_result.call_evidence,
         protocol_call_evidence: typeck_result.protocol_call_evidence,
+        cleanup_edges: resourceck_result.cleanup_edges,
+        consume_sites: resourceck_result.consume_sites,
+        defer_plans: resourceck_result.defer_plans,
         diagnostics,
     }
 }
@@ -114,6 +133,9 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.call_type_args,
         &checked.call_evidence,
         &checked.protocol_call_evidence,
+        &checked.cleanup_edges,
+        &checked.consume_sites,
+        &checked.defer_plans,
         interner,
         source,
     ) {
@@ -217,7 +239,7 @@ mod tests {
         let mut map = SourceMap::new();
         let source = map.add_file(
             "t.npt",
-            "func helper(x: i64) -> i64 { defer x; return x } \
+            "func helper(x: i64) -> i64 { value r = 0..x; return x } \
              func main() -> i64 { return helper(1) }",
         );
         let mut interner = Interner::new();

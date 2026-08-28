@@ -56,6 +56,7 @@ pub enum Item {
     Protocol(ProtocolDecl),
     Extend(ExtendDecl),
     Import(ImportDecl),
+    Resource(ResourceDecl),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +101,25 @@ pub struct UsesClause {
 pub struct Param {
     pub name: Ident,
     pub ty: Type,
+    /// Whether this parameter was declared `take file: File` (`rfcs/0011`)
+    /// -- an ownership-transferring parameter, moving the caller's own
+    /// argument in, rather than an ordinary call-scoped observation.
+    /// Meaningless (but harmlessly `false`) for a non-resource type.
+    pub take: bool,
+    pub span: Span,
+}
+
+/// `resource File { descriptor: i64 }` (`rfcs/0011`): an affine,
+/// non-copyable nominal aggregate. Reuses `Field`'s own grammar
+/// unchanged -- construction (`File { descriptor: 3 }`) is the same
+/// `RecordLiteral` production a `record` construction already uses.
+/// Deliberately has no `type_params`: generic resources are out of
+/// scope this milestone (`rfcs/0011`'s own non-goals).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceDecl {
+    pub public: bool,
+    pub name: Ident,
+    pub fields: Vec<Field>,
     pub span: Span,
 }
 
@@ -207,7 +227,15 @@ pub struct Block {
 pub enum Stmt {
     Binding(BindingStmt),
     Expr(Expr),
-    Defer { expr: Expr, span: Span },
+    Defer {
+        expr: Expr,
+        span: Span,
+    },
+    /// `drop file;` (`rfcs/0011`): consumes a live resource immediately.
+    Drop {
+        expr: Expr,
+        span: Span,
+    },
     While(WhileStmt),
     Loop(LoopStmt),
 }

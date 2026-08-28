@@ -1,6 +1,7 @@
 # Spec 0006: Napitia IR (NIR)
 
-- Status: Partially implemented (Alpha 0.1.5)
+- Status: Partially implemented (Alpha 0.1.5; `drop` instruction and
+  resource-state verification added in Alpha 0.1.7, `rfcs/0011`)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -53,7 +54,10 @@ value is a real, typed value, not an absence of one.
 %d = alloc.<ty>                       ; reserve a local slot of type ty
 %d = const.<ty> <literal>              ; materialize a literal constant
 %d = load <local>                      ; read a local slot
-      store <local>, %s                ; write a local slot (no result)
+      store <local>, %s                ; write a local slot, observing (no result)
+      store.transfer <local>, %s       ; write a local slot, transferring ownership (rfcs/0011)
+%d = move %s                           ; transfer ownership into a fresh value, no slot (rfcs/0011)
+%d = defer.capture %s                  ; transfer a take-flagged defer argument at registration (rfcs/0011)
 %d = add.<ty> %a, %b
 %d = sub.<ty> %a, %b
 %d = mul.<ty> %a, %b
@@ -77,7 +81,25 @@ value is a real, typed value, not an absence of one.
 %d = record.field @<record>.<index> %base
 %d = variant.create @<variant>[<type-args>].<case>(%a, ...) ; payload in declaration order
 %d = variant.payload @<variant>.<case>.<index> %base
+      drop %v                          ; destroy a resource value (no result, rfcs/0011)
 ```
+
+`drop` (Alpha 0.1.7, `rfcs/0011`) destroys a resource-typed value:
+lowering emits one for every explicit `drop <expr>;`, and one more for
+every resource-typed local still owned at its own function's normal
+`return`/`raise`/postfix-`?`-propagation exit (in reverse declaration
+order, interleaved with any registered `defer` calls). The verifier
+independently checks its operand is resource-typed and, via a
+reachability-aware forward *may*-dataflow analysis (joins union their
+reachable predecessors' own facts, unlike `Invoke`-slot initialization's
+must analysis, which intersects them -- a value already dropped on even
+one incoming path is enough to make a later unconditional drop of it a
+genuine double drop on that path, so a join must not require every path
+to agree first, and a value's own dropped fact is killed again at the
+instruction that redefines it, so a loop-carried temporary reusing the
+same static value id across iterations is never mistaken for still
+carrying a previous iteration's own drop forward), that no value is
+ever the operand of two `Drop`s on any single reachable path.
 
 `record.create`/`variant.create` reference fields/cases by resolved
 **declaration index**, never by name, matching how `call` already
@@ -376,8 +398,98 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   nested node. `Extension` evidence is rejected outright (`V0060`) if the
   required arguments are still symbolic -- only an exact `Forwarded`
   match is legal until every argument is concrete.
+- **Raises and `Invoke`** (Alpha 0.1.6, `rfcs/0010`): a function's own
+  declared `raises` set names only real, non-generic-parameter variant
+  types with no duplicate entry; only a fallible callee (non-empty
+  `raises`) may be the target of `Terminator::Invoke`, and only an
+  infallible one may be an ordinary `Call`; an `Invoke`'s own success
+  slot/type and every `InvokeErrTarget`'s own slot/type match the
+  callee's substituted return type/that raised variant exactly, its
+  error targets cover the callee's own `raises` set exactly once each,
+  and every value a `Terminator::Raise` produces is itself one of the
+  current function's own declared `raises` entries; an extend's own
+  method must itself be infallible. A raised/success slot is only ever
+  read from a block every incoming edge actually guarantees was
+  written (`V0073`), the same "re-derived from the CFG's actual
+  predecessors" discipline aggregates/generics already get.
+- **Resource ownership** (Alpha 0.1.7, `rfcs/0011`): ownership is
+  explicit in the instruction stream itself, never re-derived from how
+  many times a value happens to be used elsewhere -- `store`'s own
+  `OwnershipMode` (`Observe` or `Transfer`), and the dedicated `Move`/
+  `DeferCapture` value kinds, are `resourceck`'s own already-checked
+  decision, threaded through unchanged by `nir::lower`. The verifier
+  never re-infers a transfer; it only checks that these explicit
+  markers are themselves used consistently. `Drop`'s own operand must
+  be resource-typed (`V0074`); the exact same `ValueId` is never the
+  operand of `Drop` twice on any reachable path (`V0075`); and,
+  independently of both `resourceck` and the check above, a resource's
+  own underlying identity -- unified across every `Load` of the same
+  slot, not only one bare `ValueId` -- is never used again (read,
+  stored, passed as any call argument, dropped, moved, captured, or
+  transferred) once already consumed by a `Drop`, a `store.transfer`, a
+  `Move`/`DeferCapture`, a `take` argument/`Invoke` argument, or a
+  `return`/`raise` (`V0076`); and a resource this function itself
+  created, received through a `take` parameter, or received through a
+  fallible `Invoke`'s own success slot, is never still owned -- never
+  `Drop`ped, moved into a `take`/`Invoke` argument, or transferred out
+  through `return`/`raise` -- at a reachable `return`/`raise` (`V0077`).
+  An `Invoke`'s own success slot is seeded as newly owned specifically
+  on the block reached through its own `ok_target` edge, never on a
+  block reached only through one of its `err_targets` -- the same
+  per-edge distinction `V0073` already needs when an `Invoke`'s
+  `ok_target` and one of its `err_targets`' own `target` coincide on the
+  same block, adapted to this check's own reachable-*union* (not
+  must-intersection) dataflow. A `Move`/`DeferCapture` whose own
+  `source` is not itself resource-typed is independently rejected
+  (`V0078`) -- both exist only to represent an ownership transfer, so a
+  non-resource source is always malformed, never merely a no-op. None
+  of this trusts that the NIR being checked ever passed through
+  `resourceck` at all.
+- **Ownership roles and aliasing** (Alpha 0.1.7, `rfcs/0011`): every
+  value/slot is additionally tracked, flow-sensitively, as either
+  `Owned` or merely `Observed` -- an ordinary (non-`take`) parameter,
+  and anything ever loaded from a `store.observe`'d slot, is
+  `Observed`, and is rejected outright if used as a `Drop`/`Move`/
+  `DeferCapture` operand, a `take`/`Invoke` argument, a
+  `store.transfer` value, or a `return`/`raise` operand (`V0079`;
+  `V0080` for `store.transfer` specifically, since its own diagnostic
+  names the slot). Separately, a value/slot's own true resource
+  identity is unified across an observing `store`/`load` pair, not
+  only a slot's own repeated loads: a `Drop` reaching a given point
+  through *any* alias of a resource poisons every other alias of that
+  same identity for every later use there, consuming or not (`V0081`)
+  -- an observation created before a drop, still nominally in scope,
+  can never be used again as though nothing happened. `Move`/
+  `DeferCapture` relocate ownership to a fresh `ValueId` while still
+  sharing the same resolved identity as their own `source` (so a drop
+  reachable through either is recognized as the same resource), but
+  `V0075`/`V0076`'s own identity bookkeeping deliberately keeps
+  treating a `Move`/`DeferCapture` result as a fresh, decoupled
+  identity of its own -- unifying *that* bookkeeping through a move
+  too would make a legitimate later use of the new owner collide with
+  its own now-permanently-consumed `source`.
+- **Definite initialization** (Alpha 0.1.7, `rfcs/0011`): every
+  resource-typed value/slot's own role/identity is only ever meaningful
+  once it is definitely initialized on *every* reachable path reaching
+  the point it is used -- a three-state lattice (`Uninitialized`/
+  `Initialized(origins, role)`/`MaybeUninitialized`), computed by the
+  same reachable-union forward dataflow every other check above already
+  uses. `Alloc` starts a resource-typed slot at `Uninitialized`;
+  `store.observe`/`store.transfer` initialize it; a fallible `Invoke`'s
+  own success slot is initialized only on its own `ok_target` edge. A
+  join downgrades to `MaybeUninitialized` the moment even one reachable
+  predecessor never wrote it -- a key present on only one side of a
+  join is treated as `Uninitialized` on the other, never copied through
+  as if both agreed. A location this pass never recorded anything for
+  resolves to `Uninitialized`, never a lenient fresh `Owned` guess:
+  every use -- a `Load` included -- of anything not definitely
+  `Initialized` is rejected (`V0082`) before this check's own role/
+  origin checks even run, and before role/origin disagreement between
+  two predecessors that *both* wrote it is even considered (that stays
+  `Initialized`, with the union-origins/conservative-role merge above
+  already representing it soundly).
 
-It reports structured diagnostics (`V0001`–`V0060` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0082` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no
@@ -399,12 +511,12 @@ interpreter partially lowered or unverified.
 
 ## Accepted design direction
 
-- **Ownership/effect metadata on values and calls**: the `Instruction` and
-  `Function` representations are structured so an ownership state (moved /
-  borrowed / owned) or an effect set (`spec/0005`) can be attached to a
-  value or a call instruction as additional fields, without changing the
-  shape of the control-flow graph itself. Nothing reads or enforces this
-  metadata yet.
+- **Effect metadata on calls**: the `Instruction`/`Function`
+  representations are structured so an effect set (`spec/0005`) can be
+  attached to a call instruction as an additional field, without
+  changing the shape of the control-flow graph itself. Nothing reads or
+  enforces this yet. (Ownership metadata on values, by contrast, is
+  already implemented and enforced -- see "Resource ownership" above.)
 - **Array/collection types** as NIR-level values, once the type checker
   supports them (record/variant aggregates are implemented as of
   Alpha 0.1.1 — see "Instructions implemented" above).

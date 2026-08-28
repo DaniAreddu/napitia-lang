@@ -17,7 +17,7 @@
 //! never reference a function that lowering silently left out, because
 //! there is no way to leave one out and still get a `Module` back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
@@ -71,6 +71,9 @@ pub fn lower_module(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -82,6 +85,9 @@ pub fn lower_module(
         call_type_args,
         call_evidence,
         protocol_call_evidence,
+        cleanup_edges,
+        consume_sites,
+        defer_plans,
         interner,
         source,
         ModulePathMode::SingleFile,
@@ -106,6 +112,9 @@ pub fn lower_module_with_paths(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
@@ -118,6 +127,9 @@ pub fn lower_module_with_paths(
         call_type_args,
         call_evidence,
         protocol_call_evidence,
+        cleanup_edges,
+        consume_sites,
+        defer_plans,
         interner,
         source,
         ModulePathMode::Project(module_path_of),
@@ -133,6 +145,9 @@ fn lower_module_impl(
     call_type_args: &HashMap<ExprId, Vec<Ty>>,
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
+    cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
     module_path_mode: ModulePathMode<'_>,
@@ -170,6 +185,7 @@ fn lower_module_impl(
                 name: r.name,
                 type_params: r.type_params.iter().map(|p| (p.id, p.name)).collect(),
                 fields,
+                affine: r.affine,
             },
         );
     }
@@ -382,6 +398,9 @@ fn lower_module_impl(
         function_requirements,
         function_raises,
         function_named_type_params,
+        cleanup_edges,
+        consume_sites,
+        defer_plans,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -777,6 +796,27 @@ struct Lowering<'a> {
     /// `ItemId`. Absent (falls back to `f.type_params` directly) for an
     /// ordinary function, which owns its parameters itself.
     function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>>,
+    /// `resourceck`'s own authoritative, checked cleanup plan
+    /// (`rfcs/0011`), keyed by the exiting HIR node's own stable id --
+    /// the single source of truth for which locals still need
+    /// destroying and which `defer`s still need running at any given
+    /// reachable exit. Lowering never independently decides this itself
+    /// (no `moved_out`/per-branch join bookkeeping of its own): it
+    /// looks the already-checked answer up here and simply materializes
+    /// it as real instructions, in the order given.
+    cleanup_edges: &'a BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    /// `resourceck`'s own authoritative observe-vs-transfer decision
+    /// for every resource-typed expression it checked (`rfcs/0011`),
+    /// keyed by that exact expression's own `ExprId` -- a binding's own
+    /// initializer, an assignment's own value, or a call/`Invoke`
+    /// argument. Lowering reads this back directly (`lookup_consume`)
+    /// rather than re-deriving the same verdict from the expression's
+    /// own HIR shape or a callee's declared `take` flags a second time.
+    consume_sites: &'a BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    /// `resourceck`'s own checked plan for every `defer` statement
+    /// (`rfcs/0011`), keyed by that exact call expression's own
+    /// `ExprId` -- see `resourceck::CheckedDeferPlan`.
+    defer_plans: &'a BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
 }
 
 #[derive(Copy, Clone)]
@@ -802,6 +842,28 @@ enum LocalBinding {
     Slot(ValueId),
 }
 
+/// A deferred call's own callee/arguments, already lowered (evaluated
+/// once, at the `defer` statement itself, per `rfcs/0011`) and replayed
+/// as an ordinary `Call` at every cleanup point this function currently
+/// supports (normal fallthrough, and an explicit `return` in the same
+/// function-level scope -- see `ResourceScope`'s own doc comment for
+/// this milestone's honest scope limits).
+#[derive(Clone)]
+struct PendingDefer {
+    callee: ItemId,
+    type_args: Vec<Ty>,
+    args: Vec<ValueId>,
+    evidence: Vec<Evidence>,
+    /// The deferred callee's own declared return type (Blocker 6) --
+    /// never `Ty::Unit` fabricated regardless of what the callee
+    /// actually returns: the replayed `Call` at cleanup time must
+    /// carry the same real result type an ordinary call to the same
+    /// function would, even though that result is always discarded
+    /// (a resource-returning callee is rejected outright at `defer`
+    /// registration, so this is never itself an affine type here).
+    ret_ty: Ty,
+}
+
 /// The result of lowering one expression: either a real value the
 /// current (still-open) block can keep building on, or proof that
 /// control already left this block. `return`/`break`/`continue` lower
@@ -820,6 +882,43 @@ enum LoweredExpr {
     Diverged,
 }
 
+/// Where a `match` decision tree's own winning arm hands its value off,
+/// once decided (`rfcs/0011`, Blocker 2): merged into a shared slot for
+/// the construct's own ordinary value (`Merge`, exactly like before),
+/// or forwarded straight to an enclosing `return`'s own per-branch
+/// sink (`Return`), exactly like `Lowering::lower_into_return_sink`
+/// already does for a nested `if`. Wrapped in `Option` by every caller
+/// (never a bare `ArmSink`) the same way `merge: Option<(ValueId,
+/// BlockId)>` already was: `None` means every arm diverges on its own
+/// (`Ty::Never`), so there is no value for any arm to hand off to
+/// anything at all.
+enum ArmSink<'a, 'f> {
+    Merge(ValueId, BlockId),
+    Return(
+        Ty,
+        &'f mut dyn FnMut(&mut Lowering<'a>, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ),
+}
+
+impl<'a> ArmSink<'a, '_> {
+    /// Produces a fresh, independently-usable `ArmSink` referring to
+    /// the same underlying slot/sink -- required at every recursive
+    /// decision-tree call site that itself sits inside a loop over
+    /// several sibling cases (`lower_bool_switch`'s two arms,
+    /// `lower_variant_switch`'s cases, `lower_literal_chain`'s then/
+    /// else split): `Merge` is trivially `Copy`, but `Return`'s own
+    /// `&mut dyn FnMut` is not, so it must be explicitly reborrowed
+    /// (exactly like `Lowering::lower_into_return_sink`'s own `&mut
+    /// *finish` reborrows already do) rather than moved once and
+    /// exhausted after the first sibling.
+    fn reborrow(&mut self) -> ArmSink<'a, '_> {
+        match self {
+            ArmSink::Merge(slot, after) => ArmSink::Merge(*slot, *after),
+            ArmSink::Return(hint, finish) => ArmSink::Return(hint.clone(), &mut **finish),
+        }
+    }
+}
+
 /// Per-function mutable lowering state: value numbering, the
 /// in-progress block list, and the active loop's break/continue targets.
 struct FnBuilder {
@@ -832,6 +931,16 @@ struct FnBuilder {
     /// bare literal in `return <literal>` to the right type instead of
     /// the usual i64/f64 default.
     return_ty: Ty,
+    /// Every `defer` statement's own already-lowered callee/arguments,
+    /// keyed by that exact statement's own callee-expression id
+    /// (`rfcs/0011`) -- populated once, when lowering first reaches
+    /// that `defer` statement itself, and read back (never re-lowered)
+    /// every time a checked cleanup action from `resourceck`'s own
+    /// `ResourceCheckResult::cleanup_edges` replays it. Argument
+    /// evaluation happens exactly once, here, at registration time,
+    /// matching `defer`'s own "never delays argument evaluation, only
+    /// the call's own side effect" rule.
+    defer_calls: HashMap<ExprId, PendingDefer>,
 }
 
 impl FnBuilder {
@@ -848,6 +957,7 @@ impl FnBuilder {
             current: entry,
             loop_stack: Vec::new(),
             return_ty,
+            defer_calls: HashMap::new(),
         }
     }
 
@@ -897,7 +1007,7 @@ impl FnBuilder {
         result
     }
 
-    fn push_store(&mut self, slot: ValueId, value: ValueId) {
+    fn push_store(&mut self, slot: ValueId, value: ValueId, mode: crate::nir::OwnershipMode) {
         debug_assert!(
             !self.current_terminated(),
             "internal invariant: appended a store to block {:?} after it was already terminated",
@@ -905,7 +1015,18 @@ impl FnBuilder {
         );
         self.current_block_mut()
             .instructions
-            .push(crate::nir::Instruction::Store { slot, value });
+            .push(crate::nir::Instruction::Store { slot, value, mode });
+    }
+
+    /// Appends any non-value-producing instruction (currently only
+    /// `Instruction::Drop`, `rfcs/0011`) to the current block.
+    fn push_instruction(&mut self, instruction: crate::nir::Instruction) {
+        debug_assert!(
+            !self.current_terminated(),
+            "internal invariant: appended an instruction to block {:?} after it was already terminated",
+            self.current
+        );
+        self.current_block_mut().instructions.push(instruction);
     }
 
     /// Sets the current block's terminator. This is the one place a
@@ -955,27 +1076,53 @@ impl<'a> Lowering<'a> {
         let mut fb = FnBuilder::new(return_type.clone());
         let mut params = Vec::new();
         for p in &f.params {
-            let ty = self.local_types.get(&p.local).cloned().unwrap_or(Ty::Error);
+            let Some(ty) = self.local_types.get(&p.local).cloned() else {
+                return Err(self.internal_error(&format!(
+                    "parameter {:?} has no type recorded by typeck",
+                    p.local
+                )));
+            };
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
-            params.push(Param { value, ty });
+            params.push(Param {
+                value,
+                ty,
+                take: p.take,
+            });
         }
 
-        let body_result = self.lower_block_value(&mut fb, &f.body)?;
-        if !fb.current_terminated() {
-            // `Diverged` always means the block that produced it is
-            // already terminated (see `LoweredExpr`), so reaching here
-            // means the body itself did produce a real value.
-            let LoweredExpr::Value(body_value) = body_result else {
-                unreachable!(
-                    "internal invariant: a Diverged result always already terminated its block"
-                );
-            };
-            if matches!(return_type, Ty::Unit) {
+        // The function's own implicit tail return is lowered through
+        // the same per-branch sink [`Self::lower_into_return_sink`]
+        // explicit `return` uses (Blocker 2) -- a resource-typed
+        // compound tail (`if cond { left } else { right }`, with no
+        // explicit `return` at all) needs exactly the same per-branch
+        // cleanup+terminate, not a single post-merge guess.
+        let return_type_for_tail = return_type.clone();
+        let mut finish_tail = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+            if matches!(return_type_for_tail, Ty::Unit) {
                 fb.terminate(Terminator::Return(None));
             } else {
-                fb.terminate(Terminator::Return(Some(body_value)));
+                let v = this.move_if_transferred(fb, v, &return_type_for_tail, true);
+                fb.terminate(Terminator::Return(Some(v)));
+            }
+            Ok(LoweredExpr::Diverged)
+        };
+        if self.is_affine(&return_type) {
+            self.lower_into_return_sink_block(&mut fb, &f.body, &return_type, &mut finish_tail)?;
+        } else {
+            let body_result = self.lower_block_value(&mut fb, &f.body)?;
+            if !fb.current_terminated() {
+                // `Diverged` always means the block that produced it is
+                // already terminated (see `LoweredExpr`), so reaching
+                // here means the body itself did produce a real value.
+                let LoweredExpr::Value(body_value) = body_result else {
+                    unreachable!(
+                        "internal invariant: a Diverged result always already terminated its block"
+                    );
+                };
+                self.emit_checked_cleanup(&mut fb, f.body.id)?;
+                finish_tail(self, &mut fb, body_value)?;
             }
         }
 
@@ -1039,11 +1186,13 @@ impl<'a> Lowering<'a> {
     // vs `add.f64`) is always a lookup by the node's own `ExprId`, never
     // a re-inference.
 
-    fn expr_ty(&self, expr: &HirExpr) -> Ty {
-        self.expr_types
-            .get(&expr.id())
-            .cloned()
-            .unwrap_or(Ty::Error)
+    fn expr_ty(&self, expr: &HirExpr) -> LowerResult<Ty> {
+        self.expr_types.get(&expr.id()).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "expression {:?} has no type recorded by typeck",
+                expr.id()
+            ))
+        })
     }
 
     /// Builds the diagnostic for a construct that reached lowering
@@ -1098,7 +1247,12 @@ impl<'a> Lowering<'a> {
     fn lower_stmt(&mut self, fb: &mut FnBuilder, stmt: &HirStmt) -> LowerResult<()> {
         match stmt {
             HirStmt::Binding(b) => {
-                let ty = self.local_types.get(&b.local).cloned().unwrap_or(Ty::Error);
+                let Some(ty) = self.local_types.get(&b.local).cloned() else {
+                    return Err(self.internal_error(&format!(
+                        "binding {:?} has no type recorded by typeck",
+                        b.local
+                    )));
+                };
                 let value = match self.lower_expr_hinted(fb, &b.value, &ty)? {
                     LoweredExpr::Value(v) => v,
                     // The initializer itself diverged (e.g. `value x =
@@ -1108,9 +1262,33 @@ impl<'a> Lowering<'a> {
                     LoweredExpr::Diverged => return Ok(()),
                 };
                 let binding = if b.mutable {
-                    let slot = fb.alloc_slot(ty);
-                    fb.push_store(slot, value);
+                    let slot = fb.alloc_slot(ty.clone());
+                    // A `value`/`mutable` binding's own initializer is
+                    // always checked with `ConsumeKind::Other`
+                    // (`resourceck::flow::check_binding`) -- never a
+                    // mere observation -- so a resource-typed one always
+                    // transfers ownership into this fresh slot. Read
+                    // back from `resourceck`'s own checked decision
+                    // directly, rather than re-derived from `ty` alone.
+                    let transfers =
+                        self.lookup_consume_mode(b.value.id(), &ty, "a binding initializer")?;
+                    let mode = if transfers {
+                        crate::nir::OwnershipMode::Transfer
+                    } else {
+                        crate::nir::OwnershipMode::Observe
+                    };
+                    fb.push_store(slot, value, mode);
                     LocalBinding::Slot(slot)
+                } else if matches!(b.value, HirExpr::Local { .. })
+                    && self.lookup_consume_mode(b.value.id(), &ty, "a binding initializer")?
+                {
+                    // Rebinding a resource directly from another
+                    // already-owned local (`value b = a;`) transfers
+                    // ownership explicitly, even with no slot involved:
+                    // `a`'s own prior identity must not remain
+                    // independently usable after this point.
+                    let moved = fb.push_value(ty.clone(), ValueKind::Move { source: value });
+                    LocalBinding::Direct(moved)
                 } else {
                     LocalBinding::Direct(value)
                 };
@@ -1121,18 +1299,532 @@ impl<'a> Lowering<'a> {
                 self.lower_expr(fb, e)?;
                 Ok(())
             }
-            // typeck rejects a non-empty `defer` outright (T0007) before
-            // lowering ever runs in the normal pipeline. A direct caller
-            // that bypasses that gate must not have it silently
-            // dropped (which would run the enclosing block as though
-            // the `defer` had never been written at all) -- this
-            // milestone's interpreter has nowhere correct to run
-            // deferred cleanup (spec/0004), so it is rejected here too.
-            HirStmt::Defer { span, .. } => Err(self.unsupported(*span, "`defer`")),
+            HirStmt::Defer { expr, span } => {
+                let Some(pending) = self.lower_defer_call(fb, expr, *span)? else {
+                    return Ok(());
+                };
+                fb.defer_calls.insert(expr.id(), pending);
+                Ok(())
+            }
+            HirStmt::Drop { expr, .. } => {
+                // The common case (`rfcs/0011`) is a bare local reference
+                // naming an owned resource -- bookkeeping-tracked, so
+                // this scope's own end-of-scope sweep knows to skip it.
+                // Any other resource-typed expression (e.g. dropping a
+                // freshly-constructed value with no binding at all) is
+                // still a valid, if unusual, `drop`: evaluated and
+                // destroyed the same way, just with no local to update
+                // bookkeeping for.
+                let value = match self.lower_expr(fb, expr)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(()),
+                };
+                fb.push_instruction(crate::nir::Instruction::Drop { value });
+                Ok(())
+            }
             HirStmt::While {
                 condition, body, ..
             } => self.lower_while(fb, condition, body),
             HirStmt::Loop { body, .. } => self.lower_loop(fb, body),
+        }
+    }
+
+    /// `true` iff `ty` is a resolved reference to a declared `resource`
+    /// (`rfcs/0011`), mirroring `resourceck`'s own identical check.
+    fn is_affine(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|r| r.affine))
+    }
+
+    /// The current NIR value behind `local`'s own binding: its value
+    /// directly, or (for a `mutable` binding) a fresh `Load` of its
+    /// slot, typed from `self.local_types` exactly like an ordinary
+    /// `HirExpr::Local` read already is.
+    fn load_current(
+        &self,
+        fb: &mut FnBuilder,
+        local: LocalId,
+        binding: LocalBinding,
+    ) -> LowerResult<ValueId> {
+        match binding {
+            LocalBinding::Direct(value) => Ok(value),
+            LocalBinding::Slot(slot) => {
+                let Some(ty) = self.local_types.get(&local).cloned() else {
+                    return Err(self.internal_error(&format!(
+                        "local {local:?} has a bound slot but no recorded type"
+                    )));
+                };
+                Ok(fb.push_value(ty, ValueKind::Load(slot)))
+            }
+        }
+    }
+
+    /// Lowers a `defer`'s own call expression's callee/arguments *now*
+    /// (`rfcs/0011`: a `defer` never delays argument evaluation, only
+    /// the call's own side effect), without emitting the call itself --
+    /// returns the pieces needed to replay it later, at each cleanup
+    /// point. `None` (with an internal-error diagnostic) for anything
+    /// this milestone's own scoped-down `defer` support does not cover:
+    /// a callee that isn't a plain, non-generic, capability-free
+    /// function reference.
+    fn lower_defer_call(
+        &mut self,
+        fb: &mut FnBuilder,
+        expr: &HirExpr,
+        span: Span,
+    ) -> LowerResult<Option<PendingDefer>> {
+        let HirExpr::Call { callee, args, .. } = expr else {
+            return Err(self.unsupported(span, "a `defer` whose expression is not a direct call"));
+        };
+        let HirExpr::Function { item, .. } = callee.as_ref() else {
+            return Err(self.unsupported(
+                span,
+                "a `defer` whose callee is not a plain function reference",
+            ));
+        };
+        let (type_params, param_tys, ret_ty) = self.lookup_function_sig(*item, "a `defer` call")?;
+        if !type_params.is_empty() {
+            return Err(self.unsupported(span, "a `defer` calling a generic function"));
+        }
+        // Cleanup-time failure semantics (what happens to a `raise`
+        // reaching the *enclosing* function's own cleanup point, which
+        // may already be mid-way through unwinding for a different
+        // reason) are not implemented this milestone (Blocker 6) --
+        // rejected outright here rather than silently dropping the
+        // raised effect or miscompiling it.
+        let raises = self.lookup_function_raises(*item, "a `defer` call")?;
+        if !raises.is_empty() {
+            return Err(self.unsupported(span, "a `defer` calling a fallible function"));
+        }
+        // A deferred call whose own result is itself a resource would
+        // need a new owner lined up for it at cleanup time, which this
+        // milestone has no mechanism for at all (Blocker 6) -- rejected
+        // outright rather than silently leaking (or double-owning) it.
+        if self.is_affine(&ret_ty) {
+            return Err(self.unsupported(span, "a `defer` calling a function returning a resource"));
+        }
+        // `resourceck::flow::check_defer` already recorded exactly this
+        // shape's own checked plan (`rfcs/0011`) -- the same per-
+        // argument observe/transfer verdict `check_expr_ctx`'s own
+        // `HirExpr::Call` handling decided, running this call through
+        // the same move-checking any other call gets. A structural
+        // mismatch here (this exact shape reached lowering, but
+        // resourceck recorded no plan for it) is a bug in one stage or
+        // the other, never silently treated as "observe everything".
+        let plan = self.defer_plans.get(&expr.id()).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "a `defer` calling {item:?} has no checked argument plan recorded by resourceck"
+            ))
+        })?;
+        // The plan's own shape must independently agree with what this
+        // stage resolves on its own, in every dimension -- a plan that
+        // merely exists is not enough (`rfcs/0011`): the wrong callee,
+        // the wrong argument/return type count, or a return type
+        // disagreement all mean the two stages disagree about this
+        // exact `defer`, which is never silently trusted just because a
+        // plan happens to be present.
+        if plan.callee != *item {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has a checked plan naming a different callee ({:?})",
+                plan.callee
+            )));
+        }
+        if plan.arg_modes.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has {} checked argument mode(s) but {} argument(s)",
+                plan.arg_modes.len(),
+                args.len()
+            )));
+        }
+        if plan.arg_types.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has {} checked argument type(s) but {} argument(s)",
+                plan.arg_types.len(),
+                args.len()
+            )));
+        }
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} declares {} parameter(s) but is called with {} argument(s)",
+                param_tys.len(),
+                args.len()
+            )));
+        }
+        if plan.return_type != ret_ty {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has a checked return type that disagrees with its own resolved signature"
+            )));
+        }
+        let mut arg_values = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let hint = &param_tys[i];
+            if plan.arg_types[i] != *hint {
+                return Err(self.internal_error(&format!(
+                    "a `defer` calling {item:?} has a checked argument type for argument {i} that disagrees with its own resolved parameter type"
+                )));
+            }
+            let v = match self.lower_expr_hinted(fb, arg, hint)? {
+                LoweredExpr::Value(v) => v,
+                LoweredExpr::Diverged => {
+                    return Err(self.unsupported(span, "a `defer` whose own argument diverges"));
+                }
+            };
+            // A `take` parameter transfers ownership of this argument
+            // into a dedicated, hidden capture *right here, at
+            // registration time* (`rfcs/0011`, Blocker 6) -- not later,
+            // when the deferred call this capture feeds actually
+            // replays. `resourceck` already decided this argument
+            // transfers (`checker::flow::check_defer` running the call
+            // through the same move-checking `check_expr` any other
+            // call gets); this `DeferCapture` only ever materializes
+            // that decision, immediately, so the replayed `Call` later
+            // consumes the already-captured owner, never the caller's
+            // own (by then long-invalid) original argument value.
+            // Cross-checked against `consume_sites` -- the exact same
+            // verdict `check_expr_ctx`'s own `HirExpr::Call` handling
+            // recorded for this same argument -- rather than trusted
+            // from the defer plan alone.
+            let plan_transfers =
+                matches!(plan.arg_modes[i], crate::resourceck::ConsumeInfo::Transfer);
+            let site_transfers = self.lookup_consume_mode(arg.id(), hint, "a defer argument")?;
+            if plan_transfers != site_transfers {
+                return Err(self.internal_error(&format!(
+                    "a `defer` calling {item:?} has argument {i}'s own checked plan mode disagreeing with its own recorded consume site"
+                )));
+            }
+            let captured = if plan_transfers && self.is_affine(hint) {
+                fb.push_value(hint.clone(), ValueKind::DeferCapture { source: v })
+            } else {
+                v
+            };
+            arg_values.push(captured);
+        }
+        let requirements = self.lookup_function_requirements(*item, "a `defer` call")?;
+        if !requirements.is_empty() {
+            return Err(self.unsupported(span, "a `defer` calling a capability-requiring function"));
+        }
+        Ok(Some(PendingDefer {
+            callee: *item,
+            type_args: Vec::new(),
+            args: arg_values,
+            evidence: Vec::new(),
+            ret_ty,
+        }))
+    }
+
+    /// Replays `resourceck`'s own checked cleanup list for `exit_id`
+    /// (`ResourceCheckResult::cleanup_edges`, already in replay order --
+    /// last declared/registered first), materializing each entry as a
+    /// real `Drop` instruction or a replayed deferred `Call` (`rfcs/0011`).
+    /// Lowering does not decide *whether* a local still needs dropping
+    /// here (`resourceck` already excluded anything `Moved`/`Dropped`
+    /// from this exact list) -- only *how* to materialize each entry
+    /// this stage already proved is owed. Every call site only ever
+    /// reaches this for an exit lowering itself has already independently
+    /// determined is reachable (an unreachable one is never lowered at
+    /// all -- see e.g. `LoweredExpr::Diverged` short-circuiting before
+    /// any of these call sites), so a missing `exit_id` here is never a
+    /// legitimate "unreachable" case: it means resourceck recorded no
+    /// plan for an exit lowering still reached, a structural mismatch
+    /// between the two stages -- reported as an internal error, never
+    /// silently treated as "nothing to clean up".
+    fn emit_checked_cleanup(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        let Some(actions) = self.cleanup_edges.get(&exit_id).cloned() else {
+            return Err(self.internal_error(&format!(
+                "exit {exit_id:?} is reachable but resourceck recorded no checked cleanup plan for it"
+            )));
+        };
+        // `resourceck`'s own `cleanup_edges` is already in replay order
+        // (last declared/registered first, `rfcs/0011`) -- so every
+        // `Defer` this exact list replays must name a strictly
+        // *decreasing* `registration_order`, matching that same LIFO
+        // discipline from its own `CheckedDeferPlan`. Never trusted
+        // silently: a plan replayed out of its own declared order would
+        // run deferred calls in the wrong sequence without ever
+        // producing a diagnostic otherwise.
+        let mut last_defer_registration: Option<u32> = None;
+        for action in actions {
+            match action {
+                crate::resourceck::CleanupAction::Drop(local) => {
+                    // `resourceck` only ever schedules a `Drop` for a
+                    // local it already proved `Available`/
+                    // `DropScheduled` at this exact exit -- which itself
+                    // already means this exact local was bound on
+                    // whichever path reached here. A missing binding
+                    // means this checked plan and what lowering actually
+                    // built have disagreed, not that there is nothing
+                    // to clean up here.
+                    let Some(binding) = fb.local_bindings.get(&local).copied() else {
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup action drops local {local:?}, which this frame never bound"
+                        )));
+                    };
+                    let value = self.load_current(fb, local, binding)?;
+                    fb.push_instruction(crate::nir::Instruction::Drop { value });
+                }
+                crate::resourceck::CleanupAction::Defer(defer_id) => {
+                    let Some(pending) = fb.defer_calls.get(&defer_id).cloned() else {
+                        return Err(self.internal_error(
+                            "a checked cleanup action replays a `defer` this frame never lowered",
+                        ));
+                    };
+                    let Some(plan) = self.defer_plans.get(&defer_id) else {
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup action replays defer {defer_id:?}, which has no checked plan recorded"
+                        )));
+                    };
+                    if let Some(last) = last_defer_registration
+                        && plan.registration_order >= last
+                    {
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup list replays defer {defer_id:?} out of its own declared LIFO registration order"
+                        )));
+                    }
+                    last_defer_registration = Some(plan.registration_order);
+                    fb.push_value(
+                        pending.ret_ty,
+                        ValueKind::Call(
+                            pending.callee,
+                            pending.type_args,
+                            pending.args,
+                            pending.evidence,
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lowers a *nested* block (an `if`/`match`/`handle` arm body, a
+    /// `while`/`loop` body, or a bare `{ ... }` block expression) as its
+    /// own resource-cleanup scope, distinct from the enclosing
+    /// function's own top-level one (`rfcs/0011`). Any resource local
+    /// this block itself declares and never moves is destroyed exactly
+    /// once, right here, at this block's own normal fallthrough exit --
+    /// never left in the function-wide cleanup list for an *enclosing*
+    /// scope's own later cleanup to also (incorrectly) replay, which
+    /// would either double-drop it or, since a value only ever a nested
+    /// block's own nested basic blocks defined does not dominate
+    /// anywhere outside that block, fail NIR verification outright. A
+    /// block that itself diverges (`return`/`raise`/`break`/`continue`)
+    /// needs no separate handling here: whichever function-level
+    /// cleanup point it already terminated through has already replayed
+    /// every entry up to and including this scope's own (`emit_cleanup`
+    /// always covers the *whole*, still-flat list) -- this only ever
+    /// needs to act, and truncate, on top of that.
+    fn lower_scoped_block(
+        &mut self,
+        fb: &mut FnBuilder,
+        block: &HirBlock,
+    ) -> LowerResult<LoweredExpr> {
+        let result = self.lower_block_value(fb, block)?;
+        if !fb.current_terminated() {
+            self.emit_checked_cleanup(fb, block.id)?;
+        }
+        Ok(result)
+    }
+
+    /// Like [`Self::lower_scoped_block`], for a `while`/`loop` body
+    /// (`lower_block_void`'s own void-result shape) -- a resource this
+    /// loop body itself declares fresh each iteration is destroyed at
+    /// the body's own normal fallthrough (the back edge to the loop
+    /// header), never left for the function-wide list to replay after
+    /// the loop, where its own value would not dominate at all.
+    fn lower_scoped_block_void(&mut self, fb: &mut FnBuilder, block: &HirBlock) -> LowerResult<()> {
+        self.lower_block_void(fb, block)?;
+        if !fb.current_terminated() {
+            self.emit_checked_cleanup(fb, block.id)?;
+        }
+        Ok(())
+    }
+
+    /// Lowers one branch/arm's own body (`f`) (`rfcs/0011`). Historically
+    /// this isolated a per-branch `moved_out` snapshot so a sibling
+    /// branch's own moves couldn't leak into this one -- lowering no
+    /// longer maintains any such cross-branch mutable ownership state at
+    /// all: `resourceck::flow`'s own per-branch state clone already
+    /// isolates each branch when it builds `ResourceCheckResult::
+    /// cleanup_edges`, so every exit `f` reaches looks its own already-
+    /// correctly-isolated cleanup list up directly, with nothing left
+    /// here to isolate a second time. Kept as a named seam (rather than
+    /// inlining every one of its call sites) purely so each branch/arm
+    /// of a branching construct's own lowering reads the same way it
+    /// always has.
+    fn lower_branch_moves<T>(
+        &mut self,
+        fb: &mut FnBuilder,
+        f: impl FnOnce(&mut Self, &mut FnBuilder) -> LowerResult<T>,
+    ) -> LowerResult<T> {
+        f(self, fb)
+    }
+
+    /// `return <expr>;`/`return;` (`rfcs/0011`, Blocker 2). A
+    /// resource-typed `expr` that is itself a nested `if`/block is
+    /// lowered through [`Self::lower_into_return_sink`] rather than
+    /// the ordinary value-producing path (`if`/`match`/`handle`'s own
+    /// shared-slot-then-merge machinery): a different underlying
+    /// resource local may be the one actually transferred on each
+    /// reachable branch (e.g. `return if cond { left } else { right
+    /// }`, where `left` is moved and `right` must still be dropped on
+    /// the `then` path, and vice versa on `else`), and NIR has no phi
+    /// node to reconcile two branches' disagreeing ownership facts at
+    /// one shared point -- so this `return`'s own cleanup+terminate
+    /// must run separately inside each branch, using that branch's own
+    /// correctly-isolated `moved_out` (see [`Self::lower_branch_moves`]).
+    /// `resourceck` already rejects every other compound-origin shape
+    /// (`match`/`handle`, or a non-`return` consuming position) this
+    /// milestone cannot yet lower soundly, so `expr` reaching here is
+    /// never one of those.
+    fn lower_return(
+        &mut self,
+        fb: &mut FnBuilder,
+        id: ExprId,
+        value: Option<&HirExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        let Some(value) = value else {
+            self.emit_checked_cleanup(fb, id)?;
+            fb.terminate(Terminator::Return(None));
+            return Ok(LoweredExpr::Diverged);
+        };
+        let ret_ty = fb.return_ty.clone();
+        let ret_ty_for_finish = ret_ty.clone();
+        let mut finish = |this: &mut Self, fb: &mut FnBuilder, v: ValueId| {
+            // Transfers ownership out to the caller explicitly
+            // (`rfcs/0011`) -- a no-op for a non-affine `ret_ty`. Applied
+            // uniformly here, in `finish` itself, so every leaf that
+            // reaches it (a direct return value, or one compound branch
+            // of a nested `if`/`match`/`handle`/block) gets the exact
+            // same treatment without each call site needing to remember
+            // to.
+            let v = this.move_if_transferred(fb, v, &ret_ty_for_finish, true);
+            fb.terminate(Terminator::Return(Some(v)));
+            Ok(LoweredExpr::Diverged)
+        };
+        // The per-branch sink is only actually needed (and only ever
+        // changes the NIR shape produced) for a resource-typed return
+        // value -- a plain value type has no ownership ambiguity a
+        // single post-merge terminator could get wrong, so it keeps
+        // the ordinary, simpler shared-slot-then-merge lowering
+        // (`rfcs/0011`, Blocker 2 is scoped to affine types only). Each
+        // compound leaf calls `emit_checked_cleanup` itself, keyed by
+        // its own id (see `lower_into_return_sink`'s own catch-all); a
+        // direct, non-compound return value has no leaf of its own, so
+        // it is keyed by this `return`'s own id instead, right here.
+        if self.is_affine(&ret_ty) {
+            self.lower_into_return_sink(fb, value, &ret_ty, &mut finish)
+        } else {
+            let v = match self.lower_expr_hinted(fb, value, &ret_ty)? {
+                LoweredExpr::Value(v) => v,
+                LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+            };
+            self.emit_checked_cleanup(fb, id)?;
+            finish(self, fb, v)
+        }
+    }
+
+    /// Lowers `expr` in a position whose own final value must be
+    /// handed to `finish` (a `return`'s own cleanup+terminate, or the
+    /// function's own implicit-tail-return finish) separately on each
+    /// reachable leaf of a nested `if`/block wrapping `expr`, instead
+    /// of merging every branch's value into one shared slot first and
+    /// calling `finish` once, afterward. See [`Self::lower_return`]'s
+    /// own doc comment for why this is required at all.
+    fn lower_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        expr: &HirExpr,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        match expr {
+            HirExpr::Block(block) => self.lower_into_return_sink_block(fb, block, hint, finish),
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => self.lower_match_into_return_sink(fb, scrutinee, arms, hint, finish),
+            HirExpr::Handle { operand, arms, .. } => {
+                self.lower_handle_into_return_sink(fb, operand, arms, hint, finish)
+            }
+            HirExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let cond_value = match self.lower_expr(fb, condition)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                let then_block = fb.new_block();
+                let else_block = fb.new_block();
+                fb.terminate(Terminator::CondBranch {
+                    condition: cond_value,
+                    then_block,
+                    else_block,
+                });
+
+                fb.switch_to(then_block);
+                self.lower_branch_moves(fb, |this, fb| {
+                    this.lower_into_return_sink_block(fb, then_branch, hint, &mut *finish)
+                })?;
+
+                fb.switch_to(else_block);
+                self.lower_branch_moves(fb, |this, fb| match else_branch {
+                    Some(HirElse::Block(b)) => {
+                        this.lower_into_return_sink_block(fb, b, hint, &mut *finish)
+                    }
+                    Some(HirElse::If(inner)) => {
+                        this.lower_into_return_sink(fb, inner, hint, &mut *finish)
+                    }
+                    None => {
+                        let v = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                        finish(this, fb, v)
+                    }
+                })?;
+
+                Ok(LoweredExpr::Diverged)
+            }
+            _ => {
+                let value = match self.lower_expr_hinted(fb, expr, hint)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                // This exact leaf is one branch's own return value
+                // (`rfcs/0011`, Blocker 2): `resourceck::flow`'s own
+                // `check_block_ctx_inner` records this leaf's own
+                // checked cleanup under this same id, using that
+                // branch's own state before any join with a sibling
+                // branch runs.
+                self.emit_checked_cleanup(fb, expr.id())?;
+                finish(self, fb, value)
+            }
+        }
+    }
+
+    /// Like [`Self::lower_into_return_sink`], for one nested block's
+    /// own statements + tail directly (an `if`-branch's own body, or a
+    /// bare `{ ... }` wrapping the sink's own expression) -- scoped
+    /// exactly like [`Self::lower_scoped_block`], so a resource this
+    /// block itself declares and never moves does not leak into a
+    /// sibling branch's own cleanup list.
+    fn lower_into_return_sink_block(
+        &mut self,
+        fb: &mut FnBuilder,
+        block: &HirBlock,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        for stmt in &block.statements {
+            self.lower_stmt(fb, stmt)?;
+            if fb.current_terminated() {
+                return Ok(LoweredExpr::Diverged);
+            }
+        }
+        match &block.tail {
+            Some(tail) => self.lower_into_return_sink(fb, tail, hint, finish),
+            None => {
+                let v = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                finish(self, fb, v)
+            }
         }
     }
 
@@ -1162,7 +1854,6 @@ impl<'a> Lowering<'a> {
             // reachable, so they are never created at all.
             LoweredExpr::Diverged => return Ok(()),
         };
-
         let loop_body = fb.new_block();
         let after = fb.new_block();
         fb.terminate(Terminator::CondBranch {
@@ -1176,12 +1867,18 @@ impl<'a> Lowering<'a> {
             break_target: after,
             continue_target: header,
         });
-        self.lower_block_void(fb, body)?;
+        self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
         }
 
+        // `after` is reached either through the condition-false edge or
+        // through some reachable `break`; `resourceck::flow`'s own
+        // `finish_loop` already joined every one of those into a single
+        // agreed-upon state before recording whatever comes lexically
+        // after this loop's own checked cleanup -- nothing further to
+        // reconcile here.
         fb.switch_to(after);
         Ok(())
     }
@@ -1196,12 +1893,17 @@ impl<'a> Lowering<'a> {
             break_target: after,
             continue_target: header,
         });
-        self.lower_block_void(fb, body)?;
+        self.lower_scoped_block_void(fb, body)?;
         fb.loop_stack.pop();
         if !fb.current_terminated() {
             fb.terminate(Terminator::Branch(header));
         }
 
+        // A bare `loop` has no condition-false edge at all -- only a
+        // reachable `break` can ever reach `after`. If none exist,
+        // `after` is itself unreachable, and nothing lexically after
+        // this loop is either (`resourceck`'s own `stmt_diverges`
+        // already treats such a loop as divergent).
         fb.switch_to(after);
         Ok(())
     }
@@ -1226,13 +1928,25 @@ impl<'a> Lowering<'a> {
                 fb.push_value(Ty::Bool, ValueKind::Const(Const::Bool(*value))),
             )),
             HirExpr::Local { local, .. } => {
-                let binding = *fb.local_bindings.get(local).expect(
-                    "internal invariant: a resolved local is always bound by the time it's read",
-                );
+                // A hand-built HIR module can name a `LocalId` this
+                // function never actually bound (no matching parameter
+                // or `let`-style statement) -- `hir::lower`'s own name
+                // resolution already rules this out for the ordinary
+                // pipeline, but this module never trusts that a direct
+                // caller bypassing it did too.
+                let Some(&binding) = fb.local_bindings.get(local) else {
+                    return Err(self.internal_error(&format!(
+                        "local {local:?} is read before it was ever bound"
+                    )));
+                };
                 match binding {
                     LocalBinding::Direct(value) => Ok(LoweredExpr::Value(value)),
                     LocalBinding::Slot(slot) => {
-                        let ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
+                        let Some(ty) = self.local_types.get(local).cloned() else {
+                            return Err(self.internal_error(&format!(
+                                "local {local:?} has a bound slot but no recorded type"
+                            )));
+                        };
                         Ok(LoweredExpr::Value(fb.push_value(ty, ValueKind::Load(slot))))
                     }
                 }
@@ -1293,10 +2007,12 @@ impl<'a> Lowering<'a> {
             // unpropagated inner value would let either "succeed" while
             // lying about what it does.
             HirExpr::Cast { span, .. } => Err(self.unsupported(*span, "casts (`as`)")),
-            HirExpr::Try { expr: inner, .. } => self.lower_try(fb, inner),
-            HirExpr::Raise { operand, .. } => self.lower_raise(fb, operand),
+            HirExpr::Try {
+                expr: inner, id, ..
+            } => self.lower_try(fb, *id, inner),
+            HirExpr::Raise { operand, id, .. } => self.lower_raise(fb, *id, operand),
             HirExpr::Handle { operand, arms, .. } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_handle(fb, operand, arms, result_ty)
             }
             HirExpr::If {
@@ -1305,36 +2021,23 @@ impl<'a> Lowering<'a> {
                 else_branch,
                 ..
             } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
             HirExpr::Match {
                 scrutinee, arms, ..
             } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_match(fb, scrutinee, arms, result_ty)
             }
-            HirExpr::Block(b) => self.lower_block_value(fb, b),
+            HirExpr::Block(b) => self.lower_scoped_block(fb, b),
             HirExpr::RecordLiteral { record, fields, .. } => {
                 self.lower_record_literal(fb, *record, fields, expr)
             }
-            HirExpr::Return { value, .. } => {
-                let ret_ty = fb.return_ty.clone();
-                let v = match value {
-                    Some(v) => match self.lower_expr_hinted(fb, v, &ret_ty)? {
-                        LoweredExpr::Value(val) => Some(val),
-                        // The value being returned already diverged
-                        // (e.g. `return return 1`); this outer `return`
-                        // never actually executes, and the block is
-                        // already terminated by the inner one.
-                        LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
-                    },
-                    None => None,
-                };
-                fb.terminate(Terminator::Return(v));
-                Ok(LoweredExpr::Diverged)
-            }
-            HirExpr::Break { value, span, .. } => {
+            HirExpr::Return { value, id, .. } => self.lower_return(fb, *id, value.as_deref()),
+            HirExpr::Break {
+                value, id, span, ..
+            } => {
                 // typeck rejects any value-carrying `break` outright
                 // (T0007) regardless of the value's type, before
                 // lowering ever runs in the normal pipeline. A direct
@@ -1347,21 +2050,32 @@ impl<'a> Lowering<'a> {
                         self.unsupported(*span, "`break` with a value (loop-as-expression)")
                     );
                 }
-                let target = fb
+                let ctx = *fb
                     .loop_stack
                     .last()
-                    .map(|c| c.break_target)
                     .ok_or_else(|| self.unsupported(*span, "`break` outside a loop"))?;
-                fb.terminate(Terminator::Branch(target));
+                // Destroys exactly this iteration's own live resources
+                // (`rfcs/0011`, Blocker 5) before jumping past the loop
+                // entirely -- `resourceck::flow` already recorded this
+                // exact `break`'s own checked cleanup list, covering
+                // only what this loop's own current iteration owns
+                // (nested scopes included), never an enclosing scope's
+                // (an outer loop, or the function itself).
+                self.emit_checked_cleanup(fb, *id)?;
+                fb.terminate(Terminator::Branch(ctx.break_target));
                 Ok(LoweredExpr::Diverged)
             }
-            HirExpr::Continue { span, .. } => {
-                let target = fb
+            HirExpr::Continue { id, span, .. } => {
+                let ctx = *fb
                     .loop_stack
                     .last()
-                    .map(|c| c.continue_target)
                     .ok_or_else(|| self.unsupported(*span, "`continue` outside a loop"))?;
-                fb.terminate(Terminator::Branch(target));
+                // Same cleanup as `break` above, before looping back to
+                // the condition instead of past it -- this iteration's
+                // own resources must still be destroyed exactly once
+                // before the next iteration freshly redeclares them.
+                self.emit_checked_cleanup(fb, *id)?;
+                fb.terminate(Terminator::Branch(ctx.continue_target));
                 Ok(LoweredExpr::Diverged)
             }
             HirExpr::Error { .. } => Ok(LoweredExpr::Value(
@@ -1396,7 +2110,7 @@ impl<'a> Lowering<'a> {
         op: UnaryOp,
         operand: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
-        let ty = self.expr_ty(operand);
+        let ty = self.expr_ty(operand)?;
         let v = match self.lower_expr_hinted(fb, operand, &ty)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -1435,7 +2149,7 @@ impl<'a> Lowering<'a> {
         // recorded a diagnostic if it couldn't), so either side's
         // resolved expr_type is the operand type -- no need to guess
         // which side "actually" carries it based on which is a literal.
-        let operand_ty = self.expr_ty(left);
+        let operand_ty = self.expr_ty(left)?;
 
         let lv = match self.lower_expr_hinted(fb, left, &operand_ty)? {
             LoweredExpr::Value(v) => v,
@@ -1499,7 +2213,7 @@ impl<'a> Lowering<'a> {
         let after_block = fb.new_block();
         let result_slot = fb.alloc_slot(Ty::Bool);
 
-        fb.push_store(result_slot, left_value);
+        fb.push_store(result_slot, left_value, crate::nir::OwnershipMode::Observe);
         let (then_block, else_block) = if short_on_true {
             (after_block, right_block)
         } else {
@@ -1517,7 +2231,7 @@ impl<'a> Lowering<'a> {
         // no value to store and no `after_block` branch to add on top
         // of that.
         if let LoweredExpr::Value(right_value) = self.lower_expr(fb, right)? {
-            fb.push_store(result_slot, right_value);
+            fb.push_store(result_slot, right_value, crate::nir::OwnershipMode::Observe);
             fb.terminate(Terminator::Branch(after_block));
         }
 
@@ -1547,19 +2261,39 @@ impl<'a> Lowering<'a> {
         };
         // typeck rejects assigning to a binding that isn't `mutable`
         // before NIR lowering ever runs, so a well-typed program's
-        // assignment target always has a real slot here.
+        // assignment target always has a real slot here -- but a direct
+        // caller hand-building HIR past that gate could still name an
+        // unbound, or immutable (`LocalBinding::Direct`), local as an
+        // assignment's own target.
         let slot = match fb.local_bindings.get(local) {
             Some(LocalBinding::Slot(slot)) => *slot,
-            other => panic!(
-                "internal invariant: assignment target must be a mutable local's slot, found {other:?}"
-            ),
+            other => {
+                return Err(self.internal_error(&format!(
+                    "assignment target {local:?} must be a mutable local's slot, found {other:?}"
+                )));
+            }
         };
-        let target_ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
+        let Some(target_ty) = self.local_types.get(local).cloned() else {
+            return Err(self.internal_error(&format!(
+                "assignment target {local:?} has no type recorded by typeck"
+            )));
+        };
         let value_value = match self.lower_expr_hinted(fb, value, &target_ty)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-
+        // Resource reassignment (`rfcs/0011`, Blocker 5): `resourceck`
+        // already proved the target's own previous value was moved or
+        // dropped before this reassignment was ever accepted, and that
+        // a plain-local RHS (`target = source;`) is itself consumed by
+        // it exactly like any other move. `resourceck::flow`'s own
+        // checked cleanup plan already reflects both halves of that on
+        // its own -- `local`'s own `Drop` entry is only ever included
+        // in a cleanup snapshot taken while `resourceck` still
+        // considers it `Available`/`DropScheduled`, and `source`'s own
+        // is excluded from any snapshot taken after this reassignment,
+        // since `resourceck` already transitioned it to `Moved` -- so
+        // lowering has nothing further of its own to update here.
         let final_value = match op {
             AssignOp::Assign => value_value,
             _ => {
@@ -1580,7 +2314,19 @@ impl<'a> Lowering<'a> {
                 fb.push_value(target_ty.clone(), kind)
             }
         };
-        fb.push_store(slot, final_value);
+        // A plain reassignment (`target = source;`) is itself a move,
+        // exactly like a `value`/`mutable` binding's own initializer
+        // (`ConsumeKind::Other`); a compound assignment (`target +=
+        // ...`) is always numeric/bitwise, never affine, and never
+        // itself checked by `resourceck` as a consume site at all.
+        let transfers = op == AssignOp::Assign
+            && self.lookup_consume_mode(value.id(), &target_ty, "an assignment value")?;
+        let mode = if transfers {
+            crate::nir::OwnershipMode::Transfer
+        } else {
+            crate::nir::OwnershipMode::Observe
+        };
+        fb.push_store(slot, final_value, mode);
         Ok(LoweredExpr::Value(
             fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
         ))
@@ -1637,21 +2383,36 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a call to {item:?} has {} argument(s) but its own resolved signature declares {}",
+                args.len(),
+                param_tys.len()
+            )));
+        }
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
-            match self.lower_expr_hinted(fb, arg, &hint)? {
-                LoweredExpr::Value(v) => arg_values.push(v),
+            let hint = crate::types::substitute(&param_tys[i], &subst);
+            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
-            }
+            };
+            // `resourceck` already decided whether this exact argument
+            // transfers ownership into the call (`rfcs/0011`): its own
+            // checked cleanup plan already excludes a transferred
+            // argument's own source local from its former scope's
+            // cleanup wherever it would otherwise be dropped again --
+            // this explicit `Move` only ever materializes that already-
+            // checked decision, read back directly, never re-derived
+            // from the callee's own `take` flags a second time.
+            let transfers = self.lookup_consume_mode(arg.id(), &hint, "a call argument")?;
+            arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::Call(*item, type_args, arg_values, evidence),
         )))
     }
@@ -1737,16 +2498,31 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "{context} calls {item:?} with {} argument(s) but its own resolved signature declares {}",
+                args.len(),
+                param_tys.len()
+            )));
+        }
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
-            match self.lower_expr_hinted(fb, arg, &hint)? {
-                LoweredExpr::Value(v) => arg_values.push(v),
+            let hint = crate::types::substitute(&param_tys[i], &subst);
+            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+                LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(None),
-            }
+            };
+            // Exactly `lower_call`'s own rule (`rfcs/0011`, Blocker 1):
+            // an argument transfers ownership into the call whether
+            // that call is an ordinary `Call` or a fallible `Invoke` --
+            // `resourceck` already decided this, and its own checked
+            // cleanup plan already reflects it on every edge (the
+            // success edge, and every failure edge alike); this
+            // explicit `Move` only ever materializes it, read back
+            // directly rather than re-derived from the callee's own
+            // `take` flags a second time.
+            let transfers = self.lookup_consume_mode(arg.id(), &hint, "an invoke argument")?;
+            arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, context)?;
         let evidence = self.resolve_call_evidence(operand.id(), &requirements, context)?;
@@ -1795,7 +2571,12 @@ impl<'a> Lowering<'a> {
     /// function's own `Terminator::Raise` -- `typeck`'s own
     /// `PROPAGATION_NOT_DECLARED` check already proved every one of
     /// those effects is also a member of this function's own `raises`.
-    fn lower_try(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+    fn lower_try(
+        &mut self,
+        fb: &mut FnBuilder,
+        id: ExprId,
+        operand: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
         let Some((ret_ty, ok_slot, ok_target, err_blocks, _)) =
             self.lower_invoke(fb, operand, "postfix `?`", None)?
         else {
@@ -1808,6 +2589,13 @@ impl<'a> Lowering<'a> {
             let name = layout.name;
             fb.switch_to(dispatch_block);
             let loaded = fb.push_value(Ty::Named(variant, name), ValueKind::Load(err_slot));
+            // Propagating out via `?` leaves this function's own scope
+            // exactly like an explicit `raise`/`return` does
+            // (`rfcs/0011`): every failure dispatch block replays this
+            // exact `?`'s own checked cleanup (looked up once by its
+            // own id, since the state at the point of the `?` does not
+            // depend on which raised variant actually propagated).
+            self.emit_checked_cleanup(fb, id)?;
             fb.terminate(Terminator::Raise { value: loaded });
         }
         fb.switch_to(ok_target);
@@ -1820,11 +2608,32 @@ impl<'a> Lowering<'a> {
     /// `return`/`break`: `operand` is evaluated exactly once, then the
     /// current block ends with `Terminator::Raise` instead of falling
     /// through to anything else.
-    fn lower_raise(&mut self, fb: &mut FnBuilder, operand: &HirExpr) -> LowerResult<LoweredExpr> {
+    fn lower_raise(
+        &mut self,
+        fb: &mut FnBuilder,
+        id: ExprId,
+        operand: &HirExpr,
+    ) -> LowerResult<LoweredExpr> {
         let value = match self.lower_expr(fb, operand)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
+        // `raise` leaves this function's own scope exactly like `return`
+        // does (`rfcs/0011`): every still-owned resource this function's
+        // own top-level scope owns, and every registered `defer`, must
+        // still run before control actually transfers to the caller's
+        // own failure edge.
+        self.emit_checked_cleanup(fb, id)?;
+        // A no-op today (a raised value is always a declared error
+        // variant, and `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`/T0064
+        // already forbids an affine field in any aggregate, so `operand`
+        // itself is never actually resource-typed) -- kept for the same
+        // reason `lower_raise` still calls `emit_checked_cleanup` at
+        // all: an explicit transfer out through `raise`, wherever the
+        // accepted language ever does permit one, must never depend on
+        // this call site remembering to add it later.
+        let ty = self.expr_ty(operand)?;
+        let value = self.move_if_transferred(fb, value, &ty, true);
         fb.terminate(Terminator::Raise { value });
         Ok(LoweredExpr::Diverged)
     }
@@ -1859,7 +2668,67 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(LoweredExpr::Diverged);
         };
+        let sink = merge.map(|(slot, after)| ArmSink::Merge(slot, after));
+        self.lower_handle_dispatch(
+            fb, arms, ok_ty, ok_slot, ok_target, err_blocks, sink, result_ty,
+        )
+    }
 
+    /// Lowers `expr` (a `handle`) in a position whose own final value
+    /// must be handed to `finish` separately on each reachable arm,
+    /// instead of merging every arm's value into one shared slot first
+    /// -- exactly [`Self::lower_match_into_return_sink`]'s own treatment
+    /// of a `match`, applied to `handle`'s own success/failure dispatch
+    /// (`rfcs/0011`, Blocker 2).
+    fn lower_handle_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        arms: &[HirHandleArm],
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        // No merge slot at all -- exactly like postfix `?`'s own
+        // `lower_try` (`merge_result_ty: None`): each arm hands its own
+        // value straight to `finish`, which terminates its own block
+        // itself, so there is no shared value for anything to merge.
+        let Some((ok_ty, ok_slot, ok_target, err_blocks, _)) =
+            self.lower_invoke(fb, operand, "`handle`", None)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+        self.lower_handle_dispatch(
+            fb,
+            arms,
+            ok_ty,
+            ok_slot,
+            ok_target,
+            err_blocks,
+            Some(ArmSink::Return(hint.clone(), finish)),
+            Ty::Never,
+        )
+    }
+
+    /// The shared success/failure dispatch both [`Self::lower_handle`]
+    /// and [`Self::lower_handle_into_return_sink`] delegate to, once
+    /// each has resolved its own `sink` (a shared merge slot, or an
+    /// enclosing `return`'s own per-arm sink) through
+    /// [`Self::lower_invoke`] in whichever way its own caller needs.
+    /// `result_ty` is only ever consulted in the `ArmSink::Merge` case
+    /// (the merge slot's own final `Load`'s type) -- callers with no
+    /// merge slot at all pass `Ty::Never`, which is never read.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_handle_dispatch(
+        &mut self,
+        fb: &mut FnBuilder,
+        arms: &[HirHandleArm],
+        ok_ty: Ty,
+        ok_slot: ValueId,
+        ok_target: BlockId,
+        err_blocks: Vec<(ItemId, ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
         // For every (variant, case-index) pair any raised effect
         // declares, which arm (by index into `arms`) actually covers it:
         // the first `Case` arm naming it, or else the single trailing
@@ -1946,10 +2815,18 @@ impl<'a> Lowering<'a> {
                                 index: i,
                             },
                         );
-                        self.bind_arm_pattern(fb, pat, v)?;
+                        self.bind_arm_pattern(fb, pat, v, ty)?;
                     }
                 }
-                self.lower_arm_body(fb, &arms[arm_index].body, merge)?;
+                let body = &arms[arm_index].body;
+                let body_id = match body {
+                    HirMatchArmBody::Expr(e) => e.id(),
+                    HirMatchArmBody::Block(b) => b.id,
+                };
+                let arm_sink = sink.as_mut().map(|s| s.reborrow());
+                self.lower_branch_moves(fb, |this, fb| {
+                    this.lower_handle_arm_body(fb, body, arm_sink, body_id)
+                })?;
                 fb.switch_to(dispatch_block);
             }
             fb.terminate(Terminator::Switch {
@@ -1960,7 +2837,7 @@ impl<'a> Lowering<'a> {
         }
 
         fb.switch_to(ok_target);
-        let ok_value = fb.push_value(ok_ty, ValueKind::Load(ok_slot));
+        let ok_value = fb.push_value(ok_ty.clone(), ValueKind::Load(ok_slot));
         let Some(success_arm) = arms
             .iter()
             .find(|a| matches!(a.kind, HirHandleArmKind::Success(_)))
@@ -1972,28 +2849,48 @@ impl<'a> Lowering<'a> {
         let HirHandleArmKind::Success(pattern) = &success_arm.kind else {
             unreachable!("just matched Success above");
         };
-        self.bind_arm_pattern(fb, pattern, ok_value)?;
-        self.lower_arm_body(fb, &success_arm.body, merge)?;
+        // Blocker 4: `success file => ...` owns the callee's returned
+        // resource -- `resourceck` already scheduled it for cleanup, so
+        // leaving the arm without moving/returning/dropping `file`
+        // still destroys it exactly once instead of leaking it.
+        self.bind_arm_pattern(fb, pattern, ok_value, &ok_ty)?;
+        let success_body_id = match &success_arm.body {
+            HirMatchArmBody::Expr(e) => e.id(),
+            HirMatchArmBody::Block(b) => b.id,
+        };
+        let success_sink = sink.as_mut().map(|s| s.reborrow());
+        self.lower_branch_moves(fb, |this, fb| {
+            this.lower_handle_arm_body(fb, &success_arm.body, success_sink, success_body_id)
+        })?;
 
-        match merge {
-            Some((slot, after)) => {
+        match sink {
+            Some(ArmSink::Merge(slot, after)) => {
                 fb.switch_to(after);
                 Ok(LoweredExpr::Value(
                     fb.push_value(result_ty, ValueKind::Load(slot)),
                 ))
             }
-            None => Ok(LoweredExpr::Diverged),
+            Some(ArmSink::Return(..)) | None => Ok(LoweredExpr::Diverged),
         }
     }
 
     /// Binds a `success`/failure-payload pattern -- always a bare `Bind`
     /// or `Wildcard` once resolved (`typeck` rejects anything else) -- to
-    /// an already-computed value.
+    /// an already-computed value. A resource-typed binding (only ever
+    /// possible for a `success` pattern -- a failure payload's own type
+    /// is a raised variant's case payload, which
+    /// `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` already forbids from ever
+    /// being affine) owns that value exactly like an ordinary `value`
+    /// binding does (`rfcs/0011`, Blocker 4): scheduled for cleanup the
+    /// same way, so leaving the arm without moving, returning, or
+    /// explicitly dropping it still destroys it exactly once, rather
+    /// than silently leaking it.
     fn bind_arm_pattern(
         &mut self,
         fb: &mut FnBuilder,
         pattern: &HirPattern,
         value: ValueId,
+        value_ty: &Ty,
     ) -> LowerResult<()> {
         match pattern {
             HirPattern::Bind { local, .. } => {
@@ -2001,24 +2898,51 @@ impl<'a> Lowering<'a> {
                     .insert(*local, LocalBinding::Direct(value));
                 Ok(())
             }
-            HirPattern::Wildcard { .. } => Ok(()),
+            // A `_` pattern names nothing a later expression could ever
+            // refer to, so a resource-typed value bound this way (only
+            // ever a `success` pattern -- see `bind_arm_pattern`'s own
+            // doc comment) can never be moved, returned, or explicitly
+            // dropped through it either. There is no local to schedule
+            // ordinary cleanup for, so it is destroyed immediately,
+            // right here, rather than silently discarded and leaked.
+            HirPattern::Wildcard { .. } => {
+                if self.is_affine(value_ty) {
+                    fb.push_instruction(crate::nir::Instruction::Drop { value });
+                }
+                Ok(())
+            }
             other => Err(self.internal_error(&format!(
                 "a `handle` arm's pattern other than a bare bind or wildcard reached lowering: {other:?}"
             ))),
         }
     }
 
-    /// Lowers one `handle` arm's body, storing its value into `merge`'s
-    /// slot and branching to its block -- exactly `lower_decision`'s own
-    /// tail behavior for an ordinary `match` arm. Does nothing further
-    /// when the body diverged on its own (it already terminated its
-    /// block itself).
+    /// Lowers one `handle`/`match` arm's body, storing its value into
+    /// `merge`'s slot and branching to its block. Does nothing further
+    /// when the body diverged on its own (it already replayed its own
+    /// checked cleanup through whichever exit -- `return`/`raise`/
+    /// `break`/`continue` -- it actually terminated through).
+    /// `resourceck::flow` records this arm's own combined
+    /// pattern-binding-plus-body cleanup under this exact body's own id
+    /// (`body_id` -- `block.id` for a block body, the tail expression's
+    /// own id for a bare one -- see `resourceck::flow::
+    /// check_match_arms`/`check_handle_arms`), so a normal completion
+    /// looks it up by that same id, once, right here.
     fn lower_arm_body(
         &mut self,
         fb: &mut FnBuilder,
         body: &HirMatchArmBody,
         merge: Option<(ValueId, BlockId)>,
+        body_id: ExprId,
     ) -> LowerResult<()> {
+        // `lower_block_value`, not `lower_scoped_block`: this arm's own
+        // wider cleanup lookup below (keyed by `body_id`) already covers
+        // a block body's own internal locals combined with this arm's
+        // own pattern binding, exactly mirroring `resourceck::flow`'s
+        // own `check_block_ctx_body` bypass -- calling the ordinary,
+        // self-cleaning `lower_scoped_block` here as well would look
+        // the identical `block.id` entry up (and replay it) a second
+        // time.
         let result = match body {
             HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
             HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
@@ -2026,10 +2950,63 @@ impl<'a> Lowering<'a> {
         if let LoweredExpr::Value(v) = result
             && let Some((slot, after)) = merge
         {
-            fb.push_store(slot, v);
+            self.emit_checked_cleanup(fb, body_id)?;
+            // A resource-typed match/handle arm only ever reaches this
+            // ordinary merge-into-slot path in an observing (`Read`)
+            // context -- any consuming (`return`) context is instead
+            // routed through `lower_arm_body_into_return_sink`, which
+            // never allocates a merge slot at all (`rfcs/0011`).
+            fb.push_store(slot, v, crate::nir::OwnershipMode::Observe);
             fb.terminate(Terminator::Branch(after));
         }
         Ok(())
+    }
+
+    /// Like [`Self::lower_arm_body`], but for a winning arm reached
+    /// through [`Self::lower_match_into_return_sink`] instead of an
+    /// ordinary merge-into-slot `match` (`rfcs/0011`, Blocker 2):
+    /// `finish` is called directly on this arm's own value, exactly
+    /// like a nested `if`-branch's own leaf already is by
+    /// [`Self::lower_into_return_sink`], which this delegates straight
+    /// to -- correctly recursing into a further nested `if`/`match`/
+    /// block this exact arm's own body might itself be, rather than
+    /// treating it as a single opaque leaf the way [`Self::
+    /// lower_arm_body`]'s flat `lower_expr`/`lower_block_value` call
+    /// would.
+    fn lower_arm_body_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        match body {
+            HirMatchArmBody::Expr(e) => self.lower_into_return_sink(fb, e, hint, finish),
+            HirMatchArmBody::Block(b) => self.lower_into_return_sink_block(fb, b, hint, finish),
+        }
+    }
+
+    /// One `handle` arm's own share of [`Self::lower_handle_dispatch`]:
+    /// dispatches to the ordinary merge-into-slot
+    /// [`Self::lower_arm_body`] or the per-arm [`Self::
+    /// lower_arm_body_into_return_sink`], whichever `sink` calls for.
+    fn lower_handle_arm_body(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        sink: Option<ArmSink<'a, '_>>,
+        body_id: ExprId,
+    ) -> LowerResult<()> {
+        match sink {
+            Some(ArmSink::Merge(slot, after)) => {
+                self.lower_arm_body(fb, body, Some((slot, after)), body_id)
+            }
+            Some(ArmSink::Return(hint, finish)) => {
+                self.lower_arm_body_into_return_sink(fb, body, &hint, finish)?;
+                Ok(())
+            }
+            None => self.lower_arm_body(fb, body, None, body_id),
+        }
     }
 
     /// Lowers an explicit protocol-call expression,
@@ -2062,8 +3039,9 @@ impl<'a> Lowering<'a> {
                 "protocol call has no recorded call-site evidence from typeck's capability solver",
             ));
         };
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::ProtocolCall {
                 protocol,
                 arguments: resolved_arguments,
@@ -2123,17 +3101,23 @@ impl<'a> Lowering<'a> {
         }
         let mut payload = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = payload_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
+            // The arity check just above already guarantees `i` is in
+            // range; still checked explicitly (never `Ty::Error`) rather
+            // than trusted blindly.
+            let Some(param_ty) = payload_tys.get(i) else {
+                return Err(self.internal_error(&format!(
+                    "variant construction for case {case} of {variant:?} has no declared payload type for argument {i}"
+                )));
+            };
+            let hint = crate::types::substitute(param_ty, &subst);
             match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => payload.push(v),
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::VariantCreate {
                 variant,
                 case,
@@ -2216,7 +3200,14 @@ impl<'a> Lowering<'a> {
             let declared = self.records[&record].fields[f.field_index].1.clone();
             let hint = crate::types::substitute(&declared, &subst);
             match self.lower_expr_hinted(fb, &f.value, &hint)? {
-                LoweredExpr::Value(v) => by_index[f.field_index] = Some(v),
+                LoweredExpr::Value(v) => {
+                    by_index[f.field_index] = Some(v);
+                    // A resource-typed field is rejected outright at its
+                    // own containing aggregate's declaration
+                    // (`RESOURCE_FIELD_IN_ORDINARY_AGGREGATE`, T0064),
+                    // so no well-typed program ever reaches this point
+                    // with an affine `f.value` at all.
+                }
                 // A diverging initializer means the whole construction
                 // never completes; no field written after it in source
                 // order is lowered as reachable work.
@@ -2227,8 +3218,9 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|v| v.expect("every index was already proven present above"))
             .collect();
+        let literal_ty = self.expr_ty(literal_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(literal_expr),
+            literal_ty,
             ValueKind::RecordCreate(record, type_args, ordered),
         )))
     }
@@ -2244,7 +3236,7 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-        let base_ty = self.expr_ty(base);
+        let base_ty = self.expr_ty(base)?;
         // A generic record's own body (e.g. `unwrap[T](box: Box[T]) ->
         // T { box.value }`) accesses a field whose base is symbolically
         // typed `Box[T]` (`Ty::Applied`), never `Ty::Named` -- checked
@@ -2269,8 +3261,9 @@ impl<'a> Lowering<'a> {
             .ok_or_else(|| {
                 self.unsupported(field_expr.span(), "field access on an unknown field")
             })?;
+        let field_ty = self.expr_ty(field_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(field_expr),
+            field_ty,
             ValueKind::RecordField {
                 base: base_value,
                 record,
@@ -2311,19 +3304,24 @@ impl<'a> Lowering<'a> {
             });
 
             fb.switch_to(then_block);
-            let then_result = self.lower_block_value(fb, then_branch)?;
+            let then_result =
+                self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?;
 
             fb.switch_to(else_block);
-            let else_result = match else_branch {
-                Some(HirElse::Block(b)) => self.lower_block_value(fb, b)?,
-                Some(HirElse::If(inner)) => self.lower_expr(fb, inner)?,
-                // An else-less `if` always types as `unit` (see below),
-                // never `never` -- typeck cannot have produced this
-                // combination.
-                None => unreachable!(
-                    "internal invariant: an else-less `if` is always unit-typed, not never"
-                ),
-            };
+            let else_result = self.lower_branch_moves(fb, |this, fb| match else_branch {
+                Some(HirElse::Block(b)) => this.lower_scoped_block(fb, b),
+                Some(HirElse::If(inner)) => this.lower_expr(fb, inner),
+                // An else-less `if` always types as `unit` in the
+                // ordinary pipeline (see below), never `never` -- but
+                // `expr_types` is caller-supplied data a direct caller
+                // hand-building HIR controls directly, and could name
+                // an else-less `if` as `Ty::Never` with no HIR-level
+                // else branch to actually justify it.
+                None => Err(this.internal_error(
+                    "an else-less `if` was typed as `never`, which requires a diverging else \
+                     branch that does not exist",
+                )),
+            })?;
             debug_assert!(
                 matches!(then_result, LoweredExpr::Diverged)
                     && matches!(else_result, LoweredExpr::Diverged),
@@ -2350,7 +3348,9 @@ impl<'a> Lowering<'a> {
         });
 
         fb.switch_to(then_block);
-        if let LoweredExpr::Value(then_value) = self.lower_block_value(fb, then_branch)? {
+        if let LoweredExpr::Value(then_value) =
+            self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, then_branch))?
+        {
             if else_branch.is_none() {
                 // No `else`: typeck gives the whole expression type
                 // `unit` regardless of what the then-branch's own tail
@@ -2363,9 +3363,14 @@ impl<'a> Lowering<'a> {
                 // of the wrong type into it.
                 let _ = then_value;
                 let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                fb.push_store(result_slot, unit_value);
+                fb.push_store(result_slot, unit_value, crate::nir::OwnershipMode::Observe);
             } else {
-                fb.push_store(result_slot, then_value);
+                // A resource-typed `if` only ever reaches this ordinary
+                // merge-into-slot path in an observing (`Read`) context
+                // -- any consuming (`return`) context is instead routed
+                // through `lower_into_return_sink`, which never
+                // allocates a merge slot at all (`rfcs/0011`).
+                fb.push_store(result_slot, then_value, crate::nir::OwnershipMode::Observe);
             }
             fb.terminate(Terminator::Branch(after_block));
         }
@@ -2373,21 +3378,28 @@ impl<'a> Lowering<'a> {
         fb.switch_to(else_block);
         match else_branch {
             Some(HirElse::Block(b)) => {
-                if let LoweredExpr::Value(else_value) = self.lower_block_value(fb, b)? {
-                    fb.push_store(result_slot, else_value);
+                if let LoweredExpr::Value(else_value) =
+                    self.lower_branch_moves(fb, |this, fb| this.lower_scoped_block(fb, b))?
+                {
+                    fb.push_store(result_slot, else_value, crate::nir::OwnershipMode::Observe);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             Some(HirElse::If(inner)) => {
-                if let LoweredExpr::Value(else_value) = self.lower_expr(fb, inner)? {
-                    fb.push_store(result_slot, else_value);
+                if let LoweredExpr::Value(else_value) =
+                    self.lower_branch_moves(fb, |this, fb| this.lower_expr(fb, inner))?
+                {
+                    fb.push_store(result_slot, else_value, crate::nir::OwnershipMode::Observe);
                     fb.terminate(Terminator::Branch(after_block));
                 }
             }
             None => {
-                let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
-                fb.push_store(result_slot, unit_value);
-                fb.terminate(Terminator::Branch(after_block));
+                self.lower_branch_moves(fb, |_, fb| {
+                    let unit_value = fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit));
+                    fb.push_store(result_slot, unit_value, crate::nir::OwnershipMode::Observe);
+                    fb.terminate(Terminator::Branch(after_block));
+                    Ok(())
+                })?;
             }
         }
 
@@ -2424,7 +3436,7 @@ impl<'a> Lowering<'a> {
             // `never`, and no arm is lowered as reachable work.
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-        let scrutinee_ty = self.expr_ty(scrutinee);
+        let scrutinee_ty = self.expr_ty(scrutinee)?;
 
         let rows: Vec<MatrixRow> = arms
             .iter()
@@ -2458,7 +3470,7 @@ impl<'a> Lowering<'a> {
             rows,
             occurrences,
             arms,
-            Some((result_slot, after_block)),
+            Some(ArmSink::Merge(result_slot, after_block)),
             0,
         )?;
 
@@ -2468,13 +3480,57 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// Lowers `expr` (a `match`) in a position whose own final value
+    /// must be handed to `finish` separately on each reachable winning
+    /// arm, instead of merging every arm's value into one shared slot
+    /// first -- exactly `Lowering::lower_into_return_sink`'s own
+    /// treatment of a nested `if`, generalized to a `match`'s own
+    /// decision tree (`rfcs/0011`, Blocker 2).
+    fn lower_match_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        scrutinee: &HirExpr,
+        arms: &[HirMatchArm],
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        let scrutinee_value = match self.lower_expr(fb, scrutinee)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let scrutinee_ty = self.expr_ty(scrutinee)?;
+
+        let rows: Vec<MatrixRow> = arms
+            .iter()
+            .enumerate()
+            .map(|(i, arm)| MatrixRow {
+                arm_index: i,
+                patterns: vec![PatternSlot::Real(&arm.pattern)],
+                bindings: Vec::new(),
+            })
+            .collect();
+        let occurrences = vec![Occurrence {
+            value: scrutinee_value,
+            ty: scrutinee_ty,
+        }];
+        self.lower_decision(
+            fb,
+            rows,
+            occurrences,
+            arms,
+            Some(ArmSink::Return(hint.clone(), finish)),
+            0,
+        )?;
+        Ok(LoweredExpr::Diverged)
+    }
+
     fn lower_decision<'h>(
         &mut self,
         fb: &mut FnBuilder,
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         // Each round trip through lower_decision and one of
@@ -2502,15 +3558,26 @@ impl<'a> Lowering<'a> {
                     .insert(*local, LocalBinding::Direct(*value));
             }
             let arm = &arms[winner.arm_index];
-            let result = match &arm.body {
-                HirMatchArmBody::Expr(e) => self.lower_expr(fb, e)?,
-                HirMatchArmBody::Block(b) => self.lower_block_value(fb, b)?,
+            let body_id = match &arm.body {
+                HirMatchArmBody::Expr(e) => e.id(),
+                HirMatchArmBody::Block(b) => b.id,
             };
-            if let LoweredExpr::Value(v) = result
-                && let Some((slot, after)) = merge
-            {
-                fb.push_store(slot, v);
-                fb.terminate(Terminator::Branch(after));
+            match sink {
+                Some(ArmSink::Merge(slot, after)) => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body(fb, &arm.body, Some((slot, after)), body_id)
+                    })?;
+                }
+                Some(ArmSink::Return(hint, finish)) => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body_into_return_sink(fb, &arm.body, &hint, finish)
+                    })?;
+                }
+                None => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body(fb, &arm.body, None, body_id)
+                    })?;
+                }
             }
             return Ok(());
         }
@@ -2526,7 +3593,7 @@ impl<'a> Lowering<'a> {
             _ => None,
         };
         if scrutinee_variant.is_some_and(|item| self.variants.contains_key(&item)) {
-            self.lower_variant_switch(fb, rows, occurrences, arms, merge, depth)
+            self.lower_variant_switch(fb, rows, occurrences, arms, sink, depth)
         } else if matches!(&occurrences[0].ty, Ty::Bool) {
             // `bool` is a closed two-constructor domain (like a
             // variant's finite case set), so it is switched on
@@ -2534,9 +3601,9 @@ impl<'a> Lowering<'a> {
             // chain below -- an exhaustive `match true { true => ..,
             // false => .. }` (no wildcard at all) would otherwise have
             // no catch-all to terminate that chain's recursion on.
-            self.lower_bool_switch(fb, rows, occurrences, arms, merge, depth)
+            self.lower_bool_switch(fb, rows, occurrences, arms, sink, depth)
         } else {
-            self.lower_literal_chain(fb, rows, occurrences, arms, merge, depth)
+            self.lower_literal_chain(fb, rows, occurrences, arms, sink, depth)
         }
     }
 
@@ -2547,7 +3614,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -2572,7 +3639,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
         }
 
         let then_block = fb.new_block();
@@ -2620,7 +3687,14 @@ impl<'a> Lowering<'a> {
                     self.internal_error("a match's bool switch left a branch with no covering arm")
                 );
             }
-            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+            self.lower_decision(
+                fb,
+                new_rows,
+                rest_occ.clone(),
+                arms,
+                sink.as_mut().map(|s| s.reborrow()),
+                depth + 1,
+            )?;
         }
         Ok(())
     }
@@ -2632,7 +3706,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -2667,7 +3741,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
         }
 
         let num_cases = self
@@ -2792,7 +3866,14 @@ impl<'a> Lowering<'a> {
 
             let mut new_occurrences = payload_occurrences;
             new_occurrences.extend(rest_occ.clone());
-            self.lower_decision(fb, new_rows, new_occurrences, arms, merge, depth + 1)?;
+            self.lower_decision(
+                fb,
+                new_rows,
+                new_occurrences,
+                arms,
+                sink.as_mut().map(|s| s.reborrow()),
+                depth + 1,
+            )?;
         }
         Ok(())
     }
@@ -2804,7 +3885,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -2820,7 +3901,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings: first.bindings.clone(),
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
             Classified::Bind(local) => {
                 let mut bindings = first.bindings.clone();
@@ -2830,7 +3911,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings,
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
             Classified::Literal(lit) => {
                 let const_value = literal_const(fb, &lit, &occ.ty);
@@ -2873,7 +3954,14 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 fb.switch_to(then_block);
-                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+                self.lower_decision(
+                    fb,
+                    then_rows,
+                    rest_occ.clone(),
+                    arms,
+                    sink.as_mut().map(|s| s.reborrow()),
+                    depth + 1,
+                )?;
 
                 let else_rows: Vec<MatrixRow<'h>> = rows
                     .into_iter()
@@ -2889,7 +3977,7 @@ impl<'a> Lowering<'a> {
                 }
                 let mut all_occ = vec![occ];
                 all_occ.extend(rest_occ);
-                self.lower_decision(fb, else_rows, all_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, else_rows, all_occ, arms, sink, depth + 1)
             }
             Classified::Case { .. } => Err(self
                 .internal_error("a variant pattern was tested against a non-variant occurrence")),
@@ -2996,6 +4084,53 @@ impl<'a> Lowering<'a> {
                 "{context} targets a function this module never resolved a raised-effect set for"
             ))
         })
+    }
+
+    /// Looks up `resourceck`'s own checked observe-vs-transfer decision
+    /// for the exact expression `id` names (`rfcs/0011`) -- a call/
+    /// `Invoke` argument, a binding's own initializer, or an
+    /// assignment's own value. Always `false` for a non-affine type:
+    /// `resourceck` never records anything for one (there is no
+    /// ownership to decide), so this never even consults `consume_
+    /// sites` for it. For an affine type, a missing entry is a
+    /// structural mismatch between this stage and `resourceck` -- never
+    /// silently treated as "observe" -- since every affine expression
+    /// `resourceck` accepted in a consuming position always has one.
+    fn lookup_consume_mode(&self, id: ExprId, ty: &Ty, context: &str) -> LowerResult<bool> {
+        if !self.is_affine(ty) {
+            return Ok(false);
+        }
+        match self.consume_sites.get(&id) {
+            Some(crate::resourceck::ConsumeInfo::Transfer) => Ok(true),
+            Some(crate::resourceck::ConsumeInfo::Observe) => Ok(false),
+            None => Err(self.internal_error(&format!(
+                "{context} is affine-typed but resourceck recorded no checked consume decision for it"
+            ))),
+        }
+    }
+
+    /// Emits an explicit ownership transfer for a call/`return`/`raise`
+    /// operand `resourceck` already proved consumes its own source
+    /// (`rfcs/0011`) -- `value`'s own prior identity is invalid
+    /// immediately afterward; the returned `ValueId` is the resource's
+    /// one current owner from this point on. A no-op (`value` passed
+    /// straight through) for a non-affine type, or when `transfers` is
+    /// `false` (an ordinary, non-`take` argument's own observation):
+    /// `nir::verify` never accepts a `Move` whose own source isn't
+    /// resource-typed, and there is nothing to transfer when this exact
+    /// operand doesn't consume anything in the first place.
+    fn move_if_transferred(
+        &mut self,
+        fb: &mut FnBuilder,
+        value: ValueId,
+        ty: &Ty,
+        transfers: bool,
+    ) -> ValueId {
+        if transfers && self.is_affine(ty) {
+            fb.push_value(ty.clone(), ValueKind::Move { source: value })
+        } else {
+            value
+        }
     }
 
     /// Reads `expr_id`'s already-resolved type arguments back from
@@ -3158,6 +4293,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         lower_module(
             &hir,
             &result.local_types,
@@ -3166,6 +4312,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -3195,6 +4344,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         lower_module(
             &hir,
             &result.local_types,
@@ -3203,9 +4363,506 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
+    }
+
+    #[test]
+    fn a_missing_consume_site_for_an_affine_binding_is_an_internal_error_not_a_silent_observe() {
+        // `resourceck` genuinely recorded a checked transfer for this
+        // exact binding -- this test discards it before lowering ever
+        // sees it, simulating the two stages disagreeing (`rfcs/0011`).
+        // Lowering must report a structured internal diagnostic, never
+        // silently fall back to treating the initializer as a mere
+        // observation.
+        // A `mutable` binding's own `Store` always consults its checked
+        // consume decision, regardless of the initializer's own shape
+        // (unlike an immutable rebind, which only ever needs one for a
+        // bare-local source -- there is no `Move` to decide for a fresh
+        // construction either way, so nothing would notice its absence).
+        let text = "resource File { descriptor: i64 } \
+                     func f() { mutable file = File { descriptor: 3 }; drop file; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.consume_sites.is_empty(),
+            "expected resourceck to have actually recorded a consume site"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            // Deliberately empty, discarding resourceck's own real
+            // decision, rather than the authentic `consume_sites`.
+            &BTreeMap::new(),
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("no checked consume decision"),
+            "expected a missing-consume-decision internal error, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// Runs a real `defer close(file);` (`take`) program through the
+    /// whole front end, asserting every stage is clean, and returns
+    /// everything needed to call `lower_module` directly -- for tests
+    /// that then deliberately tamper with one field of the checked
+    /// `CheckedDeferPlan` this program's own `resourceck` pass recorded,
+    /// before lowering, to prove each field is actually validated
+    /// (`rfcs/0011`) rather than merely present.
+    #[allow(clippy::type_complexity)]
+    fn checked_take_defer_pipeline() -> (
+        crate::hir::HirModule,
+        HashMap<LocalId, Ty>,
+        HashMap<ExprId, Ty>,
+        HashMap<PatternId, (ItemId, usize)>,
+        HashMap<ExprId, Vec<Ty>>,
+        crate::resourceck::ResourceCheckResult,
+        Interner,
+        SourceId,
+    ) {
+        let text = "resource File { descriptor: i64 } \
+                     func close(take file: File) -> unit { drop file; } \
+                     func f() { value file = File { descriptor: 3 }; defer close(file); }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert_eq!(
+            resourceck_result.defer_plans.len(),
+            1,
+            "expected exactly one checked defer plan: {:?}",
+            resourceck_result.defer_plans
+        );
+        (
+            hir,
+            result.local_types,
+            result.expr_types,
+            result.pattern_case,
+            result.call_type_args,
+            resourceck_result,
+            interner,
+            id,
+        )
+    }
+
+    /// Lowers `checked_take_defer_pipeline`'s own program with its sole
+    /// `CheckedDeferPlan` replaced by `tamper`'s own result, asserting
+    /// lowering fails with a structured internal diagnostic whose
+    /// message contains `expected_message_fragment`.
+    fn assert_tampered_defer_plan_rejected(
+        tamper: impl FnOnce(crate::resourceck::CheckedDeferPlan) -> crate::resourceck::CheckedDeferPlan,
+        expected_message_fragment: &str,
+    ) {
+        let (
+            hir,
+            local_types,
+            expr_types,
+            pattern_case,
+            call_type_args,
+            mut resourceck_result,
+            interner,
+            id,
+        ) = checked_take_defer_pipeline();
+        let (defer_id, plan) = resourceck_result
+            .defer_plans
+            .iter()
+            .next()
+            .map(|(id, plan)| (*id, plan.clone()))
+            .expect("checked above");
+        resourceck_result.defer_plans.insert(defer_id, tamper(plan));
+        let outcome = lower_module(
+            &hir,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a tampered-defer-plan internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains(expected_message_fragment),
+            "expected a message containing {expected_message_fragment:?}, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_naming_the_wrong_callee_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.callee = ItemId(9999);
+                plan
+            },
+            "a different callee",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_few_argument_modes_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes.clear();
+                plan
+            },
+            "checked argument mode(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_many_argument_modes_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes.push(crate::resourceck::ConsumeInfo::Observe);
+                plan
+            },
+            "checked argument mode(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_few_argument_types_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types.clear();
+                plan
+            },
+            "checked argument type(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_many_argument_types_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types.push(Ty::I64);
+                plan
+            },
+            "checked argument type(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_the_wrong_argument_type_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types[0] = Ty::I64;
+                plan
+            },
+            "disagrees with its own resolved parameter type",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_the_wrong_return_type_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.return_type = Ty::I64;
+                plan
+            },
+            "disagrees with its own resolved signature",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_a_mode_disagreeing_with_its_own_consume_site_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes[0] = crate::resourceck::ConsumeInfo::Observe;
+                plan
+            },
+            "disagreeing with its own recorded consume site",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_an_out_of_range_registration_order_replay_is_rejected() {
+        // A single `defer` in this program is trivially "in order" on
+        // its own -- this instead proves the *replay* check itself
+        // fires by directly constructing two cleanup actions for the
+        // same defer id at decreasing-then-increasing order, exactly
+        // the shape `emit_checked_cleanup` must reject.
+        let (
+            hir,
+            local_types,
+            expr_types,
+            pattern_case,
+            call_type_args,
+            mut resourceck_result,
+            interner,
+            id,
+        ) = checked_take_defer_pipeline();
+        let (defer_id, _) = resourceck_result
+            .defer_plans
+            .iter()
+            .next()
+            .map(|(id, plan)| (*id, plan.clone()))
+            .expect("checked above");
+        for actions in resourceck_result.cleanup_edges.values_mut() {
+            let existing: Vec<_> = actions
+                .iter()
+                .filter(|a| matches!(a, crate::resourceck::CleanupAction::Defer(_)))
+                .cloned()
+                .collect();
+            for action in existing {
+                actions.push(action);
+            }
+        }
+        let outcome = lower_module(
+            &hir,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with an out-of-order replay internal error");
+        };
+        assert!(
+            diagnostics.iter().any(
+                |d| d.message.contains("own declared LIFO registration order")
+                    || d.message.contains("this frame never lowered")
+            ),
+            "expected an out-of-order or double-replay internal error, got: {diagnostics:?}"
+        );
+        let _ = defer_id;
+    }
+
+    #[test]
+    fn a_missing_defer_plan_is_an_internal_error_not_a_silent_fallback() {
+        // Same shape as the consume-site regression above, but for a
+        // `defer` statement's own checked plan (`rfcs/0011`).
+        let text = "resource File { descriptor: i64 } \
+                     func close(take file: File) -> unit { drop file; } \
+                     func f() { value file = File { descriptor: 3 }; defer close(file); }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.defer_plans.is_empty(),
+            "expected resourceck to have actually recorded a defer plan"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            // Deliberately empty, discarding resourceck's own real plan.
+            &BTreeMap::new(),
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("no checked argument plan"),
+            "expected a missing-defer-plan internal error, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_missing_reachable_cleanup_plan_is_an_internal_error_not_a_silent_no_op() {
+        // Same shape as the two regressions above, but for
+        // `cleanup_edges` itself (`rfcs/0011`): a reachable exit
+        // resourceck genuinely recorded a plan for, with its own entry
+        // discarded before lowering ever sees it, simulating the two
+        // stages disagreeing about whether anything needs cleaning up.
+        let text = "resource File { descriptor: i64 } \
+                     func f() { value file = File { descriptor: 3 }; drop file; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.cleanup_edges.is_empty(),
+            "expected resourceck to have actually recorded a cleanup plan"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            // Deliberately empty, discarding resourceck's own real
+            // cleanup plan for this function's own reachable exit.
+            &BTreeMap::new(),
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("no checked cleanup plan"),
+            "expected a missing-cleanup-plan internal error, got: {}",
+            diagnostics[0].message
+        );
     }
 
     /// Like `lower`, but also runs the module through the NIR verifier
@@ -3231,6 +4888,17 @@ mod tests {
             "unexpected type errors: {:?}",
             result.diagnostics
         );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
         let module = lower_module(
             &hir,
             &result.local_types,
@@ -3239,11 +4907,1013 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
         .expect("expected lowering to succeed");
         crate::nir::verify_module(&module, id, &interner, &crate::hir::ItemRegistry::default())
+    }
+
+    fn drop_count(f: &Function) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::Drop { .. }))
+            .count()
+    }
+
+    // -- Loop break moved_out join (loop condition re-evaluation fix) ---
+
+    #[test]
+    fn a_resource_taken_on_a_conditional_break_path_is_not_dropped_again_after_the_loop() {
+        // The exact regression: sink's own take call already destroyed
+        // file on the break path; whatever runs after the loop (here,
+        // the function's own implicit end-of-scope cleanup, sharing the
+        // same exit block break itself branches to) must not drop it a
+        // second time.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func conditional_break(cond: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if cond { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> unit { drop file; } \
+             func conditional_break(cond: bool) { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     if cond { \
+                         sink(file); \
+                         break; \
+                     } \
+                 } \
+             }",
+        );
+        // Declaration order: `sink` first, `conditional_break` second.
+        let sink = &module.functions[0];
+        let conditional_break = &module.functions[1];
+        assert_eq!(
+            drop_count(sink),
+            1,
+            "sink's own take parameter must be dropped exactly once, inside sink itself"
+        );
+        assert_eq!(
+            drop_count(conditional_break),
+            0,
+            "conditional_break's own scope must not drop a resource the break path already \
+             moved into sink's own take parameter"
+        );
+    }
+
+    #[test]
+    fn a_while_conditions_own_moved_out_state_applies_after_the_loop() {
+        // Each evaluation of the condition take-consumes `file`; the
+        // body reassigns it before looping back, which is exactly what
+        // makes the backedge agree with entry again (Moved -> Available
+        // is a legal reassignment). Every reachable exit -- there is no
+        // `break` here, only the condition's own false edge -- leaves
+        // `file` Moved, since the condition itself always runs last.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func consume_as_bool(take file: File) -> bool { \
+                 drop file; \
+                 return false; \
+             } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = File { descriptor: 1 }; \
+                 while consume_as_bool(file) { \
+                     file = second(); \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func consume_as_bool(take file: File) -> bool { \
+                 drop file; \
+                 return false; \
+             } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable file = File { descriptor: 1 }; \
+                 while consume_as_bool(file) { \
+                     file = second(); \
+                 } \
+             }",
+        );
+        // Declaration order: `consume_as_bool`, `second`, `f`.
+        let consume_as_bool = &module.functions[0];
+        let f = &module.functions[2];
+        assert_eq!(drop_count(consume_as_bool), 1);
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource the condition's own last take call \
+             already consumed"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_match_returned_alongside_a_take_param_drops_it_exactly_once() {
+        // The `match` itself produces `i64`, not a resource: `kind`
+        // still propagates `Return` through it while checking, but that
+        // must never be mistaken for `file` itself being the thing
+        // under compound return-sink treatment -- `file`'s own implicit
+        // destruction belongs solely to the `return`'s own
+        // whole-function cleanup, replayed once at the shared merge
+        // point every arm branches to, never claimed a second time by
+        // an arm's own (otherwise-empty) local cleanup list.
+        let diags = lower_and_verify(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func f(c: Choice, take file: File) -> i64 { \
+                 return match c { A => 1, B => 2 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func f(c: Choice, take file: File) -> i64 { \
+                 return match c { A => 1, B => 2 }; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "file must be dropped exactly once, not once per arm: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_handle_returned_alongside_a_take_param_drops_it_exactly_once() {
+        let diags = lower_and_verify(
+            "variant OpenError { Invalid } \
+             resource File { descriptor: i64 } \
+             func open() -> i64 raises OpenError { return 1 } \
+             func f(take file: File) -> i64 { \
+                 return handle open() { \
+                     success n => n, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant OpenError { Invalid } \
+             resource File { descriptor: i64 } \
+             func open() -> i64 raises OpenError { return 1 } \
+             func f(take file: File) -> i64 { \
+                 return handle open() { \
+                     success n => n, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "file must be dropped exactly once, not once per arm: {f:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_drop_lowers_to_a_real_drop_instruction() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f() { value file = File { descriptor: 3 }; drop file; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f() { value file = File { descriptor: 3 }; drop file; }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(drop_count(f), 1, "expected exactly one Drop instruction");
+    }
+
+    #[test]
+    fn an_unmoved_resource_local_is_implicitly_dropped_at_function_exit() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f() { value file = File { descriptor: 3 }; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } func f() { value file = File { descriptor: 3 }; }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the still-owned resource to be implicitly dropped exactly once"
+        );
+    }
+
+    #[test]
+    fn a_moved_resource_is_not_implicitly_dropped_again() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; consume(file); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit {} \
+             func f() { value file = File { descriptor: 3 }; consume(file); }",
+        );
+        // Declaration order: `consume` first, `f` second.
+        let callee = &module.functions[0];
+        let caller = &module.functions[1];
+        assert_eq!(
+            drop_count(caller),
+            0,
+            "the caller must not drop a resource it already moved into a take argument"
+        );
+        assert_eq!(
+            drop_count(callee),
+            1,
+            "the callee's own take parameter must be dropped exactly once"
+        );
+    }
+
+    #[test]
+    fn defer_and_resource_drops_run_in_declaration_reversed_order() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f() { \
+                 value first = File { descriptor: 1 }; \
+                 defer touch(first); \
+                 value second = File { descriptor: 2 }; \
+                 defer touch(second); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f() { \
+                 value first = File { descriptor: 1 }; \
+                 defer touch(first); \
+                 value second = File { descriptor: 2 }; \
+                 defer touch(second); \
+             }",
+        );
+        // Declaration order: `touch` first, `f` second.
+        let f = &module.functions[1];
+        // Registration order: first, defer(first), second, defer(second).
+        // Reversed cleanup order: defer(second), drop(second), defer(first), drop(first).
+        let sequence: Vec<&str> = f.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Value {
+                    kind: crate::nir::ValueKind::Call(..),
+                    ..
+                } => Some("call"),
+                Instruction::Drop { .. } => Some("drop"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec!["call", "drop", "call", "drop"],
+            "expected defer/drop cleanup interleaved in declaration-reversed order, got {sequence:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_moved_into_a_deferred_take_argument_is_not_also_dropped_by_its_own_scope() {
+        // Blocker 6: a resource passed to a deferred `take` parameter
+        // transfers ownership into the pending deferred invocation at
+        // registration time -- the caller's own scope-exit cleanup
+        // must not additionally drop the same resource once the
+        // deferred call (which drops its own taken argument) actually
+        // runs. This used to double-drop it.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> unit { drop file; } \
+             func f() { \
+                 value file = File { descriptor: 3 }; \
+                 defer consume(file); \
+             }",
+        );
+        // Declaration order: `consume` first, `f` second.
+        let consume = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(consume),
+            1,
+            "consume's own take parameter must be dropped exactly once, inside consume itself"
+        );
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the deferred call"
+        );
+    }
+
+    // -- Resource reassignment (Blocker 5) -------------------------------
+
+    #[test]
+    fn reassigning_after_an_explicit_drop_destroys_the_new_value_exactly_once() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable target = first(); \
+                 drop target; \
+                 target = second(); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() { \
+                 mutable target = first(); \
+                 drop target; \
+                 target = second(); \
+             }",
+        );
+        // Declaration order: `first`, `second`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected the explicit drop of the first value and the implicit scope-exit drop \
+             of the reassigned second value, got a different count entirely"
+        );
+    }
+
+    #[test]
+    fn reassigning_from_a_local_moves_the_source_and_transfers_ownership_to_the_target() {
+        // The exact regression from the review: `source`'s own binding
+        // must not also be dropped once its value moved into `target`,
+        // and `target`'s own new value must still reach exactly one
+        // `Drop` -- at the caller, once the returned resource is done
+        // with, never inside `f` itself before the `Return`.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() -> File { \
+                 mutable target = first(); \
+                 drop target; \
+                 value source = second(); \
+                 target = source; \
+                 return target; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func first() -> File { return File { descriptor: 1 } } \
+             func second() -> File { return File { descriptor: 2 } } \
+             func f() -> File { \
+                 mutable target = first(); \
+                 drop target; \
+                 value source = second(); \
+                 target = source; \
+                 return target; \
+             }",
+        );
+        // Declaration order: `first`, `second`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected only the explicit drop of the first value -- the reassigned resource is \
+             returned, not dropped inside f, and `source` must not be independently dropped \
+             once its value moved into `target`"
+        );
+    }
+
+    // -- Resource ownership from patterns (Blocker 4) --------------------
+
+    #[test]
+    fn a_handle_success_bindings_resource_returning_a_primitive_is_still_dropped_exactly_once() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => file.descriptor, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => file.descriptor, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        // Declaration order: `open` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the success arm's own resource binding must be destroyed exactly once, even \
+             though the arm itself only ever reads a primitive field out of it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_bindings_resource_moved_into_a_take_call_is_not_also_dropped() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => consume(file), \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func consume(take file: File) -> i64 { return 1 } \
+             func f() -> i64 { \
+                 return handle open() { \
+                     success file => consume(file), \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        // Declaration order: `open`, `consume`, `f`.
+        let f = &module.functions[2];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "the success arm's own binding was moved into consume's own take parameter; f's \
+             own scope must not also drop it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_wildcards_resource_is_destroyed_immediately() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func make_file() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle make_file() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func make_file() -> File raises OpenError { return File { descriptor: 1 } } \
+             func f() -> i64 { \
+                 return handle make_file() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        // Declaration order: `make_file` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the success value bound by `_` must still be destroyed exactly once, immediately, \
+             since no local exists to schedule ordinary cleanup for it"
+        );
+    }
+
+    #[test]
+    fn a_handle_success_wildcard_for_a_non_resource_result_emits_no_drop() {
+        let module = lower(
+            "variant OpenError { Invalid } \
+             func make_number() -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 return handle make_number() { \
+                     success _ => 0, \
+                     failure OpenError.Invalid => -1, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "a non-resource success value must never be dropped, even when wildcard-bound"
+        );
+    }
+
+    // -- Fallible `take` transfer through Invoke (Blocker 1) ------------
+
+    #[test]
+    fn a_take_argument_to_a_postfix_try_call_is_not_also_dropped_by_the_caller() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 raises OpenError { \
+                 value file = File { descriptor: 3 }; \
+                 return consume(file)?; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 raises OpenError { \
+                 value file = File { descriptor: 3 }; \
+                 return consume(file)?; \
+             }",
+        );
+        // Declaration order: `consume` first, `f` second.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the Invoke, on \
+             either edge"
+        );
+    }
+
+    #[test]
+    fn a_take_argument_to_a_handled_call_is_not_also_dropped_by_the_caller() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File) -> i64 raises OpenError { return 1 } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            0,
+            "f's own scope must not drop a resource it already moved into the Invoke, on \
+             either edge, and the handled failure arm never received it either"
+        );
+    }
+
+    #[test]
+    fn a_resource_taken_by_a_failing_invoke_is_not_leaked_or_double_dropped() {
+        // The callee's own failure edge is reached; the callee is the
+        // one now responsible for whatever it did with its taken
+        // argument (Blocker 1) -- the caller's own diagnostics/lowering
+        // must stay identical regardless of which edge actually runs at
+        // runtime, since both are decided the same way, at Invoke-time,
+        // before either edge exists.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Bad } \
+             func consume(take file: File, fail: bool) -> i64 raises OpenError { \
+                 if fail { \
+                     drop file; \
+                     raise OpenError.Bad; \
+                 } \
+                 return 1; \
+             } \
+             func f(fail: bool) -> i64 { \
+                 value file = File { descriptor: 3 }; \
+                 return handle consume(file, fail) { \
+                     success v => v, \
+                     failure OpenError.Bad => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_deferred_calls_own_non_unit_result_carries_its_real_type() {
+        // Blocker 6: the replayed deferred call must carry the
+        // callee's own actual return type, never a fabricated
+        // `Ty::Unit`, even though the result is always discarded.
+        let module = lower(
+            "func touch() -> i64 { return 1 } \
+             func f() { defer touch(); }",
+        );
+        // Declaration order: `touch` first, `f` second.
+        let f = &module.functions[1];
+        let call_value_ty = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Instruction::Value {
+                    ty,
+                    kind: crate::nir::ValueKind::Call(..),
+                    ..
+                } => Some(ty.clone()),
+                _ => None,
+            })
+            .expect("expected the deferred call's own Value instruction");
+        assert_eq!(
+            call_value_ty,
+            Ty::I64,
+            "expected the deferred call's own result to carry touch's real return type"
+        );
+    }
+
+    #[test]
+    fn a_resource_is_cleaned_up_before_an_explicit_raise() {
+        let diags = lower_and_verify(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 raise Failure.Broken; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 raise Failure.Broken; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the still-owned resource to be dropped before the raise"
+        );
+    }
+
+    #[test]
+    fn a_resource_is_cleaned_up_before_a_postfix_try_propagates() {
+        let diags = lower_and_verify(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func fail() -> i64 raises Failure { raise Failure.Broken; } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 return fail()?; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Failure { Broken } \
+             resource File { descriptor: i64 } \
+             func fail() -> i64 raises Failure { raise Failure.Broken; } \
+             func f() -> i64 raises Failure { \
+                 value file = File { descriptor: 3 }; \
+                 return fail()?; \
+             }",
+        );
+        // Declaration order: `fail` first, `f` second. Two reachable
+        // exit paths out of `f` (the `?`'s own ok edge, continuing to
+        // `f`'s own `return`, and its one failure edge, propagating
+        // onward) each get their own copy of the cleanup sequence, so
+        // two `Drop`s total -- one per path, never a double-drop on
+        // either path individually.
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected the still-owned resource to be dropped on both the ok and the propagating path"
+        );
+    }
+
+    #[test]
+    fn a_resource_declared_inside_an_if_branch_is_cleaned_up_in_its_own_scope() {
+        // A resource declared and left unmoved inside one arm of an
+        // `if` must be destroyed at that arm's own end, not left for
+        // the enclosing function's own cleanup to replay after the
+        // join -- the value never dominates anywhere past its own arm,
+        // so replaying it there would fail NIR verification (this was
+        // a real bug this milestone's own internal review caught: the
+        // function-wide cleanup list must have each nested scope's own
+        // entries removed once that scope's own cleanup already ran).
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 if cond { \
+                     value file = File { descriptor: 3 }; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 if cond { \
+                     value file = File { descriptor: 3 }; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the if-branch's own resource to be dropped exactly once, inside its own arm"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_one_if_branch_does_not_skip_the_fallthrough_paths_own_cleanup() {
+        // Alpha 0.1.7 (Blocker 1): `fb.moved_out` used to be a single
+        // function-wide set with no branch isolation, so moving `file`
+        // into `sink`'s own `take` parameter inside the `then` branch
+        // leaked into the state seen while lowering the code *after*
+        // the `if` -- wrongly skipping `file`'s own drop on the
+        // fallthrough path where `cond` was false and `file` was never
+        // moved at all.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return sink(file); \
+                 } \
+                 return 0; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return sink(file); \
+                 } \
+                 return 0; \
+             }",
+        );
+        // Declaration order: `sink` first, `f` second.
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(sink),
+            1,
+            "sink's own take parameter must be dropped exactly once"
+        );
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected exactly one drop: `file` moved into `sink` on the taken branch must not \
+             be dropped there, but the fallthrough branch never moved it and must still drop it"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_the_else_branch_does_not_skip_the_thens_own_cleanup() {
+        // The reverse arrangement of the test above: the move happens in
+        // the `else` branch instead of `then`.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return 0; \
+                 } else { \
+                     return sink(file); \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 if cond { \
+                     return 0; \
+                 } else { \
+                     return sink(file); \
+                 } \
+             }",
+        );
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(drop_count(sink), 1);
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the `then` branch never moved `file` and must still drop it, independent of the \
+             `else` branch's own move"
+        );
+    }
+
+    #[test]
+    fn a_move_inside_a_nested_if_branch_does_not_leak_into_a_sibling_match_arm() {
+        // A resource move nested two levels deep (an `if` inside one
+        // `match` arm) must still be isolated from a sibling arm's own
+        // cleanup, not just a directly-adjacent branch.
+        let diags = lower_and_verify(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(choice: Choice, cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 match choice { \
+                     A => { \
+                         if cond { return sink(file); } \
+                         return 1; \
+                     } \
+                     B => { return 2; } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func sink(take file: File) -> i64 { return 1 } \
+             func f(choice: Choice, cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 match choice { \
+                     A => { \
+                         if cond { return sink(file); } \
+                         return 1; \
+                     } \
+                     B => { return 2; } \
+                 } \
+             }",
+        );
+        let sink = &module.functions[0];
+        let f = &module.functions[1];
+        assert_eq!(drop_count(sink), 1);
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected a drop on the `Choice.A` arm's own non-taken path and one more on the \
+             whole `Choice.B` arm, neither poisoned by the nested `if`'s own move"
+        );
+    }
+
+    #[test]
+    fn a_compound_return_drops_the_unchosen_take_parameter_on_each_branch() {
+        // Blocker 2: `return if cond { left } else { right }` must drop
+        // exactly the *other* parameter on each branch, and never the
+        // one it actually returns -- a single post-merge cleanup point
+        // cannot represent this (NIR has no phi node), so `lower_if`'s
+        // ordinary shared-slot-then-merge path is not used here at all;
+        // each branch gets its own `Return` terminator instead.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 return if cond { left } else { right }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 return if cond { left } else { right }; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            f.blocks.len(),
+            3,
+            "expected no shared merge block: entry, then, and else, each with their own Return"
+        );
+        let returns = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Return(Some(_))))
+            .count();
+        assert_eq!(returns, 2, "expected a distinct Return on each branch");
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected exactly one drop per branch, dropping the unchosen parameter"
+        );
+    }
+
+    #[test]
+    fn an_implicit_compound_tail_return_drops_the_unchosen_take_parameter() {
+        // Same as above, but through the function's own implicit tail
+        // return rather than an explicit `return` statement.
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 if cond { left } else { right } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func choose(cond: bool, take left: File, take right: File) -> File { \
+                 if cond { left } else { right } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected exactly one drop per branch, dropping the unchosen parameter"
+        );
+    }
+
+    #[test]
+    fn a_non_resource_compound_return_still_uses_a_shared_merge_block() {
+        // The per-branch sink is only needed for resource types
+        // (Blocker 2) -- a plain value type keeps the ordinary,
+        // simpler shared-slot-then-merge shape, unchanged from before.
+        let module = lower("func f(cond: bool) -> i64 { return if cond { 1 } else { 2 }; }");
+        let f = &module.functions[0];
+        assert_eq!(
+            f.blocks.len(),
+            4,
+            "expected entry, then, else, and a shared merge block"
+        );
+        let returns = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Return(Some(_))))
+            .count();
+        assert_eq!(returns, 1, "expected exactly one shared Return");
     }
 
     #[test]
@@ -3797,7 +6467,7 @@ mod tests {
         let slot = fb.alloc_slot(Ty::I64);
         let value = fb.push_value(Ty::I64, ValueKind::Const(Const::Int(1)));
         fb.terminate(Terminator::Return(None));
-        fb.push_store(slot, value);
+        fb.push_store(slot, value, crate::nir::OwnershipMode::Observe);
     }
 
     #[test]
@@ -3813,6 +6483,243 @@ mod tests {
         let module =
             lower("func f() -> i64 { mutable x = 0; while x < 10 { x = x + 1; } return x }");
         assert!(module.functions[0].blocks.len() >= 3);
+    }
+
+    #[test]
+    fn break_drops_a_resource_declared_earlier_in_the_same_iteration() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { break; } \
+                     drop file; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { break; } \
+                     drop file; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one on the fallthrough path"
+        );
+    }
+
+    #[test]
+    fn continue_drops_a_resource_declared_earlier_in_the_same_iteration() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     continue; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     continue; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "expected the resource to be dropped exactly once, before continue loops back"
+        );
+    }
+
+    #[test]
+    fn a_resource_declared_in_a_nested_block_inside_a_loop_is_dropped_by_break() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     { \
+                         value file = File { descriptor: 1 }; \
+                         if cond { break; } \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     { \
+                         value file = File { descriptor: 1 }; \
+                         if cond { break; } \
+                     } \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one at the nested block's own normal exit"
+        );
+    }
+
+    #[test]
+    fn break_and_a_pending_defer_both_run_in_declaration_reversed_order() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     defer touch(file); \
+                     value other = File { descriptor: 2 }; \
+                     if cond { break; } \
+                     drop other; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func touch(file: File) -> unit {} \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     defer touch(file); \
+                     value other = File { descriptor: 2 }; \
+                     if cond { break; } \
+                     drop other; \
+                 } \
+             }",
+        );
+        // Declaration order: `touch` first, `f` second. Registration
+        // order within one iteration: file, defer(file), other.
+        // Reversed cleanup on *each* exit path (break, and the
+        // fallthrough back-edge): drop(other), call(touch), drop(file)
+        // -- checked per-block, since a block-level assertion (rather
+        // than a whole-function instruction count) is the only way to
+        // confirm the ordering rather than merely the totals.
+        let f = &module.functions[1];
+        let mut saw_correct_sequence_block = false;
+        for block in &f.blocks {
+            let sequence: Vec<&str> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i {
+                    Instruction::Value {
+                        kind: crate::nir::ValueKind::Call(..),
+                        ..
+                    } => Some("call"),
+                    Instruction::Drop { .. } => Some("drop"),
+                    _ => None,
+                })
+                .collect();
+            if sequence == vec!["drop", "call", "drop"] {
+                saw_correct_sequence_block = true;
+            } else if !sequence.is_empty() {
+                panic!(
+                    "expected only the correct drop/call/drop sequence per exit block, found {sequence:?}"
+                );
+            }
+        }
+        assert!(
+            saw_correct_sequence_block,
+            "expected at least one exit block with other's own drop, then the deferred call, \
+             then file's own drop"
+        );
+    }
+
+    #[test]
+    fn break_from_an_inner_loop_does_not_clean_up_the_outer_loops_live_resource() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value outer = File { descriptor: 1 }; \
+                     while cond { \
+                         if cond { break; } \
+                     } \
+                     drop outer; \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value outer = File { descriptor: 1 }; \
+                     while cond { \
+                         if cond { break; } \
+                     } \
+                     drop outer; \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "the inner loop's own break must not drop the outer loop's still-live resource"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_inside_branches_each_clean_up_correctly() {
+        let diags = lower_and_verify(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { \
+                         break; \
+                     } else { \
+                         continue; \
+                     } \
+                 } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "resource File { descriptor: i64 } \
+             func f(cond: bool) { \
+                 while cond { \
+                     value file = File { descriptor: 1 }; \
+                     if cond { \
+                         break; \
+                     } else { \
+                         continue; \
+                     } \
+                 } \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            2,
+            "expected one drop on the break path and one on the continue path, no duplicates"
+        );
     }
 
     #[test]
@@ -3966,6 +6873,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -4019,6 +6929,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         );
@@ -4102,6 +7015,7 @@ mod tests {
             public: true,
             type_params: Vec::new(),
             fields: vec![],
+            affine: false,
         }
     }
 
@@ -4157,6 +7071,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_local_never_bound_by_a_param_or_a_let_fails_lowering_not_a_panic() {
+        // `local` names no parameter and no preceding `let`-style
+        // statement in this function's own body -- `hir::lower`'s own
+        // name resolution already rules this out for the ordinary
+        // pipeline, but a direct caller hand-building HIR bypasses it.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let x = interner.intern("x");
+        let unbound_local = LocalId(0);
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function_with_tail(
+                ItemId(1),
+                f,
+                HirExpr::Local {
+                    id: ExprId(0),
+                    local: unbound_local,
+                    name: x,
+                    span: Span::dummy(),
+                },
+                source,
+            )],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::I64);
+        let (local_types, _, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for a read of a never-bound local")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn assigning_to_an_immutable_local_fails_lowering_not_a_panic() {
+        // typeck rejects assigning to a binding that isn't `mutable`
+        // before the ordinary pipeline ever reaches lowering, but a
+        // direct caller hand-building HIR can still construct one --
+        // `x` here is bound as an ordinary (immutable) parameter, never
+        // given a slot to assign into.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let x = interner.intern("x");
+        let x_local = LocalId(0);
+        let mut function = function_with_tail(
+            ItemId(1),
+            f,
+            HirExpr::Assign {
+                id: ExprId(0),
+                target: Box::new(HirExpr::Local {
+                    id: ExprId(1),
+                    local: x_local,
+                    name: x,
+                    span: Span::dummy(),
+                }),
+                op: AssignOp::Assign,
+                value: Box::new(HirExpr::Int {
+                    id: ExprId(2),
+                    value: 1,
+                    base: crate::lexer::IntBase::Decimal,
+                    span: Span::dummy(),
+                }),
+                span: Span::dummy(),
+            },
+            source,
+        );
+        function.params = vec![crate::hir::HirParam {
+            local: x_local,
+            name: x,
+            span: Span::dummy(),
+            ty: crate::hir::HirType::Unresolved {
+                name: interner.intern("i64"),
+                span: Span::dummy(),
+            },
+            take: false,
+        }];
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut local_types = HashMap::new();
+        local_types.insert(x_local, Ty::I64);
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Unit);
+        expr_types.insert(ExprId(1), Ty::I64);
+        expr_types.insert(ExprId(2), Ty::I64);
+        let pattern_case = HashMap::new();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for an assignment to an immutable local")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
+    #[test]
+    fn an_else_less_if_typed_as_never_fails_lowering_not_a_panic() {
+        // `expr_types` is caller-supplied data a direct caller controls
+        // directly -- an else-less `if` can never actually type as
+        // `Ty::Never` through the ordinary pipeline (there is no
+        // diverging else branch to justify it), but nothing stops a
+        // hand-built caller from claiming it does anyway.
+        let mut interner = Interner::new();
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let f = interner.intern("f");
+        let if_expr = HirExpr::If {
+            id: ExprId(0),
+            condition: Box::new(HirExpr::Bool {
+                id: ExprId(1),
+                value: true,
+                span: Span::dummy(),
+            }),
+            then_branch: HirBlock {
+                id: ExprId(2),
+                statements: vec![],
+                tail: None,
+                span: Span::dummy(),
+            },
+            else_branch: None,
+            span: Span::dummy(),
+        };
+        let module = HirModule {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function_with_tail(ItemId(1), f, if_expr, source)],
+            records: vec![],
+            variants: vec![],
+            other_items: vec![],
+        };
+        let mut expr_types = HashMap::new();
+        expr_types.insert(ExprId(0), Ty::Never);
+        expr_types.insert(ExprId(1), Ty::Bool);
+        let (local_types, _, pattern_case) = empty_maps();
+        let result = lower_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &interner,
+            source,
+        );
+        let Err(diagnostics) = result else {
+            panic!("expected lowering to fail for an else-less if wrongly typed as never")
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "I0002"));
+    }
+
     fn case_ref(variant: ItemId, case: usize, name: Symbol) -> HirExpr {
         HirExpr::CaseRef {
             id: ExprId(0),
@@ -4201,6 +7307,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4247,6 +7356,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4309,6 +7421,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4386,6 +7501,8 @@ mod tests {
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
+        let resourceck_result =
+            crate::resourceck::check_module(&module, &local_types, &expr_types, &interner);
         let result = lower_module_with_paths(
             &module,
             &local_types,
@@ -4394,6 +7511,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             manifest_source,
             &module_path_of,
@@ -4484,6 +7604,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -4552,6 +7675,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &HashMap::new(),
@@ -4592,6 +7718,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4634,6 +7763,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4676,6 +7808,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4715,6 +7850,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4756,6 +7894,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -4808,6 +7949,9 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
                 &interner,
                 source,
             )
@@ -4863,6 +8007,9 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
+            cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
+            consume_sites: Box::leak(Box::new(BTreeMap::new())),
+            defer_plans: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -4899,6 +8046,9 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
+            cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
+            consume_sites: Box::leak(Box::new(BTreeMap::new())),
+            defer_plans: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -5127,6 +8277,7 @@ mod tests {
                 name: interner.intern("Box"),
                 type_params: vec![(t, interner.intern("T"))],
                 fields: vec![(interner.intern("value"), Ty::Param(t, interner.intern("T")))],
+                affine: false,
             },
         );
         let (local_types, expr_types, pattern_case) = empty_maps();
@@ -5182,7 +8333,9 @@ mod tests {
         let mut function_sigs = HashMap::new();
         function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
         let g_name = interner.intern("g");
-        let (local_types, expr_types, pattern_case) = empty_maps();
+        let (local_types, _, pattern_case) = empty_maps();
+        let mut expr_types: HashMap<ExprId, Ty> = HashMap::new();
+        expr_types.insert(ExprId(1), Ty::I64);
         let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
         let mut lowering = direct_lowering_with_generics(
             source,
@@ -5438,10 +8591,16 @@ mod tests {
             type_args: Vec::new(),
             span: Span::dummy(),
         };
+        let arg = HirExpr::Int {
+            id: ExprId(2),
+            value: 0,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        };
         let operand = HirExpr::Call {
             id: call_expr_id,
             callee: Box::new(callee),
-            args: Vec::new(),
+            args: vec![arg],
             span: Span::dummy(),
         };
         let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);
@@ -5510,6 +8669,7 @@ mod tests {
                 name: interner.intern("Point"),
                 type_params: Vec::new(),
                 fields: vec![(interner.intern("x"), Ty::I64)],
+                affine: false,
             },
         );
         let local_types = HashMap::new();
@@ -5574,6 +8734,7 @@ mod tests {
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
                 ],
+                affine: false,
             },
         );
         let local_types = HashMap::new();
@@ -5634,6 +8795,7 @@ mod tests {
                     (interner.intern("x"), Ty::I64),
                     (interner.intern("y"), Ty::I64),
                 ],
+                affine: false,
             },
         );
         let local_types = HashMap::new();
@@ -5910,6 +9072,7 @@ mod tests {
                 name: variant_sym,
                 span: Span::dummy(),
                 ty: variant_ty_name,
+                take: false,
             }],
             return_type: Some(i64_name),
             uses: vec![],
@@ -5946,6 +9109,9 @@ mod tests {
             &call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6101,6 +9267,9 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         );

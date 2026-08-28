@@ -1,0 +1,21 @@
+import resources.close;
+import resources.validate;
+import resources.open;
+import resources.OpenError;
+import resources.File as ResourceFile;
+
+// `file` is owned here, across the module boundary, before a second
+// fallible call: if `validate` raises, `file` must still be destroyed
+// on that failure edge, not merely on the ordinary success path.
+func process(descriptor: i64) -> i64 raises OpenError {
+    value file = open(descriptor)?;
+    validate(descriptor)?;
+    return close(file);
+}
+
+func main() -> i64 {
+    return handle process(150) {
+        success v => v,
+        failure OpenError.Invalid => -1,
+    };
+}

@@ -15,6 +15,7 @@ pub(crate) mod limits;
 pub mod nir;
 pub mod project;
 pub mod resolve;
+pub mod resourceck;
 pub mod source;
 pub mod symbol;
 pub mod syntax;

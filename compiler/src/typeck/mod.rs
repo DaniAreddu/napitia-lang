@@ -159,6 +159,52 @@ mod codes {
     /// direct caller lowering hand-built HIR could still hand this a
     /// dangling function reference.
     pub const CALLEE_METADATA_MISSING: &str = "T0060";
+    /// `drop <expr>` (`rfcs/0011`) where `<expr>`'s own static type is
+    /// not a declared `resource` -- a primitive, `str`, or ordinary
+    /// (non-affine) record/variant value is never a valid `drop` target.
+    pub const DROP_OF_NON_RESOURCE: &str = "T0061";
+    /// A `resource` used where a protocol type argument or `extend`
+    /// target is expected (`rfcs/0011`) -- protocols over resource types
+    /// are out of scope this milestone; this is a dedicated diagnostic,
+    /// never silent ordinary-value treatment.
+    pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0062";
+    /// A `record`/`variant` (ordinary, freely copyable) declares a
+    /// field/payload whose type is itself an affine `resource`
+    /// (`rfcs/0011`). Copying a value of the ordinary aggregate would
+    /// duplicate the resource it holds, which affine values may never
+    /// be -- only another `resource` (itself already non-copyable) may
+    /// hold a resource-typed field.
+    pub const RESOURCE_FIELD_IN_ORDINARY_AGGREGATE: &str = "T0064";
+    /// A parameter declared `take` whose own static type is not a
+    /// declared `resource` (`rfcs/0011`). `take` transfers ownership
+    /// into the call; an ordinary (non-affine) value has no ownership
+    /// state to transfer at all, so this is a dedicated diagnostic
+    /// rather than silently treating it like an ordinary parameter.
+    pub const TAKE_OF_NON_RESOURCE: &str = "T0065";
+    /// `defer <expr>;` where `<expr>` is not a shape this milestone's
+    /// checked defer contract supports (`rfcs/0011`, Blocker 6): a
+    /// direct call to a plain, non-generic, capability-free function
+    /// that does not return a resource. `nir::lower` cannot represent
+    /// anything else (an indirect/dynamic callee, a generic
+    /// substitution, a capability requirement, or a new resource
+    /// needing an owner at cleanup time) -- rejected here, at check
+    /// time, so `check` and `ir` never disagree about which programs
+    /// this milestone actually accepts.
+    pub const UNSUPPORTED_DEFER_SHAPE: &str = "T0066";
+    /// An `extend` method declares a `take` parameter (`rfcs/0011`,
+    /// `rfcs/0009`, Section 11 protocol dispatch audit) -- rejected
+    /// regardless of what the protocol itself declares (a protocol
+    /// method can never declare `take` at all, see `hir::lower`'s own
+    /// `TAKE_IN_PROTOCOL_METHOD`), because an extend method is only
+    /// ever reachable through `Protocol[Args].method(...)` dispatch,
+    /// which resolves which concrete extend actually runs only at
+    /// evidence-resolution time: `resourceck`'s own static
+    /// `take_flags_for_callee` treats every `ProtocolMethodRef` callee
+    /// as having no `take` parameters at all, so a `take` parameter
+    /// here would silently let a protocol call transfer ownership at
+    /// runtime while the caller's own resource checker still thinks it
+    /// only observed.
+    pub const TAKE_IN_EXTEND_METHOD: &str = "T0067";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -342,6 +388,7 @@ pub fn check_module_with_registry(
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
+    checker.check_resource_field_containment(hir);
     checker.check_aggregate_cycles(hir);
     checker.register_protocols(hir);
     checker.build_signatures(hir);
@@ -547,6 +594,9 @@ struct RecordInfo {
     /// This record's own generic parameters, in declaration order.
     /// Empty for a non-generic record.
     type_params: Vec<TypeParamId>,
+    /// Whether this was declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- see [`crate::hir::HirRecord::affine`].
+    affine: bool,
 }
 
 #[derive(Clone)]
@@ -608,6 +658,7 @@ impl<'a> Checker<'a> {
                     fields,
                     source: r.source,
                     type_params: r.type_params.iter().map(|p| p.id).collect(),
+                    affine: r.affine,
                 },
             );
         }
@@ -647,6 +698,80 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// No `record` or `resource` may hold a resource-typed field, and no
+    /// `variant` case may carry a resource-typed payload (`rfcs/0011`,
+    /// Blocker 8's own "Nested resources" scope limit). An ordinary
+    /// aggregate is freely copyable, and copying one that held a
+    /// resource would duplicate it, which affine values may never
+    /// allow -- but a `resource` field nested inside *another*
+    /// `resource` has no such copying problem and is rejected for a
+    /// different reason instead: the runtime's own destruction of the
+    /// outer resource does not recurse into destroying a nested one,
+    /// so accepting this would silently leak every nested resource
+    /// forever. Alpha 0.1.7 implements neither transitive ownership
+    /// transfer into a nested field nor recursive destruction out of
+    /// one, so this is rejected symbolically at every aggregate's own
+    /// declaration, resource or not, rather than only once some
+    /// specific construction site turns out to leak. Run once, after
+    /// `build_aggregate_info` has every field's own resolved type
+    /// available, before any function body is checked -- reported even
+    /// for a record/variant/resource nothing ever constructs.
+    fn check_resource_field_containment(&mut self, hir: &HirModule) {
+        for r in &hir.records {
+            let Some(info) = self.records.get(&r.id) else {
+                continue;
+            };
+            for (field, (_, ty, _)) in r.fields.iter().zip(info.fields.iter()) {
+                if self.is_affine_resource(ty) {
+                    let kind = if r.affine { "resource" } else { "record" };
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
+                            r.source,
+                            field.span,
+                            format!(
+                                "field `{}` of {kind} `{}` cannot hold a resource; Alpha 0.1.7 \
+                                 has no nested resource ownership model",
+                                self.interner.resolve(field.name),
+                                self.interner.resolve(r.name),
+                            ),
+                        )
+                        .with_primary_label(if r.affine {
+                            "resource field nested inside another resource"
+                        } else {
+                            "resource field in an ordinary record"
+                        }),
+                    );
+                }
+            }
+        }
+        for v in &hir.variants {
+            let Some(info) = self.variants.get(&v.id) else {
+                continue;
+            };
+            for (case, (_, payload_tys)) in v.cases.iter().zip(info.cases.iter()) {
+                for (payload_hir_ty, payload_ty) in case.payload.iter().zip(payload_tys.iter()) {
+                    if self.is_affine_resource(payload_ty) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
+                                v.source,
+                                payload_hir_ty.span(),
+                                format!(
+                                    "case `{}` of variant `{}` cannot carry a resource payload; \
+                                     Alpha 0.1.7 has no nested resource ownership model",
+                                    self.interner.resolve(case.name),
+                                    self.interner.resolve(v.name),
+                                ),
+                            )
+                            .with_primary_label("resource payload in a variant case"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Rejects an infinitely-sized direct (or indirect) aggregate cycle
     /// -- see `typeck::cycles` -- once, before any function body is
     /// checked, so a cyclic declaration is reported even if nothing in
@@ -678,11 +803,14 @@ impl<'a> Checker<'a> {
     fn build_signatures(&mut self, hir: &HirModule) {
         for f in &hir.functions {
             self.source = f.source;
-            let params = f
+            let params: Vec<Ty> = f
                 .params
                 .iter()
                 .map(|p| self.resolve_named_type(&p.ty))
                 .collect();
+            for (p, ty) in f.params.iter().zip(&params) {
+                self.check_take_target(p, ty);
+            }
             let ret = f
                 .return_type
                 .as_ref()
@@ -713,11 +841,15 @@ impl<'a> Checker<'a> {
             self.source = e.source;
             let extend_type_params: Vec<TypeParamId> = e.type_params.iter().map(|p| p.id).collect();
             for m in &e.methods {
-                let params = m
+                let params: Vec<Ty> = m
                     .params
                     .iter()
                     .map(|p| self.resolve_named_type(&p.ty))
                     .collect();
+                for (p, ty) in m.params.iter().zip(&params) {
+                    self.check_take_target(p, ty);
+                    self.check_extend_method_take(p);
+                }
                 let ret = m
                     .return_type
                     .as_ref()
@@ -1066,8 +1198,18 @@ impl<'a> Checker<'a> {
             }
             HirStmt::Expr(e) => self.check_expr(e),
             HirStmt::Defer { expr, span } => {
+                // Type-checked immediately, exactly like any other
+                // statement-expression, even though `resourceck`/NIR
+                // lowering only actually run the call later, at scope
+                // exit (`rfcs/0011`) -- there is no "check it when it
+                // eventually runs" deferred pass.
                 self.check_expr(expr);
-                self.push_unsupported(*span, "`defer`");
+                self.check_defer_shape(expr, *span);
+                Ty::Unit
+            }
+            HirStmt::Drop { expr, span } => {
+                let ty = self.check_expr(expr);
+                self.check_drop_target(&ty, *span);
                 Ty::Unit
             }
             HirStmt::While {
@@ -1096,7 +1238,21 @@ impl<'a> Checker<'a> {
                 self.loop_depth += 1;
                 self.check_block(body);
                 self.loop_depth -= 1;
-                Ty::Unit
+                // A bare `loop` has no condition at all, so the only way
+                // it can ever fall through to whatever follows it is a
+                // `break` somewhere in its own body -- with none
+                // anywhere (`loop_has_reachable_break`, deliberately not
+                // entering a nested loop/while of its own, whose own
+                // `break` targets only that inner loop), this statement
+                // itself never produces a value at all, the same as any
+                // other genuinely divergent statement: `func f() -> i64
+                // { loop {} }` must type-check, not report an unrelated
+                // "body doesn't match declared return type" mismatch.
+                if loop_has_reachable_break(body) {
+                    Ty::Unit
+                } else {
+                    Ty::Never
+                }
             }
         }
     }
@@ -3602,6 +3758,191 @@ impl<'a> Checker<'a> {
         self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
+    /// `true` iff `ty` is a resolved reference to a declared `resource`
+    /// (`rfcs/0011`), never a `record`/`variant`/primitive. Used by every
+    /// resource-specific check (`drop`, equality rejection, protocol
+    /// rejection) instead of each re-deriving it from `self.records`.
+    fn is_affine_resource(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|info| info.affine))
+    }
+
+    /// `drop <expr>;` (`rfcs/0011`) only ever accepts a resource-typed
+    /// operand -- a primitive, `str`, or ordinary record/variant value
+    /// has no owned resource state for `resourceck` to transition to
+    /// `Dropped` at all.
+    fn check_drop_target(&mut self, ty: &Ty, span: Span) {
+        let resolved = self.ctx.resolve(ty);
+        if matches!(resolved, Ty::Error | Ty::Never) {
+            return;
+        }
+        if !self.is_affine_resource(&resolved) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::DROP_OF_NON_RESOURCE,
+                    self.source,
+                    span,
+                    format!(
+                        "`drop` requires a resource value, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("not a resource"),
+            );
+        }
+    }
+
+    /// A `take` parameter's own declared type must be a resource
+    /// (`rfcs/0011`, Blocker 9) -- `take` transfers ownership into the
+    /// call, and an ordinary (non-affine) value has no ownership state
+    /// at all for `resourceck`/`nir::lower` to transfer. Declared on a
+    /// still-unresolved generic parameter type is intentionally not
+    /// flagged here (never a concrete resource or not, until a call
+    /// site substitutes it) -- this milestone's own resources are never
+    /// generic, so a real violation always resolves to a concrete
+    /// non-resource type here regardless.
+    fn check_take_target(&mut self, param: &crate::hir::HirParam, ty: &Ty) {
+        if !param.take {
+            return;
+        }
+        let resolved = self.ctx.resolve(ty);
+        if matches!(resolved, Ty::Error | Ty::Never) {
+            return;
+        }
+        // A type parameter (Blocker 10, `rfcs/0011`) is never accepted
+        // here either, even though `is_affine_resource` below would
+        // already reject it on its own: Alpha 0.1.7 has no generic
+        // resource ownership model at all (a `T` bound to a resource at
+        // one instantiation and a primitive at another would need
+        // per-instantiation `take`-acceptance, which nothing downstream
+        // -- `resourceck`, `nir::lower`, the runtime identity model --
+        // implements), so this is rejected symbolically, at the
+        // declaration itself, rather than only once some future
+        // instantiation happens to pick a resource type.
+        if !self.is_affine_resource(&resolved) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::TAKE_OF_NON_RESOURCE,
+                    self.source,
+                    param.span,
+                    format!(
+                        "`take` requires a resource parameter, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("not a resource"),
+            );
+        }
+    }
+
+    /// Rejects `take` on an `extend` method's own parameter outright
+    /// (Section 11 protocol dispatch audit) -- independent of
+    /// `check_take_target`'s own resource-ness check, and regardless of
+    /// what the protocol itself declares (which can never declare
+    /// `take` at all -- see `hir::lower`'s own
+    /// `TAKE_IN_PROTOCOL_METHOD`). An extend method is only ever
+    /// reachable through `Protocol[Args].method(...)` dispatch, and
+    /// `resourceck::flow::FlowChecker::take_flags_for_callee` treats
+    /// every such callee as having no `take` parameters at all, since
+    /// which concrete extend actually runs is resolved only at
+    /// evidence-resolution time -- a `take` parameter here would
+    /// silently let a protocol call transfer ownership at runtime while
+    /// the caller's own resource checker still thinks it only observed.
+    fn check_extend_method_take(&mut self, param: &crate::hir::HirParam) {
+        if !param.take {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::TAKE_IN_EXTEND_METHOD,
+                self.source,
+                param.span,
+                "a `take` parameter is not supported on an extend method this milestone: which \
+                 concrete extend a protocol call actually dispatches to is resolved only at \
+                 evidence-resolution time, so the caller's own resource checker can never know \
+                 whether such a call transfers ownership"
+                    .to_string(),
+            )
+            .with_primary_label("`take` not supported on a protocol implementation"),
+        );
+    }
+
+    /// Rejects a `defer` whose own expression is not this milestone's
+    /// checked contract (`rfcs/0011`, Blocker 6) -- kept exactly in
+    /// sync with `nir::lower::Lowering::lower_defer_call`'s own
+    /// acceptance so `check`/`ir`/`run` never disagree about which
+    /// `defer` a program may use. A `defer` calling a *fallible*
+    /// function is already rejected by the general "an unhandled
+    /// fallible call's result must be `?`/`handle`d" rule (`T0048`)
+    /// this same `check_expr(expr)` call already applies -- not
+    /// re-checked a second time here.
+    fn check_defer_shape(&mut self, expr: &HirExpr, span: Span) {
+        let unsupported = |this: &mut Self, message: &str| {
+            this.diagnostics.push(
+                Diagnostic::error(
+                    codes::UNSUPPORTED_DEFER_SHAPE,
+                    this.source,
+                    span,
+                    message.to_string(),
+                )
+                .with_primary_label("unsupported `defer` this milestone"),
+            );
+        };
+        let HirExpr::Call { callee, args, .. } = expr else {
+            unsupported(self, "`defer` requires a direct call to a plain function");
+            return;
+        };
+        // A diverging argument (`raise`/`return`/`break`/`continue`
+        // nested inside it) never actually produces the value the
+        // deferred call would need to capture at registration time --
+        // `nir::lower` has no way to represent "this defer never
+        // actually registers" as anything but an internal lowering
+        // error, so it is rejected symbolically here instead, before
+        // that point is ever reached.
+        for arg in args {
+            if matches!(self.expr_types.get(&arg.id()), Some(Ty::Never)) {
+                unsupported(
+                    self,
+                    "a `defer`'s own argument cannot diverge (`raise`/`return`/`break`/\
+                     `continue`): registration would never actually happen",
+                );
+                return;
+            }
+        }
+        let HirExpr::Function { item, .. } = callee.as_ref() else {
+            unsupported(
+                self,
+                "a `defer`'s own callee must be a plain function reference, not an indirect or \
+                 dynamic value",
+            );
+            return;
+        };
+        let Some(sig) = self.functions.get(item).cloned() else {
+            // An unresolved callee is already diagnosed elsewhere
+            // (resolve/typeck's own "unknown function" checks).
+            return;
+        };
+        if !sig.type_params.is_empty() {
+            unsupported(
+                self,
+                "a `defer` calling a generic function is not supported this milestone",
+            );
+        }
+        if !sig.requirements.is_empty() {
+            unsupported(
+                self,
+                "a `defer` calling a capability-requiring function is not supported this \
+                 milestone",
+            );
+        }
+        if self.is_affine_resource(&sig.ret) {
+            unsupported(
+                self,
+                "a `defer` calling a function that returns a resource is not supported this \
+                 milestone",
+            );
+        }
+    }
+
     /// `true` for a resolved type this checker can prove *no* operation
     /// is universally valid for -- specifically, one of the enclosing
     /// generic declaration's own unconstrained type parameters
@@ -3715,6 +4056,87 @@ impl<'a> Checker<'a> {
             );
         }
     }
+}
+
+/// Whether `body` -- a bare `loop`'s own body -- contains a `break`
+/// anywhere within it that targets *this* loop, structurally: every
+/// nested `if`/`match`/`handle`/block is walked, but a nested
+/// `while`/`loop` of its own is not, since a `break` inside it targets
+/// only that inner loop. Deliberately conservative rather than a full
+/// reachability analysis (unlike `resourceck`'s own equivalent, which
+/// runs after this and can afford one): a `break` inside code this
+/// function still counts as unreachable dead code (after an
+/// unconditional `return`, say) is harmless to still count here, since
+/// whatever already made that code unreachable already gives the
+/// enclosing block its own real divergence independently of this loop's
+/// own type.
+fn loop_has_reachable_break(body: &HirBlock) -> bool {
+    fn in_block(block: &HirBlock) -> bool {
+        block.statements.iter().any(in_stmt) || block.tail.as_deref().is_some_and(in_expr)
+    }
+    fn in_stmt(stmt: &HirStmt) -> bool {
+        match stmt {
+            HirStmt::Binding(b) => in_expr(&b.value),
+            HirStmt::Expr(e) => in_expr(e),
+            HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => in_expr(expr),
+            // A nested loop's own `break` never targets this outer one.
+            HirStmt::While { .. } | HirStmt::Loop { .. } => false,
+        }
+    }
+    fn in_expr(expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::Break { .. } => true,
+            HirExpr::Int { .. }
+            | HirExpr::Float { .. }
+            | HirExpr::Str { .. }
+            | HirExpr::Char { .. }
+            | HirExpr::Bool { .. }
+            | HirExpr::Function { .. }
+            | HirExpr::CaseRef { .. }
+            | HirExpr::ProtocolMethodRef { .. }
+            | HirExpr::Local { .. }
+            | HirExpr::Continue { .. }
+            | HirExpr::Error { .. } => false,
+            HirExpr::Unary { operand, .. }
+            | HirExpr::Cast { expr: operand, .. }
+            | HirExpr::Try { expr: operand, .. } => in_expr(operand),
+            HirExpr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
+            HirExpr::Assign { target, value, .. } => in_expr(target) || in_expr(value),
+            HirExpr::Call { callee, args, .. } => in_expr(callee) || args.iter().any(in_expr),
+            HirExpr::Field { base, .. } => in_expr(base),
+            HirExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                in_expr(condition)
+                    || in_block(then_branch)
+                    || match else_branch {
+                        Some(HirElse::Block(block)) => in_block(block),
+                        Some(HirElse::If(inner)) => in_expr(inner),
+                        None => false,
+                    }
+            }
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => in_expr(scrutinee) || arms.iter().any(|arm| in_arm_body(&arm.body)),
+            HirExpr::Block(block) => in_block(block),
+            HirExpr::Return { value, .. } => value.as_deref().is_some_and(in_expr),
+            HirExpr::RecordLiteral { fields, .. } => fields.iter().any(|f| in_expr(&f.value)),
+            HirExpr::Raise { operand, .. } => in_expr(operand),
+            HirExpr::Handle { operand, arms, .. } => {
+                in_expr(operand) || arms.iter().any(|arm| in_arm_body(&arm.body))
+            }
+        }
+    }
+    fn in_arm_body(body: &HirMatchArmBody) -> bool {
+        match body {
+            HirMatchArmBody::Expr(e) => in_expr(e),
+            HirMatchArmBody::Block(block) => in_block(block),
+        }
+    }
+    in_block(body)
 }
 
 #[cfg(test)]
@@ -4442,13 +4864,374 @@ mod tests {
     }
 
     #[test]
-    fn defer_statement_is_reported_as_an_unsupported_feature() {
-        // `defer` must never be silently dropped: it is parsed and its
-        // expression is still checked, but running it has no
-        // implemented semantics yet.
+    fn defer_statements_own_expression_is_type_checked_normally() {
+        // `defer` is real as of `rfcs/0011`: its expression is
+        // type-checked exactly like an ordinary statement-expression.
+        let diags = check(
+            "func consume(x: i64) -> unit {} func f() { value x = 1; defer consume(x + 1); }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn defer_of_an_arithmetic_expression_is_rejected() {
+        // Blocker 6: only a direct call to a plain function is a
+        // supported `defer` shape this milestone -- an arbitrary
+        // expression is rejected at check time, not silently accepted
+        // only to fail lowering later with an internal diagnostic.
         let diags = check("func f() { value x = 1; defer x + 1; }");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "T0007");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_generic_function_call_is_rejected() {
+        let diags =
+            check("func identity[T](x: T) -> T { return x } func f() { defer identity[i64](1); }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_function_returning_a_resource_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make() -> File { return File { descriptor: 1 } } \
+             func f() { defer make(); }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn defer_of_a_plain_function_call_returning_a_non_resource_is_accepted() {
+        let diags = check("func touch() -> i64 { return 1 } func f() { defer touch(); }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_malformed_defer_expression_is_still_a_diagnostic() {
+        let diags = check("func f() { defer true + 1; }");
+        assert!(
+            diags.iter().any(|d| d.code == "T0001"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_defer_argument_that_raises_is_rejected_at_check() {
+        // Registration would never actually happen on this path --
+        // `nir::lower` has no way to represent that, so it must be
+        // rejected here, not surfaced as an internal lowering error.
+        let diags = check(
+            "variant OpenError { Invalid } \
+             func touch(x: i64) -> unit {} \
+             func f() -> i64 raises OpenError { \
+                 defer touch(raise OpenError.Invalid); \
+                 return 0; \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_defer_argument_that_returns_is_rejected_at_check() {
+        let diags = check(
+            "func touch(x: i64) -> unit {} \
+             func f() -> i64 { \
+                 defer touch(return 0); \
+                 return 1; \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0066"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_constructs_and_reads_fields_exactly_like_a_record() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() -> i64 { value file = File { descriptor: 3 }; return file.descriptor }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_construction_with_a_mistyped_field_is_a_diagnostic() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() -> File { return File { descriptor: true } }",
+        );
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn resource_equality_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f(a: File, b: File) -> bool { return a == b }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0016"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn drop_of_a_live_resource_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func f() { value file = File { descriptor: 3 }; drop file; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn drop_of_a_non_resource_is_rejected() {
+        let diags = check("func f() { value x = 1; drop x; }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0061"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_take_parameter_is_accepted_and_type_checked_normally() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take file: File) -> i64 { return file.descriptor }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn take_on_a_non_resource_parameter_is_rejected() {
+        let diags = check("func bad(take number: i64) -> i64 { return number }");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0065"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_non_resource_extend_method_parameter_is_rejected() {
+        let diags = check(
+            "record Box { amount: i64 } \
+             protocol Bad[T] { func bad(number: i64) -> i64; } \
+             extend Bad[Box] { func bad(take number: i64) -> i64 { return number } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_non_resource_parameter_points_at_the_take_declaration() {
+        let diags = check("func bad(take number: i64) -> i64 { return number }");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        let span = diags[0].primary_span;
+        let text = "func bad(take number: i64) -> i64 { return number }";
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "take number: i64",
+            "expected the diagnostic to span the `take` declaration itself"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_is_rejected() {
+        // Alpha 0.1.7 has no generic resource ownership model at all --
+        // rejected symbolically, at the declaration, never deferred
+        // until some future instantiation happens to pick a resource
+        // type (Blocker 10).
+        let diags = check("func bad[T](take item: T) {}");
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0065"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn calling_a_generic_take_function_at_a_concrete_type_is_still_rejected() {
+        let diags = check("func bad[T](take item: T) {} func f() { bad[i64](1); }");
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_used_for_resource_instantiation_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func bad[T](take item: T) {} \
+             func f() { value file = File { descriptor: 1 }; bad[File](file); }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_extend_method_parameter_is_rejected() {
+        let diags = check(
+            "record Box { amount: i64 } \
+             protocol Bad[T] { func bad(number: T) -> i64; } \
+             extend Bad[Box] { func bad(take number: Box) -> i64 { return number.amount } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0065"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn take_on_a_generic_type_parameter_points_at_the_take_declaration() {
+        let diags = check("func bad[T](take item: T) {}");
+        assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+        let span = diags[0].primary_span;
+        let text = "func bad[T](take item: T) {}";
+        assert_eq!(
+            &text[span.start as usize..span.end as usize],
+            "take item: T",
+            "expected the diagnostic to span the `take` declaration itself"
+        );
+    }
+
+    // -- Nested resource fields (Blocker 8) ------------------------------
+
+    #[test]
+    fn a_resource_typed_field_in_an_ordinary_record_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { file: File }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_field_in_another_resource_is_rejected() {
+        // Alpha 0.1.7 implements neither transitive ownership transfer
+        // into a nested resource field nor recursive destruction out of
+        // one, so this is rejected the same way an ordinary record
+        // holding one already is, not silently accepted and then
+        // leaked at runtime.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Wrapper { file: File }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_variant_payload_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant Holder { Has(File) }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_typed_field_in_another_resource_is_reported_even_if_never_constructed() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Wrapper { file: File } \
+             func main() -> i64 { return 0 }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0064"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_used_as_a_protocol_type_argument_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             protocol Equal[T] { func equal(left: T, right: T) -> bool; } \
+             extend Equal[File] { func equal(left: File, right: File) -> bool { return true } }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0062"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    // -- Protocol dispatch take audit (Section 11) -----------------------
+    //
+    // Rejecting `take` on a protocol method's own declaration
+    // (TAKE_IN_PROTOCOL_METHOD, R0033) is a resolve-stage check --
+    // covered by `hir::lower`'s own test module instead, since this
+    // module's `check()` helper asserts resolve diagnostics are already
+    // empty before ever reaching typeck.
+
+    #[test]
+    fn take_on_an_extend_methods_own_parameter_is_rejected_even_when_the_protocol_lacks_it() {
+        // The protocol itself never declares `take`; the extend adding
+        // it on its own implementation is exactly as unsound, since
+        // resourceck can never statically know which extend a protocol
+        // call dispatches to.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { amount: i64 } \
+             protocol Closer[T] { func close(target: T, item: File) -> unit; } \
+             extend Closer[Box] { \
+                 func close(target: Box, take item: File) -> unit { drop item; } \
+             }",
+        );
+        assert_eq!(
+            codes_of(&diags),
+            vec!["T0067"],
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_resource_parameter_on_a_protocol_method_remains_valid() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Box { amount: i64 } \
+             protocol Inspector[T] { func inspect(target: T, item: File) -> i64; } \
+             extend Inspector[Box] { \
+                 func inspect(target: Box, item: File) -> i64 { return item.descriptor } \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]
@@ -5022,6 +5805,7 @@ mod tests {
                     },
                 },
             ],
+            affine: false,
         };
         let param_local = LocalId(0);
         let function = HirFunction {
@@ -5042,6 +5826,7 @@ mod tests {
                     args: Vec::new(),
                     span: Span::dummy(),
                 },
+                take: false,
             }],
             return_type: Some(HirType::Unresolved {
                 name: interner.intern("i64"),
@@ -5181,8 +5966,8 @@ mod tests {
         let diags = check(
             "variant Shape { Circle(i64) } \
              variant Other { X } \
-             func take(o: Other) { } \
-             func f() { take(Shape.Circle(1)); }",
+             func accept(o: Other) { } \
+             func f() { accept(Shape.Circle(1)); }",
         );
         assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
         assert_eq!(diags[0].code, "T0001");
@@ -7003,5 +7788,38 @@ mod tests {
             }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- Loop divergence (`rfcs/0011`, infinite-loop reachability) ------
+
+    #[test]
+    fn a_break_less_loop_as_a_functions_own_body_satisfies_any_return_type() {
+        // A bare `loop {}` with no reachable `break` never produces a
+        // value at all -- its own type must be `Ty::Never`, not
+        // `Ty::Unit`, or this would wrongly report a return-type
+        // mismatch against `i64` even though the function's own body
+        // never actually falls through with the wrong type (it never
+        // falls through at all).
+        let diags = check("func f() -> i64 { loop { } }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_loop_with_a_reachable_break_still_needs_a_real_tail_value() {
+        // Once a `break` makes the loop's own fallthrough reachable
+        // again, it reverts to `Ty::Unit` as before -- this function's
+        // own declared `i64` return type is still unsatisfied by a
+        // `loop` statement with no further tail expression.
+        let diags = check("func f(cond: bool) -> i64 { loop { if cond { break } } }");
+        assert!(!diags.is_empty(), "expected a return-type mismatch");
+    }
+
+    #[test]
+    fn a_break_nested_in_an_inner_loop_does_not_make_the_outer_loop_reachable() {
+        let diags = check("func f() -> i64 { loop { loop { break } } }");
+        assert!(
+            diags.is_empty(),
+            "an inner loop's own break must not affect the outer loop's own divergence: {diags:?}"
+        );
     }
 }

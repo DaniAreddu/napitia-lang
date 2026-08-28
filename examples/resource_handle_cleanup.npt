@@ -1,0 +1,30 @@
+variant OpenError {
+    Invalid,
+}
+
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func validate(descriptor: i64) -> i64 raises OpenError {
+    if descriptor < 0 {
+        raise OpenError.Invalid;
+    }
+    return descriptor;
+}
+
+func main() -> i64 {
+    // `file` is owned by `main`'s own top-level scope for the whole
+    // function, independent of which `handle` arm actually runs --
+    // it is implicitly dropped once, at `main`'s own normal exit,
+    // after whichever arm produced this tail value.
+    value file = open(4);
+    return handle validate(file.descriptor) {
+        success descriptor => descriptor,
+        failure OpenError.Invalid => 0,
+    };
+}

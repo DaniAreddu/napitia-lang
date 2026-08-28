@@ -464,6 +464,7 @@ mod tests {
                         span: Span::dummy(),
                     },
                 }],
+                affine: false,
             },
             field_ty,
         )
@@ -732,6 +733,7 @@ mod tests {
                         span: Span::dummy(),
                     },
                 }],
+                affine: false,
             },
             field_ty,
         )

@@ -193,6 +193,14 @@ pub struct HirRecord {
     /// (`rfcs/0006`); irrelevant to single-file compilation.
     pub public: bool,
     pub fields: Vec<HirField>,
+    /// Whether this was declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- an affine, non-copyable value tracked by
+    /// `resourceck`, rather than an ordinary, freely-copyable record.
+    /// Everything about a resource's own *shape* (fields, construction,
+    /// privacy, imports) reuses this same `HirRecord`/`RecordLayout`
+    /// representation unchanged; only this flag, and the ownership-flow
+    /// analysis it gates, differs.
+    pub affine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +379,10 @@ pub struct HirParam {
     pub name: Symbol,
     pub span: Span,
     pub ty: HirType,
+    /// Whether this parameter was declared `take` (`rfcs/0011`) --
+    /// ownership-transferring rather than a call-scoped observation.
+    /// Meaningless (but harmlessly `false`) for a non-resource type.
+    pub take: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +398,11 @@ pub enum HirStmt {
     Binding(HirBinding),
     Expr(HirExpr),
     Defer {
+        expr: HirExpr,
+        span: Span,
+    },
+    /// `drop file;` (`rfcs/0011`): consumes a live resource immediately.
+    Drop {
         expr: HirExpr,
         span: Span,
     },

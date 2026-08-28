@@ -1,0 +1,22 @@
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+// An ordinary parameter is a call-scoped observation: `consume` owns
+// `file` for the duration of this call only.
+func consume(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+func main() -> i64 {
+    value file = open(7);
+    // Ownership moves into `consume` here -- `file` is no longer usable
+    // in `main` after this call.
+    return consume(file);
+}

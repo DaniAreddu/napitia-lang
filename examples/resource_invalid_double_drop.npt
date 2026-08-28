@@ -1,0 +1,16 @@
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func main() -> i64 {
+    value file = open(3);
+    drop file;
+    // `file` was already dropped above -- dropping it again is
+    // rejected at compile time (U0003).
+    drop file;
+    return 0;
+}

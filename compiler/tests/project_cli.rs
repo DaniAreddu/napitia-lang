@@ -594,3 +594,113 @@ fn a_raised_variant_and_a_fallible_function_imported_across_modules_run_end_to_e
     assert!(ran.status.success(), "run failed: {}", stderr(&ran));
     assert_eq!(stdout(&ran).trim(), "-1");
 }
+
+/// An imported `resource` type (aliased on import), a `take` parameter
+/// crossing a module boundary, and cleanup across postfix `?` all work
+/// together across two files (`rfcs/0011`).
+#[test]
+fn an_imported_resource_type_and_a_take_parameter_work_across_modules() {
+    let dir = project("resource_two_file");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    assert!(
+        !stdout(&ired).contains("V0"),
+        "leaked internal diagnostic: {}",
+        stdout(&ired)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "5");
+}
+
+/// The two-file fixture above never actually owns a resource before its
+/// own failing call -- `acquire`'s postfix `?` propagates `open`'s own
+/// failure directly, with nothing constructed yet to clean up. This
+/// fixture instead owns a resource across the module boundary (`value
+/// file = open(descriptor)?;`), then makes a *second*, independent
+/// fallible cross-module call (`validate(descriptor)?`) that actually
+/// fails -- proving the owned resource is destroyed on that failure
+/// edge, not merely on the ordinary success path.
+#[test]
+fn a_resource_owned_before_a_second_fallible_call_is_cleaned_up_on_its_failure() {
+    let dir = project("resource_cross_module_failure_cleanup");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    let ir = stdout(&ired);
+    assert!(!ir.contains("V0"), "leaked internal diagnostic: {ir}");
+    // The owned resource (returned by `open`'s own success edge) must
+    // be dropped on `validate`'s own failure edge, inside `process`
+    // itself -- not silently skipped, and not left for some other,
+    // unrelated exit to (possibly wrongly) handle.
+    assert_eq!(
+        ir.matches("drop").count(),
+        2,
+        "expected exactly one drop on validate's own failure edge inside process, and one \
+         inside close's own body on the (here, unreached) success path: {ir}"
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(
+        stdout(&ran).trim(),
+        "-1",
+        "descriptor 150 passes open (only rejects negative) but fails validate (>100), so \
+         process must propagate that failure with file already cleaned up"
+    );
+
+    // Repeated runs produce byte-identical output.
+    let ran_again = napitia(&["run", &dir]);
+    assert_eq!(stdout(&ran).trim(), stdout(&ran_again).trim());
+}
+
+#[test]
+fn resource_cross_module_failure_cleanup_nir_is_deterministic_under_reversed_import_order() {
+    let normal = project("resource_cross_module_failure_cleanup");
+    let reordered = project("resource_cross_module_failure_cleanup_reordered");
+
+    let normal_ir = stdout(&napitia(&["ir", &normal]));
+    let reordered_ir = stdout(&napitia(&["ir", &reordered]));
+    assert!(!normal_ir.is_empty());
+    assert_eq!(
+        normal_ir, reordered_ir,
+        "NIR must not depend on import declaration order"
+    );
+}
+
+/// Same project as above, but every `import` in `main.npt` is written
+/// in reversed order -- the resulting NIR must be byte-identical,
+/// proving a resource type's own canonical identity (and its
+/// take/observation lowering) never depends on import declaration
+/// order.
+#[test]
+fn resource_nir_is_deterministic_under_reversed_import_order() {
+    let normal = project("resource_two_file");
+    let reordered = project("resource_two_file_reordered");
+
+    let normal_ir = stdout(&napitia(&["ir", &normal]));
+    let reordered_ir = stdout(&napitia(&["ir", &reordered]));
+    assert!(!normal_ir.is_empty());
+    assert_eq!(
+        normal_ir, reordered_ir,
+        "NIR must not depend on import declaration order"
+    );
+}

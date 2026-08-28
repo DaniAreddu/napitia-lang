@@ -1,0 +1,34 @@
+resource File {
+    descriptor: i64,
+}
+
+variant Choice {
+    Left,
+    Right,
+}
+
+// A resource-valued `match` used directly as a `return`'s own operand
+// (or the function's own implicit tail) is a compound origin: each arm
+// resolves to a different underlying `File`, and `nir::lower` pushes
+// this `return`'s own cleanup into every arm separately, so the arm
+// that is *not* chosen still has its own resource destroyed on that
+// exact path, while the chosen one transfers out untouched.
+func choose(c: Choice, take left: File, take right: File) -> File {
+    return match c {
+        Left => left,
+        Right => right,
+    };
+}
+
+func consume(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+func main() -> i64 {
+    value a = File { descriptor: 3 };
+    value b = File { descriptor: 4 };
+    value picked = choose(Choice.Right, a, b);
+    return consume(picked);
+}

@@ -13,7 +13,7 @@ pub mod printer;
 pub mod verify;
 
 pub use block::{BasicBlock, BlockId, InvokeErrTarget, Terminator};
-pub use instruction::{Const, FunctionRef, Instruction, ValueId, ValueKind};
+pub use instruction::{Const, FunctionRef, Instruction, OwnershipMode, ValueId, ValueKind};
 pub use lower::{lower_module, lower_module_with_paths};
 pub use printer::print_module;
 pub use verify::verify_module;
@@ -92,6 +92,11 @@ pub struct RecordLayout {
     /// `(field name, declared type)`, in declaration order -- the order
     /// `record.create`'s arguments are always given in.
     pub fields: Vec<(Symbol, Ty)>,
+    /// Whether this was declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- see [`crate::hir::HirRecord::affine`]. Read back
+    /// by `nir::lower`'s own cleanup-insertion bookkeeping and by
+    /// `nir::verify`'s resource-state checks.
+    pub affine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -145,4 +150,11 @@ pub struct Function {
 pub struct Param {
     pub value: ValueId,
     pub ty: Ty,
+    /// Whether this parameter was declared `take` (`rfcs/0011`) --
+    /// ownership-transferring rather than a call-scoped observation.
+    /// Carried into NIR itself (not just `nir::lower`'s own internal
+    /// bookkeeping) so a consumer independent of lowering -- the
+    /// verifier, the interpreter -- can tell the two apart without
+    /// re-deriving it from HIR.
+    pub take: bool,
 }

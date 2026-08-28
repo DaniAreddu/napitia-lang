@@ -1,0 +1,36 @@
+resource File {
+    descriptor: i64,
+}
+
+// `defer` registered inside a loop body is scoped to that one
+// iteration: reaching `break` exits the loop body's own scope right
+// there, releasing this observing defer's protection immediately
+// (rather than leaving it "still needed" past the loop), so the file
+// is free to move into `consume` afterward.
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func consume(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+func f(cond: bool) -> i64 {
+    value file = File { descriptor: 6 };
+
+    loop {
+        defer inspect(file);
+
+        if cond {
+            break;
+        }
+    }
+
+    return consume(file);
+}
+
+func main() -> i64 {
+    return f(true);
+}

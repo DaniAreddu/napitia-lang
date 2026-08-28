@@ -153,6 +153,20 @@ struct LoopFrame {
     /// `pending_cleanup[cleanup_marker..]`, mirroring `nir::lower`'s
     /// own `LoopCtx::cleanup_marker`.
     cleanup_marker: usize,
+    /// `defer_scopes.len()` at the point this loop's own body began
+    /// being checked -- every scope pushed at or after this index
+    /// belongs to this exact iteration (the body's own top-level scope,
+    /// or any block nested inside it), and is exited -- not merely
+    /// truncated away later by its own `check_block_ctx_body`'s normal
+    /// pop -- by a `break`/`continue` reached inside it. A `break`'s/
+    /// `continue`'s own recorded exit state must reflect every one of
+    /// those scopes' own observing-`defer` protections already released
+    /// (see [`Self::released_snapshot`]) *before* it is stored, or code
+    /// reachable after the loop (for `break`) or the next iteration
+    /// (for `continue`) would wrongly still see a resource as
+    /// `defer`-protected past the exact scope that protection was only
+    /// ever supposed to outlive.
+    defer_scope_marker: usize,
 }
 
 pub struct FlowChecker<'a> {
@@ -323,6 +337,32 @@ impl<'a> FlowChecker<'a> {
     fn record_exit(&mut self, id: ExprId, marker: usize) {
         let actions = self.snapshot_cleanup(marker);
         self.cleanup_edges.insert(id, actions);
+    }
+
+    /// A copy of `self.states` with every scope in
+    /// `self.defer_scopes[from_scope..]`'s own observing-`defer`
+    /// protection already released -- exactly the reset
+    /// `check_block_ctx_body`'s own normal pop would apply to each of
+    /// those scopes in turn, applied here instead to a `break`'s/
+    /// `continue`'s own *recorded exit state*, since neither actually
+    /// waits for those scopes to pop normally: both exit them early,
+    /// right here, before `check_block_ctx_body` ever gets a chance to
+    /// (`rfcs/0011`). Never mutates `self.defer_scopes`/`self.states`
+    /// themselves -- those still belong to whatever scope keeps walking
+    /// after this exact point (a sibling statement in an enclosing,
+    /// *not*-exited block; dead code after an unconditional break/
+    /// continue is never walked at all, see `stmt_diverges`), which
+    /// must still see its own protection exactly as it was.
+    fn released_snapshot(&self, from_scope: usize) -> HashMap<LocalId, ResourceState> {
+        let mut states = self.states.clone();
+        for scope in &self.defer_scopes[from_scope.min(self.defer_scopes.len())..] {
+            for local in scope {
+                if let Some(ResourceState::DropScheduled) = states.get(local) {
+                    states.insert(*local, ResourceState::Available);
+                }
+            }
+        }
+        states
     }
 
     fn is_resource_local(&self, local: LocalId) -> bool {
@@ -604,6 +644,7 @@ impl<'a> FlowChecker<'a> {
         let entry = self.states.clone();
         self.loop_stack.push(LoopFrame {
             cleanup_marker: self.pending_cleanup.len(),
+            defer_scope_marker: self.defer_scopes.len(),
             ..LoopFrame::default()
         });
         self.check_block(body);
@@ -645,6 +686,7 @@ impl<'a> FlowChecker<'a> {
         let entry = self.states.clone();
         self.loop_stack.push(LoopFrame {
             cleanup_marker: self.pending_cleanup.len(),
+            defer_scope_marker: self.defer_scopes.len(),
             ..LoopFrame::default()
         });
         self.check_expr(condition);
@@ -819,12 +861,25 @@ impl<'a> FlowChecker<'a> {
             | HirExpr::ProtocolMethodRef { .. }
             | HirExpr::Error { .. } => {}
             HirExpr::Continue { id, .. } => {
-                let state = self.states.clone();
                 if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
                     self.record_exit(*id, marker);
                 }
-                if let Some(frame) = self.loop_stack.last_mut() {
-                    frame.continue_states.push(state);
+                if let Some(frame) = self.loop_stack.last() {
+                    // This iteration's own scopes (the loop body's own
+                    // top-level scope, and any block nested inside it
+                    // this `continue` sits within) are exited right
+                    // here, back to the loop's own condition/backedge --
+                    // any observing `defer` they registered must be
+                    // released in this exact recorded state, or the
+                    // next iteration's own fresh `check_defer` call
+                    // would wrongly find it still protected instead of
+                    // `Available` again (`rfcs/0011`).
+                    let state = self.released_snapshot(frame.defer_scope_marker);
+                    self.loop_stack
+                        .last_mut()
+                        .expect("checked Some immediately above")
+                        .continue_states
+                        .push(state);
                 }
             }
             HirExpr::Local {
@@ -939,7 +994,20 @@ impl<'a> FlowChecker<'a> {
                 if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
                     self.record_exit(*id, marker);
                 }
-                let state = self.states.clone();
+                // This loop's own body scope (and any block nested
+                // inside it this `break` sits within) is exited right
+                // here, straight past the loop entirely -- any
+                // observing `defer` one of those scopes registered must
+                // be released in this exact recorded state, or code
+                // reachable after the loop would wrongly still find it
+                // `defer`-protected past the exact scope that
+                // protection was only ever supposed to outlive
+                // (`rfcs/0011`).
+                let state = self
+                    .loop_stack
+                    .last()
+                    .map(|frame| self.released_snapshot(frame.defer_scope_marker))
+                    .unwrap_or_else(|| self.states.clone());
                 if let Some(frame) = self.loop_stack.last_mut() {
                     frame.break_states.push(state);
                 }

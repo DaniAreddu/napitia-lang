@@ -1301,6 +1301,65 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_temporary_on_one_arm_of_an_if_passed_to_an_ordinary_parameter_is_rejected() {
+        // `cond`-false leaks nothing (`existing` is an already-owned
+        // binding, merely observed), but `cond`-true constructs a
+        // genuinely fresh resource with no owner at all -- caught by
+        // recursing into the `if`'s own reachable leaves, not just at
+        // `inspect`'s own call-argument position directly.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func make_file(n: i64) -> File { return File { descriptor: n } } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) -> i64 { \
+                 value existing = File { descriptor: 1 }; \
+                 value result = inspect(if cond { make_file(9) } else { existing }); \
+                 drop existing; \
+                 return result; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_fresh_temporary_in_one_match_arm_passed_to_an_ordinary_parameter_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant Choice { A, B } \
+             func make_file(n: i64) -> File { return File { descriptor: n } } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(c: Choice) -> i64 { \
+                 value existing = File { descriptor: 1 }; \
+                 value result = inspect(match c { A => make_file(9), B => existing }); \
+                 drop existing; \
+                 return result; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0011"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn every_arm_re_observing_an_already_owned_local_through_an_if_remains_valid() {
+        // Neither branch constructs anything fresh -- both merely
+        // re-observe already-owned bindings -- so this is exactly the
+        // still-valid shape `RESOURCE_TEMPORARY_LEAK`'s own doc comment
+        // describes, not a leak.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func f(cond: bool) -> i64 { \
+                 value a = File { descriptor: 1 }; \
+                 value b = File { descriptor: 2 }; \
+                 value result = inspect(if cond { a } else { b }); \
+                 drop a; \
+                 drop b; \
+                 return result; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn a_resource_temporary_observed_by_a_defer_is_rejected() {
         let diags = check(
             "resource File { descriptor: i64 } \

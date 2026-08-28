@@ -65,6 +65,10 @@ pub struct CheckOutput {
     /// truth for resource cleanup, rather than re-inferring it.
     pub cleanup_edges:
         std::collections::BTreeMap<hir::ExprId, Vec<crate::resourceck::CleanupAction>>,
+    /// See [`crate::resourceck::ResourceCheckResult::consume_sites`].
+    pub consume_sites: std::collections::BTreeMap<hir::ExprId, crate::resourceck::ConsumeInfo>,
+    /// See [`crate::resourceck::ResourceCheckResult::defer_plans`].
+    pub defer_plans: std::collections::BTreeMap<hir::ExprId, crate::resourceck::CheckedDeferPlan>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -91,6 +95,8 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         call_evidence: typeck_result.call_evidence,
         protocol_call_evidence: typeck_result.protocol_call_evidence,
         cleanup_edges: resourceck_result.cleanup_edges,
+        consume_sites: resourceck_result.consume_sites,
+        defer_plans: resourceck_result.defer_plans,
         diagnostics,
     }
 }
@@ -128,6 +134,8 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.call_evidence,
         &checked.protocol_call_evidence,
         &checked.cleanup_edges,
+        &checked.consume_sites,
+        &checked.defer_plans,
         interner,
         source,
     ) {

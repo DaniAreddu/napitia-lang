@@ -23,7 +23,7 @@ use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::Ty;
 
-use super::plan::CleanupAction;
+use super::plan::{CheckedDeferPlan, CleanupAction, ConsumeInfo};
 use super::state::ResourceState;
 
 mod codes {
@@ -243,6 +243,14 @@ pub struct FlowChecker<'a> {
     /// progress -- exported once this function's own check finishes
     /// (see [`Self::into_cleanup_edges`]).
     cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>>,
+    /// Every checked observe-vs-transfer decision this function's own
+    /// check actually made, keyed by the exact expression's own
+    /// `ExprId` -- see [`super::plan::ResourceCheckResult::
+    /// consume_sites`].
+    consume_sites: BTreeMap<ExprId, ConsumeInfo>,
+    /// Every `defer` statement's own checked plan -- see
+    /// [`super::plan::ResourceCheckResult::defer_plans`].
+    defer_plans: BTreeMap<ExprId, CheckedDeferPlan>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -270,15 +278,33 @@ impl<'a> FlowChecker<'a> {
             diverging_loops: HashSet::new(),
             pending_cleanup: Vec::new(),
             cleanup_edges: BTreeMap::new(),
+            consume_sites: BTreeMap::new(),
+            defer_plans: BTreeMap::new(),
         }
     }
 
-    /// Consumes this checker, handing its own checked cleanup plan to
+    /// Records `id`'s own checked observe-vs-transfer decision
+    /// (`rfcs/0011`) -- only ever called for a resource-typed
+    /// expression; `nir::lower` never needs (and this never records)
+    /// anything for an ordinary value, which is always freely copyable
+    /// regardless of context.
+    fn record_consume(&mut self, id: ExprId, info: ConsumeInfo) {
+        self.consume_sites.insert(id, info);
+    }
+
+    /// Consumes this checker, handing its own checked plan to
     /// [`super::check_module`] for merging into the module-wide
     /// [`super::ResourceCheckResult`]. Called once this checker's own
     /// function/extend-method has been fully checked.
-    pub fn into_cleanup_edges(self) -> BTreeMap<ExprId, Vec<CleanupAction>> {
-        self.cleanup_edges
+    #[allow(clippy::type_complexity)]
+    pub fn into_plan(
+        self,
+    ) -> (
+        BTreeMap<ExprId, Vec<CleanupAction>>,
+        BTreeMap<ExprId, ConsumeInfo>,
+        BTreeMap<ExprId, CheckedDeferPlan>,
+    ) {
+        (self.cleanup_edges, self.consume_sites, self.defer_plans)
     }
 
     pub fn check_function(&mut self, f: &HirFunction) {
@@ -516,6 +542,12 @@ impl<'a> FlowChecker<'a> {
     }
 
     fn check_binding(&mut self, b: &HirBinding) {
+        // A binding's own initializer always transfers ownership into
+        // the fresh local it names (`rfcs/0011`) -- there is no
+        // "observing" binding.
+        if self.is_affine_expr(b.value.id()) {
+            self.record_consume(b.value.id(), ConsumeInfo::Transfer);
+        }
         self.check_expr_ctx(&b.value, ConsumeKind::Other);
         if self.is_resource_local(b.local) {
             self.states.insert(b.local, ResourceState::Available);
@@ -536,6 +568,38 @@ impl<'a> FlowChecker<'a> {
     /// call that still needs to observe it.
     fn check_defer(&mut self, expr: &HirExpr, _span: Span) {
         self.check_expr(expr);
+        // `nir::lower`'s own `lower_defer_call` independently re-checks
+        // that `expr` is structurally a direct call to a plain function
+        // reference (a well-formedness concern outside this stage's own
+        // ownership-decision scope, exactly like an unsupported generic/
+        // fallible/resource-returning defer already is) -- a plan is
+        // only ever recorded here when it already is, so a shape that
+        // fails that structural check simply never gets one, and
+        // `nir::lower` reports its own diagnostic for it as today.
+        if let HirExpr::Call { callee, args, .. } = expr
+            && let HirExpr::Function { item, .. } = callee.as_ref()
+        {
+            let take_flags = self.take_flags_for_callee(callee);
+            let arg_modes = args
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let takes = take_flags.and_then(|f| f.get(i)).copied().unwrap_or(false);
+                    if takes {
+                        ConsumeInfo::Transfer
+                    } else {
+                        ConsumeInfo::Observe
+                    }
+                })
+                .collect();
+            self.defer_plans.insert(
+                expr.id(),
+                CheckedDeferPlan {
+                    callee: *item,
+                    arg_modes,
+                },
+            );
+        }
         // Registered by this exact call's own callee-expression id
         // (`rfcs/0011`): `nir::lower` looks its own already-lowered
         // callee/arguments back up by this same id when it later
@@ -927,6 +991,15 @@ impl<'a> FlowChecker<'a> {
                 self.check_expr(right);
             }
             HirExpr::Assign { target, value, .. } => {
+                // A plain reassignment's own value always transfers,
+                // exactly like a binding's own initializer (`rfcs/
+                // 0011`) -- `nir::lower` only actually applies this for
+                // `AssignOp::Assign` (a compound assignment is always
+                // numeric/bitwise, never affine, so `is_affine_expr`
+                // already excludes it here).
+                if self.is_affine_expr(value.id()) {
+                    self.record_consume(value.id(), ConsumeInfo::Transfer);
+                }
                 self.check_expr_ctx(value, ConsumeKind::Other);
                 if let HirExpr::Local {
                     local, name, span, ..
@@ -946,6 +1019,16 @@ impl<'a> FlowChecker<'a> {
                         .and_then(|flags| flags.get(index))
                         .copied()
                         .unwrap_or(false);
+                    if self.is_affine_expr(arg.id()) {
+                        self.record_consume(
+                            arg.id(),
+                            if takes {
+                                ConsumeInfo::Transfer
+                            } else {
+                                ConsumeInfo::Observe
+                            },
+                        );
+                    }
                     self.check_expr_ctx(
                         arg,
                         if takes {

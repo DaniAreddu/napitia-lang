@@ -858,6 +858,43 @@ enum LoweredExpr {
     Diverged,
 }
 
+/// Where a `match` decision tree's own winning arm hands its value off,
+/// once decided (`rfcs/0011`, Blocker 2): merged into a shared slot for
+/// the construct's own ordinary value (`Merge`, exactly like before),
+/// or forwarded straight to an enclosing `return`'s own per-branch
+/// sink (`Return`), exactly like `Lowering::lower_into_return_sink`
+/// already does for a nested `if`. Wrapped in `Option` by every caller
+/// (never a bare `ArmSink`) the same way `merge: Option<(ValueId,
+/// BlockId)>` already was: `None` means every arm diverges on its own
+/// (`Ty::Never`), so there is no value for any arm to hand off to
+/// anything at all.
+enum ArmSink<'a, 'f> {
+    Merge(ValueId, BlockId),
+    Return(
+        Ty,
+        &'f mut dyn FnMut(&mut Lowering<'a>, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ),
+}
+
+impl<'a> ArmSink<'a, '_> {
+    /// Produces a fresh, independently-usable `ArmSink` referring to
+    /// the same underlying slot/sink -- required at every recursive
+    /// decision-tree call site that itself sits inside a loop over
+    /// several sibling cases (`lower_bool_switch`'s two arms,
+    /// `lower_variant_switch`'s cases, `lower_literal_chain`'s then/
+    /// else split): `Merge` is trivially `Copy`, but `Return`'s own
+    /// `&mut dyn FnMut` is not, so it must be explicitly reborrowed
+    /// (exactly like `Lowering::lower_into_return_sink`'s own `&mut
+    /// *finish` reborrows already do) rather than moved once and
+    /// exhausted after the first sibling.
+    fn reborrow(&mut self) -> ArmSink<'a, '_> {
+        match self {
+            ArmSink::Merge(slot, after) => ArmSink::Merge(*slot, *after),
+            ArmSink::Return(hint, finish) => ArmSink::Return(hint.clone(), &mut **finish),
+        }
+    }
+}
+
 /// Per-function mutable lowering state: value numbering, the
 /// in-progress block list, and the active loop's break/continue targets.
 struct FnBuilder {
@@ -1508,6 +1545,9 @@ impl<'a> Lowering<'a> {
     ) -> LowerResult<LoweredExpr> {
         match expr {
             HirExpr::Block(block) => self.lower_into_return_sink_block(fb, block, hint, finish),
+            HirExpr::Match {
+                scrutinee, arms, ..
+            } => self.lower_match_into_return_sink(fb, scrutinee, arms, hint, finish),
             HirExpr::If {
                 condition,
                 then_branch,
@@ -2597,6 +2637,30 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// Like [`Self::lower_arm_body`], but for a winning arm reached
+    /// through [`Self::lower_match_into_return_sink`] instead of an
+    /// ordinary merge-into-slot `match` (`rfcs/0011`, Blocker 2):
+    /// `finish` is called directly on this arm's own value, exactly
+    /// like a nested `if`-branch's own leaf already is by
+    /// [`Self::lower_into_return_sink`], which this delegates straight
+    /// to -- correctly recursing into a further nested `if`/`match`/
+    /// block this exact arm's own body might itself be, rather than
+    /// treating it as a single opaque leaf the way [`Self::
+    /// lower_arm_body`]'s flat `lower_expr`/`lower_block_value` call
+    /// would.
+    fn lower_arm_body_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        match body {
+            HirMatchArmBody::Expr(e) => self.lower_into_return_sink(fb, e, hint, finish),
+            HirMatchArmBody::Block(b) => self.lower_into_return_sink_block(fb, b, hint, finish),
+        }
+    }
+
     /// Lowers an explicit protocol-call expression,
     /// `Protocol[Args].method(..)` (`rfcs/0009`) -- `typeck` already
     /// resolved exactly which extension (or forwarded requirement)
@@ -3040,7 +3104,7 @@ impl<'a> Lowering<'a> {
             rows,
             occurrences,
             arms,
-            Some((result_slot, after_block)),
+            Some(ArmSink::Merge(result_slot, after_block)),
             0,
         )?;
 
@@ -3050,13 +3114,57 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// Lowers `expr` (a `match`) in a position whose own final value
+    /// must be handed to `finish` separately on each reachable winning
+    /// arm, instead of merging every arm's value into one shared slot
+    /// first -- exactly `Lowering::lower_into_return_sink`'s own
+    /// treatment of a nested `if`, generalized to a `match`'s own
+    /// decision tree (`rfcs/0011`, Blocker 2).
+    fn lower_match_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        scrutinee: &HirExpr,
+        arms: &[HirMatchArm],
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        let scrutinee_value = match self.lower_expr(fb, scrutinee)? {
+            LoweredExpr::Value(v) => v,
+            LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+        };
+        let scrutinee_ty = self.expr_ty(scrutinee);
+
+        let rows: Vec<MatrixRow> = arms
+            .iter()
+            .enumerate()
+            .map(|(i, arm)| MatrixRow {
+                arm_index: i,
+                patterns: vec![PatternSlot::Real(&arm.pattern)],
+                bindings: Vec::new(),
+            })
+            .collect();
+        let occurrences = vec![Occurrence {
+            value: scrutinee_value,
+            ty: scrutinee_ty,
+        }];
+        self.lower_decision(
+            fb,
+            rows,
+            occurrences,
+            arms,
+            Some(ArmSink::Return(hint.clone(), finish)),
+            0,
+        )?;
+        Ok(LoweredExpr::Diverged)
+    }
+
     fn lower_decision<'h>(
         &mut self,
         fb: &mut FnBuilder,
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         // Each round trip through lower_decision and one of
@@ -3088,9 +3196,23 @@ impl<'a> Lowering<'a> {
                 HirMatchArmBody::Expr(e) => e.id(),
                 HirMatchArmBody::Block(b) => b.id,
             };
-            self.lower_branch_moves(fb, |this, fb| {
-                this.lower_arm_body(fb, &arm.body, merge, body_id)
-            })?;
+            match sink {
+                Some(ArmSink::Merge(slot, after)) => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body(fb, &arm.body, Some((slot, after)), body_id)
+                    })?;
+                }
+                Some(ArmSink::Return(hint, finish)) => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body_into_return_sink(fb, &arm.body, &hint, finish)
+                    })?;
+                }
+                None => {
+                    self.lower_branch_moves(fb, |this, fb| {
+                        this.lower_arm_body(fb, &arm.body, None, body_id)
+                    })?;
+                }
+            }
             return Ok(());
         }
 
@@ -3105,7 +3227,7 @@ impl<'a> Lowering<'a> {
             _ => None,
         };
         if scrutinee_variant.is_some_and(|item| self.variants.contains_key(&item)) {
-            self.lower_variant_switch(fb, rows, occurrences, arms, merge, depth)
+            self.lower_variant_switch(fb, rows, occurrences, arms, sink, depth)
         } else if matches!(&occurrences[0].ty, Ty::Bool) {
             // `bool` is a closed two-constructor domain (like a
             // variant's finite case set), so it is switched on
@@ -3113,9 +3235,9 @@ impl<'a> Lowering<'a> {
             // chain below -- an exhaustive `match true { true => ..,
             // false => .. }` (no wildcard at all) would otherwise have
             // no catch-all to terminate that chain's recursion on.
-            self.lower_bool_switch(fb, rows, occurrences, arms, merge, depth)
+            self.lower_bool_switch(fb, rows, occurrences, arms, sink, depth)
         } else {
-            self.lower_literal_chain(fb, rows, occurrences, arms, merge, depth)
+            self.lower_literal_chain(fb, rows, occurrences, arms, sink, depth)
         }
     }
 
@@ -3126,7 +3248,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -3151,7 +3273,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
         }
 
         let then_block = fb.new_block();
@@ -3199,7 +3321,14 @@ impl<'a> Lowering<'a> {
                     self.internal_error("a match's bool switch left a branch with no covering arm")
                 );
             }
-            self.lower_decision(fb, new_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+            self.lower_decision(
+                fb,
+                new_rows,
+                rest_occ.clone(),
+                arms,
+                sink.as_mut().map(|s| s.reborrow()),
+                depth + 1,
+            )?;
         }
         Ok(())
     }
@@ -3211,7 +3340,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -3246,7 +3375,7 @@ impl<'a> Lowering<'a> {
                     bindings,
                 });
             }
-            return self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1);
+            return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
         }
 
         let num_cases = self
@@ -3371,7 +3500,14 @@ impl<'a> Lowering<'a> {
 
             let mut new_occurrences = payload_occurrences;
             new_occurrences.extend(rest_occ.clone());
-            self.lower_decision(fb, new_rows, new_occurrences, arms, merge, depth + 1)?;
+            self.lower_decision(
+                fb,
+                new_rows,
+                new_occurrences,
+                arms,
+                sink.as_mut().map(|s| s.reborrow()),
+                depth + 1,
+            )?;
         }
         Ok(())
     }
@@ -3383,7 +3519,7 @@ impl<'a> Lowering<'a> {
         rows: Vec<MatrixRow<'h>>,
         occurrences: Vec<Occurrence>,
         arms: &'h [HirMatchArm],
-        merge: Option<(ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
         depth: usize,
     ) -> LowerResult<()> {
         let occ = occurrences[0].clone();
@@ -3399,7 +3535,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings: first.bindings.clone(),
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
             Classified::Bind(local) => {
                 let mut bindings = first.bindings.clone();
@@ -3409,7 +3545,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings,
                 }];
-                self.lower_decision(fb, new_rows, rest_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
             Classified::Literal(lit) => {
                 let const_value = literal_const(fb, &lit, &occ.ty);
@@ -3452,7 +3588,14 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 fb.switch_to(then_block);
-                self.lower_decision(fb, then_rows, rest_occ.clone(), arms, merge, depth + 1)?;
+                self.lower_decision(
+                    fb,
+                    then_rows,
+                    rest_occ.clone(),
+                    arms,
+                    sink.as_mut().map(|s| s.reborrow()),
+                    depth + 1,
+                )?;
 
                 let else_rows: Vec<MatrixRow<'h>> = rows
                     .into_iter()
@@ -3468,7 +3611,7 @@ impl<'a> Lowering<'a> {
                 }
                 let mut all_occ = vec![occ];
                 all_occ.extend(rest_occ);
-                self.lower_decision(fb, else_rows, all_occ, arms, merge, depth + 1)
+                self.lower_decision(fb, else_rows, all_occ, arms, sink, depth + 1)
             }
             Classified::Case { .. } => Err(self
                 .internal_error("a variant pattern was tested against a non-variant occurrence")),

@@ -28,10 +28,10 @@
 //! HIR node *is* that exit, rather than lowering independently
 //! re-walking branches/loop back-edges to guess the same answer a
 //! second time. A resource-typed `return`/tail value that is itself a
-//! compound `if`/block is the one shape `nir::lower` handles by pushing
-//! that `return`'s own cleanup into each branch separately
-//! (`Lowering::lower_into_return_sink`), each branch's own leaf looked
-//! up by its own `ExprId` in `cleanup_edges`.
+//! compound `if`/`match`/`handle`/block is handled by pushing that
+//! `return`'s own cleanup into each branch/arm separately
+//! (`Lowering::lower_into_return_sink`), each branch/arm's own leaf
+//! looked up by its own `ExprId` in `cleanup_edges`.
 //!
 //! Known, honest scope limits for this milestone: only a *whole*
 //! binding may ever be moved -- moving a resource-typed value out of a

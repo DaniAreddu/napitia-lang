@@ -39,10 +39,10 @@
 //! own `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` (T0064) already rejects a
 //! resource-typed field in any aggregate -- record, variant, or another
 //! resource -- at that aggregate's own declaration; a resource-typed
-//! `match`/`handle`, or a resource-typed `if` in any consuming position
+//! `handle`, or a resource-typed `if`/`match` in any consuming position
 //! other than `return`/the function's own implicit tail, is rejected
-//! outright (`U0008`), since `nir::lower` has no per-branch sink for
-//! those yet; a resource-typed temporary reaching a compound
+//! outright (`U0008`), since `nir::lower` has no per-branch/per-arm
+//! sink for those yet; a resource-typed temporary reaching a compound
 //! `if`/`match`/`handle` that itself constructs a genuinely fresh
 //! resource on some branch is not caught by the temporary check
 //! (`U0011`), only a direct call or literal construction is.
@@ -483,12 +483,41 @@ mod tests {
     }
 
     #[test]
-    fn a_resource_typed_match_directly_returned_is_rejected() {
+    fn a_resource_typed_match_directly_returned_has_no_diagnostics() {
         let diags = check(
             "variant Choice { A, B } \
              resource File { descriptor: i64 } \
              func choose(c: Choice, take left: File, take right: File) -> File { \
                  return match c { A => left, B => right }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_match_bound_to_a_value_is_still_rejected() {
+        let diags = check(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func choose(c: Choice, take left: File, take right: File) -> File { \
+                 value picked = match c { A => left, B => right }; \
+                 return picked; \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_handle_directly_returned_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func choose(take fallback: File) -> File { \
+                 return handle open() { \
+                     success file => file, \
+                     failure OpenError.Invalid => fallback, \
+                 }; \
              }",
         );
         assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");

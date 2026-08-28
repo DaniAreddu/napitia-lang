@@ -55,16 +55,17 @@ mod codes {
     /// declared outside the loop disagrees with its state on entry --
     /// a second iteration could not safely reuse it.
     pub const LOOP_CARRIED_INVALIDATION: &str = "U0007";
-    /// A resource-typed `match`/`handle` (any consuming position), or a
-    /// resource-typed `if` in a consuming position other than `return`/
-    /// the function's own implicit tail, whose own value is directly
-    /// moved, bound, assigned, passed to a `take` parameter, stored in
-    /// a constructed aggregate, or raised. `nir::lower` can only push a
-    /// `return`'s own per-branch cleanup into a nested `if`/block's own
-    /// branches (`rfcs/0011`); every other compound origin shape (and
-    /// `match`/`handle` even as a `return`'s own operand) has no sound
-    /// lowering this milestone, so it is rejected here rather than
-    /// silently mis-lowered into a double-drop or a leak.
+    /// A resource-typed `handle` (any consuming position), or a
+    /// resource-typed `if`/`match` in a consuming position other than
+    /// `return`/the function's own implicit tail, whose own value is
+    /// directly moved, bound, assigned, passed to a `take` parameter,
+    /// stored in a constructed aggregate, or raised. `nir::lower` can
+    /// only push a `return`'s own per-branch/per-arm cleanup into a
+    /// nested `if`/`match`/block's own branches/arms (`rfcs/0011`);
+    /// every other compound origin shape (and `handle` even as a
+    /// `return`'s own operand) has no sound lowering this milestone, so
+    /// it is rejected here rather than silently mis-lowered into a
+    /// double-drop or a leak.
     pub const UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN: &str = "U0008";
     // U0009 ("resource field extraction") retired: `typeck`'s own
     // RESOURCE_FIELD_IN_ORDINARY_AGGREGATE (T0064) now rejects a
@@ -115,10 +116,10 @@ enum ConsumeKind {
     Read,
     /// Consumed by `return`, or the function's own implicit tail
     /// return. `nir::lower` pushes this sink into each reachable
-    /// branch of a nested `if`/block separately (Blocker 2), so a
-    /// resource-typed `if` is accepted here even when its two branches
-    /// resolve to different underlying locals; `match`/`handle` are
-    /// still not supported even in this position.
+    /// branch/arm of a nested `if`/`match`/block separately (Blocker
+    /// 2), so a resource-typed `if`/`match` is accepted here even when
+    /// its branches/arms resolve to different underlying locals;
+    /// `handle` is still not supported even in this position.
     Return,
     /// Consumed by anything else that transfers ownership: a `value`/
     /// `mutable` binding's own initializer, an assignment's own value,
@@ -210,15 +211,14 @@ pub struct FlowChecker<'a> {
     diverging_loops: HashSet<ExprId>,
     /// Every resource local's own implicit destruction, and every
     /// `defer`'s own registration, in the exact order this walk
-    /// encountered them -- the authoritative source `nir::lower` builds
-    /// its own cleanup instructions from (`rfcs/0011`; see
+    /// encountered them -- the sole, authoritative source `nir::lower`
+    /// builds every cleanup instruction it emits from (`rfcs/0011`; see
     /// `resourceck::plan::CleanupAction`). A single flat, function-wide
-    /// list mirroring `nir::lower`'s own (soon to be retired)
-    /// `cleanup_actions`: a nested scope's own entries are appended onto
-    /// the same list as its enclosing scopes', and truncated back off
-    /// again once that exact scope's own snapshot has been recorded
-    /// (see [`Self::record_exit`]), so an enclosing scope's later
-    /// snapshot never includes (and never re-records) them.
+    /// list: a nested scope's own entries are appended onto the same
+    /// list as its enclosing scopes', and truncated back off again once
+    /// that exact scope's own snapshot has been recorded (see
+    /// [`Self::record_exit`]), so an enclosing scope's later snapshot
+    /// never includes (and never re-records) them.
     pending_cleanup: Vec<CleanupAction>,
     /// Every reachable exit's own checked, ordered cleanup list, keyed
     /// by the stable id of whatever HIR node *is* that exit (an
@@ -967,8 +967,8 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    /// Rejects a resource-typed `match`/`handle`, or a resource-typed
-    /// `if` used in a consuming position other than `return`, with
+    /// Rejects a resource-typed `handle`, or a resource-typed `if`/
+    /// `match` used in a consuming position other than `return`, with
     /// [`UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN`] (Blocker 2:
     /// `nir::lower` cannot yet represent a compound origin there --
     /// see [`ConsumeKind`]) -- returning `ConsumeKind::Read` in that
@@ -976,8 +976,8 @@ impl<'a> FlowChecker<'a> {
     /// correctness inside every branch/arm, just without pretending
     /// the construct's own overall value is soundly consumed. Returns
     /// `kind` unchanged whenever no rejection is needed (a `Read`
-    /// context, a non-affine type, or -- for `if` specifically -- a
-    /// `Return` context).
+    /// context, a non-affine type, or -- for `if`/`match` specifically
+    /// -- a `Return` context).
     fn check_compound_origin(
         &mut self,
         id: crate::hir::ExprId,
@@ -987,7 +987,7 @@ impl<'a> FlowChecker<'a> {
     ) -> ConsumeKind {
         let supported = match kind {
             ConsumeKind::Read => true,
-            ConsumeKind::Return => construct == "if",
+            ConsumeKind::Return => matches!(construct, "if" | "match"),
             ConsumeKind::Other => false,
         };
         if supported || !self.is_affine_expr(id) {
@@ -1270,10 +1270,28 @@ impl<'a> FlowChecker<'a> {
             // exactly matching declaration order reversed.
             let marker = self.pending_cleanup.len();
             self.check_pattern(&arm.pattern);
-            let (body_id, diverges) = match &arm.body {
+            let (body_id, diverges, return_leaf_recorded) = match &arm.body {
                 HirMatchArmBody::Expr(e) => {
                     self.check_expr_ctx(e, kind);
-                    (e.id(), self.diverges(e.id()))
+                    let diverges = self.diverges(e.id());
+                    // A compound `return`'s own per-branch cleanup
+                    // (Blocker 2), mirroring `check_block_ctx_inner`'s
+                    // identical tail special-case: in a `Return`
+                    // context this exact bare arm body *is* the leaf
+                    // `nir::lower`'s own `lower_into_return_sink`
+                    // replays cleanup for, so it needs its own
+                    // whole-function (marker-0) snapshot -- taken here,
+                    // before this arm's own state joins any sibling.
+                    // Recorded *instead of* (not in addition to) the
+                    // arm-local-marker version below, which shares this
+                    // exact same id (an Expr body's own id) for a bare
+                    // arm -- recording both would let whichever ran
+                    // second silently overwrite the other's entry.
+                    let return_leaf_recorded = kind == ConsumeKind::Return;
+                    if return_leaf_recorded && !diverges {
+                        self.record_exit(e.id(), 0);
+                    }
+                    (e.id(), diverges, return_leaf_recorded)
                 }
                 HirMatchArmBody::Block(block) => {
                     // `check_block_ctx_body`, not `check_block_ctx`:
@@ -1281,12 +1299,17 @@ impl<'a> FlowChecker<'a> {
                     // separately under its own id -- this arm's own
                     // wider marker (opened above, before the pattern)
                     // already spans it, so it is recorded once, below,
-                    // combined with the pattern's own binding(s).
+                    // combined with the pattern's own binding(s). A
+                    // `Return` context's own whole-function snapshot is
+                    // already handled independently, keyed by this
+                    // block's own *tail expression*'s id (never
+                    // `block.id` itself), by `check_block_ctx_inner`,
+                    // so there is no id collision here to guard against.
                     self.check_block_ctx_body(block, kind);
-                    (block.id, self.diverges(block.id))
+                    (block.id, self.diverges(block.id), false)
                 }
             };
-            if !diverges {
+            if !diverges && !return_leaf_recorded {
                 self.record_exit(body_id, marker);
             }
             self.pending_cleanup.truncate(marker);
@@ -1298,7 +1321,15 @@ impl<'a> FlowChecker<'a> {
             branches.push((self.states.clone(), diverges));
         }
         self.states = join_branch_states(&entry, &branches);
-        if self.states.values().any(|s| *s == ResourceState::Error)
+        // See `check_if`'s identical guard: in a `Return` context, two
+        // arms disagreeing about exactly which underlying resource
+        // their own shared tail moved is the expected shape of a
+        // compound return (`nir::lower` already gives each arm its own
+        // independent per-branch cleanup+terminate), not a real
+        // ambiguity -- nothing ever reads `self.states` again on either
+        // path, since both already end the function right here.
+        if kind != ConsumeKind::Return
+            && self.states.values().any(|s| *s == ResourceState::Error)
             && entry.values().all(|s| *s != ResourceState::Error)
         {
             self.diagnose_inconsistent_join(match_id, span);

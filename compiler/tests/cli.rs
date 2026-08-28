@@ -872,6 +872,11 @@ fn resource_defer_break_example_runs_end_to_end() {
 }
 
 #[test]
+fn resource_if_observed_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_if_observed.npt", "5");
+}
+
+#[test]
 fn resource_raise_cleanup_example_runs_end_to_end() {
     assert_resource_example_runs("resource_raise_cleanup.npt", "5");
 }

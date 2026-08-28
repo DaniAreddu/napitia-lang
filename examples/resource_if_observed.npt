@@ -1,0 +1,25 @@
+resource File {
+    descriptor: i64,
+}
+
+// Neither branch of this `if` constructs anything fresh: both merely
+// re-observe an already-owned local, feeding `inspect`'s own ordinary
+// (non-`take`) parameter. `a`/`b` remain independently valid and are
+// each dropped separately afterward -- passing them through the `if`
+// only to select which one to observe must not be mistaken for a move.
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func f(cond: bool) -> i64 {
+    value a = File { descriptor: 5 };
+    value b = File { descriptor: 9 };
+    value result = inspect(if cond { a } else { b });
+    drop a;
+    drop b;
+    return result;
+}
+
+func main() -> i64 {
+    return f(true);
+}

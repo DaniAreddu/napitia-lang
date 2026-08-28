@@ -1548,6 +1548,9 @@ impl<'a> Lowering<'a> {
             HirExpr::Match {
                 scrutinee, arms, ..
             } => self.lower_match_into_return_sink(fb, scrutinee, arms, hint, finish),
+            HirExpr::Handle { operand, arms, .. } => {
+                self.lower_handle_into_return_sink(fb, operand, arms, hint, finish)
+            }
             HirExpr::If {
                 condition,
                 then_branch,
@@ -2423,7 +2426,67 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(LoweredExpr::Diverged);
         };
+        let sink = merge.map(|(slot, after)| ArmSink::Merge(slot, after));
+        self.lower_handle_dispatch(
+            fb, arms, ok_ty, ok_slot, ok_target, err_blocks, sink, result_ty,
+        )
+    }
 
+    /// Lowers `expr` (a `handle`) in a position whose own final value
+    /// must be handed to `finish` separately on each reachable arm,
+    /// instead of merging every arm's value into one shared slot first
+    /// -- exactly [`Self::lower_match_into_return_sink`]'s own treatment
+    /// of a `match`, applied to `handle`'s own success/failure dispatch
+    /// (`rfcs/0011`, Blocker 2).
+    fn lower_handle_into_return_sink(
+        &mut self,
+        fb: &mut FnBuilder,
+        operand: &HirExpr,
+        arms: &[HirHandleArm],
+        hint: &Ty,
+        finish: &mut dyn FnMut(&mut Self, &mut FnBuilder, ValueId) -> LowerResult<LoweredExpr>,
+    ) -> LowerResult<LoweredExpr> {
+        // No merge slot at all -- exactly like postfix `?`'s own
+        // `lower_try` (`merge_result_ty: None`): each arm hands its own
+        // value straight to `finish`, which terminates its own block
+        // itself, so there is no shared value for anything to merge.
+        let Some((ok_ty, ok_slot, ok_target, err_blocks, _)) =
+            self.lower_invoke(fb, operand, "`handle`", None)?
+        else {
+            return Ok(LoweredExpr::Diverged);
+        };
+        self.lower_handle_dispatch(
+            fb,
+            arms,
+            ok_ty,
+            ok_slot,
+            ok_target,
+            err_blocks,
+            Some(ArmSink::Return(hint.clone(), finish)),
+            Ty::Never,
+        )
+    }
+
+    /// The shared success/failure dispatch both [`Self::lower_handle`]
+    /// and [`Self::lower_handle_into_return_sink`] delegate to, once
+    /// each has resolved its own `sink` (a shared merge slot, or an
+    /// enclosing `return`'s own per-arm sink) through
+    /// [`Self::lower_invoke`] in whichever way its own caller needs.
+    /// `result_ty` is only ever consulted in the `ArmSink::Merge` case
+    /// (the merge slot's own final `Load`'s type) -- callers with no
+    /// merge slot at all pass `Ty::Never`, which is never read.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_handle_dispatch(
+        &mut self,
+        fb: &mut FnBuilder,
+        arms: &[HirHandleArm],
+        ok_ty: Ty,
+        ok_slot: ValueId,
+        ok_target: BlockId,
+        err_blocks: Vec<(ItemId, ValueId, BlockId)>,
+        mut sink: Option<ArmSink<'a, '_>>,
+        result_ty: Ty,
+    ) -> LowerResult<LoweredExpr> {
         // For every (variant, case-index) pair any raised effect
         // declares, which arm (by index into `arms`) actually covers it:
         // the first `Case` arm naming it, or else the single trailing
@@ -2518,8 +2581,9 @@ impl<'a> Lowering<'a> {
                     HirMatchArmBody::Expr(e) => e.id(),
                     HirMatchArmBody::Block(b) => b.id,
                 };
+                let arm_sink = sink.as_mut().map(|s| s.reborrow());
                 self.lower_branch_moves(fb, |this, fb| {
-                    this.lower_arm_body(fb, body, merge, body_id)
+                    this.lower_handle_arm_body(fb, body, arm_sink, body_id)
                 })?;
                 fb.switch_to(dispatch_block);
             }
@@ -2552,18 +2616,19 @@ impl<'a> Lowering<'a> {
             HirMatchArmBody::Expr(e) => e.id(),
             HirMatchArmBody::Block(b) => b.id,
         };
+        let success_sink = sink.as_mut().map(|s| s.reborrow());
         self.lower_branch_moves(fb, |this, fb| {
-            this.lower_arm_body(fb, &success_arm.body, merge, success_body_id)
+            this.lower_handle_arm_body(fb, &success_arm.body, success_sink, success_body_id)
         })?;
 
-        match merge {
-            Some((slot, after)) => {
+        match sink {
+            Some(ArmSink::Merge(slot, after)) => {
                 fb.switch_to(after);
                 Ok(LoweredExpr::Value(
                     fb.push_value(result_ty, ValueKind::Load(slot)),
                 ))
             }
-            None => Ok(LoweredExpr::Diverged),
+            Some(ArmSink::Return(..)) | None => Ok(LoweredExpr::Diverged),
         }
     }
 
@@ -2671,6 +2736,29 @@ impl<'a> Lowering<'a> {
         match body {
             HirMatchArmBody::Expr(e) => self.lower_into_return_sink(fb, e, hint, finish),
             HirMatchArmBody::Block(b) => self.lower_into_return_sink_block(fb, b, hint, finish),
+        }
+    }
+
+    /// One `handle` arm's own share of [`Self::lower_handle_dispatch`]:
+    /// dispatches to the ordinary merge-into-slot
+    /// [`Self::lower_arm_body`] or the per-arm [`Self::
+    /// lower_arm_body_into_return_sink`], whichever `sink` calls for.
+    fn lower_handle_arm_body(
+        &mut self,
+        fb: &mut FnBuilder,
+        body: &HirMatchArmBody,
+        sink: Option<ArmSink<'a, '_>>,
+        body_id: ExprId,
+    ) -> LowerResult<()> {
+        match sink {
+            Some(ArmSink::Merge(slot, after)) => {
+                self.lower_arm_body(fb, body, Some((slot, after)), body_id)
+            }
+            Some(ArmSink::Return(hint, finish)) => {
+                self.lower_arm_body_into_return_sink(fb, body, &hint, finish)?;
+                Ok(())
+            }
+            None => self.lower_arm_body(fb, body, None, body_id),
         }
     }
 
@@ -4129,6 +4217,74 @@ mod tests {
             0,
             "f's own scope must not drop a resource the condition's own last take call \
              already consumed"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_match_returned_alongside_a_take_param_drops_it_exactly_once() {
+        // The `match` itself produces `i64`, not a resource: `kind`
+        // still propagates `Return` through it while checking, but that
+        // must never be mistaken for `file` itself being the thing
+        // under compound return-sink treatment -- `file`'s own implicit
+        // destruction belongs solely to the `return`'s own
+        // whole-function cleanup, replayed once at the shared merge
+        // point every arm branches to, never claimed a second time by
+        // an arm's own (otherwise-empty) local cleanup list.
+        let diags = lower_and_verify(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func f(c: Choice, take file: File) -> i64 { \
+                 return match c { A => 1, B => 2 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func f(c: Choice, take file: File) -> i64 { \
+                 return match c { A => 1, B => 2 }; \
+             }",
+        );
+        let f = &module.functions[0];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "file must be dropped exactly once, not once per arm: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_handle_returned_alongside_a_take_param_drops_it_exactly_once() {
+        let diags = lower_and_verify(
+            "variant OpenError { Invalid } \
+             resource File { descriptor: i64 } \
+             func open() -> i64 raises OpenError { return 1 } \
+             func f(take file: File) -> i64 { \
+                 return handle open() { \
+                     success n => n, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let module = lower(
+            "variant OpenError { Invalid } \
+             resource File { descriptor: i64 } \
+             func open() -> i64 raises OpenError { return 1 } \
+             func f(take file: File) -> i64 { \
+                 return handle open() { \
+                     success n => n, \
+                     failure OpenError.Invalid => 0, \
+                 }; \
+             }",
+        );
+        let f = &module.functions[1];
+        assert_eq!(
+            drop_count(f),
+            1,
+            "file must be dropped exactly once, not once per arm: {f:?}"
         );
     }
 

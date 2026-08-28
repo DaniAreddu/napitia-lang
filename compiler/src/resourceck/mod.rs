@@ -1058,6 +1058,58 @@ mod tests {
     }
 
     #[test]
+    fn breaking_out_of_a_loop_releases_that_iterations_own_observing_defer() {
+        // The break exits the loop body's own scope, where `defer
+        // inspect(file)` was registered -- its own observing
+        // protection must release right there, exactly like reaching
+        // the end of that same scope normally would, so `consume(file)`
+        // after the loop is accepted.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> i64 { drop file; return 1 } \
+             func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 loop { \
+                     defer inspect(file); \
+                     if cond { \
+                         break; \
+                     } \
+                 } \
+                 return consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn continuing_a_loop_releases_that_iterations_own_observing_defer() {
+        // `continue` exits the current iteration's own scope back to
+        // the loop's own backedge -- the next iteration's fresh `defer`
+        // must find the resource `Available` again, not still
+        // protected by the iteration that just ended.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func inspect(file: File) -> i64 { return file.descriptor } \
+             func consume(take file: File) -> i64 { drop file; return 1 } \
+             func f(start: i64) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 mutable n = start; \
+                 loop { \
+                     defer inspect(file); \
+                     n = n - 1; \
+                     if n > 0 { \
+                         continue; \
+                     } \
+                     break; \
+                 } \
+                 return consume(file); \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn an_observing_defer_still_protects_its_resource_before_its_own_scope_exits() {
         let diags = check(
             "resource File { descriptor: i64 } \

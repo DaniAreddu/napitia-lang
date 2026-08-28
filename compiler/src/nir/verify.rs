@@ -327,6 +327,20 @@ mod codes {
     /// "was this value's own underlying resource already consumed by
     /// anything".
     pub const RESOURCE_USE_AFTER_CONSUME: &str = "V0076";
+    /// A resource this function itself created, or received through a
+    /// `take` parameter, is still owned (never `Drop`ped, moved into a
+    /// `take` parameter/`Invoke` argument, or transferred out through
+    /// `Terminator::Return`/`Raise`) at a reachable `Return`/`Raise`
+    /// (`rfcs/0011`). Independent of `resourceck`: reconstructed here
+    /// purely from NIR, the same reachable-union dataflow
+    /// `RESOURCE_USE_AFTER_CONSUME` already uses, tracking "still live"
+    /// instead of "already consumed". Deliberately narrower than every
+    /// ownership-transferring shape this milestone supports: a resource
+    /// transferred in through `Terminator::Invoke`'s own `ok_slot` is
+    /// not tracked here at all (see `verify_resource_ownership`'s own
+    /// doc comment), so a leak reachable only through that exact shape
+    /// still depends on the interpreter's own frame-exit check.
+    pub const RESOURCE_LEAKED_ON_EXIT: &str = "V0077";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -3874,37 +3888,54 @@ fn verify_drop_state(
     }
 }
 
-/// Independently reconstructs whether every resource-typed value in
-/// `function` is used at most once after its own underlying resource was
-/// already consumed -- dropped, moved into a `take` parameter or
-/// `Invoke` argument, or transferred out through `Terminator::Return`
-/// (`rfcs/0011`). This does not trust `resourceck`'s own acceptance of
-/// the source program: it walks the already-lowered NIR on its own,
-/// using only `Function`/`Module`-level facts (`value_types`, each
-/// callee's own declared `take` flags, each record's own declared
-/// `affine` flag) that a hand-built NIR module -- never having passed
-/// through `resourceck` at all -- still carries.
+/// Independently reconstructs two `rfcs/0011` invariants over every
+/// resource-typed value in `function`, in one combined forward dataflow
+/// walk (see `State`, below): that it is used at most once after its
+/// own underlying resource was already consumed -- dropped, moved into
+/// a `take` parameter or `Invoke` argument, or transferred out through
+/// `Terminator::Return`/`Raise` (`RESOURCE_USE_AFTER_CONSUME`) -- and
+/// that every resource this function itself owns (a fresh construction,
+/// or a `take` parameter) is actually destroyed or transferred out on
+/// every reachable exit, rather than merely abandoned
+/// (`RESOURCE_LEAKED_ON_EXIT`). This does not trust `resourceck`'s own
+/// acceptance of the source program: it walks the already-lowered NIR
+/// on its own, using only `Function`/`Module`-level facts
+/// (`value_types`, each callee's own declared `take` flags, each
+/// record's own declared `affine` flag) that a hand-built NIR module --
+/// never having passed through `resourceck` at all -- still carries.
 ///
 /// Reuses `verify_drop_state`'s own reachable-union worklist shape
-/// (a value already consumed on *any* reachable path in is a live
-/// hazard the moment this path's own next use runs), generalized in two
-/// ways: consumption is not only `Drop`, and identity is not only a
-/// bare `ValueId` -- a value loaded from a slot shares that slot's own
-/// identity with every other `Load` of it, so a second, differently
-/// numbered `Load` of an already-consumed slot is caught exactly like
-/// reusing the original `ValueId` directly would be. A fresh `Store`
-/// into a slot clears whatever consumption that slot's own prior
-/// occupant carried -- reassigning a slot after its own resource was
-/// already dropped or moved out is `resourceck`'s own concern
-/// (`U0010`), not this pass's.
+/// (a value already consumed -- or still live -- on *any* reachable
+/// path in is a live hazard the moment this path's own next use, or
+/// exit, runs), generalized in two ways: consumption is not only
+/// `Drop`, and identity is not only a bare `ValueId` -- a value loaded
+/// from a slot shares that slot's own identity with every other `Load`
+/// of it, so a second, differently numbered `Load` of an already-
+/// consumed slot is caught exactly like reusing the original `ValueId`
+/// directly would be, and a resource stored into a slot relocates its
+/// own leak-tracking identity onto that slot for the same reason. A
+/// fresh `Store` into a slot clears whatever consumption/liveness that
+/// slot's own prior occupant carried -- reassigning a slot after its
+/// own resource was already dropped or moved out is `resourceck`'s own
+/// concern (`U0010`), not this pass's.
 ///
-/// Known, honest scope limit: identity is only ever unified through a
-/// slot's own repeated `Load`s -- moving a resource by rebinding it to a
-/// *different* local (`value b = a;`, a fresh slot for `b`) is not
-/// traced back to `a`'s own slot here, since well-lowered NIR never
-/// reads `a`'s slot again after such a move in the first place. Only a
-/// hand-built module that fabricates such a read past that point could
-/// evade this pass on that specific shape.
+/// Known, honest scope limits: identity is only ever unified through a
+/// slot's own repeated `Load`s (for `RESOURCE_USE_AFTER_CONSUME`) or a
+/// value's own flow into a `Store` (for `RESOURCE_LEAKED_ON_EXIT`) --
+/// moving a resource by rebinding it to a *different* local without an
+/// intervening slot is not traced here, since well-lowered NIR never
+/// reads the old binding's own slot again after such a move in the
+/// first place. A resource transferred in through `Terminator::Invoke`'s
+/// own success slot is not tracked by `RESOURCE_LEAKED_ON_EXIT` at all:
+/// that slot is only genuinely written on its own success edge, never
+/// its failure edges, an edge-sensitivity this single reachable-union
+/// set per block cannot soundly express (see
+/// `verify_invoke_slot_initialization`, which exists precisely because
+/// ordinary union-of-predecessors dataflow cannot represent this) --
+/// a leak reachable only through that exact shape still depends on the
+/// interpreter's own frame-exit check. Only a hand-built module that
+/// fabricates a NIR shape past one of these exact points could evade
+/// this pass on that specific shape.
 fn verify_resource_ownership(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
@@ -3992,12 +4023,18 @@ fn verify_resource_ownership(
     // Marks `raw`'s own underlying resource as used at this point:
     // records a violation if its origin is already in `facts`, and
     // reports whether that origin was newly consumed here (the caller
-    // decides whether this particular use is itself consuming).
+    // decides whether this particular use is itself consuming). A
+    // consuming use also discharges `raw`'s own leak obligation, if it
+    // is still tracked as `live` -- exactly the same origin identity as
+    // `facts`, so a value already reported as a use-after-consume
+    // violation is never *also* reported as leaked (it has an owner: an
+    // erroneous second one).
     fn check_use(
         raw: ValueId,
         is_resource: &impl Fn(ValueId) -> bool,
         origin: &impl Fn(ValueId) -> ValueId,
         facts: &mut HashSet<ValueId>,
+        live: &mut HashSet<ValueId>,
         violations: &mut Vec<ValueId>,
         consumes: bool,
     ) {
@@ -4010,147 +4047,229 @@ fn verify_resource_ownership(
         } else if consumes {
             facts.insert(o);
         }
+        if consumes {
+            live.remove(&o);
+        }
     }
 
-    let transfer =
-        |block: &BasicBlock, in_facts: &HashSet<ValueId>| -> (HashSet<ValueId>, Vec<ValueId>) {
-            let mut facts = in_facts.clone();
-            let mut violations = Vec::new();
-            for instruction in &block.instructions {
-                match instruction {
-                    Instruction::Value { result, kind, .. } => {
-                        // A loop-carried temporary reuses one fixed `ValueId`
-                        // across iterations; this instruction's own
-                        // redefinition kills whatever a previous iteration
-                        // left behind for it, exactly like `verify_drop_state`
-                        // already does for `Drop`.
-                        facts.remove(result);
-                        match kind {
-                            ValueKind::Call(callee, _, args, _) => {
-                                let take = known_functions.get(callee).map(|f| f.take.as_slice());
-                                for (i, arg) in args.iter().enumerate() {
-                                    let consumes =
-                                        take.and_then(|t| t.get(i)).copied().unwrap_or(false);
-                                    check_use(
-                                        *arg,
-                                        &is_resource,
-                                        &origin,
-                                        &mut facts,
-                                        &mut violations,
-                                        consumes,
-                                    );
-                                }
+    // `State` pairs `facts` (`RESOURCE_USE_AFTER_CONSUME`'s own already-
+    // consumed set) with `live` (`RESOURCE_LEAKED_ON_EXIT`'s own
+    // currently-owned-and-not-yet-discharged set) -- computed together,
+    // by the same single forward walk, since a consuming use always
+    // updates both at once (see `check_use`).
+    type State = (HashSet<ValueId>, HashSet<ValueId>);
+
+    let transfer = |block: &BasicBlock, in_state: &State| -> (State, Vec<ValueId>, Vec<ValueId>) {
+        let (mut facts, mut live) = in_state.clone();
+        let mut violations = Vec::new();
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::Value { result, kind, .. } => {
+                    // A loop-carried temporary reuses one fixed `ValueId`
+                    // across iterations; this instruction's own
+                    // redefinition kills whatever a previous iteration
+                    // left behind for it, exactly like `verify_drop_state`
+                    // already does for `Drop`.
+                    facts.remove(result);
+                    live.remove(result);
+                    match kind {
+                        ValueKind::Call(callee, _, args, _) => {
+                            let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                            for (i, arg) in args.iter().enumerate() {
+                                let consumes =
+                                    take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                                check_use(
+                                    *arg,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    consumes,
+                                );
                             }
-                            _ => {
-                                for operand in operands_of(kind) {
-                                    check_use(
-                                        operand,
-                                        &is_resource,
-                                        &origin,
-                                        &mut facts,
-                                        &mut violations,
-                                        false,
-                                    );
-                                }
+                        }
+                        _ => {
+                            for operand in operands_of(kind) {
+                                check_use(
+                                    operand,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    false,
+                                );
                             }
                         }
                     }
-                    Instruction::Store { slot, value } => {
-                        check_use(
-                            *value,
-                            &is_resource,
-                            &origin,
-                            &mut facts,
-                            &mut violations,
-                            false,
-                        );
-                        // A fresh value now occupies `slot`; whatever
-                        // consumption its own prior occupant carried no
-                        // longer applies (`resourceck`'s own `U0010` already
-                        // rejects overwriting a still-live resource).
-                        facts.remove(slot);
-                    }
-                    Instruction::Drop { value } => {
-                        check_use(
-                            *value,
-                            &is_resource,
-                            &origin,
-                            &mut facts,
-                            &mut violations,
-                            true,
-                        );
+                    // Every resource-typed value definition other than a
+                    // `Load` (which aliases its own slot's already-
+                    // tracked identity, never a fresh one) or an `Alloc`
+                    // (which only reserves a slot -- nothing has been
+                    // stored into it yet, so there is nothing live at
+                    // this point) brings a freshly owned resource into
+                    // this function's own care: a direct construction,
+                    // or one an ordinary (non-`Invoke`) call transferred
+                    // in as its return value (`rfcs/0011`). `Invoke`'s
+                    // own `ok_slot` is deliberately excluded here -- its
+                    // own value is only live on its own success edge,
+                    // never its failure edges, an edge-sensitivity this
+                    // single-set-per-block dataflow cannot soundly
+                    // express (see `verify_invoke_slot_initialization`,
+                    // which exists precisely because ordinary union-of-
+                    // predecessors dataflow cannot represent this).
+                    if is_resource(*result)
+                        && !matches!(kind, ValueKind::Load(_) | ValueKind::Alloc)
+                    {
+                        live.insert(*result);
                     }
                 }
-            }
-            match &block.terminator {
-                Terminator::Return(Some(value)) => {
+                Instruction::Store { slot, value } => {
                     check_use(
                         *value,
                         &is_resource,
                         &origin,
                         &mut facts,
+                        &mut live,
                         &mut violations,
-                        true,
+                        false,
                     );
+                    // A fresh value now occupies `slot`; whatever
+                    // consumption/liveness its own prior occupant
+                    // carried no longer applies (`resourceck`'s own
+                    // `U0010` already rejects overwriting a still-live
+                    // resource).
+                    facts.remove(slot);
+                    live.remove(slot);
+                    // A resource-typed value being stored relocates its
+                    // own leak-tracking identity onto the slot it now
+                    // occupies -- every later `Load` of this exact slot
+                    // already shares that slot's own identity (`origin`,
+                    // above), so its own obligation must live there too,
+                    // not stay pinned to wherever it was first defined.
+                    if is_resource(*value) {
+                        live.remove(&origin(*value));
+                        live.insert(*slot);
+                    }
                 }
-                Terminator::Raise { value } => {
+                Instruction::Drop { value } => {
                     check_use(
                         *value,
                         &is_resource,
                         &origin,
                         &mut facts,
+                        &mut live,
                         &mut violations,
                         true,
                     );
                 }
-                Terminator::Invoke { callee, args, .. } => {
-                    let take = known_functions.get(callee).map(|f| f.take.as_slice());
-                    for (i, arg) in args.iter().enumerate() {
-                        let consumes = take.and_then(|t| t.get(i)).copied().unwrap_or(false);
-                        check_use(
-                            *arg,
-                            &is_resource,
-                            &origin,
-                            &mut facts,
-                            &mut violations,
-                            consumes,
-                        );
-                    }
-                }
-                Terminator::Return(None)
-                | Terminator::Branch(_)
-                | Terminator::CondBranch { .. }
-                | Terminator::Switch { .. } => {}
             }
-            (facts, violations)
+        }
+        match &block.terminator {
+            Terminator::Return(Some(value)) => {
+                check_use(
+                    *value,
+                    &is_resource,
+                    &origin,
+                    &mut facts,
+                    &mut live,
+                    &mut violations,
+                    true,
+                );
+            }
+            Terminator::Raise { value } => {
+                check_use(
+                    *value,
+                    &is_resource,
+                    &origin,
+                    &mut facts,
+                    &mut live,
+                    &mut violations,
+                    true,
+                );
+            }
+            Terminator::Invoke { callee, args, .. } => {
+                let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                for (i, arg) in args.iter().enumerate() {
+                    let consumes = take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                    check_use(
+                        *arg,
+                        &is_resource,
+                        &origin,
+                        &mut facts,
+                        &mut live,
+                        &mut violations,
+                        consumes,
+                    );
+                }
+            }
+            Terminator::Return(None)
+            | Terminator::Branch(_)
+            | Terminator::CondBranch { .. }
+            | Terminator::Switch { .. } => {}
+        }
+        // Every reachable `Return`/`Raise` is a real exit this function
+        // takes: whatever is still `live` right here was created (or
+        // transferred in) somewhere on this exact path and never
+        // destroyed or transferred back out (`rfcs/0011`) -- a leak.
+        // `Invoke`'s own args are already fully handled above (as
+        // ownership-transferring or not); it is never itself a function
+        // exit, so it contributes no leaks of its own.
+        let leaks = match &block.terminator {
+            Terminator::Return(_) | Terminator::Raise { .. } => live.iter().copied().collect(),
+            _ => Vec::new(),
         };
+        ((facts, live), violations, leaks)
+    };
 
-    fn in_facts_for(
+    fn in_state_for(
         block_id: BlockId,
         entry: BlockId,
+        entry_live: &HashSet<ValueId>,
         incoming: &HashMap<BlockId, Vec<BlockId>>,
         reachable: &HashSet<BlockId>,
-        out: &HashMap<BlockId, HashSet<ValueId>>,
-    ) -> HashSet<ValueId> {
+        out: &HashMap<BlockId, State>,
+    ) -> State {
         if block_id == entry {
-            return HashSet::new();
+            // Every `take`-flagged resource parameter is already live the
+            // moment this function begins -- an entry block that itself
+            // exits directly (no successors at all) must still be
+            // checked against that seed, not empty state (only `out`,
+            // used to propagate *past* the entry block to its own
+            // successors, needs it folded in separately -- see
+            // `entry_out`, below).
+            return (HashSet::new(), entry_live.clone());
         }
         let Some(preds) = incoming.get(&block_id) else {
-            return HashSet::new();
+            return (HashSet::new(), HashSet::new());
         };
         let mut preds = preds.iter().filter(|p| reachable.contains(p));
         let Some(first) = preds.next() else {
-            return HashSet::new();
+            return (HashSet::new(), HashSet::new());
         };
         // Union, not intersection, matching `verify_drop_state`: a
-        // resource already consumed on *any* reachable predecessor path
-        // is a live hazard the moment this path's own next use runs.
+        // resource already consumed (or still live) on *any* reachable
+        // predecessor path is a live hazard the moment this path's own
+        // next use -- or exit -- runs.
         let mut acc = out.get(first).cloned().unwrap_or_default();
         for pred in preds {
-            let other = out.get(pred).cloned().unwrap_or_default();
-            acc.extend(other);
+            let (other_facts, other_live) = out.get(pred).cloned().unwrap_or_default();
+            acc.0.extend(other_facts);
+            acc.1.extend(other_live);
         }
         acc
+    }
+
+    // Every `take`-flagged resource parameter is already owned the
+    // moment this function begins (`rfcs/0011`): if it is never
+    // destroyed or transferred back out on some reachable exit, that
+    // exit leaks it exactly like an unfreed local construction would.
+    let mut entry_live: HashSet<ValueId> = HashSet::new();
+    for param in &function.params {
+        if param.take && is_resource(param.value) {
+            entry_live.insert(param.value);
+        }
     }
 
     let entry_block = function
@@ -4158,16 +4277,16 @@ fn verify_resource_ownership(
         .iter()
         .find(|b| b.id == entry)
         .expect("presence already checked above");
-    let (entry_out, _) = transfer(entry_block, &HashSet::new());
+    let (entry_out, _, _) = transfer(entry_block, &(HashSet::new(), entry_live.clone()));
 
-    let mut out: HashMap<BlockId, HashSet<ValueId>> = function
+    let mut out: HashMap<BlockId, State> = function
         .blocks
         .iter()
         .map(|b| {
             let initial = if b.id == entry {
                 entry_out.clone()
             } else {
-                HashSet::new()
+                (HashSet::new(), HashSet::new())
             };
             (b.id, initial)
         })
@@ -4185,8 +4304,8 @@ fn verify_resource_ownership(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_facts = in_facts_for(id, entry, &incoming, &reachable, &out);
-        let (new_out, _) = transfer(block, &in_facts);
+        let in_state = in_state_for(id, entry, &entry_live, &incoming, &reachable, &out);
+        let (new_out, _, _) = transfer(block, &in_state);
         if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
@@ -4198,12 +4317,12 @@ fn verify_resource_ownership(
     }
 
     for block in &function.blocks {
-        let in_facts = if reachable.contains(&block.id) {
-            in_facts_for(block.id, entry, &incoming, &reachable, &out)
+        let in_state = if reachable.contains(&block.id) {
+            in_state_for(block.id, entry, &entry_live, &incoming, &reachable, &out)
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
-        let (_, violations) = transfer(block, &in_facts);
+        let (_, violations, leaks) = transfer(block, &in_state);
         for origin_value in violations {
             diagnostics.push(Diagnostic::error(
                 codes::RESOURCE_USE_AFTER_CONSUME,
@@ -4211,6 +4330,17 @@ fn verify_resource_ownership(
                 Span::dummy(),
                 format!(
                     "function `{function_name}` uses a resource in bb{} whose underlying value (%{}) was already consumed on some path reaching it",
+                    block.id.0, origin_value.0
+                ),
+            ));
+        }
+        for origin_value in leaks {
+            diagnostics.push(Diagnostic::error(
+                codes::RESOURCE_LEAKED_ON_EXIT,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` exits in bb{} while still owning a resource (%{}) that was never destroyed or transferred out",
                     block.id.0, origin_value.0
                 ),
             ));
@@ -9961,5 +10091,253 @@ mod tests {
                 "expected V0073 (only dead predecessor stores) with order {order:?}"
             );
         }
+    }
+
+    fn leaked_resource_records(
+        resource: ItemId,
+        resource_name: Symbol,
+    ) -> Vec<(ItemId, RecordLayout)> {
+        vec![(
+            resource,
+            RecordLayout {
+                name: resource_name,
+                type_params: Vec::new(),
+                fields: Vec::new(),
+                affine: true,
+            },
+        )]
+    }
+
+    #[test]
+    fn a_created_resource_never_dropped_or_returned_is_a_leak() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: resource_ty,
+                    kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_take_parameter_never_dropped_or_returned_is_a_leak() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: resource_ty,
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_non_take_parameter_never_dropped_is_not_a_leak() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: resource_ty,
+                take: false,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn one_reachable_exit_cleans_and_a_sibling_branch_leaks() {
+        // bb1 drops the resource before returning; bb2 does not -- only
+        // bb2's own `Return` may be reported, never bb1's.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty,
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Const(Const::Bool(true)),
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Return(None),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        let leaks: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code == codes::RESOURCE_LEAKED_ON_EXIT)
+            .collect();
+        assert_eq!(leaks.len(), 1, "unexpected diagnostics: {diagnostics:?}");
+        assert!(
+            leaks[0].message.contains("bb2"),
+            "expected the leak reported against bb2, got: {}",
+            leaks[0].message
+        );
+    }
+
+    #[test]
+    fn a_resource_stored_into_a_slot_and_dropped_through_it_is_not_a_leak() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                    },
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    },
+                    Instruction::Drop { value: ValueId(2) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 }

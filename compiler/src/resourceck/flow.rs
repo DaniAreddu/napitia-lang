@@ -1081,36 +1081,103 @@ impl<'a> FlowChecker<'a> {
             .is_some_and(|ty| self.is_affine(ty))
     }
 
-    /// Rejects `expr` with [`RESOURCE_TEMPORARY_LEAK`] (Blocker 3) if it
-    /// directly constructs a fresh, affine-typed value with no owner at
-    /// all yet -- a call, or a record/resource literal. Deliberately
-    /// narrower than "any affine expression that is not a bare local
-    /// reference": a compound `if`/`match`/`handle`/block wrapping one
-    /// or more already-owned locals (e.g. `if cond { file } else { file
-    /// }`, still valid input to an observing `defer`) merely
-    /// *re-observes* an existing binding on every branch, the same
-    /// thing a bare local reference here would -- it never brings a new,
-    /// otherwise-unreachable resource into existence the way a call or a
-    /// literal construction does, so it is not this check's concern.
-    /// Known honest gap: a compound expression that *does* construct a
-    /// genuinely fresh resource on some branch (`if cond { make_file() }
-    /// else { file }`) is not caught here.
+    /// Rejects `expr` with [`RESOURCE_TEMPORARY_LEAK`] (Blocker 3) if
+    /// evaluating it can produce a fresh, affine-typed value with no
+    /// owner at all yet -- a call, or a record/resource literal, at
+    /// `expr` itself or (recursing through every construct transparent
+    /// to its own resulting value) at some reachable leaf of a nested
+    /// `if`/`match`/`handle`/block wrapping one. Deliberately narrower
+    /// than "any affine expression that is not a bare local reference":
+    /// a compound expression every one of whose reachable leaves merely
+    /// *re-observes* an existing binding (`if cond { file } else { file
+    /// }`, still valid input to an observing `defer`) never brings a
+    /// new, otherwise-unreachable resource into existence the way a
+    /// call or a literal construction does, so it is not this check's
+    /// concern -- only a leaf that actually constructs one is.
     fn reject_leaked_temporary(&mut self, expr: &HirExpr) {
-        if !matches!(expr, HirExpr::Call { .. } | HirExpr::RecordLiteral { .. }) {
-            return;
+        match expr {
+            HirExpr::Call { .. } | HirExpr::RecordLiteral { .. } => {
+                if !self.is_affine_expr(expr.id()) {
+                    return;
+                }
+                self.diagnose(
+                    RESOURCE_TEMPORARY_LEAK,
+                    expr.span(),
+                    "a resource-typed temporary here is never bound, returned, dropped, or \
+                     transferred to a `take` parameter, so nothing would ever destroy it; bind \
+                     it to a `value` first, or pass/return/drop it directly"
+                        .to_string(),
+                    "resource temporary would leak",
+                );
+            }
+            // Transparent to their own resulting value: a fresh
+            // resource any *reachable* leaf of one of these directly
+            // constructs is exactly as much this position's own concern
+            // as if it were written here directly -- a diverging leaf
+            // (`self.diverges`) never actually produces a value here at
+            // all, so it is not recursed into.
+            HirExpr::Block(block) => {
+                if let Some(tail) = &block.tail
+                    && !self.diverges(tail.id())
+                {
+                    self.reject_leaked_temporary(tail);
+                }
+            }
+            HirExpr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                if let Some(tail) = &then_branch.tail
+                    && !self.diverges(tail.id())
+                {
+                    self.reject_leaked_temporary(tail);
+                }
+                match else_branch {
+                    Some(HirElse::Block(block)) => {
+                        if let Some(tail) = &block.tail
+                            && !self.diverges(tail.id())
+                        {
+                            self.reject_leaked_temporary(tail);
+                        }
+                    }
+                    Some(HirElse::If(inner)) if !self.diverges(inner.id()) => {
+                        self.reject_leaked_temporary(inner);
+                    }
+                    Some(HirElse::If(_)) | None => {}
+                }
+            }
+            HirExpr::Match { arms, .. } => {
+                for arm in arms {
+                    self.reject_leaked_temporary_in_arm_body(&arm.body);
+                }
+            }
+            HirExpr::Handle { arms, .. } => {
+                for arm in arms {
+                    self.reject_leaked_temporary_in_arm_body(&arm.body);
+                }
+            }
+            _ => {}
         }
-        if !self.is_affine_expr(expr.id()) {
-            return;
+    }
+
+    /// One `match`/`handle` arm's own share of [`Self::
+    /// reject_leaked_temporary`]'s recursion.
+    fn reject_leaked_temporary_in_arm_body(&mut self, body: &HirMatchArmBody) {
+        match body {
+            HirMatchArmBody::Expr(e) => {
+                if !self.diverges(e.id()) {
+                    self.reject_leaked_temporary(e);
+                }
+            }
+            HirMatchArmBody::Block(block) => {
+                if let Some(tail) = &block.tail
+                    && !self.diverges(tail.id())
+                {
+                    self.reject_leaked_temporary(tail);
+                }
+            }
         }
-        self.diagnose(
-            RESOURCE_TEMPORARY_LEAK,
-            expr.span(),
-            "a resource-typed temporary here is never bound, returned, dropped, or transferred \
-             to a `take` parameter, so nothing would ever destroy it; bind it to a `value` \
-             first, or pass/return/drop it directly"
-                .to_string(),
-            "resource temporary would leak",
-        );
     }
 
     fn check_local_use(

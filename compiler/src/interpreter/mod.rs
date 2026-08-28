@@ -2115,6 +2115,84 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_resource_handle_left_behind_by_a_defer_capture_is_an_error_not_a_panic() {
+        // `nir::lower` emits `ValueKind::DeferCapture` to transfer a
+        // `take`-flagged `defer` argument's ownership away *at the
+        // `defer` statement's own lexical registration point*
+        // (`rfcs/0011`) -- this hand-built module reads the original
+        // `%0` again immediately afterward, bypassing `nir::verify`'s
+        // own static `RESOURCE_USE_AFTER_CONSUME` rejection entirely,
+        // to prove the interpreter's own independent runtime backstop
+        // (the resource table's generation check) catches a stale use
+        // between registration and replay on its own, exactly like it
+        // already does for an ordinary `take` call argument.
+        use crate::hir::ItemId;
+        use crate::nir::{BasicBlock, BlockId, Instruction, RecordLayout};
+        use crate::types::Ty;
+
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let f = ItemId(0);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![Function {
+                id: f,
+                name: f_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::DeferCapture { source: ValueId(0) },
+                        },
+                        // Malformed: `%0` was already captured above --
+                        // this aliases its own now-stale handle, same
+                        // shape as the analogous take-call regression.
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Drop { value: ValueId(2) },
+                        Instruction::Drop { value: ValueId(1) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+            records: vec![(
+                resource,
+                RecordLayout {
+                    name: resource_name,
+                    type_params: Vec::new(),
+                    fields: Vec::new(),
+                    affine: true,
+                },
+            )],
+            variants: Vec::new(),
+        };
+        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected a structured stale-handle error, not a panic, got {outcome:?}"
+        );
+    }
+
+    #[test]
     fn a_frame_that_returns_while_still_owning_a_resource_is_an_error_not_a_panic() {
         // This function constructs a resource and returns without ever
         // dropping or transferring it away -- `resourceck`/`nir::verify`

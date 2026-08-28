@@ -9,7 +9,7 @@
 //! reach the interpreter (where it could panic or silently misbehave).
 //! It runs once, after lowering and before interpretation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
@@ -328,18 +328,17 @@ mod codes {
     /// anything".
     pub const RESOURCE_USE_AFTER_CONSUME: &str = "V0076";
     /// A resource this function itself created, or received through a
-    /// `take` parameter, is still owned (never `Drop`ped, moved into a
-    /// `take` parameter/`Invoke` argument, or transferred out through
-    /// `Terminator::Return`/`Raise`) at a reachable `Return`/`Raise`
-    /// (`rfcs/0011`). Independent of `resourceck`: reconstructed here
-    /// purely from NIR, the same reachable-union dataflow
-    /// `RESOURCE_USE_AFTER_CONSUME` already uses, tracking "still live"
-    /// instead of "already consumed". Deliberately narrower than every
-    /// ownership-transferring shape this milestone supports: a resource
-    /// transferred in through `Terminator::Invoke`'s own `ok_slot` is
-    /// not tracked here at all (see `verify_resource_ownership`'s own
-    /// doc comment), so a leak reachable only through that exact shape
-    /// still depends on the interpreter's own frame-exit check.
+    /// `take` parameter or a fallible `Invoke`'s own success slot, is
+    /// still owned (never `Drop`ped, moved into a `take` parameter/
+    /// `Invoke` argument, or transferred out through `Terminator::
+    /// Return`/`Raise`) at a reachable `Return`/`Raise` (`rfcs/0011`).
+    /// Independent of `resourceck`: reconstructed here purely from NIR,
+    /// the same reachable-union dataflow `RESOURCE_USE_AFTER_CONSUME`
+    /// already uses, tracking "still live" instead of "already
+    /// consumed". An `Invoke`'s own success slot is seeded as owned
+    /// specifically on its own `ok_target` edge, never a sibling
+    /// failure edge that happens to share a block -- see
+    /// `verify_resource_ownership`'s own doc comment.
     pub const RESOURCE_LEAKED_ON_EXIT: &str = "V0077";
     /// `Move`/`DeferCapture`'s own `source` operand is not resource-
     /// typed (`rfcs/0011`) -- only a resource may ever be moved; an
@@ -349,6 +348,34 @@ mod codes {
     /// only ever emitted for an already-affine value); only a
     /// hand-built module can.
     pub const MOVE_SOURCE_NOT_RESOURCE: &str = "V0078";
+    /// A resource-typed value currently holding only an *observing*
+    /// role (loaded from a `store.observe`'d slot, or an ordinary
+    /// non-`take` parameter) was used where only an owning value may be
+    /// used: the `source` of a `Move`/`DeferCapture`, the operand of a
+    /// `Drop`, a `take` call/`Invoke` argument, or a `Terminator::
+    /// Return`/`Raise` operand (`rfcs/0011`). An observation is never
+    /// itself an owner and must never be silently promoted into one --
+    /// `nir::verify` tracks this role per value/slot, flow-sensitively,
+    /// independently of `resourceck`.
+    pub const RESOURCE_OBSERVER_CONSUMED: &str = "V0079";
+    /// A `store.transfer`'s own `value` operand does not currently hold
+    /// an owning role (`rfcs/0011`) -- `OwnershipMode::Transfer` always
+    /// means "the destination becomes the one current owner", which is
+    /// only ever sound if `value` was itself already an owner; storing
+    /// a merely-observing value with `Transfer` mode would silently
+    /// mint a second, spurious owner for the same underlying resource.
+    pub const INVALID_RESOURCE_STORE_MODE: &str = "V0080";
+    /// A value is used -- consumed or merely observed -- whose own
+    /// underlying resource origin was already destroyed by a `Drop`
+    /// reaching this point through a *different* alias of the same
+    /// resource (`rfcs/0011`): an observation created before the drop,
+    /// still nominally "in scope", now dangling. Distinct from
+    /// `RESOURCE_USE_AFTER_CONSUME`, which only ever unifies identity
+    /// through repeated `Load`s of one shared slot -- this check
+    /// unifies identity across an observing `Store`/`Load` pair too, so
+    /// a drop reachable through one alias is visible to every other
+    /// alias of that same resource, not only the one that performed it.
+    pub const RESOURCE_ORIGIN_CONFLICT: &str = "V0081";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -3943,25 +3970,46 @@ fn verify_drop_state(
 /// own resource was already dropped or moved out is `resourceck`'s own
 /// concern (`U0010`), not this pass's.
 ///
-/// Known, honest scope limits: identity is only ever unified through a
-/// slot's own repeated `Load`s (for `RESOURCE_USE_AFTER_CONSUME`) or a
-/// value's own flow into a `Store` (for `RESOURCE_LEAKED_ON_EXIT`) --
-/// moving a resource by rebinding it to a *different* local without an
-/// intervening slot is traced explicitly instead, through `nir::lower`'s
-/// own `ValueKind::Move`/`DeferCapture` (`rfcs/0011`): each is itself an
-/// ordinary consuming use of its own `source`, so no separate identity-
-/// unification is needed for that shape at all. A resource transferred
-/// in through `Terminator::Invoke`'s own success slot *is* tracked by
-/// `RESOURCE_LEAKED_ON_EXIT`: `in_state_for`'s own `incoming_edges`
-/// seeds it as newly live specifically on the block reached through the
-/// `Invoke`'s own `ok_target` edge, never on a block reached only
-/// through one of its `err_targets` -- the same edge-sensitive-by-
-/// specific-edge-not-just-target-block technique
-/// `verify_invoke_slot_initialization` already needs for V0073, for the
-/// same underlying reason (an `Invoke`'s own `ok_target` and one of its
-/// `err_targets`' own `target` can coincide on the same block, which an
-/// ordinary flat predecessor list keyed only by target cannot
-/// distinguish).
+/// A resource transferred in through `Terminator::Invoke`'s own success
+/// slot *is* tracked by `RESOURCE_LEAKED_ON_EXIT`: `in_state_for`'s own
+/// `incoming_edges` seeds it as newly live (and newly `Owned`)
+/// specifically on the block reached through the `Invoke`'s own
+/// `ok_target` edge, never on a block reached only through one of its
+/// `err_targets` -- the same edge-sensitive-by-specific-edge-not-just-
+/// target-block technique `verify_invoke_slot_initialization` already
+/// needs for V0073, for the same underlying reason (an `Invoke`'s own
+/// `ok_target` and one of its `err_targets`' own `target` can coincide
+/// on the same block, which an ordinary flat predecessor list keyed
+/// only by target cannot distinguish).
+///
+/// This pass also independently tracks, per value/slot and flow-
+/// sensitively, an owning-vs-observing *role* and a true resource
+/// *identity* (`Role`/`Provenance`, below) -- not merely which raw
+/// `ValueId` a use happens to name. An ordinary (non-`take`) parameter,
+/// and anything ever loaded from a `store.observe`'d slot, is
+/// `Observed`: never itself an owner, and rejected outright
+/// (`RESOURCE_OBSERVER_CONSUMED`/`INVALID_RESOURCE_STORE_MODE`) if used
+/// as a `Drop`/`Move`/`DeferCapture`/`take` operand, a `store.transfer`
+/// value, or a `Return`/`Raise` operand -- regardless of whether its
+/// own underlying resource happens to still be live elsewhere, since an
+/// observation must never be silently promoted into an owner no matter
+/// what. Separately, every value/slot's own true resource identity is
+/// unified across an observing `Store`/`Load` pair (not only a slot's
+/// own repeated `Load`s, which `RESOURCE_USE_AFTER_CONSUME`/
+/// `RESOURCE_LEAKED_ON_EXIT` already unify): a `Drop` reaching this
+/// point through *any* alias of a resource poisons every other alias
+/// of that same identity for every later use, consuming or not
+/// (`RESOURCE_ORIGIN_CONFLICT`), so an observation created before a
+/// drop, still nominally in scope, can never be used again as though
+/// nothing happened. `Move`/`DeferCapture` relocate ownership to a
+/// fresh `ValueId` while still sharing the *same* resolved identity as
+/// their own `source` (so a drop reachable through either is
+/// recognized as the same resource) -- `RESOURCE_USE_AFTER_CONSUME`'s
+/// own `facts`/`live` bookkeeping, by contrast, deliberately keeps
+/// treating a `Move`/`DeferCapture` result as a fresh, decoupled
+/// identity of its own, exactly as before: unifying *that* bookkeeping
+/// through a move too would make a legitimate later use of the new
+/// owner collide with its own now-permanently-consumed `source`.
 fn verify_resource_ownership(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
@@ -3975,6 +4023,86 @@ fn verify_resource_ownership(
         value_types.get(&v).is_some_and(|ty| {
             matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine))
         })
+    };
+
+    // Whether a value/slot currently grants owning or merely observing
+    // access to its own underlying resource (`rfcs/0011`) -- tracked
+    // flow-sensitively, per value/slot, entirely independently of
+    // `resourceck`: an ordinary non-`take` parameter, or anything ever
+    // loaded from a `store.observe`'d slot, is `Observed` and must
+    // never be silently treated as an owner.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Role {
+        Owned,
+        Observed,
+    }
+
+    /// A value/slot's own current provenance: every resource identity
+    /// it might currently denote (more than one only just past a join
+    /// where reachable predecessors disagree), and whether *every*
+    /// predecessor agrees it is currently `Owned` -- downgraded to
+    /// `Observed` the moment even one disagrees, since an `Observed`
+    /// role must never be silently widened into an owner.
+    type Provenance = (BTreeSet<ValueId>, Role);
+
+    /// A specific consuming use rejected because its own resolved
+    /// provenance was `Observed`, not `Owned` (`RESOURCE_OBSERVER_
+    /// CONSUMED`/`INVALID_RESOURCE_STORE_MODE`) -- `StoreMode` names a
+    /// `store.transfer` specifically, since its own diagnostic names
+    /// the slot rather than a generic consuming site.
+    enum RoleViolation {
+        Consumed(ValueId),
+        StoreMode(ValueId),
+    }
+
+    // Resolves `raw`'s own current provenance, defaulting a resource
+    // this pass never otherwise recorded provenance for to a fresh,
+    // self-identified owner -- lenient, matching this pass's existing
+    // leniency elsewhere for provenance it cannot fully reconstruct
+    // (e.g. a load from a slot no reachable store ever wrote, already
+    // an independent concern of the dominance/initialization passes).
+    let resolve_prov = |raw: ValueId, provenance: &HashMap<ValueId, Provenance>| -> Provenance {
+        provenance
+            .get(&raw)
+            .cloned()
+            .unwrap_or_else(|| (BTreeSet::from([raw]), Role::Owned))
+    };
+
+    // Independently checks `raw`'s own resolved provenance is safe to
+    // use at all -- regardless of whether this specific use is
+    // consuming -- against every resource identity already destroyed
+    // through some *other* alias on this path (`RESOURCE_ORIGIN_
+    // CONFLICT`), and, only when this use is itself consuming, that the
+    // resolved role actually grants ownership (`RESOURCE_OBSERVER_
+    // CONSUMED`/`INVALID_RESOURCE_STORE_MODE`). Returns whether a
+    // consuming use may actually proceed -- the caller must then treat
+    // a rejected consuming use as a plain (non-mutating) observation
+    // for `facts`/`live` bookkeeping, so an illegal attempt never
+    // mutates ownership state as if it had legitimately succeeded.
+    let check_alias_safety = |raw: ValueId,
+                              provenance: &HashMap<ValueId, Provenance>,
+                              dropped_origins: &HashSet<ValueId>,
+                              consumes: bool,
+                              store_mode: bool,
+                              origin_conflicts: &mut Vec<ValueId>,
+                              role_violations: &mut Vec<RoleViolation>|
+     -> bool {
+        if !is_resource(raw) {
+            return true;
+        }
+        let (identities, role) = resolve_prov(raw, provenance);
+        if identities.iter().any(|o| dropped_origins.contains(o)) {
+            origin_conflicts.push(raw);
+        }
+        if consumes && role != Role::Owned {
+            role_violations.push(if store_mode {
+                RoleViolation::StoreMode(raw)
+            } else {
+                RoleViolation::Consumed(raw)
+            });
+            return false;
+        }
+        true
     };
 
     // Every `Load`'s own result shares its identity with the slot it
@@ -4144,16 +4272,80 @@ fn verify_resource_ownership(
         }
     }
 
-    // `State` pairs `facts` (`RESOURCE_USE_AFTER_CONSUME`'s own already-
-    // consumed set) with `live` (`RESOURCE_LEAKED_ON_EXIT`'s own
-    // currently-owned-and-not-yet-discharged set) -- computed together,
-    // by the same single forward walk, since a consuming use always
-    // updates both at once (see `check_use`).
-    type State = (HashSet<ValueId>, HashSet<ValueId>);
+    // Merges two predecessors' own provenance maps at a join: a key
+    // present in only one predecessor is copied through as-is (that
+    // predecessor's own path simply never touched it); a key present in
+    // both unions their possible identities (either could be the one
+    // actually reached) and keeps `Owned` only if *both* predecessors
+    // already agree it is -- downgraded to `Observed` the moment even
+    // one disagrees, matching `RESOURCE_LEAKED_ON_EXIT`'s own "union,
+    // not intersection" rule for `facts`/`live` below.
+    fn merge_provenance(
+        mut a: HashMap<ValueId, Provenance>,
+        b: &HashMap<ValueId, Provenance>,
+    ) -> HashMap<ValueId, Provenance> {
+        for (k, (b_ids, b_role)) in b {
+            a.entry(*k)
+                .and_modify(|(ids, role)| {
+                    ids.extend(b_ids.iter().copied());
+                    *role = if *role == Role::Owned && *b_role == Role::Owned {
+                        Role::Owned
+                    } else {
+                        Role::Observed
+                    };
+                })
+                .or_insert_with(|| (b_ids.clone(), *b_role));
+        }
+        a
+    }
 
-    let transfer = |block: &BasicBlock, in_state: &State| -> (State, Vec<ValueId>, Vec<ValueId>) {
-        let (mut facts, mut live) = in_state.clone();
+    // `State` pairs `facts` (`RESOURCE_USE_AFTER_CONSUME`'s own already-
+    // consumed set), `live` (`RESOURCE_LEAKED_ON_EXIT`'s own currently-
+    // owned-and-not-yet-discharged set), `dropped_origins` (every
+    // resource identity actually destroyed by a real `Drop` reaching
+    // this point, for `RESOURCE_ORIGIN_CONFLICT`), and `provenance`
+    // (every value/slot's own current identity/role, for both of the
+    // above) -- computed together, by the same single forward walk,
+    // since a consuming use always updates more than one at once.
+    type State = (
+        HashSet<ValueId>,
+        HashSet<ValueId>,
+        HashSet<ValueId>,
+        HashMap<ValueId, Provenance>,
+    );
+
+    let transfer = |block: &BasicBlock,
+                    in_state: &State|
+     -> (
+        State,
+        Vec<ValueId>,
+        Vec<ValueId>,
+        Vec<RoleViolation>,
+        Vec<ValueId>,
+    ) {
+        let (mut facts, mut live, mut dropped_origins, mut provenance) = in_state.clone();
         let mut violations = Vec::new();
+        let mut role_violations = Vec::new();
+        let mut origin_conflicts = Vec::new();
+        // A `take`/`Invoke` argument, `Move`/`DeferCapture` source,
+        // `Drop`/`store.transfer` operand, or `return`/`raise` operand
+        // must be `Owned`; every use, consuming or not, is checked
+        // against `dropped_origins` regardless. A rejected consuming
+        // use is treated as non-consuming below, so it never mutates
+        // `facts`/`live` as though it had legitimately succeeded.
+        macro_rules! alias_safe {
+            ($raw:expr, $consumes:expr, $store_mode:expr) => {
+                check_alias_safety(
+                    $raw,
+                    &provenance,
+                    &dropped_origins,
+                    $consumes,
+                    $store_mode,
+                    &mut origin_conflicts,
+                    &mut role_violations,
+                )
+            };
+        }
         for instruction in &block.instructions {
             match instruction {
                 Instruction::Value { result, kind, .. } => {
@@ -4161,15 +4353,24 @@ fn verify_resource_ownership(
                     // across iterations; this instruction's own
                     // redefinition kills whatever a previous iteration
                     // left behind for it, exactly like `verify_drop_state`
-                    // already does for `Drop`.
+                    // already does for `Drop`. `dropped_origins` needs
+                    // the same reset: a fresh construction reusing this
+                    // exact `ValueId` as its own self-identity must not
+                    // inherit a stale "already destroyed" poison left by
+                    // a *previous* iteration's own distinct resource,
+                    // reached again only because the back-edge revisits
+                    // this same static instruction.
                     facts.remove(result);
                     live.remove(result);
+                    dropped_origins.remove(result);
+                    provenance.remove(result);
                     match kind {
                         ValueKind::Call(callee, _, args, _) => {
                             let take = known_functions.get(callee).map(|f| f.take.as_slice());
                             for (i, arg) in args.iter().enumerate() {
                                 let consumes =
                                     take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                                let legal = alias_safe!(*arg, consumes, false);
                                 check_use(
                                     *arg,
                                     &is_resource,
@@ -4177,7 +4378,7 @@ fn verify_resource_ownership(
                                     &mut facts,
                                     &mut live,
                                     &mut violations,
-                                    consumes,
+                                    consumes && legal,
                                 );
                             }
                         }
@@ -4193,6 +4394,7 @@ fn verify_resource_ownership(
                         // isn't even resource-typed, which `check_use`
                         // itself would otherwise just silently ignore.
                         ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                            let legal = alias_safe!(*source, true, false);
                             check_use(
                                 *source,
                                 &is_resource,
@@ -4200,11 +4402,27 @@ fn verify_resource_ownership(
                                 &mut facts,
                                 &mut live,
                                 &mut violations,
-                                true,
+                                legal,
                             );
+                            // Ownership relocates to `result`, which
+                            // keeps sharing `source`'s own true resource
+                            // identity (so a later `Drop` reachable
+                            // through *either* is recognized as the same
+                            // resource) -- but only actually becomes
+                            // `Owned` if this move was itself legal; a
+                            // rejected attempt must never launder an
+                            // `Observed` value into an owner.
+                            if is_resource(*source) {
+                                let (ids, _) = resolve_prov(*source, &provenance);
+                                provenance.insert(
+                                    *result,
+                                    (ids, if legal { Role::Owned } else { Role::Observed }),
+                                );
+                            }
                         }
                         _ => {
                             for operand in operands_of(kind) {
+                                alias_safe!(operand, false, false);
                                 check_use(
                                     operand,
                                     &is_resource,
@@ -4217,6 +4435,20 @@ fn verify_resource_ownership(
                             }
                         }
                     }
+                    // A `Load`'s own result shares its slot's *current*
+                    // provenance exactly -- an observing slot's own
+                    // loaded alias is `Observed`, sharing the same
+                    // resource identity as whatever was observingly
+                    // stored there, never a fresh identity of its own
+                    // (the actual fix this check exists for: without
+                    // it, an alias loaded from an observing store had
+                    // no recorded connection back to the value it
+                    // aliases at all).
+                    if let ValueKind::Load(slot) = kind
+                        && let Some(p) = provenance.get(slot).cloned()
+                    {
+                        provenance.insert(*result, p);
+                    }
                     // Every resource-typed value definition other than a
                     // `Load` (which aliases its own slot's already-
                     // tracked identity, never a fresh one) or an `Alloc`
@@ -4225,7 +4457,11 @@ fn verify_resource_ownership(
                     // this point) brings a freshly owned resource into
                     // this function's own care: a direct construction,
                     // or one an ordinary (non-`Invoke`) call transferred
-                    // in as its return value (`rfcs/0011`). `Invoke`'s
+                    // in as its return value (`rfcs/0011`). `Move`/
+                    // `DeferCapture` already recorded their own result's
+                    // provenance above (propagated from `source`), so
+                    // they are excluded here to avoid overwriting it
+                    // with a fresh, decoupled self-identity. `Invoke`'s
                     // own `ok_slot` is deliberately excluded here -- it
                     // is never a `Value` result at all, and this block-
                     // local pass has no notion of *which* edge it is
@@ -4244,10 +4480,17 @@ fn verify_resource_ownership(
                         && !matches!(kind, ValueKind::Load(_) | ValueKind::Alloc)
                     {
                         live.insert(*result);
+                        if !matches!(
+                            kind,
+                            ValueKind::Move { .. } | ValueKind::DeferCapture { .. }
+                        ) {
+                            provenance.insert(*result, (BTreeSet::from([*result]), Role::Owned));
+                        }
                     }
                 }
                 Instruction::Store { slot, value, mode } => {
                     let transfers = matches!(mode, crate::nir::OwnershipMode::Transfer);
+                    let legal = alias_safe!(*value, transfers, transfers);
                     check_use(
                         *value,
                         &is_resource,
@@ -4255,7 +4498,7 @@ fn verify_resource_ownership(
                         &mut facts,
                         &mut live,
                         &mut violations,
-                        transfers,
+                        transfers && legal,
                     );
                     // A fresh value now occupies `slot`; whatever
                     // consumption/liveness its own prior occupant
@@ -4264,6 +4507,7 @@ fn verify_resource_ownership(
                     // resource).
                     facts.remove(slot);
                     live.remove(slot);
+                    provenance.remove(slot);
                     // A transferring store relocates its own value's
                     // leak-tracking identity onto the slot it now
                     // occupies -- every later `Load` of this exact slot
@@ -4279,12 +4523,28 @@ fn verify_resource_ownership(
                     // explicit `mode` on `Store` is `resourceck`'s own
                     // already-checked decision, never a guess `nir::
                     // verify` derives from how many times `value` is
-                    // used elsewhere.
-                    if transfers && is_resource(*value) {
+                    // used elsewhere. Either way, `slot` shares `value`'s
+                    // own true resource identity from now on -- `Owned`
+                    // for a legal transfer, `Observed` for an
+                    // observation (regardless of `value`'s own role: an
+                    // observing store is always a merely-observing
+                    // window, even onto an owned value), so a later
+                    // `Load` of `slot` correctly inherits it.
+                    if is_resource(*value) {
+                        let (ids, _) = resolve_prov(*value, &provenance);
+                        let role = if transfers && legal {
+                            Role::Owned
+                        } else {
+                            Role::Observed
+                        };
+                        provenance.insert(*slot, (ids, role));
+                    }
+                    if transfers && legal && is_resource(*value) {
                         live.insert(*slot);
                     }
                 }
                 Instruction::Drop { value } => {
+                    let legal = alias_safe!(*value, true, false);
                     check_use(
                         *value,
                         &is_resource,
@@ -4292,13 +4552,23 @@ fn verify_resource_ownership(
                         &mut facts,
                         &mut live,
                         &mut violations,
-                        true,
+                        legal,
                     );
+                    // A legally-dropped resource's own true identity is
+                    // now dangling for every *other* alias that shares
+                    // it, not only the one that performed this drop
+                    // (`RESOURCE_ORIGIN_CONFLICT`) -- an illegal attempt
+                    // (rejected just above) destroys nothing.
+                    if legal && is_resource(*value) {
+                        let (ids, _) = resolve_prov(*value, &provenance);
+                        dropped_origins.extend(ids);
+                    }
                 }
             }
         }
         match &block.terminator {
             Terminator::Return(Some(value)) => {
+                let legal = alias_safe!(*value, true, false);
                 check_use(
                     *value,
                     &is_resource,
@@ -4306,10 +4576,11 @@ fn verify_resource_ownership(
                     &mut facts,
                     &mut live,
                     &mut violations,
-                    true,
+                    legal,
                 );
             }
             Terminator::Raise { value } => {
+                let legal = alias_safe!(*value, true, false);
                 check_use(
                     *value,
                     &is_resource,
@@ -4317,13 +4588,14 @@ fn verify_resource_ownership(
                     &mut facts,
                     &mut live,
                     &mut violations,
-                    true,
+                    legal,
                 );
             }
             Terminator::Invoke { callee, args, .. } => {
                 let take = known_functions.get(callee).map(|f| f.take.as_slice());
                 for (i, arg) in args.iter().enumerate() {
                     let consumes = take.and_then(|t| t.get(i)).copied().unwrap_or(false);
+                    let legal = alias_safe!(*arg, consumes, false);
                     check_use(
                         *arg,
                         &is_resource,
@@ -4331,7 +4603,7 @@ fn verify_resource_ownership(
                         &mut facts,
                         &mut live,
                         &mut violations,
-                        consumes,
+                        consumes && legal,
                     );
                 }
             }
@@ -4359,13 +4631,19 @@ fn verify_resource_ownership(
             }
             _ => Vec::new(),
         };
-        ((facts, live), violations, leaks)
+        (
+            (facts, live, dropped_origins, provenance),
+            violations,
+            leaks,
+            role_violations,
+            origin_conflicts,
+        )
     };
 
     fn in_state_for(
         block_id: BlockId,
         entry: BlockId,
-        entry_live: &HashSet<ValueId>,
+        entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, Provenance>),
         incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
         reachable: &HashSet<BlockId>,
         out: &HashMap<BlockId, State>,
@@ -4379,37 +4657,49 @@ fn verify_resource_ownership(
             // used to propagate *past* the entry block to its own
             // successors, needs it folded in separately -- see
             // `entry_out`, below).
-            return (HashSet::new(), entry_live.clone());
+            let (entry_live, entry_provenance) = entry_seed;
+            return (
+                HashSet::new(),
+                entry_live.clone(),
+                HashSet::new(),
+                entry_provenance.clone(),
+            );
         }
         let Some(edges) = incoming_edges.get(&block_id) else {
-            return (HashSet::new(), HashSet::new());
+            return State::default();
         };
         let mut edges = edges.iter().filter(|(pred, _)| reachable.contains(pred));
         let Some((first_pred, first_extra)) = edges.next() else {
-            return (HashSet::new(), HashSet::new());
+            return State::default();
         };
         // Union, not intersection, matching `verify_drop_state`: a
         // resource already consumed (or still live) on *any* reachable
         // predecessor path is a live hazard the moment this path's own
         // next use -- or exit -- runs. `extra`, when present, is an
-        // `Invoke`'s own `ok_slot` -- newly live on that block's own
-        // success edge alone, never folded into any sibling failure
-        // edge that happens to reach this same block (`rfcs/0011`).
+        // `Invoke`'s own `ok_slot` -- newly live (and newly `Owned`) on
+        // that block's own success edge alone, never folded into any
+        // sibling failure edge that happens to reach this same block
+        // (`rfcs/0011`).
         let mut acc = out.get(first_pred).cloned().unwrap_or_default();
         if let Some(slot) = first_extra
             && is_resource(*slot)
         {
             acc.1.insert(*slot);
+            acc.3.insert(*slot, (BTreeSet::from([*slot]), Role::Owned));
         }
         for (pred, extra) in edges {
-            let (other_facts, mut other_live) = out.get(pred).cloned().unwrap_or_default();
+            let (other_facts, mut other_live, other_dropped, mut other_prov) =
+                out.get(pred).cloned().unwrap_or_default();
             if let Some(slot) = extra
                 && is_resource(*slot)
             {
                 other_live.insert(*slot);
+                other_prov.insert(*slot, (BTreeSet::from([*slot]), Role::Owned));
             }
             acc.0.extend(other_facts);
             acc.1.extend(other_live);
+            acc.2.extend(other_dropped);
+            acc.3 = merge_provenance(acc.3, &other_prov);
         }
         acc
     }
@@ -4418,10 +4708,21 @@ fn verify_resource_ownership(
     // moment this function begins (`rfcs/0011`): if it is never
     // destroyed or transferred back out on some reachable exit, that
     // exit leaks it exactly like an unfreed local construction would.
+    // An ordinary (non-`take`) resource parameter is already `Observed`
+    // from the moment this function begins too -- a call-scoped
+    // observation that never owned anything to begin with, exactly like
+    // one loaded from an observing store never does.
     let mut entry_live: HashSet<ValueId> = HashSet::new();
+    let mut entry_provenance: HashMap<ValueId, Provenance> = HashMap::new();
     for param in &function.params {
-        if param.take && is_resource(param.value) {
+        if !is_resource(param.value) {
+            continue;
+        }
+        if param.take {
             entry_live.insert(param.value);
+            entry_provenance.insert(param.value, (BTreeSet::from([param.value]), Role::Owned));
+        } else {
+            entry_provenance.insert(param.value, (BTreeSet::from([param.value]), Role::Observed));
         }
     }
 
@@ -4430,7 +4731,15 @@ fn verify_resource_ownership(
         .iter()
         .find(|b| b.id == entry)
         .expect("presence already checked above");
-    let (entry_out, _, _) = transfer(entry_block, &(HashSet::new(), entry_live.clone()));
+    let (entry_out, ..) = transfer(
+        entry_block,
+        &(
+            HashSet::new(),
+            entry_live.clone(),
+            HashSet::new(),
+            entry_provenance.clone(),
+        ),
+    );
 
     let mut out: HashMap<BlockId, State> = function
         .blocks
@@ -4439,7 +4748,7 @@ fn verify_resource_ownership(
             let initial = if b.id == entry {
                 entry_out.clone()
             } else {
-                (HashSet::new(), HashSet::new())
+                State::default()
             };
             (b.id, initial)
         })
@@ -4460,13 +4769,13 @@ fn verify_resource_ownership(
         let in_state = in_state_for(
             id,
             entry,
-            &entry_live,
+            (&entry_live, &entry_provenance),
             &incoming_edges,
             &reachable,
             &out,
             &is_resource,
         );
-        let (new_out, _, _) = transfer(block, &in_state);
+        let (new_out, ..) = transfer(block, &in_state);
         if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
@@ -4482,16 +4791,16 @@ fn verify_resource_ownership(
             in_state_for(
                 block.id,
                 entry,
-                &entry_live,
+                (&entry_live, &entry_provenance),
                 &incoming_edges,
                 &reachable,
                 &out,
                 &is_resource,
             )
         } else {
-            (HashSet::new(), HashSet::new())
+            State::default()
         };
-        let (_, violations, leaks) = transfer(block, &in_state);
+        let (_, violations, leaks, role_violations, origin_conflicts) = transfer(block, &in_state);
         for origin_value in violations {
             diagnostics.push(Diagnostic::error(
                 codes::RESOURCE_USE_AFTER_CONSUME,
@@ -4511,6 +4820,32 @@ fn verify_resource_ownership(
                 format!(
                     "function `{function_name}` exits in bb{} while still owning a resource (%{}) that was never destroyed or transferred out",
                     block.id.0, origin_value.0
+                ),
+            ));
+        }
+        for violation in role_violations {
+            let (code, value) = match violation {
+                RoleViolation::Consumed(v) => (codes::RESOURCE_OBSERVER_CONSUMED, v),
+                RoleViolation::StoreMode(v) => (codes::INVALID_RESOURCE_STORE_MODE, v),
+            };
+            diagnostics.push(Diagnostic::error(
+                code,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` uses a merely-observing resource value (%{}) in bb{} where only an owner may be used",
+                    value.0, block.id.0
+                ),
+            ));
+        }
+        for value in origin_conflicts {
+            diagnostics.push(Diagnostic::error(
+                codes::RESOURCE_ORIGIN_CONFLICT,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` uses a resource (%{}) in bb{} whose underlying identity was already destroyed through a different alias on some path reaching it",
+                    value.0, block.id.0
                 ),
             ));
         }
@@ -10654,6 +10989,418 @@ mod tests {
         let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
         assert!(
             !codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Observing aliases can never be treated as owners (`rfcs/0011`) --
+
+    /// `%0 = record.create @File; %1 = alloc File; store.observe %1, %0;
+    /// %2 = load %1;` -- `%2` is a merely-observing alias of `%0`'s own
+    /// resource, sharing its true identity but never itself an owner.
+    fn observing_alias_setup(resource: ItemId, resource_ty: Ty) -> Vec<Instruction> {
+        vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: resource_ty.clone(),
+                kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: resource_ty.clone(),
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Store {
+                slot: ValueId(1),
+                value: ValueId(0),
+                mode: crate::nir::OwnershipMode::Observe,
+            },
+            Instruction::Value {
+                result: ValueId(2),
+                ty: resource_ty,
+                kind: ValueKind::Load(ValueId(1)),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_observing_alias_dropped_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut instructions = observing_alias_setup(resource, resource_ty.clone());
+        instructions.push(Instruction::Drop { value: ValueId(2) });
+        instructions.push(Instruction::Drop { value: ValueId(0) });
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_OBSERVER_CONSUMED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_alias_returned_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let instructions = observing_alias_setup(resource, resource_ty.clone());
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: resource_ty,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_OBSERVER_CONSUMED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_alias_passed_to_take_is_rejected() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let sink_name = interner.intern("sink");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let f = ItemId(0);
+        let sink = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut instructions = observing_alias_setup(resource, resource_ty.clone());
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(sink, Vec::new(), vec![ValueId(2)], Vec::new()),
+        });
+        instructions.push(Instruction::Drop { value: ValueId(0) });
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![
+                Function {
+                    id: f,
+                    name: f_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions,
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+                Function {
+                    id: sink,
+                    name: sink_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: resource_ty,
+                        take: true,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: leaked_resource_records(resource, resource_name),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_OBSERVER_CONSUMED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn storing_an_observing_alias_with_transfer_mode_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut instructions = observing_alias_setup(resource, resource_ty.clone());
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: resource_ty,
+            kind: ValueKind::Alloc,
+        });
+        instructions.push(Instruction::Store {
+            slot: ValueId(3),
+            value: ValueId(2),
+            mode: crate::nir::OwnershipMode::Transfer,
+        });
+        instructions.push(Instruction::Drop { value: ValueId(0) });
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::INVALID_RESOURCE_STORE_MODE),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_alias_used_after_the_owner_is_dropped_through_a_different_reference_is_rejected() {
+        // `%0` is dropped directly; `%2`, an observing alias of the same
+        // resource created *before* that drop, is then merely passed to
+        // an ordinary (non-`take`, non-consuming) parameter -- still
+        // rejected, since the resource it aliases no longer exists,
+        // regardless of whether this particular use would itself have
+        // consumed anything.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let inspect_name = interner.intern("inspect");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let f = ItemId(0);
+        let inspect = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut instructions = observing_alias_setup(resource, resource_ty.clone());
+        instructions.push(Instruction::Drop { value: ValueId(0) });
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(inspect, Vec::new(), vec![ValueId(2)], Vec::new()),
+        });
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![
+                Function {
+                    id: f,
+                    name: f_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions,
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+                Function {
+                    id: inspect,
+                    name: inspect_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: resource_ty,
+                        take: false,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: leaked_resource_records(resource, resource_name),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_ORIGIN_CONFLICT),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn two_observing_aliases_of_one_owner_used_before_the_drop_are_accepted() {
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let inspect_name = interner.intern("inspect");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let f = ItemId(0);
+        let inspect = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut instructions = observing_alias_setup(resource, resource_ty.clone());
+        // A second, independent alias of the same slot.
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: resource_ty.clone(),
+            kind: ValueKind::Load(ValueId(1)),
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(inspect, Vec::new(), vec![ValueId(2)], Vec::new()),
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(5),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(inspect, Vec::new(), vec![ValueId(3)], Vec::new()),
+        });
+        instructions.push(Instruction::Drop { value: ValueId(0) });
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![
+                Function {
+                    id: f,
+                    name: f_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions,
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+                Function {
+                    id: inspect,
+                    name: inspect_name,
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: resource_ty,
+                        take: false,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: leaked_resource_records(resource, resource_name),
+            variants: Vec::new(),
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_move_result_dropped_after_its_own_source_shares_identity_is_not_a_false_positive() {
+        // A regression guard for the alias-role fix above: `Move`'s own
+        // result deliberately keeps sharing `source`'s true resource
+        // identity now (so a drop reachable through either is
+        // recognized as the same resource) -- this must never make a
+        // legitimate later drop of the *new* owner collide with its own
+        // already-`Move`d-out `source` in `RESOURCE_USE_AFTER_CONSUME`'s
+        // own separate (and deliberately still-decoupled) bookkeeping.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: resource_ty,
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    Instruction::Drop { value: ValueId(1) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
         );
     }

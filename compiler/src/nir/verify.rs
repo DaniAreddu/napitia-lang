@@ -3947,19 +3947,21 @@ fn verify_drop_state(
 /// slot's own repeated `Load`s (for `RESOURCE_USE_AFTER_CONSUME`) or a
 /// value's own flow into a `Store` (for `RESOURCE_LEAKED_ON_EXIT`) --
 /// moving a resource by rebinding it to a *different* local without an
-/// intervening slot is not traced here, since well-lowered NIR never
-/// reads the old binding's own slot again after such a move in the
-/// first place. A resource transferred in through `Terminator::Invoke`'s
-/// own success slot is not tracked by `RESOURCE_LEAKED_ON_EXIT` at all:
-/// that slot is only genuinely written on its own success edge, never
-/// its failure edges, an edge-sensitivity this single reachable-union
-/// set per block cannot soundly express (see
-/// `verify_invoke_slot_initialization`, which exists precisely because
-/// ordinary union-of-predecessors dataflow cannot represent this) --
-/// a leak reachable only through that exact shape still depends on the
-/// interpreter's own frame-exit check. Only a hand-built module that
-/// fabricates a NIR shape past one of these exact points could evade
-/// this pass on that specific shape.
+/// intervening slot is traced explicitly instead, through `nir::lower`'s
+/// own `ValueKind::Move`/`DeferCapture` (`rfcs/0011`): each is itself an
+/// ordinary consuming use of its own `source`, so no separate identity-
+/// unification is needed for that shape at all. A resource transferred
+/// in through `Terminator::Invoke`'s own success slot *is* tracked by
+/// `RESOURCE_LEAKED_ON_EXIT`: `in_state_for`'s own `incoming_edges`
+/// seeds it as newly live specifically on the block reached through the
+/// `Invoke`'s own `ok_target` edge, never on a block reached only
+/// through one of its `err_targets` -- the same edge-sensitive-by-
+/// specific-edge-not-just-target-block technique
+/// `verify_invoke_slot_initialization` already needs for V0073, for the
+/// same underlying reason (an `Invoke`'s own `ok_target` and one of its
+/// `err_targets`' own `target` can coincide on the same block, which an
+/// ordinary flat predecessor list keyed only by target cannot
+/// distinguish).
 fn verify_resource_ownership(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
@@ -4025,21 +4027,57 @@ fn verify_resource_ownership(
     }
 
     let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    // Every edge leaving a block, paired with whatever *extra* resource
+    // origin becomes newly live specifically on that one edge -- an
+    // `Invoke`'s own `ok_slot`, on its own `ok_target` edge alone, never
+    // any of its failure edges (`rfcs/0011`). Built the same way, and
+    // for the same reason, `verify_invoke_slot_initialization`'s own
+    // `incoming_edges` already is: an ordinary flat predecessor list
+    // keyed only by target block cannot express this at all, since an
+    // `Invoke`'s own `ok_target` and one of its `err_targets`' own
+    // `target` can coincide (the same block reached through either
+    // edge) -- indexing by the *edge* itself, not merely its target, is
+    // what keeps the success edge's own extra liveness from also
+    // leaking onto a failure edge that happens to share a target block.
+    let mut incoming_edges: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
     for block in &function.blocks {
         match &block.terminator {
-            Terminator::Branch(target) => successors.entry(block.id).or_default().push(*target),
+            Terminator::Branch(target) => {
+                successors.entry(block.id).or_default().push(*target);
+                incoming_edges
+                    .entry(*target)
+                    .or_default()
+                    .push((block.id, None));
+            }
             Terminator::CondBranch {
                 then_block,
                 else_block,
                 ..
-            } => successors
-                .entry(block.id)
-                .or_default()
-                .extend([*then_block, *else_block]),
+            } => {
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend([*then_block, *else_block]);
+                incoming_edges
+                    .entry(*then_block)
+                    .or_default()
+                    .push((block.id, None));
+                incoming_edges
+                    .entry(*else_block)
+                    .or_default()
+                    .push((block.id, None));
+            }
             Terminator::Switch { cases, .. } => {
-                successors.entry(block.id).or_default().extend(cases)
+                successors.entry(block.id).or_default().extend(cases);
+                for target in cases {
+                    incoming_edges
+                        .entry(*target)
+                        .or_default()
+                        .push((block.id, None));
+                }
             }
             Terminator::Invoke {
+                ok_slot,
                 ok_target,
                 err_targets,
                 ..
@@ -4049,14 +4087,18 @@ fn verify_resource_ownership(
                     .entry(block.id)
                     .or_default()
                     .extend(err_targets.iter().map(|t| t.target));
+                incoming_edges
+                    .entry(*ok_target)
+                    .or_default()
+                    .push((block.id, Some(*ok_slot)));
+                for target in err_targets {
+                    incoming_edges
+                        .entry(target.target)
+                        .or_default()
+                        .push((block.id, None));
+                }
             }
             Terminator::Return(_) | Terminator::Raise { .. } => {}
-        }
-    }
-    let mut incoming: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for (&from, tos) in &successors {
-        for &to in tos {
-            incoming.entry(to).or_default().push(from);
         }
     }
 
@@ -4184,13 +4226,20 @@ fn verify_resource_ownership(
                     // this function's own care: a direct construction,
                     // or one an ordinary (non-`Invoke`) call transferred
                     // in as its return value (`rfcs/0011`). `Invoke`'s
-                    // own `ok_slot` is deliberately excluded here -- its
-                    // own value is only live on its own success edge,
-                    // never its failure edges, an edge-sensitivity this
-                    // single-set-per-block dataflow cannot soundly
-                    // express (see `verify_invoke_slot_initialization`,
-                    // which exists precisely because ordinary union-of-
-                    // predecessors dataflow cannot represent this).
+                    // own `ok_slot` is deliberately excluded here -- it
+                    // is never a `Value` result at all, and this block-
+                    // local pass has no notion of *which* edge it is
+                    // running on -- but it is not left untracked: `in_
+                    // state_for`'s own `incoming_edges` seeds it as
+                    // newly live specifically on the one block reached
+                    // through the `Invoke`'s own `ok_target` edge, never
+                    // on any block reached only through one of its
+                    // `err_targets` (the same edge-sensitivity `verify_
+                    // invoke_slot_initialization` already needs for
+                    // V0073, for the same underlying reason: ordinary
+                    // union-of-predecessors dataflow keyed only by
+                    // target block cannot otherwise distinguish the two
+                    // edges when they happen to share a target).
                     if is_resource(*result)
                         && !matches!(kind, ValueKind::Load(_) | ValueKind::Alloc)
                     {
@@ -4317,9 +4366,10 @@ fn verify_resource_ownership(
         block_id: BlockId,
         entry: BlockId,
         entry_live: &HashSet<ValueId>,
-        incoming: &HashMap<BlockId, Vec<BlockId>>,
+        incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
         reachable: &HashSet<BlockId>,
         out: &HashMap<BlockId, State>,
+        is_resource: &impl Fn(ValueId) -> bool,
     ) -> State {
         if block_id == entry {
             // Every `take`-flagged resource parameter is already live the
@@ -4331,20 +4381,33 @@ fn verify_resource_ownership(
             // `entry_out`, below).
             return (HashSet::new(), entry_live.clone());
         }
-        let Some(preds) = incoming.get(&block_id) else {
+        let Some(edges) = incoming_edges.get(&block_id) else {
             return (HashSet::new(), HashSet::new());
         };
-        let mut preds = preds.iter().filter(|p| reachable.contains(p));
-        let Some(first) = preds.next() else {
+        let mut edges = edges.iter().filter(|(pred, _)| reachable.contains(pred));
+        let Some((first_pred, first_extra)) = edges.next() else {
             return (HashSet::new(), HashSet::new());
         };
         // Union, not intersection, matching `verify_drop_state`: a
         // resource already consumed (or still live) on *any* reachable
         // predecessor path is a live hazard the moment this path's own
-        // next use -- or exit -- runs.
-        let mut acc = out.get(first).cloned().unwrap_or_default();
-        for pred in preds {
-            let (other_facts, other_live) = out.get(pred).cloned().unwrap_or_default();
+        // next use -- or exit -- runs. `extra`, when present, is an
+        // `Invoke`'s own `ok_slot` -- newly live on that block's own
+        // success edge alone, never folded into any sibling failure
+        // edge that happens to reach this same block (`rfcs/0011`).
+        let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+        if let Some(slot) = first_extra
+            && is_resource(*slot)
+        {
+            acc.1.insert(*slot);
+        }
+        for (pred, extra) in edges {
+            let (other_facts, mut other_live) = out.get(pred).cloned().unwrap_or_default();
+            if let Some(slot) = extra
+                && is_resource(*slot)
+            {
+                other_live.insert(*slot);
+            }
             acc.0.extend(other_facts);
             acc.1.extend(other_live);
         }
@@ -4394,7 +4457,15 @@ fn verify_resource_ownership(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = in_state_for(id, entry, &entry_live, &incoming, &reachable, &out);
+        let in_state = in_state_for(
+            id,
+            entry,
+            &entry_live,
+            &incoming_edges,
+            &reachable,
+            &out,
+            &is_resource,
+        );
         let (new_out, _, _) = transfer(block, &in_state);
         if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
@@ -4408,7 +4479,15 @@ fn verify_resource_ownership(
 
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            in_state_for(block.id, entry, &entry_live, &incoming, &reachable, &out)
+            in_state_for(
+                block.id,
+                entry,
+                &entry_live,
+                &incoming_edges,
+                &reachable,
+                &out,
+                &is_resource,
+            )
         } else {
             (HashSet::new(), HashSet::new())
         };
@@ -10400,6 +10479,182 @@ mod tests {
             leaks[0].message.contains("bb2"),
             "expected the leak reported against bb2, got: {}",
             leaks[0].message
+        );
+    }
+
+    /// Builds a fallible `g` returning a fresh resource on success and
+    /// raising `shape_id` on failure -- paired with `invoke_of_resource_
+    /// returning_callee_caller`, below, to exercise `Terminator::Invoke`'s
+    /// own success-edge ownership tracking (`rfcs/0011`).
+    fn resource_returning_fallible_callee(
+        interner: &mut Interner,
+        shape_id: ItemId,
+        resource: ItemId,
+        resource_name: Symbol,
+    ) -> Function {
+        let g_name = interner.intern("g");
+        let resource_ty = Ty::Named(resource, resource_name);
+        Function {
+            id: ItemId(0),
+            name: g_name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: resource_ty.clone(),
+            raises: vec![shape_id],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: resource_ty,
+                    kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    /// A caller invoking `resource_returning_fallible_callee`: `%0`
+    /// (`ok_slot`) and `%1` (the failure slot) are each allocated at
+    /// their own declared type before the `Invoke`, exactly like a real
+    /// lowering would (`alloc_slots` -- checked independently of this
+    /// pass -- requires it). `ok_dropped` controls whether `ok_target`
+    /// (bb1) actually destroys the resource it received before
+    /// returning, or abandons it -- the two cases this function's own
+    /// two callers below each check.
+    fn invoke_of_resource_returning_callee_caller(
+        f_name: Symbol,
+        shape_id: ItemId,
+        shape_name: Symbol,
+        resource: ItemId,
+        resource_name: Symbol,
+        ok_dropped: bool,
+    ) -> Function {
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut caller = valid_function(ItemId(1), f_name);
+        caller.return_type = Ty::Unit;
+        caller.blocks[0].instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: resource_ty,
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Value {
+                result: ValueId(1),
+                ty: Ty::Named(shape_id, shape_name),
+                kind: ValueKind::Alloc,
+            },
+        ];
+        caller.blocks[0].terminator = Terminator::Invoke {
+            callee: ItemId(0),
+            type_args: Vec::new(),
+            args: Vec::new(),
+            evidence: Vec::new(),
+            ok_slot: ValueId(0),
+            ok_target: BlockId(1),
+            err_targets: vec![InvokeErrTarget {
+                variant: shape_id,
+                slot: ValueId(1),
+                target: BlockId(2),
+            }],
+        };
+        let ok_instructions = if ok_dropped {
+            vec![Instruction::Drop { value: ValueId(0) }]
+        } else {
+            Vec::new()
+        };
+        caller.blocks.push(BasicBlock {
+            id: BlockId(1),
+            instructions: ok_instructions,
+            terminator: Terminator::Return(None),
+        });
+        caller.blocks.push(BasicBlock {
+            id: BlockId(2),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+        });
+        caller
+    }
+
+    #[test]
+    fn an_invoke_success_slot_abandoned_on_its_own_success_edge_is_a_leak() {
+        // Before ownership was tracked per `Invoke` edge, this exact
+        // shape passed `nir::verify` silently: `ok_slot` was never
+        // seeded as live at all, so bb1 abandoning it went undetected
+        // until (at best) the interpreter's own frame-exit check.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let callee =
+            resource_returning_fallible_callee(&mut interner, shape_id, resource, resource_name);
+        let caller = invoke_of_resource_returning_callee_caller(
+            f_name,
+            shape_id,
+            shape_name,
+            resource,
+            resource_name,
+            false,
+        );
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: leaked_resource_records(resource, resource_name),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        let leaks: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.code == codes::RESOURCE_LEAKED_ON_EXIT)
+            .collect();
+        assert_eq!(leaks.len(), 1, "unexpected diagnostics: {diagnostics:?}");
+        assert!(
+            leaks[0].message.contains("bb1"),
+            "expected the leak reported against the success edge's own bb1, got: {}",
+            leaks[0].message
+        );
+    }
+
+    #[test]
+    fn an_invoke_success_slot_dropped_on_its_own_success_edge_is_not_a_leak() {
+        // The same shape as above, except bb1 destroys the resource it
+        // received before returning -- must not be flagged, and the
+        // sibling failure edge (bb2, which never owns anything) must
+        // not be flagged either.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let callee =
+            resource_returning_fallible_callee(&mut interner, shape_id, resource, resource_name);
+        let caller = invoke_of_resource_returning_callee_caller(
+            f_name,
+            shape_id,
+            shape_name,
+            resource,
+            resource_name,
+            true,
+        );
+
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee, caller],
+            records: leaked_resource_records(resource, resource_name),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::RESOURCE_LEAKED_ON_EXIT),
+            "unexpected diagnostics: {diagnostics:?}"
         );
     }
 

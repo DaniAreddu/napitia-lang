@@ -3969,6 +3969,56 @@ fn verify_resource_ownership(
     }
     let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
 
+    // How many times each `ValueId` is used as an operand anywhere in
+    // `function` -- computed once, up front, purely to decide whether a
+    // `Store`'s own leak-tracking relocation (below) is sound. A value
+    // stored and never used again by anything else (the common shape of
+    // initializing a `mutable` resource local's own slot, or of an
+    // ownership-transferring reassignment `resourceck` already proved
+    // legal) has no other future consumer of its own raw identity, so
+    // relocating its own live obligation onto the slot it was stored
+    // into is exactly right. A value used again *after* also being
+    // stored -- an `if`/`match`'s own internal merge slot, fed one
+    // already-owned local's own value on each branch purely to unify a
+    // *read*, never a move (`resourceck`'s own `ConsumeKind::Read`) --
+    // is not relocated at all: it remains independently live (and
+    // independently droppable) through its own original identity, since
+    // NIR alone -- unlike `resourceck`'s own `ConsumeKind` -- cannot yet
+    // distinguish an ownership-transferring `Store` from a merely
+    // value-copying one (`rfcs/0011`; this is exactly the ambiguity an
+    // explicit NIR move/store-mode representation would resolve).
+    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
+    let mut count_use = |v: ValueId| *use_count.entry(v).or_insert(0) += 1;
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::Value { kind, .. } => {
+                    for operand in operands_of(kind) {
+                        count_use(operand);
+                    }
+                }
+                Instruction::Store { slot, value } => {
+                    count_use(*slot);
+                    count_use(*value);
+                }
+                Instruction::Drop { value } => count_use(*value),
+            }
+        }
+        match &block.terminator {
+            Terminator::Return(Some(value)) | Terminator::Raise { value } => count_use(*value),
+            Terminator::CondBranch { condition, .. } => count_use(*condition),
+            Terminator::Switch { scrutinee, .. } => count_use(*scrutinee),
+            Terminator::Invoke { args, .. } => {
+                for arg in args {
+                    count_use(*arg);
+                }
+            }
+            Terminator::Return(None) | Terminator::Branch(_) => {}
+        }
+    }
+    let used_more_than_once_as_a_store_source =
+        |v: ValueId| -> bool { use_count.get(&v).is_some_and(|count| *count > 1) };
+
     let entry = BlockId(0);
     if !function.blocks.iter().any(|b| b.id == entry) {
         return;
@@ -4142,13 +4192,21 @@ fn verify_resource_ownership(
                     // resource).
                     facts.remove(slot);
                     live.remove(slot);
-                    // A resource-typed value being stored relocates its
-                    // own leak-tracking identity onto the slot it now
-                    // occupies -- every later `Load` of this exact slot
-                    // already shares that slot's own identity (`origin`,
-                    // above), so its own obligation must live there too,
-                    // not stay pinned to wherever it was first defined.
-                    if is_resource(*value) {
+                    // A resource-typed value stored *and never used
+                    // again by anything else* relocates its own leak-
+                    // tracking identity onto the slot it now occupies --
+                    // every later `Load` of this exact slot already
+                    // shares that slot's own identity (`origin`, above),
+                    // so its own obligation must live there too, not
+                    // stay pinned to wherever it was first defined. A
+                    // value used again after this exact store keeps its
+                    // own original identity instead (see
+                    // `used_more_than_once_as_a_store_source`'s own doc
+                    // comment) -- relocating it too would wrongly let
+                    // whichever one is consumed second look like a
+                    // brand new, still-owed obligation of its own.
+                    if is_resource(*value) && !used_more_than_once_as_a_store_source(origin(*value))
+                    {
                         live.remove(&origin(*value));
                         live.insert(*slot);
                     }
@@ -10325,6 +10383,64 @@ mod tests {
                         kind: ValueKind::Load(ValueId(0)),
                     },
                     Instruction::Drop { value: ValueId(2) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_stored_into_a_merge_slot_but_dropped_through_its_own_identity_is_not_a_leak() {
+        // %1 is stored into %0 (mirroring an `if`'s own internal merge
+        // slot fed an already-owned value purely to unify a *read*), but
+        // %1 is also dropped directly, through its own original
+        // identity, afterward -- exactly the "value used again after
+        // being stored" shape a merge slot (never an ownership-
+        // transferring move) produces. Must not relocate %1's own
+        // obligation onto %0, or this dropped-exactly-once resource
+        // would be wrongly reported as leaked through %0, which nothing
+        // here ever destroys.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: resource_ty,
+                        kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                    },
+                    Instruction::Drop { value: ValueId(1) },
                 ],
                 terminator: Terminator::Return(None),
             }],

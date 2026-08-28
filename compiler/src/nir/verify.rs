@@ -4275,7 +4275,15 @@ fn verify_resource_ownership(
         // ownership-transferring or not); it is never itself a function
         // exit, so it contributes no leaks of its own.
         let leaks = match &block.terminator {
-            Terminator::Return(_) | Terminator::Raise { .. } => live.iter().copied().collect(),
+            Terminator::Return(_) | Terminator::Raise { .. } => {
+                // Sorted, not the raw `HashSet` iteration order: two
+                // resources leaked in the same block must always be
+                // reported in the same order across runs, never
+                // dependent on this process's own random hash seed.
+                let mut leaks: Vec<ValueId> = live.iter().copied().collect();
+                leaks.sort_unstable();
+                leaks
+            }
             _ => Vec::new(),
         };
         ((facts, live), violations, leaks)
@@ -10455,5 +10463,75 @@ mod tests {
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn two_resources_leaked_in_the_same_block_are_reported_in_a_deterministic_order() {
+        // `live`'s own internal `HashSet` iteration order is not
+        // deterministic across process runs on its own -- the reported
+        // order must never depend on it. Run several times (each a
+        // fresh `HashSet`, so a stable *within-one-run* order alone
+        // would not catch a raw-iteration-order regression) and require
+        // byte-identical messages every time.
+        fn leaked_value_ids(
+            name: Symbol,
+            resource: ItemId,
+            resource_name: Symbol,
+            interner: &Interner,
+        ) -> Vec<u32> {
+            let resource_ty = Ty::Named(resource, resource_name);
+            let function = Function {
+                id: ItemId(0),
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: resource_ty,
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            };
+            let diagnostics = verify_one_with_aggregates(
+                function,
+                leaked_resource_records(resource, resource_name),
+                Vec::new(),
+                interner,
+            );
+            diagnostics
+                .iter()
+                .filter(|d| d.code == codes::RESOURCE_LEAKED_ON_EXIT)
+                .filter_map(|d| {
+                    let after = d.message.split_once("(%")?.1;
+                    after.split_once(')')?.0.parse().ok()
+                })
+                .collect()
+        }
+
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource = ItemId(1);
+        let resource_name = interner.intern("File");
+        let first = leaked_value_ids(name, resource, resource_name, &interner);
+        assert_eq!(first, vec![0, 1], "unexpected leaked ids: {first:?}");
+        for _ in 0..8 {
+            assert_eq!(
+                leaked_value_ids(name, resource, resource_name, &interner),
+                first
+            );
+        }
     }
 }

@@ -1,0 +1,38 @@
+resource File {
+    descriptor: i64,
+}
+
+variant OpenError {
+    Invalid,
+}
+
+// A resource-valued `handle` used directly as a `return`'s own operand
+// is a compound origin exactly like `if`/`match` already are: the
+// success arm transfers the callee's own returned resource out, while
+// the failure arm transfers the caller-supplied fallback out instead --
+// each arm's own unchosen resource is destroyed on that exact path.
+func open(descriptor: i64) -> File raises OpenError {
+    if descriptor < 0 {
+        raise OpenError.Invalid;
+    }
+    return File { descriptor: descriptor };
+}
+
+func consume(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+func choose(descriptor: i64, take fallback: File) -> File {
+    return handle open(descriptor) {
+        success file => file,
+        failure OpenError.Invalid => fallback,
+    };
+}
+
+func main() -> i64 {
+    value fallback = File { descriptor: 99 };
+    value picked = choose(-1, fallback);
+    return consume(picked);
+}

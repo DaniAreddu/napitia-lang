@@ -39,13 +39,10 @@
 //! own `RESOURCE_FIELD_IN_ORDINARY_AGGREGATE` (T0064) already rejects a
 //! resource-typed field in any aggregate -- record, variant, or another
 //! resource -- at that aggregate's own declaration; a resource-typed
-//! `handle`, or a resource-typed `if`/`match` in any consuming position
-//! other than `return`/the function's own implicit tail, is rejected
-//! outright (`U0008`), since `nir::lower` has no per-branch/per-arm
-//! sink for those yet; a resource-typed temporary reaching a compound
-//! `if`/`match`/`handle` that itself constructs a genuinely fresh
-//! resource on some branch is not caught by the temporary check
-//! (`U0011`), only a direct call or literal construction is.
+//! `if`/`match`/`handle` in any consuming position other than
+//! `return`/the function's own implicit tail is rejected outright
+//! (`U0008`), since `nir::lower` has no per-branch/per-arm sink for
+//! those yet.
 
 mod flow;
 mod plan;
@@ -495,6 +492,27 @@ mod tests {
     }
 
     #[test]
+    fn a_non_affine_match_returned_alongside_an_unrelated_resource_has_no_diagnostics() {
+        // The `match` itself produces `i64`, not a resource -- `kind`
+        // still propagates `Return` through it (for whatever it might
+        // contain), but that must never be mistaken for `file` itself
+        // being the thing under compound return-sink treatment: each
+        // bare arm's own leaf here is not a resource-return-sink leaf
+        // at all, so it must not claim `file`'s own whole-function
+        // cleanup for itself, wrongly excluding it from the arm-local
+        // entry `nir::lower`'s own ordinary (non-sink) merge path still
+        // depends on.
+        let diags = check(
+            "variant Choice { A, B } \
+             resource File { descriptor: i64 } \
+             func f(c: Choice, take file: File) -> i64 { \
+                 return match c { A => 1, B => 2 }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn a_resource_typed_match_bound_to_a_value_is_still_rejected() {
         let diags = check(
             "variant Choice { A, B } \
@@ -508,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resource_typed_handle_directly_returned_is_still_rejected() {
+    fn a_resource_typed_handle_directly_returned_has_no_diagnostics() {
         let diags = check(
             "resource File { descriptor: i64 } \
              variant OpenError { Invalid } \
@@ -518,6 +536,23 @@ mod tests {
                      success file => file, \
                      failure OpenError.Invalid => fallback, \
                  }; \
+             }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_resource_typed_handle_bound_to_a_value_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             variant OpenError { Invalid } \
+             func open() -> File raises OpenError { return File { descriptor: 1 } } \
+             func choose(take fallback: File) -> File { \
+                 value picked = handle open() { \
+                     success file => file, \
+                     failure OpenError.Invalid => fallback, \
+                 }; \
+                 return picked; \
              }",
         );
         assert_eq!(codes_of(&diags), vec!["U0008"], "unexpected: {diags:?}");

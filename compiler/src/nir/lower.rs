@@ -72,6 +72,8 @@ pub fn lower_module(
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -84,6 +86,8 @@ pub fn lower_module(
         call_evidence,
         protocol_call_evidence,
         cleanup_edges,
+        consume_sites,
+        defer_plans,
         interner,
         source,
         ModulePathMode::SingleFile,
@@ -109,6 +113,8 @@ pub fn lower_module_with_paths(
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
@@ -122,6 +128,8 @@ pub fn lower_module_with_paths(
         call_evidence,
         protocol_call_evidence,
         cleanup_edges,
+        consume_sites,
+        defer_plans,
         interner,
         source,
         ModulePathMode::Project(module_path_of),
@@ -138,6 +146,8 @@ fn lower_module_impl(
     call_evidence: &HashMap<ExprId, Vec<Evidence>>,
     protocol_call_evidence: &HashMap<ExprId, Evidence>,
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
     interner: &Interner,
     source: SourceId,
     module_path_mode: ModulePathMode<'_>,
@@ -210,13 +220,6 @@ fn lower_module_impl(
     let mut function_sigs = HashMap::new();
     let mut function_requirements: HashMap<ItemId, Vec<CapabilityRequirement>> = HashMap::new();
     let mut function_raises: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
-    // Every function/extend method's own per-parameter `take` flags, by
-    // declared order (`rfcs/0011`) -- a plain fact of the callee's own
-    // signature, read back here purely to decide *where* to place an
-    // explicit `Move` for a transferred argument, never to decide
-    // *whether* one transfers at all (`resourceck`/`typeck` already
-    // settled that; this module only ever materializes it).
-    let mut function_takes: HashMap<ItemId, Vec<bool>> = HashMap::new();
     for f in &hir.functions {
         let params = f
             .params
@@ -230,7 +233,6 @@ fn lower_module_impl(
             .unwrap_or(Ty::Unit);
         let type_params = f.type_params.iter().map(|p| p.id).collect();
         function_sigs.insert(f.id, (type_params, params, ret));
-        function_takes.insert(f.id, f.params.iter().map(|p| p.take).collect());
         function_requirements.insert(
             f.id,
             f.requirements
@@ -335,7 +337,6 @@ fn lower_module_impl(
                 ),
             );
             function_requirements.insert(m.id, requirements.clone());
-            function_takes.insert(m.id, m.params.iter().map(|p| p.take).collect());
             let method_raises = match canonical_raises(
                 m.raises.iter().map(|r| r.variant).collect(),
                 &variant_layouts,
@@ -397,8 +398,9 @@ fn lower_module_impl(
         function_requirements,
         function_raises,
         function_named_type_params,
-        function_takes,
         cleanup_edges,
+        consume_sites,
+        defer_plans,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -794,13 +796,6 @@ struct Lowering<'a> {
     /// `ItemId`. Absent (falls back to `f.type_params` directly) for an
     /// ordinary function, which owns its parameters itself.
     function_named_type_params: HashMap<ItemId, Vec<(crate::hir::TypeParamId, Symbol)>>,
-    /// Every function/extend method's own per-parameter `take` flags, by
-    /// `ItemId`, in declared order (`rfcs/0011`) -- read back only to
-    /// decide *where* an explicit `Move` belongs (a `take` argument
-    /// transfers into the call right there); `resourceck` has already
-    /// independently proved this program's ownership sound before
-    /// lowering ever runs.
-    function_takes: HashMap<ItemId, Vec<bool>>,
     /// `resourceck`'s own authoritative, checked cleanup plan
     /// (`rfcs/0011`), keyed by the exiting HIR node's own stable id --
     /// the single source of truth for which locals still need
@@ -810,6 +805,18 @@ struct Lowering<'a> {
     /// looks the already-checked answer up here and simply materializes
     /// it as real instructions, in the order given.
     cleanup_edges: &'a BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
+    /// `resourceck`'s own authoritative observe-vs-transfer decision
+    /// for every resource-typed expression it checked (`rfcs/0011`),
+    /// keyed by that exact expression's own `ExprId` -- a binding's own
+    /// initializer, an assignment's own value, or a call/`Invoke`
+    /// argument. Lowering reads this back directly (`lookup_consume`)
+    /// rather than re-deriving the same verdict from the expression's
+    /// own HIR shape or a callee's declared `take` flags a second time.
+    consume_sites: &'a BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
+    /// `resourceck`'s own checked plan for every `defer` statement
+    /// (`rfcs/0011`), keyed by that exact call expression's own
+    /// `ExprId` -- see `resourceck::CheckedDeferPlan`.
+    defer_plans: &'a BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
 }
 
 #[derive(Copy, Clone)]
@@ -1248,15 +1255,21 @@ impl<'a> Lowering<'a> {
                     // always checked with `ConsumeKind::Other`
                     // (`resourceck::flow::check_binding`) -- never a
                     // mere observation -- so a resource-typed one always
-                    // transfers ownership into this fresh slot.
-                    let mode = if self.is_affine(&ty) {
+                    // transfers ownership into this fresh slot. Read
+                    // back from `resourceck`'s own checked decision
+                    // directly, rather than re-derived from `ty` alone.
+                    let transfers =
+                        self.lookup_consume_mode(b.value.id(), &ty, "a binding initializer")?;
+                    let mode = if transfers {
                         crate::nir::OwnershipMode::Transfer
                     } else {
                         crate::nir::OwnershipMode::Observe
                     };
                     fb.push_store(slot, value, mode);
                     LocalBinding::Slot(slot)
-                } else if self.is_affine(&ty) && matches!(b.value, HirExpr::Local { .. }) {
+                } else if matches!(b.value, HirExpr::Local { .. })
+                    && self.lookup_consume_mode(b.value.id(), &ty, "a binding initializer")?
+                {
                     // Rebinding a resource directly from another
                     // already-owned local (`value b = a;`) transfers
                     // ownership explicitly, even with no slot involved:
@@ -1368,9 +1381,19 @@ impl<'a> Lowering<'a> {
         if self.is_affine(&ret_ty) {
             return Err(self.unsupported(span, "a `defer` calling a function returning a resource"));
         }
-        let takes = self
-            .lookup_function_takes(*item, "a `defer` call")?
-            .to_vec();
+        // `resourceck::flow::check_defer` already recorded exactly this
+        // shape's own checked plan (`rfcs/0011`) -- the same per-
+        // argument observe/transfer verdict `check_expr_ctx`'s own
+        // `HirExpr::Call` handling decided, running this call through
+        // the same move-checking any other call gets. A structural
+        // mismatch here (this exact shape reached lowering, but
+        // resourceck recorded no plan for it) is a bug in one stage or
+        // the other, never silently treated as "observe everything".
+        let plan = self.defer_plans.get(&expr.id()).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "a `defer` calling {item:?} has no checked argument plan recorded by resourceck"
+            ))
+        })?;
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
@@ -1391,7 +1414,10 @@ impl<'a> Lowering<'a> {
             // that decision, immediately, so the replayed `Call` later
             // consumes the already-captured owner, never the caller's
             // own (by then long-invalid) original argument value.
-            let transfers = takes.get(i).copied().unwrap_or(false);
+            let transfers = matches!(
+                plan.arg_modes.get(i),
+                Some(crate::resourceck::ConsumeInfo::Transfer)
+            );
             let captured = if transfers && self.is_affine(&hint) {
                 fb.push_value(hint.clone(), ValueKind::DeferCapture { source: v })
             } else {
@@ -2182,8 +2208,11 @@ impl<'a> Lowering<'a> {
         // A plain reassignment (`target = source;`) is itself a move,
         // exactly like a `value`/`mutable` binding's own initializer
         // (`ConsumeKind::Other`); a compound assignment (`target +=
-        // ...`) is always numeric/bitwise, never affine.
-        let mode = if op == AssignOp::Assign && self.is_affine(&target_ty) {
+        // ...`) is always numeric/bitwise, never affine, and never
+        // itself checked by `resourceck` as a consume site at all.
+        let transfers = op == AssignOp::Assign
+            && self.lookup_consume_mode(value.id(), &target_ty, "an assignment value")?;
+        let mode = if transfers {
             crate::nir::OwnershipMode::Transfer
         } else {
             crate::nir::OwnershipMode::Observe
@@ -2245,7 +2274,6 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
-        let takes = self.lookup_function_takes(*item, "a call")?.to_vec();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -2256,14 +2284,15 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             };
-            // A `take` parameter transfers ownership of this argument
-            // into the call (`rfcs/0011`): `resourceck` already decided
-            // this, so its own checked cleanup plan already excludes
-            // this argument's own source local from its former scope's
+            // `resourceck` already decided whether this exact argument
+            // transfers ownership into the call (`rfcs/0011`): its own
+            // checked cleanup plan already excludes a transferred
+            // argument's own source local from its former scope's
             // cleanup wherever it would otherwise be dropped again --
             // this explicit `Move` only ever materializes that already-
-            // checked decision, never makes it.
-            let transfers = takes.get(i).copied().unwrap_or(false);
+            // checked decision, read back directly, never re-derived
+            // from the callee's own `take` flags a second time.
+            let transfers = self.lookup_consume_mode(arg.id(), &hint, "a call argument")?;
             arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, "a call")?;
@@ -2355,7 +2384,6 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
-        let takes = self.lookup_function_takes(*item, context)?.to_vec();
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let hint = param_tys
@@ -2367,13 +2395,15 @@ impl<'a> Lowering<'a> {
                 LoweredExpr::Diverged => return Ok(None),
             };
             // Exactly `lower_call`'s own rule (`rfcs/0011`, Blocker 1):
-            // a `take` argument transfers ownership into the call
-            // whether that call is an ordinary `Call` or a fallible
-            // `Invoke` -- `resourceck` already decided this, and its
-            // own checked cleanup plan already reflects it on every
-            // edge (the success edge, and every failure edge alike);
-            // this explicit `Move` only ever materializes it.
-            let transfers = takes.get(i).copied().unwrap_or(false);
+            // an argument transfers ownership into the call whether
+            // that call is an ordinary `Call` or a fallible `Invoke` --
+            // `resourceck` already decided this, and its own checked
+            // cleanup plan already reflects it on every edge (the
+            // success edge, and every failure edge alike); this
+            // explicit `Move` only ever materializes it, read back
+            // directly rather than re-derived from the callee's own
+            // `take` flags a second time.
+            let transfers = self.lookup_consume_mode(arg.id(), &hint, "an invoke argument")?;
             arg_values.push(self.move_if_transferred(fb, v, &hint, transfers));
         }
         let requirements = self.lookup_function_requirements(*item, context)?;
@@ -3929,18 +3959,27 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// See [`Self::lookup_function_sig`]'s own doc comment -- same
-    /// missing-vs-legitimately-empty distinction, for a callee's own
-    /// per-parameter `take` flags (`rfcs/0011`).
-    fn lookup_function_takes(&self, item: ItemId, context: &str) -> LowerResult<&[bool]> {
-        self.function_takes
-            .get(&item)
-            .map(Vec::as_slice)
-            .ok_or_else(|| {
-                self.internal_error(&format!(
-                    "{context} targets a function this module never resolved `take` flags for"
-                ))
-            })
+    /// Looks up `resourceck`'s own checked observe-vs-transfer decision
+    /// for the exact expression `id` names (`rfcs/0011`) -- a call/
+    /// `Invoke` argument, a binding's own initializer, or an
+    /// assignment's own value. Always `false` for a non-affine type:
+    /// `resourceck` never records anything for one (there is no
+    /// ownership to decide), so this never even consults `consume_
+    /// sites` for it. For an affine type, a missing entry is a
+    /// structural mismatch between this stage and `resourceck` -- never
+    /// silently treated as "observe" -- since every affine expression
+    /// `resourceck` accepted in a consuming position always has one.
+    fn lookup_consume_mode(&self, id: ExprId, ty: &Ty, context: &str) -> LowerResult<bool> {
+        if !self.is_affine(ty) {
+            return Ok(false);
+        }
+        match self.consume_sites.get(&id) {
+            Some(crate::resourceck::ConsumeInfo::Transfer) => Ok(true),
+            Some(crate::resourceck::ConsumeInfo::Observe) => Ok(false),
+            None => Err(self.internal_error(&format!(
+                "{context} is affine-typed but resourceck recorded no checked consume decision for it"
+            ))),
+        }
     }
 
     /// Emits an explicit ownership transfer for a call/`return`/`raise`
@@ -4147,6 +4186,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -4196,9 +4237,162 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
+    }
+
+    #[test]
+    fn a_missing_consume_site_for_an_affine_binding_is_an_internal_error_not_a_silent_observe() {
+        // `resourceck` genuinely recorded a checked transfer for this
+        // exact binding -- this test discards it before lowering ever
+        // sees it, simulating the two stages disagreeing (`rfcs/0011`).
+        // Lowering must report a structured internal diagnostic, never
+        // silently fall back to treating the initializer as a mere
+        // observation.
+        // A `mutable` binding's own `Store` always consults its checked
+        // consume decision, regardless of the initializer's own shape
+        // (unlike an immutable rebind, which only ever needs one for a
+        // bare-local source -- there is no `Move` to decide for a fresh
+        // construction either way, so nothing would notice its absence).
+        let text = "resource File { descriptor: i64 } \
+                     func f() { mutable file = File { descriptor: 3 }; drop file; }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.consume_sites.is_empty(),
+            "expected resourceck to have actually recorded a consume site"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            // Deliberately empty, discarding resourceck's own real
+            // decision, rather than the authentic `consume_sites`.
+            &BTreeMap::new(),
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("no checked consume decision"),
+            "expected a missing-consume-decision internal error, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_missing_defer_plan_is_an_internal_error_not_a_silent_fallback() {
+        // Same shape as the consume-site regression above, but for a
+        // `defer` statement's own checked plan (`rfcs/0011`).
+        let text = "resource File { descriptor: i64 } \
+                     func close(take file: File) -> unit { drop file; } \
+                     func f() { value file = File { descriptor: 3 }; defer close(file); }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert!(
+            !resourceck_result.defer_plans.is_empty(),
+            "expected resourceck to have actually recorded a defer plan"
+        );
+        let outcome = lower_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &result.pattern_case,
+            &result.call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            // Deliberately empty, discarding resourceck's own real plan.
+            &BTreeMap::new(),
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a missing-metadata internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("no checked argument plan"),
+            "expected a missing-defer-plan internal error, got: {}",
+            diagnostics[0].message
+        );
     }
 
     /// Like `lower`, but also runs the module through the NIR verifier
@@ -4244,6 +4438,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
             &interner,
             id,
         )
@@ -6208,6 +6404,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -6261,6 +6459,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             id,
@@ -6443,6 +6643,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6521,6 +6723,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6578,6 +6782,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6632,6 +6838,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -6678,6 +6886,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             source,
@@ -6741,6 +6951,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             source,
@@ -6827,6 +7039,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             manifest_source,
@@ -6919,6 +7133,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -6988,6 +7204,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &HashMap::new(),
@@ -7028,6 +7246,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             source,
@@ -7072,6 +7292,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7115,6 +7337,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7154,6 +7378,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             source,
@@ -7196,6 +7422,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             source,
@@ -7249,6 +7477,8 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 &interner,
                 source,
@@ -7305,8 +7535,9 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
-            function_takes: HashMap::new(),
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
+            consume_sites: Box::leak(Box::new(BTreeMap::new())),
+            defer_plans: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -7343,8 +7574,9 @@ mod tests {
             function_requirements: HashMap::new(),
             function_raises: HashMap::new(),
             function_named_type_params: HashMap::new(),
-            function_takes: HashMap::new(),
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
+            consume_sites: Box::leak(Box::new(BTreeMap::new())),
+            defer_plans: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -7651,7 +7883,6 @@ mod tests {
             .function_requirements
             .insert(callee_item, Vec::new());
         lowering.function_raises.insert(callee_item, Vec::new());
-        lowering.function_takes.insert(callee_item, Vec::new());
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),
@@ -7878,7 +8109,6 @@ mod tests {
         lowering
             .function_raises
             .insert(callee_item, vec![error_item]);
-        lowering.function_takes.insert(callee_item, vec![false]);
         let mut fb = FnBuilder::new(Ty::I64);
         let callee = HirExpr::Function {
             id: ExprId(0),
@@ -8400,6 +8630,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8555,6 +8787,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             id,

@@ -1076,7 +1076,12 @@ impl<'a> Lowering<'a> {
         let mut fb = FnBuilder::new(return_type.clone());
         let mut params = Vec::new();
         for p in &f.params {
-            let ty = self.local_types.get(&p.local).cloned().unwrap_or(Ty::Error);
+            let Some(ty) = self.local_types.get(&p.local).cloned() else {
+                return Err(self.internal_error(&format!(
+                    "parameter {:?} has no type recorded by typeck",
+                    p.local
+                )));
+            };
             let value = fb.fresh_value();
             fb.local_bindings
                 .insert(p.local, LocalBinding::Direct(value));
@@ -1181,11 +1186,13 @@ impl<'a> Lowering<'a> {
     // vs `add.f64`) is always a lookup by the node's own `ExprId`, never
     // a re-inference.
 
-    fn expr_ty(&self, expr: &HirExpr) -> Ty {
-        self.expr_types
-            .get(&expr.id())
-            .cloned()
-            .unwrap_or(Ty::Error)
+    fn expr_ty(&self, expr: &HirExpr) -> LowerResult<Ty> {
+        self.expr_types.get(&expr.id()).cloned().ok_or_else(|| {
+            self.internal_error(&format!(
+                "expression {:?} has no type recorded by typeck",
+                expr.id()
+            ))
+        })
     }
 
     /// Builds the diagnostic for a construct that reached lowering
@@ -1240,7 +1247,12 @@ impl<'a> Lowering<'a> {
     fn lower_stmt(&mut self, fb: &mut FnBuilder, stmt: &HirStmt) -> LowerResult<()> {
         match stmt {
             HirStmt::Binding(b) => {
-                let ty = self.local_types.get(&b.local).cloned().unwrap_or(Ty::Error);
+                let Some(ty) = self.local_types.get(&b.local).cloned() else {
+                    return Err(self.internal_error(&format!(
+                        "binding {:?} has no type recorded by typeck",
+                        b.local
+                    )));
+                };
                 let value = match self.lower_expr_hinted(fb, &b.value, &ty)? {
                     LoweredExpr::Value(v) => v,
                     // The initializer itself diverged (e.g. `value x =
@@ -1327,12 +1339,21 @@ impl<'a> Lowering<'a> {
     /// directly, or (for a `mutable` binding) a fresh `Load` of its
     /// slot, typed from `self.local_types` exactly like an ordinary
     /// `HirExpr::Local` read already is.
-    fn load_current(&self, fb: &mut FnBuilder, local: LocalId, binding: LocalBinding) -> ValueId {
+    fn load_current(
+        &self,
+        fb: &mut FnBuilder,
+        local: LocalId,
+        binding: LocalBinding,
+    ) -> LowerResult<ValueId> {
         match binding {
-            LocalBinding::Direct(value) => value,
+            LocalBinding::Direct(value) => Ok(value),
             LocalBinding::Slot(slot) => {
-                let ty = self.local_types.get(&local).cloned().unwrap_or(Ty::Error);
-                fb.push_value(ty, ValueKind::Load(slot))
+                let Some(ty) = self.local_types.get(&local).cloned() else {
+                    return Err(self.internal_error(&format!(
+                        "local {local:?} has a bound slot but no recorded type"
+                    )));
+                };
+                Ok(fb.push_value(ty, ValueKind::Load(slot)))
             }
         }
     }
@@ -1394,10 +1415,54 @@ impl<'a> Lowering<'a> {
                 "a `defer` calling {item:?} has no checked argument plan recorded by resourceck"
             ))
         })?;
+        // The plan's own shape must independently agree with what this
+        // stage resolves on its own, in every dimension -- a plan that
+        // merely exists is not enough (`rfcs/0011`): the wrong callee,
+        // the wrong argument/return type count, or a return type
+        // disagreement all mean the two stages disagree about this
+        // exact `defer`, which is never silently trusted just because a
+        // plan happens to be present.
+        if plan.callee != *item {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has a checked plan naming a different callee ({:?})",
+                plan.callee
+            )));
+        }
+        if plan.arg_modes.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has {} checked argument mode(s) but {} argument(s)",
+                plan.arg_modes.len(),
+                args.len()
+            )));
+        }
+        if plan.arg_types.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has {} checked argument type(s) but {} argument(s)",
+                plan.arg_types.len(),
+                args.len()
+            )));
+        }
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} declares {} parameter(s) but is called with {} argument(s)",
+                param_tys.len(),
+                args.len()
+            )));
+        }
+        if plan.return_type != ret_ty {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has a checked return type that disagrees with its own resolved signature"
+            )));
+        }
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys.get(i).cloned().unwrap_or(Ty::Error);
-            let v = match self.lower_expr_hinted(fb, arg, &hint)? {
+            let hint = &param_tys[i];
+            if plan.arg_types[i] != *hint {
+                return Err(self.internal_error(&format!(
+                    "a `defer` calling {item:?} has a checked argument type for argument {i} that disagrees with its own resolved parameter type"
+                )));
+            }
+            let v = match self.lower_expr_hinted(fb, arg, hint)? {
                 LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => {
                     return Err(self.unsupported(span, "a `defer` whose own argument diverges"));
@@ -1414,11 +1479,19 @@ impl<'a> Lowering<'a> {
             // that decision, immediately, so the replayed `Call` later
             // consumes the already-captured owner, never the caller's
             // own (by then long-invalid) original argument value.
-            let transfers = matches!(
-                plan.arg_modes.get(i),
-                Some(crate::resourceck::ConsumeInfo::Transfer)
-            );
-            let captured = if transfers && self.is_affine(&hint) {
+            // Cross-checked against `consume_sites` -- the exact same
+            // verdict `check_expr_ctx`'s own `HirExpr::Call` handling
+            // recorded for this same argument -- rather than trusted
+            // from the defer plan alone.
+            let plan_transfers =
+                matches!(plan.arg_modes[i], crate::resourceck::ConsumeInfo::Transfer);
+            let site_transfers = self.lookup_consume_mode(arg.id(), hint, "a defer argument")?;
+            if plan_transfers != site_transfers {
+                return Err(self.internal_error(&format!(
+                    "a `defer` calling {item:?} has argument {i}'s own checked plan mode disagreeing with its own recorded consume site"
+                )));
+            }
+            let captured = if plan_transfers && self.is_affine(hint) {
                 fb.push_value(hint.clone(), ValueKind::DeferCapture { source: v })
             } else {
                 v
@@ -1460,6 +1533,15 @@ impl<'a> Lowering<'a> {
                 "exit {exit_id:?} is reachable but resourceck recorded no checked cleanup plan for it"
             )));
         };
+        // `resourceck`'s own `cleanup_edges` is already in replay order
+        // (last declared/registered first, `rfcs/0011`) -- so every
+        // `Defer` this exact list replays must name a strictly
+        // *decreasing* `registration_order`, matching that same LIFO
+        // discipline from its own `CheckedDeferPlan`. Never trusted
+        // silently: a plan replayed out of its own declared order would
+        // run deferred calls in the wrong sequence without ever
+        // producing a diagnostic otherwise.
+        let mut last_defer_registration: Option<u32> = None;
         for action in actions {
             match action {
                 crate::resourceck::CleanupAction::Drop(local) => {
@@ -1476,7 +1558,7 @@ impl<'a> Lowering<'a> {
                             "a checked cleanup action drops local {local:?}, which this frame never bound"
                         )));
                     };
-                    let value = self.load_current(fb, local, binding);
+                    let value = self.load_current(fb, local, binding)?;
                     fb.push_instruction(crate::nir::Instruction::Drop { value });
                 }
                 crate::resourceck::CleanupAction::Defer(defer_id) => {
@@ -1485,6 +1567,19 @@ impl<'a> Lowering<'a> {
                             "a checked cleanup action replays a `defer` this frame never lowered",
                         ));
                     };
+                    let Some(plan) = self.defer_plans.get(&defer_id) else {
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup action replays defer {defer_id:?}, which has no checked plan recorded"
+                        )));
+                    };
+                    if let Some(last) = last_defer_registration
+                        && plan.registration_order >= last
+                    {
+                        return Err(self.internal_error(&format!(
+                            "a checked cleanup list replays defer {defer_id:?} out of its own declared LIFO registration order"
+                        )));
+                    }
+                    last_defer_registration = Some(plan.registration_order);
                     fb.push_value(
                         pending.ret_ty,
                         ValueKind::Call(
@@ -1847,7 +1942,11 @@ impl<'a> Lowering<'a> {
                 match binding {
                     LocalBinding::Direct(value) => Ok(LoweredExpr::Value(value)),
                     LocalBinding::Slot(slot) => {
-                        let ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
+                        let Some(ty) = self.local_types.get(local).cloned() else {
+                            return Err(self.internal_error(&format!(
+                                "local {local:?} has a bound slot but no recorded type"
+                            )));
+                        };
                         Ok(LoweredExpr::Value(fb.push_value(ty, ValueKind::Load(slot))))
                     }
                 }
@@ -1913,7 +2012,7 @@ impl<'a> Lowering<'a> {
             } => self.lower_try(fb, *id, inner),
             HirExpr::Raise { operand, id, .. } => self.lower_raise(fb, *id, operand),
             HirExpr::Handle { operand, arms, .. } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_handle(fb, operand, arms, result_ty)
             }
             HirExpr::If {
@@ -1922,13 +2021,13 @@ impl<'a> Lowering<'a> {
                 else_branch,
                 ..
             } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_if(fb, condition, then_branch, else_branch, result_ty)
             }
             HirExpr::Match {
                 scrutinee, arms, ..
             } => {
-                let result_ty = self.expr_ty(expr);
+                let result_ty = self.expr_ty(expr)?;
                 self.lower_match(fb, scrutinee, arms, result_ty)
             }
             HirExpr::Block(b) => self.lower_scoped_block(fb, b),
@@ -2011,7 +2110,7 @@ impl<'a> Lowering<'a> {
         op: UnaryOp,
         operand: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
-        let ty = self.expr_ty(operand);
+        let ty = self.expr_ty(operand)?;
         let v = match self.lower_expr_hinted(fb, operand, &ty)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -2050,7 +2149,7 @@ impl<'a> Lowering<'a> {
         // recorded a diagnostic if it couldn't), so either side's
         // resolved expr_type is the operand type -- no need to guess
         // which side "actually" carries it based on which is a literal.
-        let operand_ty = self.expr_ty(left);
+        let operand_ty = self.expr_ty(left)?;
 
         let lv = match self.lower_expr_hinted(fb, left, &operand_ty)? {
             LoweredExpr::Value(v) => v,
@@ -2174,7 +2273,11 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
-        let target_ty = self.local_types.get(local).cloned().unwrap_or(Ty::Error);
+        let Some(target_ty) = self.local_types.get(local).cloned() else {
+            return Err(self.internal_error(&format!(
+                "assignment target {local:?} has no type recorded by typeck"
+            )));
+        };
         let value_value = match self.lower_expr_hinted(fb, value, &target_ty)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -2280,12 +2383,16 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .zip(type_args.iter().cloned())
             .collect();
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a call to {item:?} has {} argument(s) but its own resolved signature declares {}",
+                args.len(),
+                param_tys.len()
+            )));
+        }
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
+            let hint = crate::types::substitute(&param_tys[i], &subst);
             let v = match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -2303,8 +2410,9 @@ impl<'a> Lowering<'a> {
         }
         let requirements = self.lookup_function_requirements(*item, "a call")?;
         let evidence = self.resolve_call_evidence(call_expr.id(), &requirements, "a call")?;
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::Call(*item, type_args, arg_values, evidence),
         )))
     }
@@ -2390,12 +2498,16 @@ impl<'a> Lowering<'a> {
         // concrete value ever actually has, corrupting every downstream
         // instruction that reads it (`rfcs/0008`).
         let ret_ty = crate::types::substitute(&ret_ty, &subst);
+        if param_tys.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "{context} calls {item:?} with {} argument(s) but its own resolved signature declares {}",
+                args.len(),
+                param_tys.len()
+            )));
+        }
         let mut arg_values = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = param_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
+            let hint = crate::types::substitute(&param_tys[i], &subst);
             let v = match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => v,
                 LoweredExpr::Diverged => return Ok(None),
@@ -2520,7 +2632,7 @@ impl<'a> Lowering<'a> {
         // all: an explicit transfer out through `raise`, wherever the
         // accepted language ever does permit one, must never depend on
         // this call site remembering to add it later.
-        let ty = self.expr_ty(operand);
+        let ty = self.expr_ty(operand)?;
         let value = self.move_if_transferred(fb, value, &ty, true);
         fb.terminate(Terminator::Raise { value });
         Ok(LoweredExpr::Diverged)
@@ -2927,8 +3039,9 @@ impl<'a> Lowering<'a> {
                 "protocol call has no recorded call-site evidence from typeck's capability solver",
             ));
         };
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::ProtocolCall {
                 protocol,
                 arguments: resolved_arguments,
@@ -2988,17 +3101,23 @@ impl<'a> Lowering<'a> {
         }
         let mut payload = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let hint = payload_tys
-                .get(i)
-                .map(|t| crate::types::substitute(t, &subst))
-                .unwrap_or(Ty::Error);
+            // The arity check just above already guarantees `i` is in
+            // range; still checked explicitly (never `Ty::Error`) rather
+            // than trusted blindly.
+            let Some(param_ty) = payload_tys.get(i) else {
+                return Err(self.internal_error(&format!(
+                    "variant construction for case {case} of {variant:?} has no declared payload type for argument {i}"
+                )));
+            };
+            let hint = crate::types::substitute(param_ty, &subst);
             match self.lower_expr_hinted(fb, arg, &hint)? {
                 LoweredExpr::Value(v) => payload.push(v),
                 LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
             }
         }
+        let call_ty = self.expr_ty(call_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(call_expr),
+            call_ty,
             ValueKind::VariantCreate {
                 variant,
                 case,
@@ -3099,8 +3218,9 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|v| v.expect("every index was already proven present above"))
             .collect();
+        let literal_ty = self.expr_ty(literal_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(literal_expr),
+            literal_ty,
             ValueKind::RecordCreate(record, type_args, ordered),
         )))
     }
@@ -3116,7 +3236,7 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-        let base_ty = self.expr_ty(base);
+        let base_ty = self.expr_ty(base)?;
         // A generic record's own body (e.g. `unwrap[T](box: Box[T]) ->
         // T { box.value }`) accesses a field whose base is symbolically
         // typed `Box[T]` (`Ty::Applied`), never `Ty::Named` -- checked
@@ -3141,8 +3261,9 @@ impl<'a> Lowering<'a> {
             .ok_or_else(|| {
                 self.unsupported(field_expr.span(), "field access on an unknown field")
             })?;
+        let field_ty = self.expr_ty(field_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
-            self.expr_ty(field_expr),
+            field_ty,
             ValueKind::RecordField {
                 base: base_value,
                 record,
@@ -3315,7 +3436,7 @@ impl<'a> Lowering<'a> {
             // `never`, and no arm is lowered as reachable work.
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-        let scrutinee_ty = self.expr_ty(scrutinee);
+        let scrutinee_ty = self.expr_ty(scrutinee)?;
 
         let rows: Vec<MatrixRow> = arms
             .iter()
@@ -3377,7 +3498,7 @@ impl<'a> Lowering<'a> {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
         };
-        let scrutinee_ty = self.expr_ty(scrutinee);
+        let scrutinee_ty = self.expr_ty(scrutinee)?;
 
         let rows: Vec<MatrixRow> = arms
             .iter()
@@ -4329,6 +4450,276 @@ mod tests {
             "expected a missing-consume-decision internal error, got: {}",
             diagnostics[0].message
         );
+    }
+
+    /// Runs a real `defer close(file);` (`take`) program through the
+    /// whole front end, asserting every stage is clean, and returns
+    /// everything needed to call `lower_module` directly -- for tests
+    /// that then deliberately tamper with one field of the checked
+    /// `CheckedDeferPlan` this program's own `resourceck` pass recorded,
+    /// before lowering, to prove each field is actually validated
+    /// (`rfcs/0011`) rather than merely present.
+    #[allow(clippy::type_complexity)]
+    fn checked_take_defer_pipeline() -> (
+        crate::hir::HirModule,
+        HashMap<LocalId, Ty>,
+        HashMap<ExprId, Ty>,
+        HashMap<PatternId, (ItemId, usize)>,
+        HashMap<ExprId, Vec<Ty>>,
+        crate::resourceck::ResourceCheckResult,
+        Interner,
+        SourceId,
+    ) {
+        let text = "resource File { descriptor: i64 } \
+                     func close(take file: File) -> unit { drop file; } \
+                     func f() { value file = File { descriptor: 3 }; defer close(file); }";
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(diags.is_empty(), "unexpected lexer diagnostics: {diags:?}");
+        let (module, diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(diags.is_empty(), "unexpected parser diagnostics: {diags:?}");
+        let (hir, diags) = lower_hir(&module, id, &interner);
+        assert!(
+            diags.is_empty(),
+            "unexpected resolve diagnostics: {diags:?}"
+        );
+        let result = check_module(&hir, id, &interner, crate::typeck::EntryMain::ByName);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected type errors: {:?}",
+            result.diagnostics
+        );
+        let resourceck_result = crate::resourceck::check_module(
+            &hir,
+            &result.local_types,
+            &result.expr_types,
+            &interner,
+        );
+        assert!(
+            resourceck_result.diagnostics.is_empty(),
+            "unexpected resource errors: {:?}",
+            resourceck_result.diagnostics
+        );
+        assert_eq!(
+            resourceck_result.defer_plans.len(),
+            1,
+            "expected exactly one checked defer plan: {:?}",
+            resourceck_result.defer_plans
+        );
+        (
+            hir,
+            result.local_types,
+            result.expr_types,
+            result.pattern_case,
+            result.call_type_args,
+            resourceck_result,
+            interner,
+            id,
+        )
+    }
+
+    /// Lowers `checked_take_defer_pipeline`'s own program with its sole
+    /// `CheckedDeferPlan` replaced by `tamper`'s own result, asserting
+    /// lowering fails with a structured internal diagnostic whose
+    /// message contains `expected_message_fragment`.
+    fn assert_tampered_defer_plan_rejected(
+        tamper: impl FnOnce(crate::resourceck::CheckedDeferPlan) -> crate::resourceck::CheckedDeferPlan,
+        expected_message_fragment: &str,
+    ) {
+        let (
+            hir,
+            local_types,
+            expr_types,
+            pattern_case,
+            call_type_args,
+            mut resourceck_result,
+            interner,
+            id,
+        ) = checked_take_defer_pipeline();
+        let (defer_id, plan) = resourceck_result
+            .defer_plans
+            .iter()
+            .next()
+            .map(|(id, plan)| (*id, plan.clone()))
+            .expect("checked above");
+        resourceck_result.defer_plans.insert(defer_id, tamper(plan));
+        let outcome = lower_module(
+            &hir,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with a tampered-defer-plan internal error");
+        };
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains(expected_message_fragment),
+            "expected a message containing {expected_message_fragment:?}, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_naming_the_wrong_callee_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.callee = ItemId(9999);
+                plan
+            },
+            "a different callee",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_few_argument_modes_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes.clear();
+                plan
+            },
+            "checked argument mode(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_many_argument_modes_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes.push(crate::resourceck::ConsumeInfo::Observe);
+                plan
+            },
+            "checked argument mode(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_few_argument_types_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types.clear();
+                plan
+            },
+            "checked argument type(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_too_many_argument_types_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types.push(Ty::I64);
+                plan
+            },
+            "checked argument type(s)",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_the_wrong_argument_type_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_types[0] = Ty::I64;
+                plan
+            },
+            "disagrees with its own resolved parameter type",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_the_wrong_return_type_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.return_type = Ty::I64;
+                plan
+            },
+            "disagrees with its own resolved signature",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_a_mode_disagreeing_with_its_own_consume_site_is_rejected() {
+        assert_tampered_defer_plan_rejected(
+            |mut plan| {
+                plan.arg_modes[0] = crate::resourceck::ConsumeInfo::Observe;
+                plan
+            },
+            "disagreeing with its own recorded consume site",
+        );
+    }
+
+    #[test]
+    fn a_defer_plan_with_an_out_of_range_registration_order_replay_is_rejected() {
+        // A single `defer` in this program is trivially "in order" on
+        // its own -- this instead proves the *replay* check itself
+        // fires by directly constructing two cleanup actions for the
+        // same defer id at decreasing-then-increasing order, exactly
+        // the shape `emit_checked_cleanup` must reject.
+        let (
+            hir,
+            local_types,
+            expr_types,
+            pattern_case,
+            call_type_args,
+            mut resourceck_result,
+            interner,
+            id,
+        ) = checked_take_defer_pipeline();
+        let (defer_id, _) = resourceck_result
+            .defer_plans
+            .iter()
+            .next()
+            .map(|(id, plan)| (*id, plan.clone()))
+            .expect("checked above");
+        for actions in resourceck_result.cleanup_edges.values_mut() {
+            let existing: Vec<_> = actions
+                .iter()
+                .filter(|a| matches!(a, crate::resourceck::CleanupAction::Defer(_)))
+                .cloned()
+                .collect();
+            for action in existing {
+                actions.push(action);
+            }
+        }
+        let outcome = lower_module(
+            &hir,
+            &local_types,
+            &expr_types,
+            &pattern_case,
+            &call_type_args,
+            &HashMap::new(),
+            &HashMap::new(),
+            &resourceck_result.cleanup_edges,
+            &resourceck_result.consume_sites,
+            &resourceck_result.defer_plans,
+            &interner,
+            id,
+        );
+        let Err(diagnostics) = outcome else {
+            panic!("expected lowering to fail with an out-of-order replay internal error");
+        };
+        assert!(
+            diagnostics.iter().any(
+                |d| d.message.contains("own declared LIFO registration order")
+                    || d.message.contains("this frame never lowered")
+            ),
+            "expected an out-of-order or double-replay internal error, got: {diagnostics:?}"
+        );
+        let _ = defer_id;
     }
 
     #[test]
@@ -7942,7 +8333,9 @@ mod tests {
         let mut function_sigs = HashMap::new();
         function_sigs.insert(callee_item, (Vec::new(), Vec::new(), Ty::I64));
         let g_name = interner.intern("g");
-        let (local_types, expr_types, pattern_case) = empty_maps();
+        let (local_types, _, pattern_case) = empty_maps();
+        let mut expr_types: HashMap<ExprId, Ty> = HashMap::new();
+        expr_types.insert(ExprId(1), Ty::I64);
         let call_type_args: HashMap<ExprId, Vec<Ty>> = HashMap::new();
         let mut lowering = direct_lowering_with_generics(
             source,
@@ -8198,10 +8591,16 @@ mod tests {
             type_args: Vec::new(),
             span: Span::dummy(),
         };
+        let arg = HirExpr::Int {
+            id: ExprId(2),
+            value: 0,
+            base: crate::lexer::IntBase::Decimal,
+            span: Span::dummy(),
+        };
         let operand = HirExpr::Call {
             id: call_expr_id,
             callee: Box::new(callee),
-            args: Vec::new(),
+            args: vec![arg],
             span: Span::dummy(),
         };
         let result = lowering.lower_invoke(&mut fb, &operand, "postfix `?`", None);

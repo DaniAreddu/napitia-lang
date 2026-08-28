@@ -376,6 +376,18 @@ mod codes {
     /// a drop reachable through one alias is visible to every other
     /// alias of that same resource, not only the one that performed it.
     pub const RESOURCE_ORIGIN_CONFLICT: &str = "V0081";
+    /// A resource-typed value/slot is used (loaded, dropped, moved,
+    /// captured, passed as any argument, or transferred out) without
+    /// being definitely initialized on *every* reachable path reaching
+    /// that use (`rfcs/0011`) -- never written at all on this path, or
+    /// written on only some of several reachable paths converging here.
+    /// A full forward may-dataflow analysis over `Alloc`/`store.observe`/
+    /// `store.transfer`/`Invoke`'s own success edge, the same reachable-
+    /// union shape `RESOURCE_LEAKED_ON_EXIT` already uses -- never a
+    /// single-hop check of a use's own immediate predecessors, and never
+    /// a lenient default that treats a location this pass recorded
+    /// nothing for as already owned.
+    pub const RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED: &str = "V0082";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -4010,6 +4022,20 @@ fn verify_drop_state(
 /// identity of its own, exactly as before: unifying *that* bookkeeping
 /// through a move too would make a legitimate later use of the new
 /// owner collide with its own now-permanently-consumed `source`.
+///
+/// A value/slot's own role/identity is only ever meaningful once it is
+/// *definitely initialized* on every reachable path reaching the point
+/// it is used (`LocationState`, below) -- `Alloc` starts a resource-
+/// typed slot at `Uninitialized`; `store.observe`/`store.transfer`
+/// initialize it; a full reachable-union-of-predecessors forward
+/// dataflow (the same shape every other check in this pass already
+/// uses) propagates that fact forward, downgrading to
+/// `MaybeUninitialized` the moment even one reachable predecessor never
+/// wrote it. A location this pass never otherwise recorded anything for
+/// resolves to `Uninitialized`, never a lenient fresh `Owned` guess --
+/// every use (`Load` included) of anything not definitely `Initialized`
+/// is independently rejected (`RESOURCE_LOCATION_NOT_DEFINITELY_
+/// INITIALIZED`), before this pass's own role/origin checks even run.
 fn verify_resource_ownership(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
@@ -4037,13 +4063,73 @@ fn verify_resource_ownership(
         Observed,
     }
 
-    /// A value/slot's own current provenance: every resource identity
-    /// it might currently denote (more than one only just past a join
-    /// where reachable predecessors disagree), and whether *every*
-    /// predecessor agrees it is currently `Owned` -- downgraded to
-    /// `Observed` the moment even one disagrees, since an `Observed`
-    /// role must never be silently widened into an owner.
+    /// A value/slot's own current provenance, once definitely
+    /// initialized: every resource identity it might currently denote
+    /// (more than one only just past a join where reachable
+    /// predecessors disagree), and whether *every* predecessor agrees
+    /// it is currently `Owned` -- downgraded to `Observed` the moment
+    /// even one disagrees, since an `Observed` role must never be
+    /// silently widened into an owner.
     type Provenance = (BTreeSet<ValueId>, Role);
+
+    /// A value/slot's own current definite-initialization state
+    /// (`rfcs/0011`) -- deliberately has *no* variant that silently
+    /// grants ownership: a location this pass never otherwise recorded
+    /// anything for is `Uninitialized`, never a lenient fresh `Owned`
+    /// guess. `Alloc` starts a resource-typed slot here; every other
+    /// resource-producing value goes straight to `Initialized` at its
+    /// own definition, since it is never itself a slot with its own
+    /// separate write-then-read lifecycle.
+    #[derive(Clone, PartialEq, Eq)]
+    enum LocationState {
+        /// Never written on this exact path -- reading it is always
+        /// unsound, regardless of what some *other* path might have
+        /// done, since this is the path actually taken.
+        Uninitialized,
+        /// Written, with a definite resolved provenance, on *every*
+        /// reachable path reaching this point.
+        Initialized(Provenance),
+        /// Written on *some* but not *every* reachable path reaching
+        /// this point -- reading it is still unsound: the specific path
+        /// actually taken at runtime might be one of the ones that
+        /// never wrote it. (A role/origin disagreement between two
+        /// paths that *both* wrote it is not this state at all -- it
+        /// stays `Initialized`, with `Provenance`'s own union-origins/
+        /// conservative-role merge already representing it soundly, the
+        /// same way `RESOURCE_LEAKED_ON_EXIT`'s own reachable-union
+        /// dataflow already tolerates disagreement without needing a
+        /// distinct "conflict" state of its own.)
+        MaybeUninitialized,
+    }
+
+    // Resolves `raw`'s own current state, defaulting a location this
+    // pass never otherwise recorded anything for to `Uninitialized` --
+    // never a lenient fresh `Owned` guess. A resource-typed `Alloc`
+    // explicitly seeds `Uninitialized` itself (below), so a missing key
+    // here only ever means a hand-built module referenced a `ValueId`
+    // with no resource-typed definition this pass ever walked at all.
+    let resolve_state =
+        |raw: ValueId, provenance: &HashMap<ValueId, LocationState>| -> LocationState {
+            provenance
+                .get(&raw)
+                .cloned()
+                .unwrap_or(LocationState::Uninitialized)
+        };
+
+    // Resolves `raw`'s own current *identities*, for propagation
+    // continuity only (never for deciding legality -- `check_alias_
+    // safety` alone decides that, and always runs first): a location
+    // that is not definitely `Initialized` has no real identity yet, so
+    // this falls back to `raw` itself purely to keep downstream
+    // bookkeeping well-formed after an already-reported violation, not
+    // to grant it one.
+    let resolve_ids =
+        |raw: ValueId, provenance: &HashMap<ValueId, LocationState>| -> BTreeSet<ValueId> {
+            match provenance.get(&raw) {
+                Some(LocationState::Initialized((ids, _))) => ids.clone(),
+                _ => BTreeSet::from([raw]),
+            }
+        };
 
     /// A specific consuming use rejected because its own resolved
     /// provenance was `Observed`, not `Owned` (`RESOURCE_OBSERVER_
@@ -4055,42 +4141,42 @@ fn verify_resource_ownership(
         StoreMode(ValueId),
     }
 
-    // Resolves `raw`'s own current provenance, defaulting a resource
-    // this pass never otherwise recorded provenance for to a fresh,
-    // self-identified owner -- lenient, matching this pass's existing
-    // leniency elsewhere for provenance it cannot fully reconstruct
-    // (e.g. a load from a slot no reachable store ever wrote, already
-    // an independent concern of the dominance/initialization passes).
-    let resolve_prov = |raw: ValueId, provenance: &HashMap<ValueId, Provenance>| -> Provenance {
-        provenance
-            .get(&raw)
-            .cloned()
-            .unwrap_or_else(|| (BTreeSet::from([raw]), Role::Owned))
-    };
-
-    // Independently checks `raw`'s own resolved provenance is safe to
-    // use at all -- regardless of whether this specific use is
-    // consuming -- against every resource identity already destroyed
-    // through some *other* alias on this path (`RESOURCE_ORIGIN_
-    // CONFLICT`), and, only when this use is itself consuming, that the
-    // resolved role actually grants ownership (`RESOURCE_OBSERVER_
-    // CONSUMED`/`INVALID_RESOURCE_STORE_MODE`). Returns whether a
-    // consuming use may actually proceed -- the caller must then treat
-    // a rejected consuming use as a plain (non-mutating) observation
-    // for `facts`/`live` bookkeeping, so an illegal attempt never
-    // mutates ownership state as if it had legitimately succeeded.
+    // Independently checks `raw` is safe to use at all, in three
+    // strictly-ordered stages -- regardless of whether this specific
+    // use is consuming. First, that it is definitely initialized on
+    // every reachable path reaching this exact use (`RESOURCE_
+    // LOCATION_NOT_DEFINITELY_INITIALIZED`) -- an uninitialized or
+    // only-maybe-initialized location is never treated as owned *or*
+    // observed, since it has no real identity to be either. Second
+    // (only once initialized), that its own resolved identity was not
+    // already destroyed through some *other* alias on this path
+    // (`RESOURCE_ORIGIN_CONFLICT`). Third, only when this use is itself
+    // consuming, that the resolved role actually grants ownership
+    // (`RESOURCE_OBSERVER_CONSUMED`/`INVALID_RESOURCE_STORE_MODE`).
+    // Returns whether a consuming use may actually proceed -- the
+    // caller must then treat a rejected consuming use as a plain
+    // (non-mutating) observation for `facts`/`live` bookkeeping, so an
+    // illegal attempt never mutates ownership state as if it had
+    // legitimately succeeded.
     let check_alias_safety = |raw: ValueId,
-                              provenance: &HashMap<ValueId, Provenance>,
+                              provenance: &HashMap<ValueId, LocationState>,
                               dropped_origins: &HashSet<ValueId>,
                               consumes: bool,
                               store_mode: bool,
+                              uninitialized_uses: &mut Vec<ValueId>,
                               origin_conflicts: &mut Vec<ValueId>,
                               role_violations: &mut Vec<RoleViolation>|
      -> bool {
         if !is_resource(raw) {
             return true;
         }
-        let (identities, role) = resolve_prov(raw, provenance);
+        let (identities, role) = match resolve_state(raw, provenance) {
+            LocationState::Initialized(prov) => prov,
+            LocationState::Uninitialized | LocationState::MaybeUninitialized => {
+                uninitialized_uses.push(raw);
+                return false;
+            }
+        };
         if identities.iter().any(|o| dropped_origins.contains(o)) {
             origin_conflicts.push(raw);
         }
@@ -4272,29 +4358,60 @@ fn verify_resource_ownership(
         }
     }
 
-    // Merges two predecessors' own provenance maps at a join: a key
-    // present in only one predecessor is copied through as-is (that
-    // predecessor's own path simply never touched it); a key present in
-    // both unions their possible identities (either could be the one
-    // actually reached) and keeps `Owned` only if *both* predecessors
-    // already agree it is -- downgraded to `Observed` the moment even
-    // one disagrees, matching `RESOURCE_LEAKED_ON_EXIT`'s own "union,
-    // not intersection" rule for `facts`/`live` below.
+    // Merges two predecessors' own location-state maps at a join,
+    // reachable predecessors only (the caller already filters
+    // unreachable ones out before calling this): a key present in only
+    // one predecessor is treated as `Uninitialized` on the other (a
+    // location never touched at all on a path is exactly as
+    // uninitialized there as one explicitly never stored into), so it
+    // still correctly downgrades to `MaybeUninitialized` rather than
+    // being copied through as if both sides agreed. A key present as
+    // `Initialized` on both unions their possible identities (either
+    // could be the one actually reached) and keeps `Owned` only if
+    // *both* predecessors already agree it is -- downgraded to
+    // `Observed` the moment even one disagrees, matching
+    // `RESOURCE_LEAKED_ON_EXIT`'s own "union, not intersection" rule for
+    // `facts`/`live` below. This one combined lattice merge is what
+    // `RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`'s own definite-
+    // initialization analysis and `RESOURCE_ORIGIN_CONFLICT`'s own
+    // identity/role tracking both run on, together.
+    fn merge_location(a: LocationState, b: LocationState) -> LocationState {
+        match (a, b) {
+            (LocationState::Uninitialized, LocationState::Uninitialized) => {
+                LocationState::Uninitialized
+            }
+            (LocationState::MaybeUninitialized, _) | (_, LocationState::MaybeUninitialized) => {
+                LocationState::MaybeUninitialized
+            }
+            (LocationState::Initialized(_), LocationState::Uninitialized)
+            | (LocationState::Uninitialized, LocationState::Initialized(_)) => {
+                LocationState::MaybeUninitialized
+            }
+            (
+                LocationState::Initialized((a_ids, a_role)),
+                LocationState::Initialized((b_ids, b_role)),
+            ) => {
+                let ids = a_ids.union(&b_ids).copied().collect();
+                let role = if a_role == Role::Owned && b_role == Role::Owned {
+                    Role::Owned
+                } else {
+                    Role::Observed
+                };
+                LocationState::Initialized((ids, role))
+            }
+        }
+    }
+
     fn merge_provenance(
-        mut a: HashMap<ValueId, Provenance>,
-        b: &HashMap<ValueId, Provenance>,
-    ) -> HashMap<ValueId, Provenance> {
-        for (k, (b_ids, b_role)) in b {
+        mut a: HashMap<ValueId, LocationState>,
+        b: &HashMap<ValueId, LocationState>,
+    ) -> HashMap<ValueId, LocationState> {
+        for (k, v) in b {
             a.entry(*k)
-                .and_modify(|(ids, role)| {
-                    ids.extend(b_ids.iter().copied());
-                    *role = if *role == Role::Owned && *b_role == Role::Owned {
-                        Role::Owned
-                    } else {
-                        Role::Observed
-                    };
+                .and_modify(|existing| {
+                    *existing = merge_location(existing.clone(), v.clone());
                 })
-                .or_insert_with(|| (b_ids.clone(), *b_role));
+                .or_insert_with(|| merge_location(LocationState::Uninitialized, v.clone()));
         }
         a
     }
@@ -4304,35 +4421,41 @@ fn verify_resource_ownership(
     // owned-and-not-yet-discharged set), `dropped_origins` (every
     // resource identity actually destroyed by a real `Drop` reaching
     // this point, for `RESOURCE_ORIGIN_CONFLICT`), and `provenance`
-    // (every value/slot's own current identity/role, for both of the
-    // above) -- computed together, by the same single forward walk,
-    // since a consuming use always updates more than one at once.
+    // (every value/slot's own current definite-initialization state,
+    // for all three of the above) -- computed together, by the same
+    // single forward walk, since a consuming use always updates more
+    // than one at once.
     type State = (
         HashSet<ValueId>,
         HashSet<ValueId>,
         HashSet<ValueId>,
-        HashMap<ValueId, Provenance>,
+        HashMap<ValueId, LocationState>,
     );
 
-    let transfer = |block: &BasicBlock,
-                    in_state: &State|
-     -> (
+    // `(new_state, use_after_consume_violations, leaks, role_violations,
+    // origin_conflicts, uninitialized_uses)`.
+    type TransferResult = (
         State,
         Vec<ValueId>,
         Vec<ValueId>,
         Vec<RoleViolation>,
         Vec<ValueId>,
-    ) {
+        Vec<ValueId>,
+    );
+
+    let transfer = |block: &BasicBlock, in_state: &State| -> TransferResult {
         let (mut facts, mut live, mut dropped_origins, mut provenance) = in_state.clone();
         let mut violations = Vec::new();
         let mut role_violations = Vec::new();
         let mut origin_conflicts = Vec::new();
+        let mut uninitialized_uses = Vec::new();
         // A `take`/`Invoke` argument, `Move`/`DeferCapture` source,
         // `Drop`/`store.transfer` operand, or `return`/`raise` operand
-        // must be `Owned`; every use, consuming or not, is checked
-        // against `dropped_origins` regardless. A rejected consuming
-        // use is treated as non-consuming below, so it never mutates
-        // `facts`/`live` as though it had legitimately succeeded.
+        // must be definitely initialized and `Owned`; every use,
+        // consuming or not, is checked against both that and
+        // `dropped_origins`. A rejected consuming use is treated as
+        // non-consuming below, so it never mutates `facts`/`live` as
+        // though it had legitimately succeeded.
         macro_rules! alias_safe {
             ($raw:expr, $consumes:expr, $store_mode:expr) => {
                 check_alias_safety(
@@ -4341,6 +4464,7 @@ fn verify_resource_ownership(
                     &dropped_origins,
                     $consumes,
                     $store_mode,
+                    &mut uninitialized_uses,
                     &mut origin_conflicts,
                     &mut role_violations,
                 )
@@ -4413,10 +4537,13 @@ fn verify_resource_ownership(
                             // rejected attempt must never launder an
                             // `Observed` value into an owner.
                             if is_resource(*source) {
-                                let (ids, _) = resolve_prov(*source, &provenance);
+                                let ids = resolve_ids(*source, &provenance);
                                 provenance.insert(
                                     *result,
-                                    (ids, if legal { Role::Owned } else { Role::Observed }),
+                                    LocationState::Initialized((
+                                        ids,
+                                        if legal { Role::Owned } else { Role::Observed },
+                                    )),
                                 );
                             }
                         }
@@ -4436,18 +4563,31 @@ fn verify_resource_ownership(
                         }
                     }
                     // A `Load`'s own result shares its slot's *current*
-                    // provenance exactly -- an observing slot's own
-                    // loaded alias is `Observed`, sharing the same
-                    // resource identity as whatever was observingly
-                    // stored there, never a fresh identity of its own
-                    // (the actual fix this check exists for: without
-                    // it, an alias loaded from an observing store had
-                    // no recorded connection back to the value it
-                    // aliases at all).
+                    // state exactly -- an observing slot's own loaded
+                    // alias is `Observed`, sharing the same resource
+                    // identity as whatever was observingly stored there,
+                    // never a fresh identity of its own (the actual fix
+                    // this check exists for: without it, an alias loaded
+                    // from an observing store had no recorded connection
+                    // back to the value it aliases at all). The slot's
+                    // own `uninitialized_uses` check already ran above
+                    // (`Load(slot)`'s own operand, via the catch-all
+                    // `alias_safe!` loop) -- a not-definitely-initialized
+                    // load propagates nothing further, rather than
+                    // fabricating an owner for its own result.
                     if let ValueKind::Load(slot) = kind
-                        && let Some(p) = provenance.get(slot).cloned()
+                        && let LocationState::Initialized(prov) = resolve_state(*slot, &provenance)
                     {
-                        provenance.insert(*result, p);
+                        provenance.insert(*result, LocationState::Initialized(prov));
+                    }
+                    // `Alloc` reserves a slot with nothing stored into it
+                    // yet (`rfcs/0011`) -- definitely `Uninitialized`,
+                    // never a lenient fresh owner, so a `Load` reaching
+                    // this exact slot before any reachable `Store`
+                    // writes it is independently rejected
+                    // (`RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`).
+                    if matches!(kind, ValueKind::Alloc) && is_resource(*result) {
+                        provenance.insert(*result, LocationState::Uninitialized);
                     }
                     // Every resource-typed value definition other than a
                     // `Load` (which aliases its own slot's already-
@@ -4484,7 +4624,13 @@ fn verify_resource_ownership(
                             kind,
                             ValueKind::Move { .. } | ValueKind::DeferCapture { .. }
                         ) {
-                            provenance.insert(*result, (BTreeSet::from([*result]), Role::Owned));
+                            provenance.insert(
+                                *result,
+                                LocationState::Initialized((
+                                    BTreeSet::from([*result]),
+                                    Role::Owned,
+                                )),
+                            );
                         }
                     }
                 }
@@ -4531,13 +4677,13 @@ fn verify_resource_ownership(
                     // window, even onto an owned value), so a later
                     // `Load` of `slot` correctly inherits it.
                     if is_resource(*value) {
-                        let (ids, _) = resolve_prov(*value, &provenance);
+                        let ids = resolve_ids(*value, &provenance);
                         let role = if transfers && legal {
                             Role::Owned
                         } else {
                             Role::Observed
                         };
-                        provenance.insert(*slot, (ids, role));
+                        provenance.insert(*slot, LocationState::Initialized((ids, role)));
                     }
                     if transfers && legal && is_resource(*value) {
                         live.insert(*slot);
@@ -4560,7 +4706,7 @@ fn verify_resource_ownership(
                     // (`RESOURCE_ORIGIN_CONFLICT`) -- an illegal attempt
                     // (rejected just above) destroys nothing.
                     if legal && is_resource(*value) {
-                        let (ids, _) = resolve_prov(*value, &provenance);
+                        let ids = resolve_ids(*value, &provenance);
                         dropped_origins.extend(ids);
                     }
                 }
@@ -4637,13 +4783,14 @@ fn verify_resource_ownership(
             leaks,
             role_violations,
             origin_conflicts,
+            uninitialized_uses,
         )
     };
 
     fn in_state_for(
         block_id: BlockId,
         entry: BlockId,
-        entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, Provenance>),
+        entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, LocationState>),
         incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
         reachable: &HashSet<BlockId>,
         out: &HashMap<BlockId, State>,
@@ -4685,7 +4832,10 @@ fn verify_resource_ownership(
             && is_resource(*slot)
         {
             acc.1.insert(*slot);
-            acc.3.insert(*slot, (BTreeSet::from([*slot]), Role::Owned));
+            acc.3.insert(
+                *slot,
+                LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
+            );
         }
         for (pred, extra) in edges {
             let (other_facts, mut other_live, other_dropped, mut other_prov) =
@@ -4694,7 +4844,10 @@ fn verify_resource_ownership(
                 && is_resource(*slot)
             {
                 other_live.insert(*slot);
-                other_prov.insert(*slot, (BTreeSet::from([*slot]), Role::Owned));
+                other_prov.insert(
+                    *slot,
+                    LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
+                );
             }
             acc.0.extend(other_facts);
             acc.1.extend(other_live);
@@ -4713,16 +4866,22 @@ fn verify_resource_ownership(
     // observation that never owned anything to begin with, exactly like
     // one loaded from an observing store never does.
     let mut entry_live: HashSet<ValueId> = HashSet::new();
-    let mut entry_provenance: HashMap<ValueId, Provenance> = HashMap::new();
+    let mut entry_provenance: HashMap<ValueId, LocationState> = HashMap::new();
     for param in &function.params {
         if !is_resource(param.value) {
             continue;
         }
         if param.take {
             entry_live.insert(param.value);
-            entry_provenance.insert(param.value, (BTreeSet::from([param.value]), Role::Owned));
+            entry_provenance.insert(
+                param.value,
+                LocationState::Initialized((BTreeSet::from([param.value]), Role::Owned)),
+            );
         } else {
-            entry_provenance.insert(param.value, (BTreeSet::from([param.value]), Role::Observed));
+            entry_provenance.insert(
+                param.value,
+                LocationState::Initialized((BTreeSet::from([param.value]), Role::Observed)),
+            );
         }
     }
 
@@ -4800,7 +4959,8 @@ fn verify_resource_ownership(
         } else {
             State::default()
         };
-        let (_, violations, leaks, role_violations, origin_conflicts) = transfer(block, &in_state);
+        let (_, violations, leaks, role_violations, origin_conflicts, uninitialized_uses) =
+            transfer(block, &in_state);
         for origin_value in violations {
             diagnostics.push(Diagnostic::error(
                 codes::RESOURCE_USE_AFTER_CONSUME,
@@ -4845,6 +5005,17 @@ fn verify_resource_ownership(
                 Span::dummy(),
                 format!(
                     "function `{function_name}` uses a resource (%{}) in bb{} whose underlying identity was already destroyed through a different alias on some path reaching it",
+                    value.0, block.id.0
+                ),
+            ));
+        }
+        for value in uninitialized_uses {
+            diagnostics.push(Diagnostic::error(
+                codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}` uses a resource (%{}) in bb{} that is not definitely initialized on every path reaching it",
                     value.0, block.id.0
                 ),
             ));
@@ -11401,6 +11572,690 @@ mod tests {
         );
         assert!(
             diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- Resource slots must be definitely initialized, not just live
+    // (`rfcs/0011`) ------------------------------------------------------
+
+    /// `%0 = alloc Resource; %1 = const.bool true; condbranch %1, bb1,
+    /// bb2` (entry) -- `bb1` optionally stores a fresh resource into
+    /// `%0` (`left_mode`) before branching to `bb3`, `bb2` optionally
+    /// does the same (`right_mode`); `None` means that branch never
+    /// touches `%0` at all. `bb3` (the join) loads `%0` and returns.
+    fn uninit_join_caller(
+        name: Symbol,
+        resource: ItemId,
+        resource_ty: Ty,
+        left_mode: Option<crate::nir::OwnershipMode>,
+        right_mode: Option<crate::nir::OwnershipMode>,
+    ) -> Function {
+        let mut bb1_instructions = Vec::new();
+        if let Some(mode) = left_mode {
+            bb1_instructions.push(Instruction::Value {
+                result: ValueId(2),
+                ty: resource_ty.clone(),
+                kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+            });
+            bb1_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(2),
+                mode,
+            });
+        }
+        let mut bb2_instructions = Vec::new();
+        if let Some(mode) = right_mode {
+            bb2_instructions.push(Instruction::Value {
+                result: ValueId(3),
+                ty: resource_ty.clone(),
+                kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+            });
+            bb2_instructions.push(Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(3),
+                mode,
+            });
+        }
+        Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Const(Const::Bool(true)),
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: bb1_instructions,
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: bb2_instructions,
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_direct_uninitialized_resource_load_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn initialization_on_only_one_branch_via_transfer_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = uninit_join_caller(
+            name,
+            resource,
+            resource_ty,
+            Some(crate::nir::OwnershipMode::Transfer),
+            None,
+        );
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn initialization_on_only_one_branch_via_observe_is_rejected() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = uninit_join_caller(
+            name,
+            resource,
+            resource_ty,
+            Some(crate::nir::OwnershipMode::Observe),
+            None,
+        );
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn reversed_branches_still_reject_the_uninitialized_side() {
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = uninit_join_caller(
+            name,
+            resource,
+            resource_ty,
+            None,
+            Some(crate::nir::OwnershipMode::Transfer),
+        );
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn initialization_on_every_reachable_branch_is_accepted() {
+        // Both branches transfer a fresh (differently-origined) resource
+        // into the slot -- initialization itself is unconditionally
+        // sound here; any origin/role disagreement at the join is
+        // `RESOURCE_ORIGIN_CONFLICT`'s own concern, never this check's.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = uninit_join_caller(
+            name,
+            resource,
+            resource_ty,
+            Some(crate::nir::OwnershipMode::Transfer),
+            Some(crate::nir::OwnershipMode::Transfer),
+        );
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permuting_the_block_vector_never_changes_the_v0082_result() {
+        fn diagnoses_v0082(order: &[BlockId]) -> bool {
+            let mut interner = Interner::new();
+            let name = interner.intern("f");
+            let resource_name = interner.intern("File");
+            let resource = ItemId(1);
+            let resource_ty = Ty::Named(resource, resource_name);
+            let mut function = uninit_join_caller(
+                name,
+                resource,
+                resource_ty,
+                Some(crate::nir::OwnershipMode::Transfer),
+                None,
+            );
+            let by_id: HashMap<BlockId, BasicBlock> =
+                function.blocks.drain(..).map(|b| (b.id, b)).collect();
+            function.blocks = order.iter().map(|id| by_id[id].clone()).collect();
+            let diagnostics = verify_one_with_aggregates(
+                function,
+                leaked_resource_records(resource, resource_name),
+                Vec::new(),
+                &interner,
+            );
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED)
+        }
+
+        let entry_first = [0u32, 1, 2, 3];
+        let reversed = [3u32, 2, 1, 0];
+        let entry_last = [1u32, 2, 3, 0];
+        let shuffled = [2u32, 0, 3, 1];
+        for order in [entry_first, reversed, entry_last, shuffled] {
+            let order: Vec<BlockId> = order.into_iter().map(BlockId).collect();
+            assert!(
+                diagnoses_v0082(&order),
+                "expected V0082 regardless of block order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreachable_predecessors_own_store_never_initializes_a_reachable_join() {
+        // bb1 (the only *reachable* path into bb3) never stores into
+        // `%0`; bb20 (never actually targeted by anything reachable from
+        // entry) does -- its own store must not count.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    }],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(20),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: crate::nir::OwnershipMode::Transfer,
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_cycles_own_store_never_initializes_a_reachable_join() {
+        // bb20 and bb21 only ever branch to each other -- an unreachable
+        // cycle, per `compute_dominators`'s own doc comment concern --
+        // and bb20 stores into `%0`, but nothing reachable ever reaches
+        // either of them.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    }],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(20),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: crate::nir::OwnershipMode::Transfer,
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(21)),
+                },
+                BasicBlock {
+                    id: BlockId(21),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(20)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_loop_back_edge_that_may_bypass_initialization_is_rejected() {
+        // bb1 is the loop header: reached directly from entry (which
+        // never initializes `%0`) *and* from bb2 (the loop body, which
+        // does, then branches back) -- the exit at bb3 may be taken on
+        // the very first pass, before the body ever ran.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(0),
+                        ty: resource_ty.clone(),
+                        kind: ValueKind::Alloc,
+                    }],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::Bool,
+                        kind: ValueKind::Const(Const::Bool(true)),
+                    }],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: crate::nir::OwnershipMode::Transfer,
+                        },
+                    ],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(4),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_chain_before_initialization_is_accepted() {
+        // Five ordinary hops between the `Alloc` and the `store.transfer`
+        // that actually initializes it, then one more before the `Load`
+        // -- proves the analysis genuinely propagates the fact forward,
+        // not merely a single-hop check of a load's own immediate
+        // predecessor.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let mut blocks = vec![BasicBlock {
+            id: BlockId(0),
+            instructions: vec![Instruction::Value {
+                result: ValueId(0),
+                ty: resource_ty.clone(),
+                kind: ValueKind::Alloc,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+        }];
+        for hop in 1..5u32 {
+            blocks.push(BasicBlock {
+                id: BlockId(hop),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(hop + 1)),
+            });
+        }
+        blocks.push(BasicBlock {
+            id: BlockId(5),
+            instructions: vec![
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: resource_ty.clone(),
+                    kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                },
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(2),
+                    mode: crate::nir::OwnershipMode::Transfer,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(6)),
+        });
+        blocks.push(BasicBlock {
+            id: BlockId(6),
+            instructions: vec![Instruction::Value {
+                result: ValueId(4),
+                ty: resource_ty,
+                kind: ValueKind::Load(ValueId(0)),
+            }],
+            terminator: Terminator::Return(None),
+        });
+        let function = Function {
+            id: ItemId(0),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks,
+        };
+        let diagnostics = verify_one_with_aggregates(
+            function,
+            leaked_resource_records(resource, resource_name),
+            Vec::new(),
+            &interner,
+        );
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_success_and_failure_edge_reaching_the_same_target_rejects_the_load() {
+        // Both `ok_target` and the sole `err_target` point at the same
+        // block, which then loads `ok_slot` -- only the success edge
+        // ever actually writes it, so the load must still be rejected,
+        // never treated as initialized just because *some* edge into
+        // this block happens to write it.
+        let mut interner = Interner::new();
+        let f_name = interner.intern("f");
+        let resource_name = interner.intern("File");
+        let resource = ItemId(2);
+        let f = ItemId(0);
+        let callee = ItemId(1);
+        let resource_ty = Ty::Named(resource, resource_name);
+        let (shape_id, shape_layout, shape_name) = variant_shape(&mut interner);
+        let g_name = interner.intern("g");
+        let callee_fn = Function {
+            id: callee,
+            name: g_name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: resource_ty.clone(),
+            raises: vec![shape_id],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: resource_ty.clone(),
+                    kind: ValueKind::RecordCreate(resource, Vec::new(), Vec::new()),
+                }],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        };
+        let caller = Function {
+            id: f,
+            name: f_name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: resource_ty.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Named(shape_id, shape_name),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(0),
+                        ok_target: BlockId(1),
+                        err_targets: vec![InvokeErrTarget {
+                            variant: shape_id,
+                            slot: ValueId(1),
+                            target: BlockId(1),
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(2),
+                        ty: resource_ty,
+                        kind: ValueKind::Load(ValueId(0)),
+                    }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![callee_fn, caller],
+            records: leaked_resource_records(resource, resource_name),
+            variants: vec![(shape_id, shape_layout)],
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            codes_of(&diagnostics).contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
             "unexpected diagnostics: {diagnostics:?}"
         );
     }

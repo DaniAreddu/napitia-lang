@@ -96,7 +96,21 @@ the reasoning and the open questions this raises.
   `ResourceHandle`: an ordinary parameter binding and an observing
   store both mint a handle that can never `Drop`/transfer the resource
   it points to, regardless of what role the value it was built from
-  had. This is a real memory-safety layer -- not the universal
+  had. A value/slot's own role/identity is only ever meaningful once it
+  is definitely initialized on every reachable path reaching its own
+  use: a missing location resolves to `Uninitialized`, never a lenient
+  fresh `Owned` guess, and a join where even one reachable predecessor
+  never wrote it downgrades to `MaybeUninitialized` -- either is
+  independently rejected (`V0082`) before role/origin checks even run.
+  `resourceck`'s own checked metadata (`consume_sites`, and each
+  `defer`'s own `CheckedDeferPlan` -- callee, argument modes/types,
+  return type, and LIFO registration order) is read back by `nir::
+  lower` directly rather than re-derived from a callee's own `take`
+  flags or a binding's own AST shape a second time, and is validated
+  field-by-field against what lowering resolves on its own; missing or
+  disagreeing metadata is a structured internal error, never a silent
+  fallback to `Ty::Error`, `false`, or treating an argument as merely
+  observing. This is a real memory-safety layer -- not the universal
   region-inference design sketched below, which remains unimplemented.
 
 ## Accepted design direction

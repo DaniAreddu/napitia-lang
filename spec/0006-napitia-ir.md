@@ -468,8 +468,28 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   identity of its own -- unifying *that* bookkeeping through a move
   too would make a legitimate later use of the new owner collide with
   its own now-permanently-consumed `source`.
+- **Definite initialization** (Alpha 0.1.7, `rfcs/0011`): every
+  resource-typed value/slot's own role/identity is only ever meaningful
+  once it is definitely initialized on *every* reachable path reaching
+  the point it is used -- a three-state lattice (`Uninitialized`/
+  `Initialized(origins, role)`/`MaybeUninitialized`), computed by the
+  same reachable-union forward dataflow every other check above already
+  uses. `Alloc` starts a resource-typed slot at `Uninitialized`;
+  `store.observe`/`store.transfer` initialize it; a fallible `Invoke`'s
+  own success slot is initialized only on its own `ok_target` edge. A
+  join downgrades to `MaybeUninitialized` the moment even one reachable
+  predecessor never wrote it -- a key present on only one side of a
+  join is treated as `Uninitialized` on the other, never copied through
+  as if both agreed. A location this pass never recorded anything for
+  resolves to `Uninitialized`, never a lenient fresh `Owned` guess:
+  every use -- a `Load` included -- of anything not definitely
+  `Initialized` is rejected (`V0082`) before this check's own role/
+  origin checks even run, and before role/origin disagreement between
+  two predecessors that *both* wrote it is even considered (that stays
+  `Initialized`, with the union-origins/conservative-role merge above
+  already representing it soundly).
 
-It reports structured diagnostics (`V0001`–`V0081` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0082` as of this milestone)
 and never panics; a module that fails verification is never handed to
 the interpreter, and the interpreter's normal entry point
 (`Interpreter::run`) only ever receives a verified module — there is no

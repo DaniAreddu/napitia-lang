@@ -1,0 +1,22 @@
+// Dropping the same structural field twice is rejected, exactly like
+// dropping the same whole local twice already was (`rfcs/0012`).
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func main() -> i64 {
+    mutable session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    value input = session.input;
+    drop input;
+    drop input;
+    drop session;
+    return 0;
+}

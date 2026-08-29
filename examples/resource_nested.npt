@@ -1,0 +1,34 @@
+// A resource declared with a resource-typed field (`rfcs/0012`): a
+// resource may contain another resource, and the outer aggregate
+// becomes affine transitively.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func sink(take file: File) -> i64 {
+    value d = file.descriptor;
+    drop file;
+    return d;
+}
+
+func detach(take session: Session) -> File {
+    // Transfers only `session.input`; `session.output` is unaffected
+    // and is structurally destroyed when `session` is dropped below.
+    value input = session.input;
+    drop session;
+    return input;
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 3 },
+        output: File { descriptor: 4 },
+    };
+    value input = detach(session);
+    return sink(input);
+}

@@ -15,9 +15,10 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::hir::ItemId;
-use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
+use crate::nir::{Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind};
+use crate::place::{Place, Projection};
 use crate::symbol::Interner;
-use crate::types::Evidence;
+use crate::types::{Evidence, Ty};
 
 /// A resource record's own identity within one [`Interpreter`]'s own
 /// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
@@ -208,6 +209,86 @@ impl ResourceTable {
         self.records[id.0 as usize].status = ResourceStatus::Dropped;
         Ok(())
     }
+
+    /// Reads `handle`'s own field at `index` without disturbing it
+    /// (`rfcs/0012`) -- legal through both an `Owner` and an `Observer`
+    /// handle, exactly like reading the resource's own top-level
+    /// identity already is ([`Self::observe`]).
+    fn observe_field(
+        &self,
+        handle: ResourceHandle,
+        index: usize,
+    ) -> Result<Value, InterpreterError> {
+        let record = self.observe(handle)?;
+        record
+            .fields
+            .get(index)
+            .cloned()
+            .ok_or_else(|| invalid("a place projects a field index out of range for this resource"))
+    }
+
+    /// Removes `handle`'s own field at `index`, leaving a
+    /// [`Value::Moved`] tombstone behind, and returns the removed value
+    /// (`rfcs/0012`) -- only ever legal through an `Owner` handle:
+    /// transferring a field out through a merely-observing handle would
+    /// let an observer silently grant itself ownership of something it
+    /// was only ever supposed to read.
+    fn take_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+    ) -> Result<Value, InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot transfer a field through a merely-observing resource handle",
+            ));
+        }
+        let record = self.observe(handle)?;
+        let _ = record;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        Ok(std::mem::replace(slot, Value::Moved))
+    }
+
+    /// Overwrites `handle`'s own field at `index` with `value`
+    /// (`rfcs/0012`, structural reinitialization) -- only ever legal
+    /// through an `Owner` handle, for the same reason
+    /// [`Self::take_field`] is. Defensively rejects overwriting a field
+    /// that is not currently a tombstone (`Moved`/`Dropped`): `nir::
+    /// verify` already statically guarantees `StorePlace` only ever
+    /// targets a provably-empty place, but this stage never trusts that
+    /// blindly either.
+    fn set_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+        value: Value,
+    ) -> Result<(), InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot reinitialize a field through a merely-observing resource handle",
+            ));
+        }
+        let record = self.observe(handle)?;
+        let _ = record;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        if !matches!(slot, Value::Moved | Value::Dropped) {
+            return Err(invalid(
+                "cannot overwrite a resource field that still owns a live value",
+            ));
+        }
+        *slot = value;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +320,24 @@ pub enum Value {
     /// clones) duplicates only the cheap handle, never the resource's
     /// own runtime identity or data.
     Resource(ResourceHandle),
+    /// A structural tombstone (`rfcs/0012`, Alpha 0.1.8) left behind in
+    /// exactly the field slot a `PlaceRead { mode: Transfer }` just took
+    /// ownership out of, inside a plain `Record`/`Variant` value (a
+    /// `resource`'s own fields are tombstoned directly in its
+    /// `ResourceTable` record instead -- see [`ResourceRecord::fields`]
+    /// -- since they are never held inline the way an ordinary
+    /// aggregate's are). Reading a `Moved` field is a structured runtime
+    /// error, never a silent `Unit`/default value -- `nir::verify`
+    /// already statically guarantees this can never happen for verified
+    /// NIR; this is this stage's own independent backstop, not a
+    /// substitute for it.
+    Moved,
+    /// Like [`Value::Moved`], but left by the recursive structural
+    /// destruction a `Drop` of an enclosing aggregate applies to each of
+    /// its own still-live affine fields (`rfcs/0012`) -- distinguished
+    /// from `Moved` only for a clearer error message on a later
+    /// (already-impossible, for verified NIR) use.
+    Dropped,
 }
 
 /// A condition the interpreter detects and reports instead of crashing:
@@ -305,16 +404,316 @@ impl<'a> Interpreter<'a> {
             .any(|(id, layout)| *id == item && layout.affine)
     }
 
-    /// Transfers ownership of `value` if it is a resource (Blocker 8);
-    /// passes any other value through unchanged. Shared by both
-    /// directions ownership crosses a call boundary: a `take`
-    /// argument's own transfer *into* a call, and a returned value's
-    /// own transfer back *out* of one.
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`) -- mirrors
+    /// `nir::lower`'s/`resourceck`'s identical query, independently
+    /// recomputed from this module's own `records`/`variants` layouts
+    /// (never a generic-instantiation-aware substitution here: this is
+    /// only ever consulted while destroying an *already-constructed*
+    /// runtime `Variant` value's own active-case payload, whose payload
+    /// types come from that one concrete case's own declared shape).
+    /// Guarded against a genuinely cyclic declaration the same way every
+    /// other stage's identical query is: a cycle back-edge contributes
+    /// `false` to that one occurrence alone, never cached (this is not
+    /// called densely enough to need memoizing).
+    fn is_affine(&self, ty: &Ty) -> bool {
+        self.is_affine_visiting(ty, &mut HashSet::new())
+    }
+
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>) -> bool {
+        let Ty::Named(item, _) = ty else {
+            return false;
+        };
+        if self.is_resource(*item) {
+            return true;
+        }
+        if !visiting.insert(*item) {
+            return false;
+        }
+        let field_types: Vec<Ty> = if let Some((_, record)) =
+            self.module.records.iter().find(|(id, _)| id == item)
+        {
+            record.fields.iter().map(|(_, t)| t.clone()).collect()
+        } else if let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| id == item) {
+            variant
+                .cases
+                .iter()
+                .flat_map(|c| c.payload.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let result = field_types
+            .iter()
+            .any(|fty| self.is_affine_visiting(fty, visiting));
+        visiting.remove(item);
+        result
+    }
+
+    /// Reads or removes the value at `place`'s own final projection step
+    /// (`rfcs/0012`), recursing through zero or more `Value::Record`
+    /// ancestors it passes through on the way there and rebuilding each
+    /// one, then writing the rebuilt root back into `values[place.root]`
+    /// -- a plain record's own fields are held directly, by value, with
+    /// no separate addressable identity of their own -- but mutating a
+    /// `resource`'s own field storage in place, directly through the
+    /// resource table, the moment the walk passes through one, since a
+    /// resource's own fields are never held inline (`rfcs/0011`, Blocker
+    /// 8). `mode: Observe` never mutates anything at all (only ever
+    /// clones); `mode: Transfer` leaves a [`Value::Moved`] tombstone
+    /// behind at the exact field it removed.
+    fn access_place(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        place: &Place<ValueId>,
+        mode: OwnershipMode,
+    ) -> Result<Value, InterpreterError> {
+        let root = get(values, &place.root)?;
+        let (result, updated_root) = self.access_projections(root, &place.projections, mode)?;
+        if let Some(updated_root) = updated_root {
+            values.insert(place.root, updated_root);
+        }
+        Ok(result)
+    }
+
+    /// Writes `value` into `place`'s own final projection step
+    /// (`rfcs/0012`, structural reinitialization) -- the write-only
+    /// counterpart of [`Self::access_place`]'s `Transfer` mode, sharing
+    /// its identical container-navigation logic.
+    fn store_place(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        place: &Place<ValueId>,
+        value: Value,
+    ) -> Result<(), InterpreterError> {
+        let root = get(values, &place.root)?;
+        let updated_root = self.store_projections(root, &place.projections, value)?;
+        values.insert(place.root, updated_root);
+        Ok(())
+    }
+
+    /// Returns `(the accessed value, Some(the rebuilt container) if it
+    /// was a plain record held by value, or None if the mutation --
+    /// `Transfer` only -- already happened directly in the resource
+    /// table instead)`.
+    fn access_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+        mode: OwnershipMode,
+    ) -> Result<(Value, Option<Value>), InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return match mode {
+                OwnershipMode::Observe => Ok((container.clone(), Some(container))),
+                OwnershipMode::Transfer => Ok((container, None)),
+            };
+        };
+        let Projection::Field { field, .. } = first else {
+            return Err(invalid(
+                "a place projects through a variant field, which this milestone's runtime never \
+                 produces",
+            ));
+        };
+        let index = field.0 as usize;
+        match container {
+            Value::Resource(handle) => {
+                let value = if rest.is_empty() {
+                    match mode {
+                        OwnershipMode::Observe => {
+                            self.resources.borrow().observe_field(handle, index)?
+                        }
+                        OwnershipMode::Transfer => {
+                            self.resources.borrow_mut().take_field(handle, index)?
+                        }
+                    }
+                } else {
+                    let inner = self.resources.borrow().observe_field(handle, index)?;
+                    let (value, updated_inner) = self.access_projections(inner, rest, mode)?;
+                    if let Some(updated_inner) = updated_inner {
+                        self.resources
+                            .borrow_mut()
+                            .set_field(handle, index, updated_inner)?;
+                    }
+                    value
+                };
+                Ok((value, None))
+            }
+            Value::Record { item, mut fields } => {
+                let Some(slot) = fields.get_mut(index) else {
+                    return Err(invalid(
+                        "a place projects a field index out of range for this record",
+                    ));
+                };
+                let value = if rest.is_empty() {
+                    match mode {
+                        OwnershipMode::Observe => slot.clone(),
+                        OwnershipMode::Transfer => std::mem::replace(slot, Value::Moved),
+                    }
+                } else {
+                    let inner = std::mem::replace(slot, Value::Moved);
+                    let (value, updated_inner) = self.access_projections(inner, rest, mode)?;
+                    *slot = updated_inner.unwrap_or(Value::Moved);
+                    value
+                };
+                Ok((value, Some(Value::Record { item, fields })))
+            }
+            Value::Moved => Err(invalid("use of a field after it was already moved")),
+            Value::Dropped => Err(invalid("use of a field after it was already dropped")),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    /// The write-only counterpart of [`Self::access_projections`]:
+    /// navigates the same way, but only ever replaces the final field's
+    /// own tombstone with `value` (`rfcs/0012`), rather than reading or
+    /// removing anything.
+    fn store_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+        value: Value,
+    ) -> Result<Value, InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(value);
+        };
+        let Projection::Field { field, .. } = first else {
+            return Err(invalid(
+                "a place projects through a variant field, which this milestone's runtime never \
+                 produces",
+            ));
+        };
+        let index = field.0 as usize;
+        match container {
+            Value::Resource(handle) => {
+                if rest.is_empty() {
+                    self.resources
+                        .borrow_mut()
+                        .set_field(handle, index, value)?;
+                } else {
+                    let inner = self.resources.borrow().observe_field(handle, index)?;
+                    let updated_inner = self.store_projections(inner, rest, value)?;
+                    self.resources
+                        .borrow_mut()
+                        .set_field(handle, index, updated_inner)?;
+                }
+                Ok(Value::Resource(handle))
+            }
+            Value::Record { item, mut fields } => {
+                let Some(slot) = fields.get_mut(index) else {
+                    return Err(invalid(
+                        "a place projects a field index out of range for this record",
+                    ));
+                };
+                if rest.is_empty() {
+                    if !matches!(slot, Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a record field that still owns a live value",
+                        ));
+                    }
+                    *slot = value;
+                } else {
+                    let inner = std::mem::replace(slot, Value::Moved);
+                    *slot = self.store_projections(inner, rest, value)?;
+                }
+                Ok(Value::Record { item, fields })
+            }
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    /// Recursively destroys `value` (`rfcs/0012`): a `resource` handle
+    /// goes through the ordinary resource table drop; a plain, still-
+    /// affine `Variant`'s own *active* case is walked to destroy every
+    /// one of its own live affine payload fields, exactly the "only the
+    /// active case is destroyed" rule `rfcs/0012` specifies -- the one
+    /// case `resourceck`'s own compile-time cleanup planning cannot
+    /// expand into individual per-field `Drop` actions itself, since
+    /// which case is live is not known until runtime (see
+    /// `resourceck::flow::FlowChecker::structural_drop_targets`'s own
+    /// doc comment on `variant_items`). A plain, non-affine value (or
+    /// one already `Moved`/`Dropped`) is left untouched -- the caller is
+    /// responsible for only ever calling this on something it already
+    /// knows is still live.
+    fn drop_value(&self, value: Value) -> Result<(), InterpreterError> {
+        match value {
+            Value::Resource(handle) => {
+                self.resources.borrow_mut().drop_resource(handle)?;
+                #[cfg(test)]
+                self.event_log
+                    .borrow_mut()
+                    .push(format!("drop:{}", handle.id.0));
+                Ok(())
+            }
+            Value::Variant {
+                item,
+                case,
+                payload,
+            } => {
+                let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item)
+                else {
+                    return Err(invalid("drop of a value naming an unknown variant"));
+                };
+                let Some(case_layout) = variant.cases.get(case) else {
+                    return Err(invalid(
+                        "drop of a variant value naming an out-of-range case",
+                    ));
+                };
+                let payload_types = case_layout.payload.clone();
+                for (field, ty) in payload.into_iter().zip(payload_types) {
+                    if self.is_affine(&ty) && !matches!(field, Value::Moved | Value::Dropped) {
+                        self.drop_value(field)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Transfers ownership of `value` if it is a resource (Blocker 8),
+    /// recursing into a plain `Record`/`Variant`'s own fields/payload to
+    /// transfer any resource nested inside *those* too (`rfcs/0012`) --
+    /// without this, constructing a new aggregate from an existing
+    /// resource value would leave the *source* `ValueId`'s own cached
+    /// copy holding a handle whose generation was never bumped, so it
+    /// would still look like a live, undestroyed obligation of this
+    /// frame's own to `leaked_resource`, even once the resource is only
+    /// really reachable through the new aggregate now. A no-op for a
+    /// non-affine leaf. Shared by every place ownership genuinely
+    /// crosses a boundary: a `take` argument's own transfer *into* a
+    /// call, a returned value's own transfer back *out* of one, and a
+    /// `record.create`/`variant.create`'s own field/payload arguments
+    /// (`resourceck`/`nir::verify` already require every one of those to
+    /// be an unconditional transfer, mirrored here).
     fn transfer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
         match value {
             Value::Resource(handle) => Ok(Value::Resource(
                 self.resources.borrow_mut().transfer(handle)?,
             )),
+            Value::Record { item, fields } => Ok(Value::Record {
+                item,
+                fields: fields
+                    .into_iter()
+                    .map(|f| self.transfer_if_resource(f))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|f| self.transfer_if_resource(f))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             other => Ok(other),
         }
     }
@@ -525,7 +924,11 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, kind, .. } => {
-                        let value = self.eval(kind, &values, &evidence)?;
+                        let value = if let ValueKind::PlaceRead { place, mode } = kind {
+                            self.access_place(&mut values, place, *mode)?
+                        } else {
+                            self.eval(kind, &values, &evidence)?
+                        };
                         values.insert(*result, value);
                     }
                     crate::nir::Instruction::Store { slot, value, mode } => {
@@ -563,12 +966,8 @@ impl<'a> Interpreter<'a> {
                         // `ValueId`) is independently caught here too,
                         // never silently treated as a fresh drop.
                         match get(&values, value)? {
-                            Value::Resource(handle) => {
-                                self.resources.borrow_mut().drop_resource(handle)?;
-                                #[cfg(test)]
-                                self.event_log
-                                    .borrow_mut()
-                                    .push(format!("drop:{}", handle.id.0));
+                            v @ (Value::Resource(_) | Value::Variant { .. }) => {
+                                self.drop_value(v)?;
                             }
                             other => {
                                 return Err(invalid(format!(
@@ -578,6 +977,10 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         values.remove(value);
+                    }
+                    crate::nir::Instruction::StorePlace { place, value } => {
+                        let v = get(&values, value)?;
+                        self.store_place(&mut values, place, v)?;
                     }
                 }
             }
@@ -721,6 +1124,15 @@ impl<'a> Interpreter<'a> {
             // place -- defended here too, rather than trusted blindly.
             ValueKind::Move { source } => self.transfer_if_resource(get(values, source)?),
             ValueKind::DeferCapture { source } => self.transfer_if_resource(get(values, source)?),
+            // Always intercepted by `call_function`'s own instruction
+            // loop before `eval` is ever reached (`rfcs/0012`): unlike
+            // every other `ValueKind`, a place read may need to *mutate*
+            // `values` itself (writing back a rebuilt container after a
+            // `Transfer`), which this method's own `&HashMap` (not
+            // `&mut`) signature cannot do.
+            ValueKind::PlaceRead { .. } => Err(invalid(
+                "ValueKind::PlaceRead must be evaluated by call_function directly, never through eval",
+            )),
             ValueKind::Add(a, b) => arith(
                 get(values, a)?,
                 get(values, b)?,
@@ -865,7 +1277,7 @@ impl<'a> Interpreter<'a> {
             ValueKind::RecordCreate(item, _type_args, field_ids) => {
                 let fields = field_ids
                     .iter()
-                    .map(|id| get(values, id))
+                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
                     .collect::<Result<Vec<_>, _>>()?;
                 // A `resource` gets its own unique runtime identity
                 // (Blocker 8) rather than being represented inline the
@@ -919,7 +1331,7 @@ impl<'a> Interpreter<'a> {
             } => {
                 let payload = payload
                     .iter()
-                    .map(|id| get(values, id))
+                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *variant,
@@ -1017,6 +1429,8 @@ fn kind_name(value: &Value) -> &'static str {
         Value::Record { .. } => "a record",
         Value::Variant { .. } => "a variant",
         Value::Resource(_) => "a resource",
+        Value::Moved => "a moved field",
+        Value::Dropped => "a dropped field",
     }
 }
 
@@ -1167,6 +1581,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -1219,6 +1639,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -1520,6 +1946,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         let nir = lower_nir(
             &hir,
@@ -1566,6 +1998,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         let nir = lower_nir(
             &hir,

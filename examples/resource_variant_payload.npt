@@ -1,0 +1,31 @@
+// A variant with a resource-typed payload (`rfcs/0012`): a variant
+// becomes affine transitively when one of its cases carries an affine
+// payload, and destructuring it through an ordinary `match` transfers
+// ownership of the bound case's own payload.
+resource File {
+    descriptor: i64,
+}
+
+variant FileResult {
+    Found(File),
+    Missing,
+}
+
+func open_maybe(ok: bool) -> FileResult {
+    if ok {
+        return FileResult.Found(File { descriptor: 8 });
+    }
+    return FileResult.Missing;
+}
+
+func main() -> i64 {
+    value result = open_maybe(true);
+    return match result {
+        Found(file) => {
+            value d = file.descriptor;
+            drop file;
+            d
+        },
+        Missing => -1,
+    }
+}

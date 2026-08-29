@@ -1,0 +1,28 @@
+// Reinitializing an emptied structural field (`rfcs/0012`): once every
+// missing field is restored, the parent is complete again and may be
+// transferred as a whole.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func consume(take session: Session) -> i64 {
+    value total = session.input.descriptor;
+    drop session;
+    return total;
+}
+
+func main() -> i64 {
+    mutable session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    value previous = session.input;
+    drop previous;
+    session.input = File { descriptor: 5 };
+    return consume(session);
+}

@@ -267,6 +267,14 @@ fn format_value(value: &Value) -> String {
         // like a variant's own case number, this only names the shape,
         // never fabricates field data it cannot see.
         Value::Resource(_) => "<resource>".to_string(),
+        // Never actually observable from a top-level `run` result for
+        // any program that passed `nir::verify` (`rfcs/0012`) -- a
+        // tombstone only ever occupies a field slot inside an aggregate
+        // that already moved or dropped it, never a value returned
+        // whole. Printed rather than panicking anyway, matching this
+        // module's own no-panic-on-unexpected-input rule.
+        Value::Moved => "<moved>".to_string(),
+        Value::Dropped => "<dropped>".to_string(),
     }
 }
 

@@ -335,6 +335,35 @@ pub struct TypeckResult {
     /// (`Equal[T].equal(..)`), the one resolved [`Evidence`] answering
     /// it -- keyed by the call expression's own `ExprId`.
     pub protocol_call_evidence: HashMap<ExprId, Evidence>,
+    /// For every `HirExpr::Field` access, the exact declaring
+    /// aggregate and stable declaration-order field position this
+    /// checker resolved it to (`rfcs/0012`) -- keyed by the field
+    /// access expression's own `ExprId`. `resourceck`/`nir::lower` read
+    /// this back directly as a structural place's own next projection
+    /// step, rather than re-resolving the field name against the
+    /// aggregate's own field list a second time. Absent for a field
+    /// access on `Ty::Error`/`Ty::Never`, or one that itself failed to
+    /// resolve (`UNKNOWN_FIELD`/`FIELD_ACCESS_NON_RECORD`) -- there is
+    /// no real place there for a later stage to ever need.
+    pub field_projections: HashMap<ExprId, (ItemId, usize)>,
+    /// Every declared record's field types, and every declared
+    /// variant's case payload types (flattened across cases), combined
+    /// -- unsubstituted, exactly as declared (a generic item's own
+    /// field may still be `Ty::Param`) -- keyed by that item's own
+    /// `ItemId` (`rfcs/0012`). What [`Checker::is_affine`] itself walks
+    /// internally, exposed so `resourceck` can recompute the same
+    /// transitive-affinity answer over its own HIR-rooted walk without
+    /// re-deriving field *type* resolution (name lookup, generic
+    /// substitution) a second time -- only ever legitimate for
+    /// resourceck to redo because it is pure, deterministic structural
+    /// data, never a semantic ownership decision.
+    pub aggregate_field_types: HashMap<ItemId, Vec<Ty>>,
+    /// Every record declared `resource` rather than `record`
+    /// (`rfcs/0011`) -- the base case transitive affinity is built on.
+    pub declared_resources: HashSet<ItemId>,
+    /// Every record/variant/function/extend's own generic parameters,
+    /// in declaration order -- empty for a non-generic declaration.
+    pub item_type_params: HashMap<ItemId, Vec<TypeParamId>>,
 }
 
 /// Type-checks an already name-resolved [`HirModule`], the same as
@@ -404,6 +433,7 @@ pub fn check_module_with_registry(
         protocols: HashMap::new(),
         extends: Vec::new(),
         capability_cache: HashMap::new(),
+        field_projections: HashMap::new(),
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
@@ -450,6 +480,19 @@ pub fn check_module_with_registry(
         })
         .collect();
 
+    let aggregate_field_types: HashMap<ItemId, Vec<Ty>> = checker
+        .records
+        .keys()
+        .chain(checker.variants.keys())
+        .map(|id| (*id, checker.item_field_types(*id)))
+        .collect();
+    let declared_resources: HashSet<ItemId> = checker
+        .records
+        .iter()
+        .filter(|(_, info)| info.affine)
+        .map(|(id, _)| *id)
+        .collect();
+
     TypeckResult {
         diagnostics: checker.diagnostics,
         local_types,
@@ -458,6 +501,10 @@ pub fn check_module_with_registry(
         call_type_args,
         call_evidence: checker.call_evidence,
         protocol_call_evidence: checker.protocol_call_evidence,
+        field_projections: checker.field_projections,
+        aggregate_field_types,
+        declared_resources,
+        item_type_params: checker.generic_params,
     }
 }
 
@@ -596,6 +643,8 @@ struct Checker<'a> {
     /// `requirement` and the fixed, already-registered `self.extends`,
     /// never on the path or budget remaining at the point it was found.
     capability_cache: HashMap<CapabilityRequirement, Evidence>,
+    /// See [`TypeckResult::field_projections`].
+    field_projections: HashMap<ExprId, (ItemId, usize)>,
 }
 
 #[derive(Clone)]
@@ -1411,8 +1460,11 @@ impl<'a> Checker<'a> {
                 span,
             } => self.check_call(*id, callee, args, *span),
             HirExpr::Field {
-                base, name, span, ..
-            } => self.check_field_access(base, *name, *span),
+                id,
+                base,
+                name,
+                span,
+            } => self.check_field_access(*id, base, *name, *span),
             HirExpr::Cast { expr, ty, span, .. } => {
                 self.check_expr(expr);
                 // Still resolve the target type name, so an unknown
@@ -2514,7 +2566,7 @@ impl<'a> Checker<'a> {
     /// depend on the base's *inferred* type, which is why (unlike
     /// record construction/variant constructors) this can only be
     /// checked here, not during `hir::lower`.
-    fn check_field_access(&mut self, base: &HirExpr, name: Symbol, span: Span) -> Ty {
+    fn check_field_access(&mut self, id: ExprId, base: &HirExpr, name: Symbol, span: Span) -> Ty {
         let base_ty = self.check_expr(base);
         if matches!(base_ty, Ty::Never) {
             return Ty::Never;
@@ -2582,8 +2634,13 @@ impl<'a> Checker<'a> {
             );
             return Ty::Error;
         };
-        match info.fields.iter().find(|(n, _, _)| *n == name) {
-            Some((_, ty, is_public)) => {
+        match info
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, (n, _, _))| *n == name)
+        {
+            Some((index, (_, ty, is_public))) => {
                 if !*is_public && info.source != self.source {
                     let text = self.interner.resolve(name);
                     self.diagnostics.push(
@@ -2600,6 +2657,7 @@ impl<'a> Checker<'a> {
                     );
                     return Ty::Error;
                 }
+                self.field_projections.insert(id, (item, index));
                 substitute(ty, &subst)
             }
             None => {
@@ -4660,6 +4718,7 @@ mod tests {
             protocols: HashMap::new(),
             extends: Vec::new(),
             capability_cache: HashMap::new(),
+            field_projections: HashMap::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -4718,6 +4777,7 @@ mod tests {
             protocols: HashMap::new(),
             extends: Vec::new(),
             capability_cache: HashMap::new(),
+            field_projections: HashMap::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }
@@ -5211,6 +5271,61 @@ mod tests {
              func f() { value b = Box[i64] { inner: 1 }; value c = b; }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn field_access_records_the_resolved_owner_and_stable_field_position() {
+        let (hir, result) = check_full_with_hir(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func f(take s: Session) -> i64 { return s.output.descriptor }",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        let session = hir.records.iter().find(|r| r.fields.len() == 2).unwrap();
+        let file = hir.records.iter().find(|r| r.fields.len() == 1).unwrap();
+        // `s.output` must resolve to Session's own field 1 (declaration
+        // order: input=0, output=1); `.descriptor` on that result must
+        // resolve to File's own field 0.
+        let owners_and_indices: std::collections::HashSet<(ItemId, usize)> =
+            result.field_projections.values().copied().collect();
+        assert!(
+            owners_and_indices.contains(&(session.id, 1)),
+            "expected a recorded projection into Session's own field 1: {owners_and_indices:?}"
+        );
+        assert!(
+            owners_and_indices.contains(&(file.id, 0)),
+            "expected a recorded projection into File's own field 0: {owners_and_indices:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_field_types_and_declared_resources_are_exposed() {
+        let (hir, result) = check_full_with_hir(
+            "resource File { descriptor: i64 } \
+             record Envelope { file: File, sequence: i64 }",
+        );
+        assert!(result.diagnostics.is_empty());
+        let file = hir.records.iter().find(|r| r.affine).unwrap();
+        let envelope = hir.records.iter().find(|r| !r.affine).unwrap();
+        assert!(result.declared_resources.contains(&file.id));
+        assert!(!result.declared_resources.contains(&envelope.id));
+        let envelope_fields = result.aggregate_field_types.get(&envelope.id).unwrap();
+        assert_eq!(
+            envelope_fields.len(),
+            2,
+            "unexpected fields: {envelope_fields:?}"
+        );
+        assert!(
+            envelope_fields
+                .iter()
+                .any(|ty| matches!(ty, Ty::Named(item, _) if *item == file.id)),
+            "expected Envelope's own field list to include a reference to File: \
+             {envelope_fields:?}"
+        );
     }
 
     #[test]

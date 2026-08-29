@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
 use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
+use crate::place::Place;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
@@ -388,6 +389,35 @@ mod codes {
     /// a lenient default that treats a location this pass recorded
     /// nothing for as already owned.
     pub const RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED: &str = "V0082";
+    /// A structural place (`rfcs/0012`) projects a field through a base
+    /// whose own resolved type is not the declared owner record at all
+    /// (a primitive, a different record, or the wrong generic
+    /// instantiation).
+    pub const PLACE_PROJECTION_THROUGH_NON_RECORD: &str = "V0083";
+    /// A structural place names a field owner `ItemId` this module never
+    /// registered as a record.
+    pub const INVALID_PLACE_FIELD_OWNER: &str = "V0084";
+    /// A structural place names a field index out of range for its own
+    /// declared owner record.
+    pub const UNKNOWN_PLACE_FIELD: &str = "V0085";
+    /// A `PlaceRead`/`StorePlace` names a place whose own resolved type
+    /// is not affine (`rfcs/0012`) -- there is no ownership state to
+    /// move or reinitialize for an ordinary, freely-copyable field.
+    pub const MOVE_OF_NON_AFFINE_PLACE: &str = "V0086";
+    /// A structural place (`rfcs/0012`) is read or moved (`PlaceRead`,
+    /// either mode) on a path where it is not *definitely* still holding
+    /// its own value -- already moved out on every reachable path
+    /// reaching this use, or moved on only some of several reachable
+    /// paths converging here. The same reachable-union "may" dataflow
+    /// shape `RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED` already
+    /// uses, applied to individual structural fields instead of whole
+    /// locations.
+    pub const PLACE_USE_AFTER_MOVE: &str = "V0087";
+    /// A `StorePlace` (`rfcs/0012`, structural reinitialization) targets
+    /// a place that is not *definitely* empty on every reachable path --
+    /// it is still holding a live value on at least one of them, which
+    /// this store would silently leak.
+    pub const PLACE_OVERWRITE_OF_LIVE_FIELD: &str = "V0088";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1216,7 +1246,7 @@ fn verify_function(
                     require_value(*value, diagnostics);
                     let is_resource = value_types
                         .get(value)
-                        .is_some_and(|ty| matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)));
+                        .is_some_and(|ty| is_affine_in(ty, agg));
                     if !is_resource {
                         diagnostics.push(Diagnostic::error(
                             codes::DROP_OF_NON_RESOURCE_VALUE,
@@ -1227,6 +1257,44 @@ fn verify_function(
                                 value.0
                             ),
                         ));
+                    }
+                }
+                Instruction::StorePlace { place, value } => {
+                    require_value(place.root, diagnostics);
+                    require_value(*value, diagnostics);
+                    if let Some(root_ty) = value_types.get(&place.root).cloned() {
+                        match resolve_place_ty(&root_ty, &place.projections, agg) {
+                            Ok(resolved_ty) => {
+                                if !is_affine_in(&resolved_ty, agg) {
+                                    diagnostics.push(Diagnostic::error(
+                                        codes::MOVE_OF_NON_AFFINE_PLACE,
+                                        source,
+                                        Span::dummy(),
+                                        format!(
+                                            "function `{name}` reinitializes a place of non-affine type `{}`",
+                                            crate::types::display_ty(&resolved_ty, interner)
+                                        ),
+                                    ));
+                                } else if let Some(value_ty) = value_types.get(value)
+                                    && resolved_ty != *value_ty
+                                {
+                                    diagnostics.push(Diagnostic::error(
+                                        codes::STORE_TYPE_MISMATCH,
+                                        source,
+                                        Span::dummy(),
+                                        format!(
+                                            "function `{name}` stores a value of type `{}` into a place declared `{}`",
+                                            crate::types::display_ty(value_ty, interner),
+                                            crate::types::display_ty(&resolved_ty, interner)
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(place_error) => {
+                                diagnostics
+                                    .push(place_error.into_diagnostic(source, &name, place.root));
+                            }
+                        }
                     }
                 }
             }
@@ -1666,6 +1734,7 @@ fn verify_function(
         &name,
         diagnostics,
     );
+    verify_structural_places(function, source, &name, diagnostics);
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -1763,6 +1832,10 @@ fn verify_dominance(
                 Instruction::Drop { value } => {
                     check_use(*value, block.id, idx, diagnostics);
                 }
+                Instruction::StorePlace { place, value } => {
+                    check_use(place.root, block.id, idx, diagnostics);
+                    check_use(*value, block.id, idx, diagnostics);
+                }
             }
         }
         // Terminator operands are treated as occurring after every
@@ -1834,6 +1907,7 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         ValueKind::VariantPayload { base, .. } => vec![*base],
         ValueKind::ProtocolCall { args, .. } => args.clone(),
         ValueKind::Move { source } | ValueKind::DeferCapture { source } => vec![*source],
+        ValueKind::PlaceRead { place, .. } => vec![place.root],
     }
 }
 
@@ -3467,7 +3541,160 @@ fn verify_value_kind(
                 );
             }
         }
+        ValueKind::PlaceRead { place, .. } => {
+            require_value(place.root, diagnostics);
+            let Some(root_ty) = ty_of(place.root) else {
+                return;
+            };
+            match resolve_place_ty(&root_ty, &place.projections, agg) {
+                Ok(resolved_ty) => {
+                    if resolved_ty != *result_ty {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "reads a place of type `{}` but is declared `{}`",
+                                ty_name(&resolved_ty),
+                                ty_name(result_ty)
+                            ),
+                        );
+                    } else if !is_affine_in(&resolved_ty, agg) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::MOVE_OF_NON_AFFINE_PLACE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}`: %{} reads a place of non-affine type `{}`",
+                                result.0,
+                                ty_name(&resolved_ty)
+                            ),
+                        ));
+                    }
+                }
+                Err(place_error) => {
+                    diagnostics.push(place_error.into_diagnostic(source, function_name, result));
+                }
+            }
+        }
     }
+}
+
+/// One malformed structural place, independent of which instruction
+/// named it (`rfcs/0012`) -- `nir::verify`'s own reconstruction of the
+/// exact same place validity `resourceck`/`nir::lower` already checked,
+/// never trusted blindly for hand-built NIR that bypasses either.
+enum PlaceError {
+    UnknownFieldOwner(ItemId),
+    ProjectionThroughNonRecord(Ty),
+    UnknownField(ItemId, usize),
+}
+
+impl PlaceError {
+    fn into_diagnostic(self, source: SourceId, function_name: &str, result: ValueId) -> Diagnostic {
+        let (code, message) = match self {
+            PlaceError::UnknownFieldOwner(owner) => (
+                codes::INVALID_PLACE_FIELD_OWNER,
+                format!(
+                    "function `{function_name}`: %{} projects a field of unknown record id {}",
+                    result.0, owner.0
+                ),
+            ),
+            PlaceError::ProjectionThroughNonRecord(ty) => (
+                codes::PLACE_PROJECTION_THROUGH_NON_RECORD,
+                format!(
+                    "function `{function_name}`: %{} projects a field through a non-record place of type `{ty:?}`",
+                    result.0
+                ),
+            ),
+            PlaceError::UnknownField(owner, field) => (
+                codes::UNKNOWN_PLACE_FIELD,
+                format!(
+                    "function `{function_name}`: %{} projects field index {field} of record {}, which has no such field",
+                    result.0, owner.0
+                ),
+            ),
+        };
+        Diagnostic::error(code, source, Span::dummy(), message)
+    }
+}
+
+/// `true` iff `ty` is transitively affine (`rfcs/0012`) -- independently
+/// recomputed from `agg`'s own declared record/variant layouts,
+/// mirroring `resourceck`'s/`nir::lower`'s identical query, never
+/// trusted from either. Guarded against a genuinely cyclic declaration
+/// the same way every other stage's identical query is: a cycle
+/// back-edge contributes `false` to that one occurrence alone, never
+/// cached (this file's own resource checks are not called densely
+/// enough per module to need memoizing).
+fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
+    is_affine_in_visiting(ty, agg, &mut HashSet::new())
+}
+
+fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet<ItemId>) -> bool {
+    let Ty::Named(item, _) = ty else {
+        return false;
+    };
+    if agg.records.get(item).is_some_and(|r| r.affine) {
+        return true;
+    }
+    if !visiting.insert(*item) {
+        return false;
+    }
+    let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
+        record.fields.iter().map(|(_, t)| t.clone()).collect()
+    } else if let Some(variant) = agg.variants.get(item) {
+        variant
+            .cases
+            .iter()
+            .flat_map(|c| c.payload.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let result = field_types
+        .iter()
+        .any(|fty| is_affine_in_visiting(fty, agg, visiting));
+    visiting.remove(item);
+    result
+}
+
+/// Resolves a structural place's own final type, starting from
+/// `root_ty` and walking each projection step against `agg`'s own
+/// declared record layouts -- independently re-validating owner/field
+/// identity exactly like `ValueKind::RecordField`'s own check does for
+/// a single-step, non-affine projection, generalized to a whole chain.
+/// Deliberately does not substitute a generic record's own type
+/// parameters the way `RecordField`'s check does (`Place`'s own
+/// `Projection` carries no type-argument list of its own) -- a known,
+/// narrower scope for a structural place through a *generic* affine
+/// record than an ordinary single-step `RecordField` projection gets;
+/// see this milestone's own generic-affine-aggregate restriction.
+fn resolve_place_ty(
+    root_ty: &Ty,
+    projections: &[crate::place::Projection],
+    agg: &AggregateContext,
+) -> Result<Ty, PlaceError> {
+    let mut ty = root_ty.clone();
+    for projection in projections {
+        let crate::place::Projection::Field { owner, field } = projection else {
+            return Err(PlaceError::UnknownFieldOwner(match projection {
+                crate::place::Projection::VariantField { variant, .. } => *variant,
+                crate::place::Projection::Field { owner, .. } => *owner,
+            }));
+        };
+        let matches_owner =
+            matches!(&ty, Ty::Named(item, _) | Ty::Applied(item, _) if item == owner);
+        if !matches_owner {
+            return Err(PlaceError::ProjectionThroughNonRecord(ty));
+        }
+        let Some(layout) = agg.records.get(owner) else {
+            return Err(PlaceError::UnknownFieldOwner(*owner));
+        };
+        let Some((_, field_ty)) = layout.fields.get(field.0 as usize) else {
+            return Err(PlaceError::UnknownField(*owner, field.0 as usize));
+        };
+        ty = field_ty.clone();
+    }
+    Ok(ty)
 }
 
 /// A `variant.payload` instruction is only legal in a block reached
@@ -4158,11 +4385,34 @@ fn verify_resource_ownership(
     function_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Deliberately nominal, not transitively affine (`rfcs/0012`): this
+    // whole-value lattice (`live`/`facts`/`provenance`/`dropped_origins`)
+    // exists to make sure every value that is *itself* ever the direct
+    // target of a whole `Drop`/`Move`/`take` obligation actually
+    // discharges it -- a plain, non-resource record/variant that merely
+    // *contains* one is never such a target on its own: `resourceck`'s
+    // own structural cleanup planning already destroys its own affine
+    // fields individually (each becomes its own fresh, nominally-
+    // resource-or-opaque-variant `ValueId` the moment `PlaceRead` reads
+    // it out, tracked here in its own right from that point on), and
+    // the container's own whole value is never itself the operand of a
+    // `Drop`. Tracking it here too would double-count: it would demand
+    // an explicit destruction of the *container* that `resourceck`
+    // never plans (and `nir::lower` never emits) at all, alongside the
+    // real one already correctly demanded of each field individually.
+    // [`is_affine_whole`], below, is the transitive query for the
+    // handful of checks that *do* need it (`Drop`/`Move`/`DeferCapture`
+    // validity): those two *are* legitimately used on a transitively-
+    // affine value directly (an opaque variant read out as a whole via
+    // `PlaceRead`, or moved between locals) -- everywhere else in this
+    // pass, `is_resource` is exactly the right, narrower question.
     let is_resource = |v: ValueId| -> bool {
-        value_types.get(&v).is_some_and(|ty| {
-            matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine))
-        })
+        value_types
+            .get(&v)
+            .is_some_and(|ty| matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)))
     };
+    let is_affine_whole =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
 
     // Whether a `Call`/`Invoke` argument at index `i` transfers
     // ownership, given `take`'s own declared flags (`rfcs/0011`) --
@@ -4311,7 +4561,7 @@ fn verify_resource_ownership(
                     _ => None,
                 };
                 if let Some((source, label)) = source
-                    && !is_resource(source)
+                    && !is_affine_whole(source)
                 {
                     non_resource_moves.push((*result, label));
                 }
@@ -4534,6 +4784,47 @@ fn verify_resource_ownership(
                                 );
                             }
                         }
+                        // Every affine field argument is unconditionally
+                        // transferred into the fresh aggregate
+                        // (`rfcs/0012`): there is no "observing" record/
+                        // resource construction, exactly like `Move`/
+                        // `DeferCapture` have no non-consuming shape --
+                        // a non-affine field is simply never resource-
+                        // typed at all, so `check_use` below is already
+                        // a no-op for it (`is_resource` gates it).
+                        ValueKind::RecordCreate(_, _, fields) => {
+                            for field in fields {
+                                let legal = alias_safe!(*field, true, false);
+                                check_use(
+                                    *field,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    legal,
+                                );
+                            }
+                        }
+                        // Every affine payload value is unconditionally
+                        // transferred into the fresh variant (`rfcs/
+                        // 0012`), for the identical reason `RecordCreate`
+                        // just above is: there is no "observing" variant
+                        // construction either.
+                        ValueKind::VariantCreate { payload, .. } => {
+                            for value in payload {
+                                let legal = alias_safe!(*value, true, false);
+                                check_use(
+                                    *value,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    legal,
+                                );
+                            }
+                        }
                         // Always an unconditional transfer (`rfcs/0011`)
                         // -- unlike a `Call` argument, whose own
                         // consumption depends on the callee's own
@@ -4573,6 +4864,39 @@ fn verify_resource_ownership(
                                         if legal { Role::Owned } else { Role::Observed },
                                     )),
                                 );
+                            }
+                        }
+                        // A structural place read never consumes its own
+                        // `place.root` at the whole-value level at all
+                        // (`rfcs/0012`) -- unlike `Move`, `root` is not
+                        // itself the value being transferred, only the
+                        // aggregate reached *through*; `check_alias_
+                        // safety`/`resourceck::flow`'s own separate
+                        // structural pass (`verify_structural_places`)
+                        // are what actually gate whether `place` itself
+                        // was live to read/move at all. `result` mints a
+                        // fresh identity (there is nothing at this
+                        // pass's own whole-value granularity to inherit
+                        // one from): `Owned`, and newly `live`, for a
+                        // `Transfer` (a genuine new obligation this
+                        // frame now owns); `Observed`, and never `live`,
+                        // for an `Observe` -- exactly like `Load`'s own
+                        // exclusion from the fresh-ownership rule below,
+                        // just explicit here since a place read is
+                        // neither `Load` nor `Alloc`.
+                        ValueKind::PlaceRead { mode, .. } => {
+                            if is_resource(*result) {
+                                let role = match mode {
+                                    crate::nir::OwnershipMode::Transfer => Role::Owned,
+                                    crate::nir::OwnershipMode::Observe => Role::Observed,
+                                };
+                                provenance.insert(
+                                    *result,
+                                    LocationState::Initialized((BTreeSet::from([*result]), role)),
+                                );
+                                if *mode == crate::nir::OwnershipMode::Transfer {
+                                    live.insert(*result);
+                                }
                             }
                         }
                         _ => {
@@ -4645,7 +4969,10 @@ fn verify_resource_ownership(
                     // target block cannot otherwise distinguish the two
                     // edges when they happen to share a target).
                     if is_resource(*result)
-                        && !matches!(kind, ValueKind::Load(_) | ValueKind::Alloc)
+                        && !matches!(
+                            kind,
+                            ValueKind::Load(_) | ValueKind::Alloc | ValueKind::PlaceRead { .. }
+                        )
                     {
                         live.insert(*result);
                         if !matches!(
@@ -4738,6 +5065,27 @@ fn verify_resource_ownership(
                         dropped_origins.extend(ids);
                     }
                 }
+                // `StorePlace` always transfers `value` into a
+                // structural field (`rfcs/0012`) -- consumed here
+                // exactly like an ordinary transferring `Store`'s own
+                // operand is, but with no slot of its own to relocate
+                // `value`'s own identity onto: a projected place is
+                // never a key in this pass's own whole-value
+                // `provenance` map at all (see [`verify_structural_
+                // places`], the dedicated pass that tracks each place's
+                // own move/reinit state instead).
+                Instruction::StorePlace { value, .. } => {
+                    let legal = alias_safe!(*value, true, false);
+                    check_use(
+                        *value,
+                        &is_resource,
+                        &origin,
+                        &mut facts,
+                        &mut live,
+                        &mut violations,
+                        legal,
+                    );
+                }
             }
         }
         match &block.terminator {
@@ -4781,10 +5129,25 @@ fn verify_resource_ownership(
                     );
                 }
             }
-            Terminator::Return(None)
-            | Terminator::Branch(_)
-            | Terminator::CondBranch { .. }
-            | Terminator::Switch { .. } => {}
+            // Matching an affine scrutinee decomposes it (`rfcs/0012`):
+            // `resourceck::flow` already treats this the same way,
+            // transferring the scrutinee's own place the moment a
+            // `match`/`handle` runs, rather than leaving it live for its
+            // own separate implicit cleanup to (wrongly) also try to
+            // destroy the very payload a pattern binding already took.
+            Terminator::Switch { scrutinee, .. } => {
+                let legal = alias_safe!(*scrutinee, true, false);
+                check_use(
+                    *scrutinee,
+                    &is_resource,
+                    &origin,
+                    &mut facts,
+                    &mut live,
+                    &mut violations,
+                    legal,
+                );
+            }
+            Terminator::Return(None) | Terminator::Branch(_) | Terminator::CondBranch { .. } => {}
         }
         // Every reachable `Return`/`Raise` is a real exit this function
         // takes: whatever is still `live` right here was created (or
@@ -5104,6 +5467,338 @@ fn verify_resource_ownership(
     }
 }
 
+/// One structural place's own current "does it still hold its own
+/// value" status (`rfcs/0012`) -- see [`verify_structural_places`]'s own
+/// doc comment for the full three-state lattice this forms.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldState {
+    Full,
+    Empty,
+    Maybe,
+}
+
+/// The pairwise lattice meet two reachable predecessors' own
+/// [`FieldState`] for the identical structural place join to: agreement
+/// keeps that state, disagreement (including either side already being
+/// the absorbing [`FieldState::Maybe`]) always joins to `Maybe` -- never
+/// silently favors one side over the other, matching `LocationState`'s
+/// own identical three-state shape (this one just has no separate
+/// origin/role payload to carry along).
+fn merge_field(a: FieldState, b: FieldState) -> FieldState {
+    match (a, b) {
+        (FieldState::Full, FieldState::Full) => FieldState::Full,
+        (FieldState::Empty, FieldState::Empty) => FieldState::Empty,
+        _ => FieldState::Maybe,
+    }
+}
+
+/// Path-sensitive tracking of every individual structural (projected)
+/// place's own "does it currently still hold its own value" state
+/// (`rfcs/0012`) -- independent of, and complementary to, [`verify_
+/// resource_ownership`]'s own whole-value provenance lattice just above
+/// (which continues to track every plain root `ValueId` completely
+/// unchanged): a place with at least one projection is never a key
+/// there at all, and `PlaceRead`/`StorePlace` are the only two
+/// instructions this pass concerns itself with.
+///
+/// Three states, exactly mirroring `LocationState`'s own three-way
+/// shape and for the identical underlying reason (see its own doc
+/// comment above): [`FieldState::Full`] (still holds its own value --
+/// the default for any place this pass never recorded anything for at
+/// all, since a fresh aggregate's own fields all start this way),
+/// [`FieldState::Empty`] (moved out, or not yet reinitialized after
+/// being moved out, on *every* reachable path), and [`FieldState::
+/// Maybe`] (moved out on only *some* of several reachable paths --
+/// absorbing, exactly like `MaybeUninitialized` is: a join can never
+/// upgrade back out of it once introduced, and neither a read/move
+/// -- which requires `Full` -- nor a reinitializing store -- which
+/// requires `Empty` -- ever accepts it). Reached via the identical
+/// reachable-union worklist shape, with the identical `computed`-set
+/// fixpoint-initialization discipline `RESOURCE_LOCATION_NOT_
+/// DEFINITELY_INITIALIZED`'s own fix required (see `in_state_for`'s own
+/// doc comment above): an as-yet-unprocessed loop back-edge predecessor
+/// must contribute nothing to a join, never be mistaken for a
+/// *computed* predecessor that has definitively proven a place `Empty`.
+fn verify_structural_places(
+    function: &Function,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let entry = BlockId(0);
+    if !function.blocks.iter().any(|b| b.id == entry) {
+        return;
+    }
+
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut incoming_edges: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        match &block.terminator {
+            Terminator::Branch(target) => {
+                successors.entry(block.id).or_default().push(*target);
+                incoming_edges.entry(*target).or_default().push(block.id);
+            }
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend([*then_block, *else_block]);
+                incoming_edges
+                    .entry(*then_block)
+                    .or_default()
+                    .push(block.id);
+                incoming_edges
+                    .entry(*else_block)
+                    .or_default()
+                    .push(block.id);
+            }
+            Terminator::Switch { cases, .. } => {
+                successors.entry(block.id).or_default().extend(cases);
+                for target in cases {
+                    incoming_edges.entry(*target).or_default().push(block.id);
+                }
+            }
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                successors.entry(block.id).or_default().push(*ok_target);
+                successors
+                    .entry(block.id)
+                    .or_default()
+                    .extend(err_targets.iter().map(|t| t.target));
+                incoming_edges.entry(*ok_target).or_default().push(block.id);
+                for target in err_targets {
+                    incoming_edges
+                        .entry(target.target)
+                        .or_default()
+                        .push(block.id);
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+    }
+
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // Every `Load`'s own result shares its own place-tracking identity
+    // with the slot it loads from (`rfcs/0012`), mirroring `verify_
+    // resource_ownership`'s own identical `load_origin`/`origin`: a
+    // `mutable` local reloads its own current whole value fresh, as a
+    // *new* `ValueId`, every time a place projects into it (`session.
+    // input`, then later `session.output`, are two entirely separate
+    // `Load(%slot)` results) -- without canonicalizing back to the one
+    // shared slot they both actually reach into, two places that are
+    // structurally the very same field would never compare equal here
+    // at all, breaking every one of this pass's own checks for it.
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
+    let canonical = |place: &Place<ValueId>| -> Place<ValueId> {
+        Place {
+            root: origin(place.root),
+            projections: place.projections.clone(),
+        }
+    };
+
+    type PlaceStates = HashMap<Place<ValueId>, FieldState>;
+
+    fn merge_place_states(a: &PlaceStates, b: &PlaceStates) -> PlaceStates {
+        let keys: std::collections::BTreeSet<Place<ValueId>> =
+            a.keys().chain(b.keys()).cloned().collect();
+        keys.into_iter()
+            .map(|key| {
+                let left = a.get(&key).copied().unwrap_or(FieldState::Full);
+                let right = b.get(&key).copied().unwrap_or(FieldState::Full);
+                (key, merge_field(left, right))
+            })
+            .collect()
+    }
+
+    fn in_state_for(
+        block_id: BlockId,
+        entry: BlockId,
+        incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
+        reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
+        out: &HashMap<BlockId, PlaceStates>,
+    ) -> PlaceStates {
+        let (reachable, computed) = reachable_and_computed;
+        if block_id == entry {
+            return PlaceStates::new();
+        }
+        let Some(edges) = incoming_edges.get(&block_id) else {
+            return PlaceStates::new();
+        };
+        let mut edges = edges
+            .iter()
+            .filter(|pred| reachable.contains(pred) && computed.contains(pred));
+        let Some(first_pred) = edges.next() else {
+            return PlaceStates::new();
+        };
+        let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+        for pred in edges {
+            let other = out.get(pred).cloned().unwrap_or_default();
+            acc = merge_place_states(&acc, &other);
+        }
+        acc
+    }
+
+    let transfer = |block: &BasicBlock,
+                    in_state: &PlaceStates|
+     -> (PlaceStates, Vec<(ValueId, Place<ValueId>, bool)>) {
+        let mut states = in_state.clone();
+        // `(root, place, is_store)` -- `is_store` distinguishes a
+        // `PLACE_OVERWRITE_OF_LIVE_FIELD` (`StorePlace`, requires
+        // `Empty`) from a `PLACE_USE_AFTER_MOVE` (`PlaceRead`, requires
+        // `Full`) at the single reporting site below, keeping this
+        // closure's own per-block loop the one place either is ever
+        // actually decided.
+        let mut violations: Vec<(ValueId, Place<ValueId>, bool)> = Vec::new();
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::PlaceRead { place, mode },
+                    ..
+                } => {
+                    if place.projections.is_empty() {
+                        continue;
+                    }
+                    let place = canonical(place);
+                    let state = states.get(&place).copied().unwrap_or(FieldState::Full);
+                    if state != FieldState::Full {
+                        violations.push((*result, place, false));
+                    } else if *mode == crate::nir::OwnershipMode::Transfer {
+                        states.insert(place, FieldState::Empty);
+                    }
+                }
+                Instruction::StorePlace { place, value } => {
+                    if place.projections.is_empty() {
+                        continue;
+                    }
+                    let place = canonical(place);
+                    let state = states.get(&place).copied().unwrap_or(FieldState::Full);
+                    if state != FieldState::Empty {
+                        violations.push((*value, place, true));
+                    } else {
+                        states.insert(place, FieldState::Full);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (states, violations)
+    };
+
+    let entry_block = function
+        .blocks
+        .iter()
+        .find(|b| b.id == entry)
+        .expect("presence already checked above");
+    let (entry_out, _) = transfer(entry_block, &PlaceStates::new());
+
+    let mut out: HashMap<BlockId, PlaceStates> = function
+        .blocks
+        .iter()
+        .map(|b| {
+            let initial = if b.id == entry {
+                entry_out.clone()
+            } else {
+                PlaceStates::new()
+            };
+            (b.id, initial)
+        })
+        .collect();
+
+    let mut computed: HashSet<BlockId> = HashSet::from([entry]);
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let in_state = in_state_for(id, entry, &incoming_edges, (&reachable, &computed), &out);
+        let (new_out, _) = transfer(block, &in_state);
+        let first_time = computed.insert(id);
+        if first_time || out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    for block in &function.blocks {
+        let in_state = if reachable.contains(&block.id) {
+            in_state_for(
+                block.id,
+                entry,
+                &incoming_edges,
+                (&reachable, &computed),
+                &out,
+            )
+        } else {
+            PlaceStates::new()
+        };
+        let (_, violations) = transfer(block, &in_state);
+        for (value, place, is_store) in violations {
+            let _ = &place;
+            let (code, verb) = if is_store {
+                (codes::PLACE_OVERWRITE_OF_LIVE_FIELD, "reinitializes")
+            } else {
+                (codes::PLACE_USE_AFTER_MOVE, "reads or moves")
+            };
+            diagnostics.push(Diagnostic::error(
+                code,
+                source,
+                Span::dummy(),
+                format!(
+                    "function `{function_name}`: %{} {verb} a structural field that is not \
+                     definitely {} on every path reaching it",
+                    value.0,
+                    if is_store {
+                        "empty"
+                    } else {
+                        "still holding its own value"
+                    }
+                ),
+            ));
+        }
+    }
+}
+
 fn verify_invoke_slot_initialization(
     function: &Function,
     source: SourceId,
@@ -5390,6 +6085,64 @@ mod tests {
             merged.get(&ValueId(0)),
             Some(&LocationState::MaybeUninitialized),
             "unexpected merge result: {merged:?}"
+        );
+    }
+
+    // -- `merge_field` lattice laws (`rfcs/0012`) --------------------
+
+    #[test]
+    fn merge_field_is_commutative() {
+        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+            for b in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+                assert_eq!(
+                    merge_field(a, b),
+                    merge_field(b, a),
+                    "merge_field({a:?}, {b:?}) != merge_field({b:?}, {a:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_field_is_idempotent() {
+        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+            assert_eq!(
+                merge_field(a, a),
+                a,
+                "merging {a:?} with itself must not change it"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_field_is_associative() {
+        let states = [FieldState::Full, FieldState::Empty, FieldState::Maybe];
+        for a in states {
+            for b in states {
+                for c in states {
+                    assert_eq!(
+                        merge_field(merge_field(a, b), c),
+                        merge_field(a, merge_field(b, c)),
+                        "(a merge b) merge c != a merge (b merge c) for {a:?}, {b:?}, {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_field_disagreement_is_the_absorbing_maybe_state() {
+        assert_eq!(
+            merge_field(FieldState::Full, FieldState::Empty),
+            FieldState::Maybe
+        );
+        assert_eq!(
+            merge_field(FieldState::Maybe, FieldState::Full),
+            FieldState::Maybe
+        );
+        assert_eq!(
+            merge_field(FieldState::Empty, FieldState::Maybe),
+            FieldState::Maybe
         );
     }
 

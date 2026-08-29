@@ -168,13 +168,15 @@ mod codes {
     /// are out of scope this milestone; this is a dedicated diagnostic,
     /// never silent ordinary-value treatment.
     pub const RESOURCE_PROTOCOL_UNSUPPORTED: &str = "T0062";
-    /// A `record`/`variant` (ordinary, freely copyable) declares a
-    /// field/payload whose type is itself an affine `resource`
-    /// (`rfcs/0011`). Copying a value of the ordinary aggregate would
-    /// duplicate the resource it holds, which affine values may never
-    /// be -- only another `resource` (itself already non-copyable) may
-    /// hold a resource-typed field.
-    pub const RESOURCE_FIELD_IN_ORDINARY_AGGREGATE: &str = "T0064";
+    // T0064 (RESOURCE_FIELD_IN_ORDINARY_AGGREGATE) retired: Alpha 0.1.8
+    // (`rfcs/0012`) lifts the blanket rejection of a resource-typed
+    // field in any aggregate -- a record/variant/resource containing an
+    // affine field now becomes transitively affine itself (see
+    // `Checker::is_affine`) and is tracked structurally, field by
+    // field, by `resourceck`/`nir::verify`, rather than rejected
+    // outright at its own declaration. Never reused for a different
+    // diagnostic: a stale code in an old build's cached output must
+    // never silently start meaning something else.
     /// A parameter declared `take` whose own static type is not a
     /// declared `resource` (`rfcs/0011`). `take` transfers ownership
     /// into the call; an ordinary (non-affine) value has no ownership
@@ -205,6 +207,22 @@ mod codes {
     /// runtime while the caller's own resource checker still thinks it
     /// only observed.
     pub const TAKE_IN_EXTEND_METHOD: &str = "T0067";
+    /// A generic function is called (or explicitly type-applied) with a
+    /// transitively affine type argument (`rfcs/0012`) -- a generic
+    /// function's own body is checked once, symbolically, and shared
+    /// unchanged by every instantiation (`rfcs/0008`), so `resourceck`
+    /// never re-checks it per instantiation the way it re-checks a
+    /// concrete function; nothing would ever track a bare `T`-typed
+    /// value's ownership if `T` turned out to be affine at this call
+    /// site. Rejected here, at the instantiation, rather than silently
+    /// treating the substituted value as an ordinary, freely-copyable
+    /// one. A generic *aggregate* (`record`/`variant`/`resource`) has no
+    /// such gap -- its own transitive affinity is recomputed per
+    /// instantiation directly from its substituted field types (see
+    /// `Checker::is_affine`), so this restriction applies to a generic
+    /// function call specifically, never to constructing a generic
+    /// record/variant.
+    pub const UNSUPPORTED_GENERIC_AFFINE_INSTANTIATION: &str = "T0068";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -372,6 +390,7 @@ pub fn check_module_with_registry(
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
+        transitively_affine: HashMap::new(),
         loop_depth: 0,
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
@@ -388,7 +407,6 @@ pub fn check_module_with_registry(
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
-    checker.check_resource_field_containment(hir);
     checker.check_aggregate_cycles(hir);
     checker.register_protocols(hir);
     checker.build_signatures(hir);
@@ -503,6 +521,11 @@ struct Checker<'a> {
     /// Display-only `(variant name, [case names])` for rendering a
     /// non-exhaustive-match witness back into surface syntax.
     variant_display: HashMap<ItemId, (String, Vec<String>)>,
+    /// Memoized transitive-affinity results (`rfcs/0012`), keyed by the
+    /// plain, unsubstituted declaration -- see [`Self::is_affine`].
+    /// Populated lazily, the first time anything actually asks; a
+    /// record/variant nothing ever queries is simply never computed.
+    transitively_affine: HashMap<ItemId, bool>,
     /// How many `while`/`loop` bodies currently enclose the expression
     /// being checked. `break`/`continue` outside of any loop is a
     /// diagnostic, not something deferred to NIR lowering or the
@@ -698,77 +721,107 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// No `record` or `resource` may hold a resource-typed field, and no
-    /// `variant` case may carry a resource-typed payload (`rfcs/0011`,
-    /// Blocker 8's own "Nested resources" scope limit). An ordinary
-    /// aggregate is freely copyable, and copying one that held a
-    /// resource would duplicate it, which affine values may never
-    /// allow -- but a `resource` field nested inside *another*
-    /// `resource` has no such copying problem and is rejected for a
-    /// different reason instead: the runtime's own destruction of the
-    /// outer resource does not recurse into destroying a nested one,
-    /// so accepting this would silently leak every nested resource
-    /// forever. Alpha 0.1.7 implements neither transitive ownership
-    /// transfer into a nested field nor recursive destruction out of
-    /// one, so this is rejected symbolically at every aggregate's own
-    /// declaration, resource or not, rather than only once some
-    /// specific construction site turns out to leak. Run once, after
-    /// `build_aggregate_info` has every field's own resolved type
-    /// available, before any function body is checked -- reported even
-    /// for a record/variant/resource nothing ever constructs.
-    fn check_resource_field_containment(&mut self, hir: &HirModule) {
-        for r in &hir.records {
-            let Some(info) = self.records.get(&r.id) else {
-                continue;
-            };
-            for (field, (_, ty, _)) in r.fields.iter().zip(info.fields.iter()) {
-                if self.is_affine_resource(ty) {
-                    let kind = if r.affine { "resource" } else { "record" };
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
-                            r.source,
-                            field.span,
-                            format!(
-                                "field `{}` of {kind} `{}` cannot hold a resource; Alpha 0.1.7 \
-                                 has no nested resource ownership model",
-                                self.interner.resolve(field.name),
-                                self.interner.resolve(r.name),
-                            ),
-                        )
-                        .with_primary_label(if r.affine {
-                            "resource field nested inside another resource"
-                        } else {
-                            "resource field in an ordinary record"
-                        }),
-                    );
-                }
-            }
+    /// This item's own field/payload types, unsubstituted, combined
+    /// across every case for a variant -- the raw material
+    /// [`Self::is_affine`] walks. Not itself resource-checked or
+    /// deduplicated: only ever used as an input to an `any()` over
+    /// affinity, which does not care which field proves it or how many
+    /// times.
+    fn item_field_types(&self, item: ItemId) -> Vec<Ty> {
+        if let Some(info) = self.records.get(&item) {
+            info.fields.iter().map(|(_, ty, _)| ty.clone()).collect()
+        } else if let Some(info) = self.variants.get(&item) {
+            info.cases
+                .iter()
+                .flat_map(|(_, payload)| payload.iter().cloned())
+                .collect()
+        } else {
+            Vec::new()
         }
-        for v in &hir.variants {
-            let Some(info) = self.variants.get(&v.id) else {
-                continue;
-            };
-            for (case, (_, payload_tys)) in v.cases.iter().zip(info.cases.iter()) {
-                for (payload_hir_ty, payload_ty) in case.payload.iter().zip(payload_tys.iter()) {
-                    if self.is_affine_resource(payload_ty) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                codes::RESOURCE_FIELD_IN_ORDINARY_AGGREGATE,
-                                v.source,
-                                payload_hir_ty.span(),
-                                format!(
-                                    "case `{}` of variant `{}` cannot carry a resource payload; \
-                                     Alpha 0.1.7 has no nested resource ownership model",
-                                    self.interner.resolve(case.name),
-                                    self.interner.resolve(v.name),
-                                ),
-                            )
-                            .with_primary_label("resource payload in a variant case"),
-                        );
-                    }
+    }
+
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
+    /// `resource` itself, or a `record`/`variant`/`resource` any of
+    /// whose reachable fields/payloads is. Replaces Alpha 0.1.7's
+    /// blanket declaration-time rejection of a resource-typed field in
+    /// any aggregate (formerly `T0064`) -- an aggregate containing an
+    /// affine field is no longer rejected outright; it becomes affine
+    /// itself, tracked structurally, field by field, by `resourceck`/
+    /// `nir::verify`.
+    ///
+    /// Memoized per plain (unsubstituted) declaration in
+    /// `self.transitively_affine`, guarded by `visiting` against a
+    /// genuinely self-referential declaration (already independently
+    /// rejected as an infinite-size layout by `check_aggregate_cycles`)
+    /// -- a cycle back-edge contributes `false` to *that one*
+    /// occurrence's own disjunction without ever being cached as the
+    /// type's own final answer, so revisiting a node still being
+    /// computed can never make a type that is genuinely affine through
+    /// some other, non-cyclic field look non-affine. A `Ty::Applied`
+    /// substitutes its own concrete arguments into the declaration's
+    /// field types before recursing, and is never itself memoized by
+    /// plain `ItemId` (only the declaration's own unsubstituted shape
+    /// is): the same generic record can be affine for one instantiation
+    /// and not for another. A bare, unconstrained `Ty::Param` is always
+    /// `false` here -- never silently treated as non-affine by a caller
+    /// that actually needs to know (`Checker::check_call_at`'s own
+    /// generic-instantiation guard, `check_take_target`, ...): each of
+    /// those rejects a symbolic type outright wherever affinity would
+    /// actually matter, rather than trusting this query's own
+    /// necessarily-approximate "false" for it.
+    fn is_affine(&mut self, ty: &Ty) -> bool {
+        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
+    }
+
+    fn is_affine_visiting(
+        &mut self,
+        ty: &Ty,
+        visiting: &mut HashSet<ItemId>,
+        depth: usize,
+    ) -> bool {
+        // The type this checks was already built by `resolve_named_type`/
+        // `substitute`, both already bounded by this same limit -- this
+        // is a defensive backstop against a hand-built or pathological
+        // input, mirroring `deep_resolve_at_depth`'s identical silent
+        // cutoff, never a case ordinary well-typed source can reach.
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
+        match ty {
+            Ty::Named(item, _) => {
+                if let Some(cached) = self.transitively_affine.get(item) {
+                    return *cached;
                 }
+                if !visiting.insert(*item) {
+                    return false;
+                }
+                let declared_resource = self.records.get(item).is_some_and(|r| r.affine);
+                let field_types = self.item_field_types(*item);
+                let result = declared_resource
+                    || field_types
+                        .iter()
+                        .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
+                visiting.remove(item);
+                self.transitively_affine.insert(*item, result);
+                result
             }
+            Ty::Applied(item, args) => {
+                if !visiting.insert(*item) {
+                    return false;
+                }
+                let type_params = self.generic_params.get(item).cloned().unwrap_or_default();
+                let subst: HashMap<TypeParamId, Ty> =
+                    type_params.into_iter().zip(args.iter().cloned()).collect();
+                let declared_resource = self.records.get(item).is_some_and(|r| r.affine);
+                let field_types = self.item_field_types(*item);
+                let result = declared_resource
+                    || field_types.iter().any(|fty| {
+                        self.is_affine_visiting(&substitute(fty, &subst), visiting, depth + 1)
+                    });
+                visiting.remove(item);
+                result
+            }
+            _ => false,
         }
     }
 
@@ -2161,8 +2214,40 @@ impl<'a> Checker<'a> {
                     )
                 })
                 .collect();
+            // A generic *function*'s own body is checked once,
+            // symbolically, and that single checked body is shared
+            // unchanged by every instantiation (`rfcs/0008`) --
+            // `resourceck` never re-checks it per instantiation the way
+            // it checks a concrete function, so nothing would ever
+            // track a bare `T`-typed value's ownership if `T` resolves
+            // to an affine type at this call site (`rfcs/0012`).
+            // Rejected here, at the instantiation, rather than silently
+            // treating the substituted value as an ordinary,
+            // freely-copyable one. A generic aggregate's own
+            // construction (`check_record_construct`/
+            // `check_variant_construct`) never reaches this function-
+            // call-specific path at all, and is unaffected.
+            for arg in &resolved_args {
+                if self.is_affine(arg) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::UNSUPPORTED_GENERIC_AFFINE_INSTANTIATION,
+                            self.source,
+                            span,
+                            format!(
+                                "{quoted} cannot be instantiated with the affine \
+                                 (resource-containing) type `{}`: a generic function's own body \
+                                 is not re-checked per instantiation",
+                                self.display_for_diagnostic(arg)
+                            ),
+                        )
+                        .with_primary_label("affine type argument to a generic function"),
+                    );
+                    ok = false;
+                }
+            }
             let key = GenericInstanceKey::new(*item, resolved_args.clone());
-            if self.record_generic_instance(key, span) {
+            if ok && self.record_generic_instance(key, span) {
                 self.call_type_args.insert(call_id, resolved_args);
             } else {
                 ok = false;
@@ -3759,10 +3844,14 @@ impl<'a> Checker<'a> {
     }
 
     /// `true` iff `ty` is a resolved reference to a declared `resource`
-    /// (`rfcs/0011`), never a `record`/`variant`/primitive. Used by every
-    /// resource-specific check (`drop`, equality rejection, protocol
-    /// rejection) instead of each re-deriving it from `self.records`.
-    fn is_affine_resource(&self, ty: &Ty) -> bool {
+    /// (`rfcs/0011`), never a `record`/`variant`/primitive -- regardless
+    /// of whether that `record`/`variant` is itself transitively affine.
+    /// `drop` remains a `resource`-only keyword in Alpha 0.1.8: an
+    /// ordinary (even transitively affine) aggregate is still only ever
+    /// destroyed implicitly (moved out, or structurally cleaned up at
+    /// its own owning scope's exit), never named directly by an explicit
+    /// `drop <expr>;`.
+    fn is_declared_resource(&self, ty: &Ty) -> bool {
         matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|info| info.affine))
     }
 
@@ -3775,7 +3864,7 @@ impl<'a> Checker<'a> {
         if matches!(resolved, Ty::Error | Ty::Never) {
             return;
         }
-        if !self.is_affine_resource(&resolved) {
+        if !self.is_declared_resource(&resolved) {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::DROP_OF_NON_RESOURCE,
@@ -3791,15 +3880,17 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A `take` parameter's own declared type must be a resource
-    /// (`rfcs/0011`, Blocker 9) -- `take` transfers ownership into the
-    /// call, and an ordinary (non-affine) value has no ownership state
-    /// at all for `resourceck`/`nir::lower` to transfer. Declared on a
-    /// still-unresolved generic parameter type is intentionally not
-    /// flagged here (never a concrete resource or not, until a call
-    /// site substitutes it) -- this milestone's own resources are never
-    /// generic, so a real violation always resolves to a concrete
-    /// non-resource type here regardless.
+    /// A `take` parameter's own declared type must be transitively
+    /// affine (`rfcs/0012`; a declared `resource`, or a `record`/
+    /// `variant` reachably containing one) -- `take` transfers ownership
+    /// into the call, and an ordinary, non-affine value has no ownership
+    /// state at all for `resourceck`/`nir::lower` to transfer. Declared
+    /// on a still-unresolved generic parameter type is intentionally not
+    /// flagged here (never affine or not, until a call site
+    /// substitutes it) -- `Checker::check_call_at`'s own generic-
+    /// instantiation guard (`T0068`) rejects an affine argument at that
+    /// substitution point instead, symbolically, since a generic
+    /// function's own body is never re-checked per instantiation.
     fn check_take_target(&mut self, param: &crate::hir::HirParam, ty: &Ty) {
         if !param.take {
             return;
@@ -3808,28 +3899,25 @@ impl<'a> Checker<'a> {
         if matches!(resolved, Ty::Error | Ty::Never) {
             return;
         }
-        // A type parameter (Blocker 10, `rfcs/0011`) is never accepted
-        // here either, even though `is_affine_resource` below would
-        // already reject it on its own: Alpha 0.1.7 has no generic
-        // resource ownership model at all (a `T` bound to a resource at
-        // one instantiation and a primitive at another would need
-        // per-instantiation `take`-acceptance, which nothing downstream
-        // -- `resourceck`, `nir::lower`, the runtime identity model --
-        // implements), so this is rejected symbolically, at the
-        // declaration itself, rather than only once some future
-        // instantiation happens to pick a resource type.
-        if !self.is_affine_resource(&resolved) {
+        // A bare type parameter is never accepted here either, even
+        // though `is_affine` below would already reject it on its own
+        // (a symbolic `Ty::Param` is never affine by that query's own
+        // necessarily-approximate answer) -- rejected for the *right*
+        // reason (this declaration itself has no way to know, not yet
+        // substituted) rather than the coincidentally-same-shaped wrong
+        // one.
+        if !self.is_affine(&resolved) {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::TAKE_OF_NON_RESOURCE,
                     self.source,
                     param.span,
                     format!(
-                        "`take` requires a resource parameter, found `{}`",
+                        "`take` requires an affine (resource-containing) value, found `{}`",
                         self.display_for_diagnostic(&resolved)
                     ),
                 )
-                .with_primary_label("not a resource"),
+                .with_primary_label("not affine"),
             );
         }
     }
@@ -3934,11 +4022,11 @@ impl<'a> Checker<'a> {
                  milestone",
             );
         }
-        if self.is_affine_resource(&sig.ret) {
+        if self.is_affine(&sig.ret) {
             unsupported(
                 self,
-                "a `defer` calling a function that returns a resource is not supported this \
-                 milestone",
+                "a `defer` calling a function that returns an affine (resource-containing) \
+                 value is not supported this milestone",
             );
         }
     }
@@ -4560,6 +4648,7 @@ mod tests {
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
+            transitively_affine: HashMap::new(),
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
@@ -4617,6 +4706,7 @@ mod tests {
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
+            transitively_affine: HashMap::new(),
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
@@ -5094,6 +5184,49 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_generic_function_instantiated_with_an_affine_type_is_rejected() {
+        // No `take` involved at all here -- `identity`'s own parameter
+        // is an ordinary observation regardless of `T`, but its body is
+        // checked once, symbolically, and shared by every instantiation
+        // (`rfcs/0008`): nothing would ever track a `File` handle's
+        // ownership if this were accepted (`rfcs/0012`, `T0068`).
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func identity[T](item: T) -> T { return item } \
+             func f() { value file = File { descriptor: 1 }; drop identity[File](file); }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"T0068"),
+            "unexpected diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_record_instantiated_with_a_non_affine_type_is_still_ordinary() {
+        // `Box[i64]` is not affine -- constructing and rebinding it must
+        // not spuriously trip the new affine-instantiation restriction,
+        // which only ever applies to a generic *function* call.
+        let diags = check(
+            "record Box[T] { inner: T } \
+             func f() { value b = Box[i64] { inner: 1 }; value c = b; }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn a_record_referencing_the_same_affine_type_through_two_fields_is_affine_once() {
+        // A diamond, not a cycle: `Pair`'s own two fields both name
+        // `File` -- `is_affine` must hit its own memoized cache the
+        // second time, never re-trip the cycle guard.
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             record Pair { left: File, right: File } \
+             func consume(take p: Pair) {}",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn take_on_a_generic_extend_method_parameter_is_rejected() {
         let diags = check(
             "record Box { amount: i64 } \
@@ -5119,64 +5252,62 @@ mod tests {
         );
     }
 
-    // -- Nested resource fields (Blocker 8) ------------------------------
+    // -- Transitive affinity (`rfcs/0012`) -------------------------------
+    // Alpha 0.1.7's blanket rejection of a resource-typed field in any
+    // aggregate (formerly T0064) is lifted: the containing declaration
+    // becomes affine itself instead, tracked structurally by
+    // `resourceck`/`nir::verify` (never re-derived here, since this
+    // module never assigns diagnostics for structural moves).
 
     #[test]
-    fn a_resource_typed_field_in_an_ordinary_record_is_rejected() {
+    fn a_resource_typed_field_in_an_ordinary_record_is_accepted_and_makes_it_affine() {
         let diags = check(
             "resource File { descriptor: i64 } \
-             record Box { file: File }",
+             record Envelope { file: File }",
         );
-        assert_eq!(
-            codes_of(&diags),
-            vec!["T0064"],
-            "unexpected diagnostics: {diags:?}"
-        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]
-    fn a_resource_typed_field_in_another_resource_is_rejected() {
-        // Alpha 0.1.7 implements neither transitive ownership transfer
-        // into a nested resource field nor recursive destruction out of
-        // one, so this is rejected the same way an ordinary record
-        // holding one already is, not silently accepted and then
-        // leaked at runtime.
+    fn a_resource_typed_field_in_another_resource_is_accepted() {
         let diags = check(
             "resource File { descriptor: i64 } \
              resource Wrapper { file: File }",
         );
-        assert_eq!(
-            codes_of(&diags),
-            vec!["T0064"],
-            "unexpected diagnostics: {diags:?}"
-        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]
-    fn a_resource_typed_variant_payload_is_rejected() {
+    fn a_resource_typed_variant_payload_is_accepted_and_makes_it_affine() {
         let diags = check(
             "resource File { descriptor: i64 } \
              variant Holder { Has(File) }",
         );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn an_ordinary_record_with_no_affine_field_still_accepts_take_as_before() {
+        // A plain, non-affine record must not be silently treated as
+        // affine just because *some* declaration elsewhere in the
+        // module is -- `is_affine` must actually walk this exact
+        // record's own fields, never return a module-wide constant.
+        let diags = check("record Point { x: i64, y: i64 } func f(take p: Point) {}");
         assert_eq!(
             codes_of(&diags),
-            vec!["T0064"],
-            "unexpected diagnostics: {diags:?}"
+            vec!["T0065"],
+            "a non-affine record's `take` parameter must still be rejected: {diags:?}"
         );
     }
 
     #[test]
-    fn a_resource_typed_field_in_another_resource_is_reported_even_if_never_constructed() {
+    fn take_accepts_a_transitively_affine_record_not_only_a_declared_resource() {
         let diags = check(
             "resource File { descriptor: i64 } \
-             resource Wrapper { file: File } \
-             func main() -> i64 { return 0 }",
+             record Envelope { file: File } \
+             func consume(take e: Envelope) {}",
         );
-        assert_eq!(
-            codes_of(&diags),
-            vec!["T0064"],
-            "unexpected diagnostics: {diags:?}"
-        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! NIR instructions.
 
 use crate::hir::ItemId;
+use crate::place::Place;
 use crate::types::{Evidence, Ty};
 
 /// Identifies a value produced within one function: a parameter
@@ -144,6 +145,25 @@ pub enum ValueKind {
     DeferCapture {
         source: ValueId,
     },
+    /// Reads the affine value at `place` (`rfcs/0012`): `root` plus a
+    /// possibly-empty chain of stable field projections, exactly the
+    /// same shared [`Place`] representation `resourceck` and
+    /// `nir::verify` also use, rooted here at a NIR [`ValueId`] instead
+    /// of a HIR local. `mode: Observe` reads without disturbing
+    /// `place`'s own current owner (repeatable, like any other read);
+    /// `mode: Transfer` moves it out (`nir::verify`'s own job to check
+    /// `place` was actually available, and that no sibling place, or the
+    /// place's own strict ancestor, is affected). A structural drop of
+    /// one field is expressed as a `Transfer` read of it immediately
+    /// followed by an ordinary [`Instruction::Drop`] of this
+    /// instruction's own result -- there is no separate `drop.place`
+    /// instruction, since "get the value, then drop it" already
+    /// composes the two primitives `rfcs/0012` itself only sketches
+    /// conceptually.
+    PlaceRead {
+        place: Place<ValueId>,
+        mode: OwnershipMode,
+    },
 }
 
 /// Whether a `Store` (or, by extension, any other place a value flows
@@ -186,4 +206,16 @@ pub enum Instruction {
     /// already have been the operand of another `Drop` on any path
     /// reaching this one (`nir::verify`'s own job, not lowering's).
     Drop { value: ValueId },
+    /// Reinitializes the affine place `place` with `value` (`rfcs/0012`):
+    /// `session.input = open_file()`'s own structural counterpart to
+    /// `Store`'s ordinary whole-slot assignment. Always a transfer of
+    /// `value` into `place` -- there is no observing form, since
+    /// reinitializing a place with a value it does not own would be
+    /// meaningless. `nir::verify` requires `place` to be provably empty
+    /// (never a live, un-moved field this would silently leak) on every
+    /// reachable path reaching this instruction.
+    StorePlace {
+        place: Place<ValueId>,
+        value: ValueId,
+    },
 }

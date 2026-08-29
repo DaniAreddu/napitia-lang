@@ -40,9 +40,51 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.7
+## Current status: Alpha 0.1.8
 
-This milestone adds `resource`/`take`/`drop`/`defer`: Napitia's first
+This milestone extends Alpha 0.1.7's ownership tracking from whole
+local bindings to individual resource-bearing *fields*. A `record`,
+`variant`, or `resource` that reachably contains an affine field
+becomes affine *transitively* — Alpha 0.1.7's blanket rejection of a
+resource-typed field in any aggregate is lifted:
+
+```napitia
+resource File { descriptor: i64 }
+resource Session { input: File, output: File }
+
+func detach(take session: Session) -> File {
+    value input = session.input   // transfers only this field
+    drop session                   // structurally destroys `output`,
+    return input                   // then `session`'s own outer identity
+}
+```
+
+Ownership is tracked per structural *place* (a root binding plus a path
+of stable field projections, `compiler/src/place.rs`), shared unchanged
+by the resource checker, NIR lowering, and the NIR verifier. Moving one
+field never affects an unaffected sibling; a partially-moved aggregate
+may still be used to access a remaining field, reinitialize the moved
+one (once every reachable path proves it empty), or be structurally
+dropped, but is rejected outright if used as a whole (observed,
+returned, transferred, or passed) until it is whole again. A variant's
+own payload — never individually addressable outside a pattern match —
+is tracked as one opaque unit; matching an affine scrutinee transfers
+ownership of the bound case's own payload. NIR gains explicit place
+operations (`load.place`/`move.place`/`store.place`), independently
+re-verified by the same reachable-union dataflow shape Alpha 0.1.7's
+own resource-initialization check already used, now keyed by place
+rather than by bare value; the interpreter gains structural tombstones
+(`Moved`/`Dropped`) so a use-after-move/drop of a field is a structured
+runtime error, an independent backstop for anything the static checks
+already rule out. See `rfcs/0012-structural-ownership.md` for the full
+design, the exact destruction order, and current honest limitations
+(no record-destructuring pattern syntax, no per-case cleanup of a
+wildcard-discarded affine payload, no resource-affine generic
+*function* instantiation).
+
+### Alpha 0.1.7: deterministic resources
+
+This milestone added `resource`/`take`/`drop`/`defer`: Napitia's first
 memory/resource-safety layer, not a copy of Rust's ownership/borrow/
 lifetime system, C++ destructors/`delete`, Java garbage collection, or
 Go's tuple-error convention. A `resource` declaration
@@ -191,7 +233,12 @@ identity and import aliases (`rfcs/0007`).
   any reachable path — see `rfcs/0011-deterministic-resources.md` for
   the full design and current honest limitations (no general
   references, lifetimes, shared ownership, reference counting, tracing
-  GC, native allocator, or nested resource-typed fields).
+  GC, or native allocator). Alpha 0.1.8 extends this to structural
+  fields: a `record`/`variant`/`resource` reachably containing an
+  affine field becomes affine transitively, tracked per structural
+  place (partial move, sibling independence, reinitialization,
+  structural drop order) rather than only per whole binding — see
+  `rfcs/0012-structural-ownership.md`.
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -399,13 +446,18 @@ traces or
 raw pointers, shared ownership, reference counting, a tracing garbage
 collector, a native heap allocator (Alpha 0.1.7's `resource` values are
 semantic runtime objects the interpreter tracks, not pointers into
-process memory — see `rfcs/0011`), generic resources, protocols over
-resource types, a user-defined destructor body attached directly to a
-`resource` declaration, transitive ownership into a resource-typed field
-nested inside another aggregate (rejected outright at declaration
-instead -- see `rfcs/0011`'s own limitations), a resource-typed
-`match`/`handle`/non-tail `if`, the indirection that would lift the
-recursive-aggregate restriction, structured concurrency,
+process memory — see `rfcs/0011`), a resource-affine *generic function*
+instantiation (rejected with a dedicated diagnostic rather than
+supported — a generic aggregate's own affinity, unlike a generic
+function's body, is recomputed per instantiation and does work — see
+`rfcs/0012`), protocols over resource (or otherwise affine) types, a
+user-defined destructor body attached directly to a `resource`
+declaration, record-destructuring pattern syntax (only the pattern
+shapes that already parsed — a bare binding, a variant case's own
+positional payload — are resource-aware), per-case structural cleanup
+of an affine payload discarded through a wildcard match pattern, a
+resource-typed `match`/`handle`/non-tail `if`, the indirection that
+would lift the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
 aliases that do exist — see above), incremental/cached compilation, an

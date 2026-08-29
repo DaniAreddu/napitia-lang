@@ -109,6 +109,28 @@ can check the base's actual type, not just index-bounds. A unit case's
 `variant.create` supplies no payload values at all -- no fabricated
 placeholder is ever allocated for it.
 
+### Structural places (Alpha 0.1.8, `rfcs/0012`)
+
+```text
+%d = load.place %r.@<owner>.<field>[.@<owner>.<field> ...]   ; observing structural read
+%d = move.place %r.@<owner>.<field>[.@<owner>.<field> ...]   ; transferring structural read
+      store.place %r.@<owner>.<field>, %v                     ; structural reinitialization
+```
+
+A place is a root value plus a chain of stable field projections
+(`Place<ValueId>`, `compiler/src/place.rs` — the same generic
+representation `resourceck`'s own HIR-rooted places share). There is no
+separate `drop.place`: a structural drop is `move.place` immediately
+followed by an ordinary `drop` of its result. The verifier independently
+re-validates every projection (unknown field owner, out-of-range field
+index, projection through the wrong or a non-aggregate type, move of a
+non-affine place — `V0083`–`V0086`) and independently re-derives each
+place's own move/reinitialization state via the identical
+reachable-union dataflow shape `V0082` already uses (`V0087`/`V0088`),
+keyed by place rather than by bare value, canonicalized through the same
+`Load`-origin unification the whole-value pass already needs for a
+`mutable` local reloaded more than once.
+
 `[<type-args>]` (Alpha 0.1.4, `rfcs/0008`) is present only when the
 callee/record/variant is generic — a call/construction against a
 non-generic declaration prints and carries no bracket at all, not an

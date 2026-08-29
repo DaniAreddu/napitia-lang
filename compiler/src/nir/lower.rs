@@ -17,7 +17,7 @@
 //! never reference a function that lowering silently left out, because
 //! there is no way to leave one out and still get a `Module` back.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{
     BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
@@ -28,9 +28,10 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFieldInit, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, ItemId,
-    LocalId, PatternId,
+    LocalId, PatternId, TypeParamId,
 };
 use crate::limits::MAX_PATTERN_DEPTH;
+use crate::place::{FieldId, Place, Projection};
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
@@ -1307,14 +1308,29 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             HirStmt::Drop { expr, .. } => {
-                // The common case (`rfcs/0011`) is a bare local reference
-                // naming an owned resource -- bookkeeping-tracked, so
-                // this scope's own end-of-scope sweep knows to skip it.
-                // Any other resource-typed expression (e.g. dropping a
-                // freshly-constructed value with no binding at all) is
-                // still a valid, if unusual, `drop`: evaluated and
-                // destroyed the same way, just with no local to update
-                // bookkeeping for.
+                // A bare local reference naming an owned, possibly
+                // *partially*-moved aggregate (`rfcs/0012`) has its own
+                // checked structural cleanup plan recorded directly
+                // under this exact operand's own `ExprId` (`resourceck::
+                // flow::FlowChecker::check_drop` -- reusing
+                // `cleanup_edges`'s own existing shape, since an
+                // explicit `drop` is its own one-off exit): replaying it
+                // destroys exactly the still-live descendants
+                // `structural_drop_targets` already proved remain, in
+                // their own correct reverse-declaration order, followed
+                // by the aggregate's own outer identity last if it is
+                // itself a declared `resource` -- never a single naive
+                // whole-value `Drop`, which would silently leak every
+                // field already-moved-out has NOT already accounted
+                // for. Any other resource-typed expression (e.g.
+                // dropping a freshly-constructed value with no binding
+                // at all, which `check_drop` never records a plan for)
+                // falls back to the original direct lowering: evaluated
+                // and destroyed the same way, just with no local to
+                // update bookkeeping for.
+                if self.cleanup_edges.contains_key(&expr.id()) {
+                    return self.emit_checked_cleanup(fb, expr.id());
+                }
                 let value = match self.lower_expr(fb, expr)? {
                     LoweredExpr::Value(v) => v,
                     LoweredExpr::Diverged => return Ok(()),
@@ -1329,10 +1345,186 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `true` iff `ty` is a resolved reference to a declared `resource`
-    /// (`rfcs/0011`), mirroring `resourceck`'s own identical check.
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
+    /// `resource` itself, or a record/variant/resource reachably
+    /// containing one -- independently recomputed from this stage's own
+    /// `records`/`variants` layouts, mirroring `resourceck`'s identical
+    /// query (`resourceck::is_affine_item`/`is_affine_ty`) rather than
+    /// trusting its verdict passed through unchecked, exactly like every
+    /// other fact `nir::lower` re-derives from checked metadata instead
+    /// of assuming. Guarded against a genuinely cyclic declaration
+    /// (already independently rejected elsewhere as an infinite-size
+    /// layout) the same way both of those do: a cycle back-edge
+    /// contributes `false` to *that one* occurrence's own disjunction,
+    /// never cached (this stage does not memoize at all, unlike
+    /// `resourceck`'s own per-module query, since it is not called
+    /// densely enough per module to need to).
     fn is_affine(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|r| r.affine))
+        self.is_affine_visiting(ty, &mut HashSet::new())
+    }
+
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>) -> bool {
+        let field_types = |item: &ItemId| -> Vec<Ty> {
+            if let Some(record) = self.records.get(item) {
+                record.fields.iter().map(|(_, t)| t.clone()).collect()
+            } else if let Some(variant) = self.variants.get(item) {
+                variant
+                    .cases
+                    .iter()
+                    .flat_map(|c| c.payload.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        match ty {
+            Ty::Named(item, _) => {
+                if self.records.get(item).is_some_and(|r| r.affine) {
+                    return true;
+                }
+                if !visiting.insert(*item) {
+                    return false;
+                }
+                let result = field_types(item)
+                    .iter()
+                    .any(|fty| self.is_affine_visiting(fty, visiting));
+                visiting.remove(item);
+                result
+            }
+            Ty::Applied(item, args) => {
+                if self.records.get(item).is_some_and(|r| r.affine) {
+                    return true;
+                }
+                if !visiting.insert(*item) {
+                    return false;
+                }
+                let type_params: Vec<TypeParamId> = self
+                    .records
+                    .get(item)
+                    .map(|r| r.type_params.iter().map(|(id, _)| *id).collect())
+                    .or_else(|| {
+                        self.variants
+                            .get(item)
+                            .map(|v| v.type_params.iter().map(|(id, _)| *id).collect())
+                    })
+                    .unwrap_or_default();
+                let subst: HashMap<TypeParamId, Ty> =
+                    type_params.into_iter().zip(args.iter().cloned()).collect();
+                let result = field_types(item).iter().any(|fty| {
+                    self.is_affine_visiting(&crate::types::substitute(fty, &subst), visiting)
+                });
+                visiting.remove(item);
+                result
+            }
+            _ => false,
+        }
+    }
+
+    /// Mirrors `resourceck::flow::FlowChecker::resolve_place`: `expr`
+    /// resolves to a stable structural place iff it is a bare local, or
+    /// a `Field` access chain rooted in one through nothing but further
+    /// `Field` accesses -- exactly the condition `resourceck` already
+    /// used to decide whether to track this exact access as a place at
+    /// all. Field indices are independently re-derived here by name,
+    /// exactly like `lower_field`'s own non-affine path already does,
+    /// rather than trusting a second parallel resolution passed through
+    /// unchecked.
+    fn resolve_place_expr(&mut self, expr: &HirExpr) -> LowerResult<Option<Place<LocalId>>> {
+        match expr {
+            HirExpr::Local { local, .. } => Ok(Some(Place::root(*local))),
+            HirExpr::Field { base, name, .. } => {
+                let Some(base_place) = self.resolve_place_expr(base)? else {
+                    return Ok(None);
+                };
+                let base_ty = self.expr_ty(base)?;
+                let record = match base_ty {
+                    Ty::Named(record, _) | Ty::Applied(record, _) => record,
+                    _ => {
+                        return Err(
+                            self.unsupported(base.span(), "field access on a non-record type")
+                        );
+                    }
+                };
+                let field_index = self
+                    .records
+                    .get(&record)
+                    .and_then(|r| r.fields.iter().position(|(n, _)| *n == *name))
+                    .ok_or_else(|| {
+                        self.unsupported(expr.span(), "field access on an unknown field")
+                    })?;
+                Ok(Some(base_place.field(record, FieldId(field_index as u32))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolves a HIR-rooted structural place (`resourceck::flow`'s own
+    /// [`Place<LocalId>`]) to its NIR counterpart -- rooted at that
+    /// local's own *current* SSA value -- and the place's own resolved
+    /// type, by loading the root and walking each projection step
+    /// against `self.records` (the same stable field identity
+    /// `resourceck` already validated, independently revalidated here
+    /// rather than trusted blindly). `Projection` itself carries no root
+    /// type parameter at all (only [`Place`] does), so the projection
+    /// list is reused unchanged -- never rebuilt field by field.
+    fn resolve_nir_place(
+        &mut self,
+        fb: &mut FnBuilder,
+        place: &Place<LocalId>,
+    ) -> LowerResult<(Place<ValueId>, Ty)> {
+        let Some(binding) = fb.local_bindings.get(&place.root).copied() else {
+            return Err(self.internal_error(&format!(
+                "a checked place names local {:?}, which this frame never bound",
+                place.root
+            )));
+        };
+        let root_value = self.load_current(fb, place.root, binding)?;
+        let Some(mut ty) = self.local_types.get(&place.root).cloned() else {
+            return Err(self.internal_error(&format!(
+                "local {:?} has no type recorded by typeck",
+                place.root
+            )));
+        };
+        for projection in &place.projections {
+            let Projection::Field { owner, field } = projection else {
+                return Err(self.internal_error(
+                    "a checked place projects through a variant field, which this milestone's \
+                     structural places never produce",
+                ));
+            };
+            let Some(record) = self.records.get(owner) else {
+                return Err(self.internal_error(&format!(
+                    "a checked place projects through unknown record {owner:?}"
+                )));
+            };
+            let Some((_, field_ty)) = record.fields.get(field.0 as usize) else {
+                return Err(self.internal_error(&format!(
+                    "a checked place projects field {field:?}, out of range for record {owner:?}"
+                )));
+            };
+            ty = field_ty.clone();
+        }
+        Ok((
+            Place {
+                root: root_value,
+                projections: place.projections.clone(),
+            },
+            ty,
+        ))
+    }
+
+    /// `resourceck`'s own checked observe-vs-transfer decision for a
+    /// field-read expression's own id (`rfcs/0012`) -- unlike
+    /// [`Self::lookup_consume_mode`] (for a position that is *always* a
+    /// consuming one), a field read's own position is only sometimes
+    /// consuming: `resourceck` records nothing at all for a pure
+    /// observation (there is no ownership decision to make), so a
+    /// missing entry here means `Observe`, not a structural mismatch.
+    fn field_read_mode(&self, id: ExprId) -> crate::nir::OwnershipMode {
+        match self.consume_sites.get(&id) {
+            Some(crate::resourceck::ConsumeInfo::Transfer) => crate::nir::OwnershipMode::Transfer,
+            _ => crate::nir::OwnershipMode::Observe,
+        }
     }
 
     /// The current NIR value behind `local`'s own binding: its value
@@ -1544,21 +1736,40 @@ impl<'a> Lowering<'a> {
         let mut last_defer_registration: Option<u32> = None;
         for action in actions {
             match action {
-                crate::resourceck::CleanupAction::Drop(local) => {
+                crate::resourceck::CleanupAction::Drop(place) => {
                     // `resourceck` only ever schedules a `Drop` for a
-                    // local it already proved `Available`/
+                    // place it already proved `Available`/
                     // `DropScheduled` at this exact exit -- which itself
-                    // already means this exact local was bound on
-                    // whichever path reached here. A missing binding
-                    // means this checked plan and what lowering actually
-                    // built have disagreed, not that there is nothing
-                    // to clean up here.
-                    let Some(binding) = fb.local_bindings.get(&local).copied() else {
-                        return Err(self.internal_error(&format!(
-                            "a checked cleanup action drops local {local:?}, which this frame never bound"
-                        )));
+                    // already means this exact place's own root was
+                    // bound on whichever path reached here. A missing
+                    // binding means this checked plan and what lowering
+                    // actually built have disagreed, not that there is
+                    // nothing to clean up here. A bare root (`rfcs/
+                    // 0011`) destroys exactly the local's own current
+                    // value, unchanged from before Alpha 0.1.8; a
+                    // projected place (`rfcs/0012`) moves the exact
+                    // structural field out first (`PlaceRead`, `mode:
+                    // Transfer`) and destroys *that* -- "get the value,
+                    // then drop it" is `drop.place`'s own realization,
+                    // see `Instruction::PlaceRead`'s own doc comment.
+                    let value = if place.projections.is_empty() {
+                        let Some(binding) = fb.local_bindings.get(&place.root).copied() else {
+                            return Err(self.internal_error(&format!(
+                                "a checked cleanup action drops local {:?}, which this frame never bound",
+                                place.root
+                            )));
+                        };
+                        self.load_current(fb, place.root, binding)?
+                    } else {
+                        let (nir_place, ty) = self.resolve_nir_place(fb, &place)?;
+                        fb.push_value(
+                            ty,
+                            ValueKind::PlaceRead {
+                                place: nir_place,
+                                mode: crate::nir::OwnershipMode::Transfer,
+                            },
+                        )
                     };
-                    let value = self.load_current(fb, local, binding)?;
                     fb.push_instruction(crate::nir::Instruction::Drop { value });
                 }
                 crate::resourceck::CleanupAction::Defer(defer_id) => {
@@ -2248,6 +2459,36 @@ impl<'a> Lowering<'a> {
         op: AssignOp,
         value: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
+        // Reinitializing an affine field place (`session.input =
+        // open_file();`, `rfcs/0012`) -- `typeck` only ever accepts this
+        // target shape for a plain `=` into an affine field
+        // (`Checker::check_assign`), and `resourceck` already proved the
+        // target place is provably empty on every reachable path before
+        // this instruction is ever reached; lowering itself resolves the
+        // place fresh here (never trusting a HIR-level annotation) and
+        // emits an explicit `StorePlace`.
+        if let HirExpr::Field { .. } = target {
+            let target_ty = self.expr_ty(target)?;
+            if self.is_affine(&target_ty) {
+                let Some(place) = self.resolve_place_expr(target)? else {
+                    return Err(self.internal_error(
+                        "an affine field assignment target has no resolvable structural place",
+                    ));
+                };
+                let (nir_place, ty) = self.resolve_nir_place(fb, &place)?;
+                let value_value = match self.lower_expr_hinted(fb, value, &ty)? {
+                    LoweredExpr::Value(v) => v,
+                    LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
+                };
+                fb.push_instruction(crate::nir::Instruction::StorePlace {
+                    place: nir_place,
+                    value: value_value,
+                });
+                return Ok(LoweredExpr::Value(
+                    fb.push_value(Ty::Unit, ValueKind::Const(Const::Unit)),
+                ));
+            }
+        }
         let HirExpr::Local { local, .. } = target else {
             if matches!(self.lower_expr(fb, target)?, LoweredExpr::Diverged) {
                 return Ok(LoweredExpr::Diverged);
@@ -3232,6 +3473,39 @@ impl<'a> Lowering<'a> {
         name: Symbol,
         field_expr: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
+        // An affine field access (`rfcs/0012`, lifting Alpha 0.1.7's
+        // blanket rejection of a resource-typed field in any aggregate)
+        // is lowered as a structural place read, never an eager
+        // whole-base evaluation plus `RecordField`: `base` is walked
+        // through `resolve_place_expr` itself (never `lower_expr(base)`
+        // first), so an intermediate `Field` in the chain is never
+        // treated as a whole-value read of its own base -- reading
+        // through an already-partially-moved intermediate aggregate
+        // (`session.output` after `session.input` was moved) must stay
+        // valid. `resourceck` already proved `base` resolves to a
+        // stable place whenever this field's own type is affine and the
+        // program is valid at all (a temporary would already have been
+        // rejected there as a leak) -- an unresolvable place here is
+        // therefore always a structural mismatch, not a case to fall
+        // back silently from.
+        let field_ty = self.expr_ty(field_expr)?;
+        if self.is_affine(&field_ty) {
+            let Some(place) = self.resolve_place_expr(field_expr)? else {
+                return Err(self.internal_error(
+                    "an affine field access has no resolvable structural place, but resourceck \
+                     already accepted this program",
+                ));
+            };
+            let (nir_place, ty) = self.resolve_nir_place(fb, &place)?;
+            let mode = self.field_read_mode(field_expr.id());
+            return Ok(LoweredExpr::Value(fb.push_value(
+                ty,
+                ValueKind::PlaceRead {
+                    place: nir_place,
+                    mode,
+                },
+            )));
+        }
         let base_value = match self.lower_expr(fb, base)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -3261,7 +3535,6 @@ impl<'a> Lowering<'a> {
             .ok_or_else(|| {
                 self.unsupported(field_expr.span(), "field access on an unknown field")
             })?;
-        let field_ty = self.expr_ty(field_expr)?;
         Ok(LoweredExpr::Value(fb.push_value(
             field_ty,
             ValueKind::RecordField {
@@ -4298,6 +4571,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4349,6 +4628,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4409,6 +4694,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4496,6 +4787,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4752,6 +5049,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4824,6 +5127,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -4893,6 +5202,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -7501,8 +7816,19 @@ mod tests {
             other_items: vec![],
         };
         let (local_types, expr_types, pattern_case) = empty_maps();
-        let resourceck_result =
-            crate::resourceck::check_module(&module, &local_types, &expr_types, &interner);
+        let empty_affine = crate::resourceck::AffineContext {
+            aggregate_field_types: &HashMap::new(),
+            declared_resources: &HashSet::new(),
+            item_type_params: &HashMap::new(),
+            field_projections: &HashMap::new(),
+        };
+        let resourceck_result = crate::resourceck::check_module(
+            &module,
+            &local_types,
+            &expr_types,
+            &interner,
+            &empty_affine,
+        );
         let result = lower_module_with_paths(
             &module,
             &local_types,

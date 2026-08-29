@@ -891,6 +891,31 @@ fn resource_handle_cleanup_example_runs_end_to_end() {
     assert_resource_example_runs("resource_handle_cleanup.npt", "4");
 }
 
+#[test]
+fn resource_nested_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_nested.npt", "3");
+}
+
+#[test]
+fn resource_field_move_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_move.npt", "20");
+}
+
+#[test]
+fn resource_partial_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_drop.npt", "0");
+}
+
+#[test]
+fn resource_field_reinitialize_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_reinitialize.npt", "5");
+}
+
+#[test]
+fn resource_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_payload.npt", "8");
+}
+
 /// Each invalid resource example is rejected at `check` with its own
 /// exact code, and every stage that runs it agrees, with no leaked
 /// internal (`Ixxxx`/`Vxxxx`) diagnostic and no panic.
@@ -937,4 +962,19 @@ fn resource_invalid_escape_example_is_u0005_at_every_stage() {
 #[test]
 fn resource_invalid_generic_take_example_is_t0065_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_generic_take.npt", "T0065");
+}
+
+#[test]
+fn resource_invalid_parent_after_partial_move_example_is_u0014_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_parent_after_partial_move.npt", "U0014");
+}
+
+#[test]
+fn resource_invalid_live_field_overwrite_example_is_u0010_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_live_field_overwrite.npt", "U0010");
+}
+
+#[test]
+fn resource_invalid_field_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_field_double_drop.npt", "U0003");
 }

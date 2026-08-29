@@ -1708,19 +1708,36 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            // Field mutation gets its own dedicated diagnostic (T0015),
-            // distinct from T0008's generic "invalid assignment
-            // target" -- the point being made is that mutation itself
-            // is unimplemented, not that the target shape is wrong.
-            // `Error` already traces back to a diagnostic recorded
-            // elsewhere and needs no second complaint.
+            // A plain `=` into an affine field is accepted as a
+            // structural reinitialization (`rfcs/0012`): `resourceck`
+            // separately decides whether the target place is actually
+            // provably empty (never a live, un-moved value it would
+            // silently leak) on every reachable path -- this stage only
+            // confirms the shape itself is legal to attempt at all.
+            // Every other field-assignment shape keeps its own
+            // dedicated diagnostic (T0015, distinct from T0008's generic
+            // "invalid assignment target"): ordinary (non-affine) field
+            // mutation remains genuinely unimplemented, and a compound
+            // assignment (`+=`, ...) to an affine field is never
+            // meaningful (there is no numeric/bitwise operation on a
+            // resource to speak of). `Error` already traces back to a
+            // diagnostic recorded elsewhere and needs no second
+            // complaint.
+            HirExpr::Field { span, .. } if self.is_affine(&target_ty) && op == AssignOp::Assign => {
+            }
             HirExpr::Field { span, .. } => {
+                let message = if self.is_affine(&target_ty) {
+                    "a compound assignment to an affine field is not supported: only a plain `=` \
+                     reinitialization is"
+                } else {
+                    "field mutation is not implemented for a non-affine field"
+                };
                 self.diagnostics.push(
                     Diagnostic::error(
                         codes::FIELD_MUTATION_UNSUPPORTED,
                         self.source,
                         *span,
-                        "field mutation is not implemented in Alpha 0.1.1",
+                        message,
                     )
                     .with_primary_label("cannot assign to a field"),
                 );

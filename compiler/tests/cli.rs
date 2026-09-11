@@ -941,6 +941,15 @@ fn assert_resource_example_rejected(name: &str, code: &str) {
             !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
             "`{cmd}` panicked instead of reporting a diagnostic for {name}: {err}"
         );
+        // The same invalid program must produce byte-identical output
+        // across two independent runs: no `HashMap` iteration order may
+        // reach a user-visible diagnostic (`rfcs/0012`).
+        let again = napitia(&[cmd, &path]);
+        assert_eq!(
+            err,
+            stderr(&again),
+            "`{cmd}`'s own diagnostics for {name} are not deterministic across repeated runs"
+        );
     }
 }
 
@@ -977,4 +986,84 @@ fn resource_invalid_live_field_overwrite_example_is_u0010_at_every_stage() {
 #[test]
 fn resource_invalid_field_double_drop_example_is_u0003_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_field_double_drop.npt", "U0003");
+}
+
+// -- Alpha 0.1.8 structural ownership repairs (`rfcs/0012`) -------------
+//
+// Every example below is one of the blockers the first Alpha 0.1.8
+// review rejected the milestone for, exercised end to end through the
+// real binary: `check` accepts it, `ir` produces deterministic NIR with
+// no leaked verifier code, and `run` produces the value that proves each
+// affine identity was transferred or destroyed exactly once.
+
+#[test]
+fn resource_wildcard_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_payload.npt", "1");
+}
+
+#[test]
+fn resource_wildcard_partial_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_partial_payload.npt", "11");
+}
+
+#[test]
+fn resource_mixed_nesting_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_mixed_nesting.npt", "82");
+}
+
+#[test]
+fn resource_generic_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_aggregate.npt", "69");
+}
+
+#[test]
+fn resource_generic_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_variant_payload.npt", "5");
+}
+
+#[test]
+fn resource_defer_field_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_defer_field.npt", "2");
+}
+
+#[test]
+fn resource_field_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_drop.npt", "2");
+}
+
+#[test]
+fn resource_structural_exits_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_exits.npt", "5");
+}
+
+#[test]
+fn resource_invalid_local_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_local_double_drop.npt", "U0003");
+}
+
+#[test]
+fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_defer_parent_drop.npt", "U0004");
+}
+
+/// The field-level double drop reports the *field* as double-dropped,
+/// not merely the generic whole-local diagnostic a local extracted out
+/// of that field first would produce -- the two examples exist side by
+/// side precisely so a regression collapsing one into the other is
+/// visible.
+#[test]
+fn the_field_and_local_double_drop_examples_name_their_own_target() {
+    let field = stderr(&napitia(&["check", &example("resource_invalid_field_double_drop.npt")]));
+    assert!(
+        field.contains("drop session.input;"),
+        "the field double drop must be reported against the field itself: {field}"
+    );
+    let local = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_local_double_drop.npt"),
+    ]));
+    assert!(
+        local.contains("drop input;"),
+        "the local double drop must be reported against the local: {local}"
+    );
 }

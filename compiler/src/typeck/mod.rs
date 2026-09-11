@@ -3918,39 +3918,32 @@ impl<'a> Checker<'a> {
         self.unify_report(&Ty::Bool, ty, span, "expected a boolean expression");
     }
 
-    /// `true` iff `ty` is a resolved reference to a declared `resource`
-    /// (`rfcs/0011`), never a `record`/`variant`/primitive -- regardless
-    /// of whether that `record`/`variant` is itself transitively affine.
-    /// `drop` remains a `resource`-only keyword in Alpha 0.1.8: an
-    /// ordinary (even transitively affine) aggregate is still only ever
-    /// destroyed implicitly (moved out, or structurally cleaned up at
-    /// its own owning scope's exit), never named directly by an explicit
-    /// `drop <expr>;`.
-    fn is_declared_resource(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Named(item, _) if self.records.get(item).is_some_and(|info| info.affine))
-    }
-
-    /// `drop <expr>;` (`rfcs/0011`) only ever accepts a resource-typed
-    /// operand -- a primitive, `str`, or ordinary record/variant value
-    /// has no owned resource state for `resourceck` to transition to
-    /// `Dropped` at all.
+    /// `drop <expr>;` (`rfcs/0011`, `rfcs/0012`) accepts any
+    /// *transitively affine* operand, not only a declared `resource`:
+    /// a record or variant that merely contains one owns real resources
+    /// too, and `drop` on it is a structural destruction of exactly what
+    /// it still holds -- the same operation the compiler already
+    /// performs implicitly at its owning scope's exit, named explicitly.
+    /// A primitive, `str`, or ordinary non-affine aggregate is still
+    /// rejected: there is no owned state there for `resourceck` to
+    /// transition to `Dropped` at all.
     fn check_drop_target(&mut self, ty: &Ty, span: Span) {
         let resolved = self.ctx.resolve(ty);
         if matches!(resolved, Ty::Error | Ty::Never) {
             return;
         }
-        if !self.is_declared_resource(&resolved) {
+        if !self.is_affine(&resolved) {
             self.diagnostics.push(
                 Diagnostic::error(
                     codes::DROP_OF_NON_RESOURCE,
                     self.source,
                     span,
                     format!(
-                        "`drop` requires a resource value, found `{}`",
+                        "`drop` requires a value that owns a resource, found `{}`",
                         self.display_for_diagnostic(&resolved)
                     ),
                 )
-                .with_primary_label("not a resource"),
+                .with_primary_label("owns no resource"),
             );
         }
     }

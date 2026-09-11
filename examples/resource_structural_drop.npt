@@ -1,0 +1,36 @@
+// `drop` destroys any value that *owns* a resource, not only a declared
+// `resource` itself (`rfcs/0012`): an ordinary record or variant that
+// merely contains one is destroyed structurally, exactly as the
+// compiler already destroys it implicitly at its owning scope's exit --
+// just named explicitly. A value that owns nothing is still rejected.
+resource File {
+    descriptor: i64,
+}
+
+record Envelope {
+    file: File,
+}
+
+variant Held {
+    Carrying(Envelope),
+    Neither,
+}
+
+func main() -> i64 {
+    // A directly dropped affine temporary.
+    drop Envelope { file: File { descriptor: 1 } };
+
+    // An affine record bound to a local, destroyed field by field.
+    value envelope = Envelope { file: File { descriptor: 2 } };
+    drop envelope;
+
+    // A variant whose active case carries an affine record: only the
+    // live case's own payload is destroyed.
+    value held = Held.Carrying(Envelope { file: File { descriptor: 3 } });
+    drop held;
+
+    value empty = Held.Neither;
+    drop empty;
+
+    return 0;
+}

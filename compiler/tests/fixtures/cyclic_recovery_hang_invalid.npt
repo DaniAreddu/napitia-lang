@@ -1,0 +1,19 @@
+// A record whose closing brace is missing, so parser recovery folds the
+// next declaration's fields into it and produces a self-referential
+// layout. `typeck::cycles` rejects that as infinite -- but checking
+// never stops at the first error, so `resourceck` still walks the same
+// HIR, and its place decomposition used to descend that infinite place
+// tree forever. Must terminate with an ordinary diagnostic.
+resource File {
+    descriptor: i64,
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}

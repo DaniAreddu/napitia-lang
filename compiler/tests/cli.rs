@@ -1153,3 +1153,30 @@ fn textual_nir_shows_a_generic_constructions_type_arguments() {
         "expected a generic variant construction to print its type arguments: {text}"
     );
 }
+
+/// A malformed program whose parser recovery produces a self-referential
+/// layout must terminate. `typeck::cycles` rejects it as an infinite
+/// layout, but checking never stops at the first error, so `resourceck`
+/// still walks the same HIR -- and its own place decomposition has to
+/// bound the infinite place tree that layout describes rather than
+/// descending it forever.
+#[test]
+fn a_recovered_self_referential_layout_terminates_instead_of_hanging() {
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &fixture("cyclic_recovery_hang_invalid.npt")]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should reject the recovered cyclic layout"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error["),
+            "`{cmd}` should report a diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked: {err}"
+        );
+    }
+}

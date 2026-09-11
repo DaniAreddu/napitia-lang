@@ -572,6 +572,16 @@ impl<'a> FlowChecker<'a> {
     /// and re-resolving it here a second time would risk disagreeing
     /// with the caller's own idea of what `place` even refers to.
     fn place_is_wholly_available(&self, place: &Place<LocalId>, ty: &Ty) -> bool {
+        // A self-referential declaration (`record A { a: A }`, or one
+        // a parser recovery folded into itself) has an infinite place
+        // tree. `typeck::cycles` already rejects it as an infinite
+        // layout -- but this stage still runs on the same HIR, because
+        // checking never stops at the first error, so it needs its own
+        // bound or it descends forever. Answering "whole" here only
+        // affects a program that is already rejected.
+        if place.projections.len() >= crate::limits::MAX_GENERIC_DEPTH {
+            return true;
+        }
         if self.place_state(place) != ResourceState::Available {
             return false;
         }
@@ -722,6 +732,15 @@ impl<'a> FlowChecker<'a> {
     /// it contributes itself alone, exactly like Alpha 0.1.7's own
     /// whole-value resources always did.
     fn structural_drop_targets(&self, place: &Place<LocalId>) -> Vec<Place<LocalId>> {
+        // Bounded for the same reason `place_is_wholly_available` is:
+        // a self-referential declaration has an infinite place tree,
+        // and this stage still walks it on HIR `typeck::cycles` has
+        // already rejected. Contributing the place itself matches how
+        // every other non-decomposable shape (a variant, malformed
+        // generic metadata) is treated.
+        if place.projections.len() >= crate::limits::MAX_GENERIC_DEPTH {
+            return vec![place.clone()];
+        }
         // `DropScheduled` still needs destroying here exactly like
         // `Available` does -- it means only that an observing `defer`
         // has *already run* by the time this exact exit replays cleanup

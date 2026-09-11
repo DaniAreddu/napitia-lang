@@ -452,6 +452,13 @@ mod codes {
     /// parent was already dropped, or dropping the same structural
     /// field twice.
     pub const DUPLICATE_STRUCTURAL_CLEANUP: &str = "V0092";
+    /// A `StorePlace` whose own stored value is the very root its
+    /// destination place projects out of (`rfcs/0012`) -- an aggregate
+    /// stored into one of its own fields. Because the store *transfers*
+    /// ownership, the container would end up holding a handle its own
+    /// transfer had just made stale, so this is rejected outright
+    /// rather than left to fail unpredictably at run time.
+    pub const STORE_PLACE_SELF_ALIAS: &str = "V0093";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1296,6 +1303,24 @@ fn verify_function(
                 Instruction::StorePlace { place, value } => {
                     require_value(place.root, diagnostics);
                     require_value(*value, diagnostics);
+                    // A store whose source *is* the storage its own
+                    // destination is rooted in would have to place an
+                    // aggregate inside itself (`rfcs/0012`) -- and
+                    // because the store transfers, it would leave the
+                    // container holding a handle its own transfer just
+                    // made stale. Rejected statically, not only by the
+                    // interpreter's own runtime guard.
+                    if place.root == *value {
+                        diagnostics.push(Diagnostic::error(
+                            codes::STORE_PLACE_SELF_ALIAS,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is stored into a place rooted at itself",
+                                value.0
+                            ),
+                        ));
+                    }
                     if let Some(root_ty) = value_types.get(&place.root).cloned() {
                         match resolve_place_ty(&root_ty, &place.projections, agg) {
                             Ok(resolved_ty) => {

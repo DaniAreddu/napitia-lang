@@ -652,18 +652,164 @@ impl<'a> Interpreter<'a> {
     /// (`rfcs/0012`, structural reinitialization) -- the write-only
     /// counterpart of [`Self::access_place`]'s `Transfer` mode, sharing
     /// its identical container-navigation logic.
-    fn store_place(
+    /// Reinitializes `place` with the value `source` names, as a genuine
+    /// **ownership transfer** (`rfcs/0011`, `rfcs/0012`) -- what
+    /// `Instruction::StorePlace` actually means, as opposed to merely
+    /// copying a value into a field and leaving the original looking
+    /// like a current owner too.
+    ///
+    /// Runs in three strictly ordered phases so the whole operation is
+    /// transactional:
+    ///
+    /// 1. **Validate**, mutating nothing: the destination chain must be
+    ///    reachable and its final field provably empty, and every
+    ///    resource reachable through `source` must be a live, current,
+    ///    owning handle. A failure here leaves the source valid, the
+    ///    destination untouched, and no generation bumped.
+    /// 2. **Transfer**: every resource identity nested in `source` is
+    ///    transferred, which bumps its generation and makes every handle
+    ///    minted from the previous one stale. Phase 1 already proved
+    ///    each one transferable, so this cannot fail partway and leave
+    ///    some children transferred and others not.
+    /// 3. **Commit**: the transferred value is written into the place,
+    ///    and `source`'s own entry is tombstoned so a later read is a
+    ///    structured error rather than a stale handle that happens to
+    ///    look plausible. Both the exact id and the storage it
+    ///    canonicalizes to are tombstoned -- a `Load` result and the
+    ///    slot it read share one identity, exactly as `nir::verify`
+    ///    treats them.
+    ///
+    /// Self-aliasing is rejected up front: a store whose source is the
+    /// very storage its destination is rooted in would have to place an
+    /// aggregate inside itself.
+    fn store_place_transfer(
         &self,
         values: &mut HashMap<ValueId, Value>,
         load_origin: &HashMap<ValueId, ValueId>,
         place: &Place<ValueId>,
-        value: Value,
+        source: ValueId,
     ) -> Result<(), InterpreterError> {
         let root_id = canonical_root(load_origin, place.root);
+        let source_id = canonical_root(load_origin, source);
+        if source_id == root_id {
+            return Err(invalid(
+                "a structural store's own source and destination name the same storage",
+            ));
+        }
         let root = get(values, &root_id)?;
-        let updated_root = self.store_projections(root, &place.projections, value)?;
+        let incoming = get(values, &source)?;
+
+        // Phase 1 -- validation only; nothing below this point mutates.
+        self.validate_store_target(&root, &place.projections)?;
+        self.validate_transferable(&incoming)?;
+
+        // Phase 2 -- the only phase that bumps a generation.
+        let owned = self.transfer_if_resource(incoming)?;
+
+        // Phase 3 -- commit.
+        let updated_root = self.store_projections(root, &place.projections, owned)?;
         values.insert(root_id, updated_root);
+        values.insert(source, Value::Moved);
+        values.insert(source_id, Value::Moved);
         Ok(())
+    }
+
+    /// Proves `projections` reaches a field that may legally be
+    /// reinitialized, without mutating anything (`rfcs/0012`) -- the
+    /// read-only half of [`Self::store_place_transfer`]'s own phase 1.
+    /// Every intermediate must be a live container, and the final field
+    /// must already be a `Moved`/`Dropped` tombstone: reinitializing
+    /// over a live value would silently leak it.
+    fn validate_store_target(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+    ) -> Result<(), InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Err(invalid("a structural store names no field to reinitialize"));
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot reinitialize a field through a merely-observing resource handle",
+                    ));
+                }
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                if rest.is_empty() {
+                    if !matches!(inner, Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a resource field that still owns a live value",
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    self.validate_store_target(&inner, rest)
+                }
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                if rest.is_empty() {
+                    if !matches!(slot, Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a record field that still owns a live value",
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    self.validate_store_target(slot, rest)
+                }
+            }
+            Value::Moved => Err(invalid(
+                "a place reinitializes through a field that was already moved",
+            )),
+            Value::Dropped => Err(invalid(
+                "a place reinitializes through a field that was already dropped",
+            )),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// Proves every resource identity reachable through `value` can be
+    /// transferred, without transferring any of them (`rfcs/0011`) --
+    /// the other read-only half of phase 1. Checking the whole tree up
+    /// front is what makes a nested aggregate's transfer all-or-nothing:
+    /// bumping the first child's generation and then discovering the
+    /// second is stale would leave the value half-transferred with no
+    /// way back.
+    fn validate_transferable(&self, value: &Value) -> Result<(), InterpreterError> {
+        match value {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot transfer ownership through a merely-observing resource handle",
+                    ));
+                }
+                let table = self.resources.borrow();
+                let record = table.record(*handle)?;
+                if record.status == ResourceStatus::Dropped {
+                    return Err(invalid(
+                        "cannot transfer ownership of a resource that was already dropped",
+                    ));
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => fields
+                .iter()
+                .try_for_each(|field| self.validate_transferable(field)),
+            Value::Variant { payload, .. } => payload
+                .iter()
+                .try_for_each(|field| self.validate_transferable(field)),
+            Value::Moved => Err(invalid("transfer of a value that was already moved")),
+            Value::Dropped => Err(invalid("transfer of a value that was already destroyed")),
+            _ => Ok(()),
+        }
     }
 
     /// Reads the value at `projections`' own final step out of
@@ -1480,8 +1626,11 @@ impl<'a> Interpreter<'a> {
                         values.remove(value);
                     }
                     crate::nir::Instruction::StorePlace { place, value } => {
-                        let v = get(&values, value)?;
-                        self.store_place(&mut values, &load_origin, place, v)?;
+                        // A structural reinitialization *transfers*
+                        // ownership into the place (`rfcs/0012`): the
+                        // source is consumed here, not copied, so it
+                        // must not go on looking like a current owner.
+                        self.store_place_transfer(&mut values, &load_origin, place, *value)?;
                     }
                 }
             }
@@ -4690,5 +4839,438 @@ mod generic_destruction {
             fields: vec![Value::Int(1)],
         };
         assert_eq!(interpreter.is_affine_value(&plain), Ok(false));
+    }
+}
+
+/// `StorePlace` as a genuine ownership transfer (`rfcs/0011`,
+/// `rfcs/0012`), driven through the interpreter's own primitives rather
+/// than through lowered source, so each phase can be observed
+/// separately: the destination must be provably empty *before* anything
+/// is transferred, the transfer must be all-or-nothing, and the source
+/// must stop being a current owner the moment it succeeds.
+#[cfg(test)]
+mod store_place_transfer {
+    use super::*;
+    use crate::nir::RecordLayout;
+    use crate::place::{FieldId, Projection};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(60);
+    const HOLDER: ItemId = ItemId(61);
+    const BOXY: ItemId = ItemId(62);
+
+    /// `File` (a declared `resource`), `Holder` (an ordinary record with
+    /// one `File` field), and `Box[T]` (generic, one field).
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn field(owner: ItemId, index: u32) -> Vec<Projection> {
+        vec![Projection::Field {
+            owner,
+            field: FieldId(index),
+        }]
+    }
+
+    fn place(root: u32, projections: Vec<Projection>) -> Place<ValueId> {
+        Place {
+            root: ValueId(root),
+            projections,
+        }
+    }
+
+    /// A `Holder` whose own field is already a tombstone (as it would be
+    /// after the field was moved out), plus a fresh `File` to store back
+    /// into it.
+    fn emptied_holder(
+        interpreter: &Interpreter<'_>,
+        holder_id: u32,
+        source_id: u32,
+    ) -> (HashMap<ValueId, Value>, ResourceHandle) {
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(holder_id),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(source_id), Value::Resource(replacement));
+        (values, replacement)
+    }
+
+    #[test]
+    fn a_successful_store_transfers_ownership_into_the_place() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(HOLDER, 0)),
+                ValueId(1),
+            )
+            .expect("storing into a provably empty field must succeed");
+
+        let Some(Value::Record { fields, .. }) = values.get(&ValueId(0)) else {
+            unreachable!("the destination is still a record")
+        };
+        let Value::Resource(stored) = fields[0] else {
+            unreachable!("the field now holds the transferred resource")
+        };
+        assert_eq!(stored.id, replacement.id, "the same resource identity");
+        assert!(
+            stored.generation > replacement.generation,
+            "a transfer must bump the generation, so the caller's own handle goes stale"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(stored).is_ok(),
+            "the new owner's handle is current"
+        );
+    }
+
+    #[test]
+    fn the_old_source_is_no_longer_a_current_owner_after_a_store() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(HOLDER, 0)),
+                ValueId(1),
+            )
+            .expect("the store must succeed");
+
+        assert_eq!(
+            values.get(&ValueId(1)),
+            Some(&Value::Moved),
+            "the source is tombstoned, not left holding a plausible-looking handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_err(),
+            "the handle the source held must be stale"
+        );
+        assert!(
+            interpreter
+                .drop_value(Value::Resource(replacement))
+                .is_err(),
+            "a double drop attempted through the stale source must be refused"
+        );
+    }
+
+    #[test]
+    fn a_store_into_a_live_field_leaves_the_source_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        // The destination field is *not* empty: the store must be
+        // refused before anything is transferred.
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(live)],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(replacement));
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "overwriting a live field must be a structured error, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused store must mutate nothing");
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_ok(),
+            "the source must still be a current owner: no generation may have been bumped"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(live).is_ok(),
+            "the destination's own live value must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_store_of_an_already_dropped_source_leaves_the_destination_empty() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+        interpreter
+            .drop_value(Value::Resource(replacement))
+            .expect("destroying the source first");
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "storing a destroyed value must be refused, got {result:?}"
+        );
+        assert_eq!(
+            values, before,
+            "the destination field must still be the tombstone it was"
+        );
+    }
+
+    #[test]
+    fn a_store_whose_source_and_destination_are_the_same_storage_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(0),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "an aggregate may not be stored into its own field, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused self-store must mutate nothing");
+    }
+
+    /// A `Load` result and the slot it read share one storage identity,
+    /// so aliasing them is the same self-store.
+    #[test]
+    fn a_store_aliasing_its_destination_through_a_load_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), Value::Unit);
+        // `%1` is a `Load` of slot `%0`.
+        let load_origin = HashMap::from([(ValueId(1), ValueId(0))]);
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &load_origin,
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a load of the destination's own slot is still the destination, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_affine_record_is_transferred_whole() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(3)]);
+        let mut values = HashMap::new();
+        // Destination: a `Box[Holder]` whose field is empty.
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(HOLDER, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        // Source: a whole `Holder` carrying a live resource.
+        values.insert(
+            ValueId(1),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(inner)],
+            },
+        );
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(BOXY, 0)),
+                ValueId(1),
+            )
+            .expect("storing a whole affine record must succeed");
+
+        assert!(
+            interpreter.resources.borrow().observe(inner).is_err(),
+            "the nested resource's own identity must have been transferred too"
+        );
+        assert_eq!(values.get(&ValueId(1)), Some(&Value::Moved));
+        // The transferred value is destroyed exactly once through its
+        // new owner, and its type arguments survived the store.
+        let stored = values.remove(&ValueId(0)).expect("the destination");
+        assert!(
+            interpreter
+                .is_affine_value(&stored)
+                .expect("well-formed metadata"),
+            "`Box[Holder]` owns a resource through its stored field"
+        );
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
+    }
+
+    #[test]
+    fn a_store_into_a_generic_aggregate_preserves_its_type_arguments() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(4)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(replacement));
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(BOXY, 0)),
+                ValueId(1),
+            )
+            .expect("the store must succeed");
+
+        let Some(Value::Record { type_args, .. }) = values.get(&ValueId(0)) else {
+            unreachable!("the destination is still a record")
+        };
+        assert_eq!(
+            type_args,
+            &vec![Ty::Named(FILE, Symbol(0))],
+            "a store must not quietly turn a `Box[File]` into a `Box[T]`"
+        );
+    }
+
+    #[test]
+    fn a_store_through_a_missing_field_index_is_a_structured_error() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "an out-of-range field must be reported, got {result:?}"
+        );
+        assert_eq!(values, before);
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_ok(),
+            "a refused store must not have bumped the source's generation"
+        );
+    }
+
+    #[test]
+    fn a_refused_store_reports_the_identical_error_every_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _) = emptied_holder(&interpreter, 0, 1);
+        let first = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        let second = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        assert_eq!(first, second, "the same refusal must be deterministic");
     }
 }

@@ -69,18 +69,35 @@ dropped, but is rejected outright if used as a whole (observed,
 returned, transferred, or passed) until it is whole again. A variant's
 own payload — never individually addressable outside a pattern match —
 is tracked as one opaque unit; matching an affine scrutinee transfers
-ownership of the bound case's own payload. NIR gains explicit place
-operations (`load.place`/`move.place`/`store.place`), independently
-re-verified by the same reachable-union dataflow shape Alpha 0.1.7's
-own resource-initialization check already used, now keyed by place
-rather than by bare value; the interpreter gains structural tombstones
+ownership of the bound case's own payload, and a payload position
+ignored by `_` is destroyed exactly once, in the arm that matched,
+before that arm's body runs. A generic aggregate instantiated with an
+affine argument (`Box[File]`) is affine and is tracked field by field
+exactly like a concrete one, while the same declaration instantiated
+otherwise (`Box[i64]`) stays freely copyable. `drop` accepts any value
+that owns a resource — not only a declared `resource` — and performs
+exactly the structural destruction the compiler already applies at an
+owning scope's exit. An observing `defer` protects the exact place it
+captured, so an unaffected sibling stays movable while it is pending.
+
+NIR gains explicit place operations
+(`load.place`/`move.place`/`store.place`), independently re-verified by
+a structural ownership lattice over the whole place *tree*: moving or
+dropping a parent consumes its entire descendant subtree, a consumed
+descendant makes its ancestors unusable as a whole while leaving
+siblings alone, and a reinitialized child restores its ancestors'
+completeness. The interpreter gains structural tombstones
 (`Moved`/`Dropped`) so a use-after-move/drop of a field is a structured
 runtime error, an independent backstop for anything the static checks
-already rule out. See `rfcs/0012-structural-ownership.md` for the full
-design, the exact destruction order, and current honest limitations
-(no record-destructuring pattern syntax, no per-case cleanup of a
-wildcard-discarded affine payload, no resource-affine generic
-*function* instantiation).
+already rule out, and one structural destruction operation covering
+every transitively affine value — reverse declaration order, only the
+active variant case, a declared `resource`'s own outer identity last.
+See `rfcs/0012-structural-ownership.md` for the full design, the exact
+destruction order, and current honest limitations (no
+record-destructuring pattern syntax, no generic parameters on a
+`resource` declaration, no resource-affine generic *function*
+instantiation) — each of them a rejection at `check`, never an accepted
+program that misbehaves later.
 
 ### Alpha 0.1.7: deterministic resources
 
@@ -454,8 +471,8 @@ function's body, is recomputed per instantiation and does work — see
 user-defined destructor body attached directly to a `resource`
 declaration, record-destructuring pattern syntax (only the pattern
 shapes that already parsed — a bare binding, a variant case's own
-positional payload — are resource-aware), per-case structural cleanup
-of an affine payload discarded through a wildcard match pattern, a
+positional payload — are resource-aware), generic parameters on a
+`resource` declaration (`record`/`variant` only), a
 resource-typed `match`/`handle`/non-tail `if`, the indirection that
 would lift the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,

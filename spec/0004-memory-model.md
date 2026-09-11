@@ -17,7 +17,18 @@ Alpha 0.1.8 lifts Alpha 0.1.7's own narrower restriction that a
 `variant`, or another `resource` that reachably contains an affine field
 now becomes affine *transitively*, and ownership is tracked per
 structural place (a root binding plus a path of field projections), not
-only per whole binding -- see `rfcs/0012-structural-ownership.md`. Every
+only per whole binding -- see `rfcs/0012-structural-ownership.md`. That
+tracking is a lattice over the place *tree*: moving or dropping a parent
+consumes everything reachable through it, a consumed descendant makes
+its ancestors unusable as a whole while leaving siblings freely usable,
+and reinitializing an emptied child restores its ancestors'
+completeness. A generic aggregate's affinity is recomputed per
+instantiation from its substituted field types, so `Box[File]` owns a
+resource where `Box[i64]` owns nothing. Every affine identity an
+accepted program creates is transferred or destroyed exactly once, in a
+deterministic order -- reverse declaration order within an aggregate,
+only the active variant case, a declared `resource`'s own outer identity
+after its remaining children. Every
 type that is not itself affine (either a declared `resource`, or an
 aggregate reachably containing one) keeps its existing, unconditional
 copy semantics — this spec's own "value semantics by default" section

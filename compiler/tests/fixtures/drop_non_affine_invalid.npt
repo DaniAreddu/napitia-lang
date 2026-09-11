@@ -1,0 +1,8 @@
+record Plain {
+    x: i64,
+}
+
+func main() -> i64 {
+    drop Plain { x: 1 };
+    return 0;
+}

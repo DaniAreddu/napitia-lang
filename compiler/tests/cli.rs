@@ -1053,7 +1053,10 @@ fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
 /// visible.
 #[test]
 fn the_field_and_local_double_drop_examples_name_their_own_target() {
-    let field = stderr(&napitia(&["check", &example("resource_invalid_field_double_drop.npt")]));
+    let field = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_field_double_drop.npt"),
+    ]));
     assert!(
         field.contains("drop session.input;"),
         "the field double drop must be reported against the field itself: {field}"
@@ -1065,5 +1068,24 @@ fn the_field_and_local_double_drop_examples_name_their_own_target() {
     assert!(
         local.contains("drop input;"),
         "the local double drop must be reported against the local: {local}"
+    );
+}
+
+#[test]
+fn resource_structural_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_drop.npt", "0");
+}
+
+/// `drop` still refuses a value that owns nothing at all -- extending it
+/// to every transitively affine value must not quietly turn it into a
+/// no-op accepted on any expression.
+#[test]
+fn dropping_a_value_that_owns_no_resource_is_still_t0061() {
+    let output = napitia(&["check", &fixture("drop_non_affine_invalid.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("error[T0061]"),
+        "expected T0061: {}",
+        stderr(&output)
     );
 }

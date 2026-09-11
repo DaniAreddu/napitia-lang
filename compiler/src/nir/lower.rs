@@ -1360,10 +1360,16 @@ impl<'a> Lowering<'a> {
     /// `resourceck`'s own per-module query, since it is not called
     /// densely enough per module to need to).
     fn is_affine(&self, ty: &Ty) -> bool {
-        self.is_affine_visiting(ty, &mut HashSet::new())
+        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
     }
 
-    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>) -> bool {
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>, depth: usize) -> bool {
+        // Bounds a genuinely cyclic generic, which `typeck::cycles`
+        // independently rejects as an infinite layout before anything
+        // reaches this stage (`rfcs/0008`).
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
         let field_types = |item: &ItemId| -> Vec<Ty> {
             if let Some(record) = self.records.get(item) {
                 record.fields.iter().map(|(_, t)| t.clone()).collect()
@@ -1387,16 +1393,20 @@ impl<'a> Lowering<'a> {
                 }
                 let result = field_types(item)
                     .iter()
-                    .any(|fty| self.is_affine_visiting(fty, visiting));
+                    .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
                 visiting.remove(item);
                 result
             }
+            // Deliberately *not* guarded by `visiting`: that set is keyed
+            // by bare `ItemId`, so it cannot tell a genuine cycle apart
+            // from a legitimately nested instantiation of the same
+            // declaration -- `Box[Box[Box[File]]]` reaches `Box` three
+            // times with different arguments and must answer from the
+            // innermost one. `depth` is the correct termination guard
+            // here, and matches what `typeck::Checker::is_affine` does.
             Ty::Applied(item, args) => {
                 if self.records.get(item).is_some_and(|r| r.affine) {
                     return true;
-                }
-                if !visiting.insert(*item) {
-                    return false;
                 }
                 let type_params: Option<Vec<TypeParamId>> = self
                     .records
@@ -1416,16 +1426,17 @@ impl<'a> Lowering<'a> {
                 // explicit owner and the mismatch surfaces as a
                 // structured diagnostic rather than a silent leak.
                 let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
-                    visiting.remove(item);
                     return true;
                 };
                 let subst: HashMap<TypeParamId, Ty> =
                     type_params.into_iter().zip(args.iter().cloned()).collect();
-                let result = field_types(item).iter().any(|fty| {
-                    self.is_affine_visiting(&crate::types::substitute(fty, &subst), visiting)
-                });
-                visiting.remove(item);
-                result
+                field_types(item).iter().any(|fty| {
+                    self.is_affine_visiting(
+                        &crate::types::substitute(fty, &subst),
+                        visiting,
+                        depth + 1,
+                    )
+                })
             }
             _ => false,
         }

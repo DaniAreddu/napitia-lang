@@ -3710,10 +3710,22 @@ impl PlaceError {
 /// cached (this file's own resource checks are not called densely
 /// enough per module to need memoizing).
 fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
-    is_affine_in_visiting(ty, agg, &mut HashSet::new())
+    is_affine_in_visiting(ty, agg, &mut HashSet::new(), 0)
 }
 
-fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet<ItemId>) -> bool {
+fn is_affine_in_visiting(
+    ty: &Ty,
+    agg: &AggregateContext,
+    visiting: &mut HashSet<ItemId>,
+    depth: usize,
+) -> bool {
+    // Bounds a genuinely cyclic declaration, which `typeck::cycles`
+    // independently rejects as an infinite layout long before anything
+    // reaches NIR -- and, for a `Ty::Applied`, is the *only* guard, see
+    // below.
+    if depth >= MAX_GENERIC_DEPTH {
+        return false;
+    }
     // A generic instantiation's own affinity is decided by what it was
     // instantiated *with* (`rfcs/0008`, `rfcs/0012`): `Box[File]` is
     // affine, `Box[i64]` is not, and the same declaration answers both
@@ -3730,20 +3742,31 @@ fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet
     if agg.records.get(item).is_some_and(|r| r.affine) {
         return true;
     }
-    if !visiting.insert(*item) {
+    // `visiting` guards a *non-generic* cycle only. It is keyed by bare
+    // `ItemId`, so it cannot tell a genuine cycle apart from a
+    // legitimately nested instantiation of the same declaration --
+    // `Box[Box[Box[File]]]` reaches `Box` three times with different
+    // arguments and must answer from the innermost one. For an
+    // instantiation, `depth` above is the termination guard, matching
+    // `typeck::Checker::is_affine`.
+    let generic = matches!(ty, Ty::Applied(..));
+    if !generic && !visiting.insert(*item) {
         return false;
     }
     let subst = match item_substitution(*item, args, agg) {
         Ok(subst) => subst,
         // A malformed arity is reported as its own structured
         // diagnostic wherever a *place* projects through it
-        // (`PLACE_GENERIC_ARITY_MISMATCH`); this pure query has no
-        // diagnostic channel, so it refuses to guess rather than
-        // fabricating a partial substitution that could answer `false`
-        // for a genuinely affine field.
+        // (`PLACE_GENERIC_ARITY_MISMATCH`). This pure query has no
+        // diagnostic channel of its own, so it fails *closed*, to
+        // affine -- matching every other stage. Answering `false` from
+        // a substitution nobody could build is the one direction that
+        // silently drops an ownership obligation.
         Err(()) => {
-            visiting.remove(item);
-            return false;
+            if !generic {
+                visiting.remove(item);
+            }
+            return true;
         }
     };
     let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
@@ -3757,10 +3780,17 @@ fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet
     } else {
         Vec::new()
     };
-    let result = field_types
-        .iter()
-        .any(|fty| is_affine_in_visiting(&crate::types::substitute(fty, &subst), agg, visiting));
-    visiting.remove(item);
+    let result = field_types.iter().any(|fty| {
+        is_affine_in_visiting(
+            &crate::types::substitute(fty, &subst),
+            agg,
+            visiting,
+            depth + 1,
+        )
+    });
+    if !generic {
+        visiting.remove(item);
+    }
     result
 }
 

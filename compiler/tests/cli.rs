@@ -1089,3 +1089,29 @@ fn dropping_a_value_that_owns_no_resource_is_still_t0061() {
         stderr(&output)
     );
 }
+
+#[test]
+fn resource_partial_sibling_access_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_sibling_access.npt", "13");
+}
+
+/// The advice `U0014` gives must actually work: a partially moved
+/// aggregate stays usable for an unaffected field (affine or not), and
+/// only using it as a *whole* value is rejected. A regression that
+/// widened the whole-value rule back over ordinary field reads would
+/// make the diagnostic's own suggestion impossible to follow.
+#[test]
+fn a_partially_moved_parent_still_permits_what_u0014_suggests() {
+    let ok = napitia(&["check", &example("resource_partial_sibling_access.npt")]);
+    assert!(
+        ok.status.success(),
+        "reading an unaffected field of a partially moved parent must stay legal: {}",
+        stderr(&ok)
+    );
+    let rejected = napitia(&[
+        "check",
+        &example("resource_invalid_parent_after_partial_move.npt"),
+    ]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stderr(&rejected).contains("error[U0014]"));
+}

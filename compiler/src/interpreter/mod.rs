@@ -5509,3 +5509,284 @@ mod store_place_transfer {
         assert_eq!(first, second, "the same refusal must be deterministic");
     }
 }
+
+/// Variant ownership is per *path* (`rfcs/0012`): one branch may destroy
+/// the whole value while a disjoint branch takes it apart and owns the
+/// payload instead. The event log is the proof that each resource is
+/// destroyed exactly once on whichever path actually ran -- a leak and a
+/// double drop both show up here, and neither shows up in a return
+/// value.
+#[cfg(test)]
+mod branch_local_variants {
+    use super::tests::run_with_log;
+
+    const DECLS: &str = "resource File { descriptor: i64 } \
+                         variant Maybe[T] { Some(T), None } \
+                         func sink(take file: File) -> i64 { \
+                             value descriptor = file.descriptor; \
+                             drop file; \
+                             return descriptor \
+                         } ";
+
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    const DISPOSE: &str = "func dispose(cond: bool, take maybe: Maybe[File]) -> i64 { \
+                               if cond { \
+                                   drop maybe; \
+                                   return 1; \
+                               } \
+                               return match maybe { \
+                                   Some(file) => { drop file; 2 }, \
+                                   None => 0, \
+                               } \
+                           } ";
+
+    #[test]
+    fn the_whole_value_branch_destroys_its_payload_exactly_once() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "dropping the shell destroys the payload it still owns, once"
+        );
+    }
+
+    #[test]
+    fn the_matching_branch_destroys_its_payload_exactly_once() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "the arm owns the payload and destroys it, once -- the shell no longer owns it"
+        );
+    }
+
+    #[test]
+    fn the_inactive_case_destroys_nothing() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].None) \
+             }}"
+        ));
+        assert_eq!(order, Vec::<String>::new(), "`None` owns nothing at all");
+    }
+
+    /// The same program with the branches written the other way round
+    /// must behave identically: nothing about this may depend on which
+    /// branch happens to come first.
+    #[test]
+    fn reversing_the_branch_order_changes_nothing() {
+        let reversed = "func dispose(cond: bool, take maybe: Maybe[File]) -> i64 { \
+                            if cond { \
+                                return match maybe { \
+                                    Some(file) => { drop file; 2 }, \
+                                    None => 0, \
+                                }; \
+                            } \
+                            drop maybe; \
+                            return 1 \
+                        } ";
+        let matched = drops(&format!(
+            "{DECLS}{reversed} func main() -> i64 {{ \
+               return dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        let dropped = drops(&format!(
+            "{DECLS}{reversed} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(matched, vec!["drop:0"]);
+        assert_eq!(dropped, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn an_arm_returning_its_payload_transfers_it_instead_of_destroying_it() {
+        // The returned payload is destroyed by its new owner, after the
+        // fallback the other arm would have returned: exactly one
+        // destruction each, in caller order.
+        let order = drops(&format!(
+            "{DECLS} func unwrap(take maybe: Maybe[File], take fallback: File) -> File {{ \
+               return match maybe {{ \
+                 Some(file) => {{ drop fallback; file }}, \
+                 None => fallback, \
+               }} \
+             }} \
+             func main() -> i64 {{ \
+               value taken = unwrap( \
+                 Maybe[File].Some(File {{ descriptor: 1 }}), \
+                 File {{ descriptor: 2 }}, \
+               ); \
+               return sink(taken) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "the unused fallback is destroyed inside the arm, the returned payload by its caller"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_arm_destroys_the_payload_it_ignores() {
+        let order = drops(&format!(
+            "{DECLS} func discard(take maybe: Maybe[File]) -> i64 {{ \
+               return match maybe {{ Some(_) => 7, None => 0 }} \
+             }} \
+             func main() -> i64 {{ \
+               return discard(Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_nested_generic_variant_is_taken_apart_at_each_level() {
+        let decls = "resource File { descriptor: i64 } \
+                     variant Maybe[T] { Some(T), None } \
+                     variant Outer { Wrap(Maybe[File]), Empty } \
+                     func nested(take outer: Outer) -> i64 { \
+                         return match outer { \
+                             Wrap(Some(file)) => { drop file; 1 }, \
+                             Wrap(None) => 2, \
+                             Empty => 3, \
+                         } \
+                     } ";
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return nested(Outer.Wrap(Maybe[File].Some(File {{ descriptor: 1 }}))) \
+                 }}"
+            )),
+            vec!["drop:0"],
+            "the innermost payload is destroyed exactly once"
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return nested(Outer.Wrap(Maybe[File].None)) \
+                 }}"
+            )),
+            Vec::<String>::new(),
+            "an inactive inner case owns nothing"
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ return nested(Outer.Empty) }}"
+            )),
+            Vec::<String>::new(),
+            "an inactive outer case owns nothing"
+        );
+    }
+
+    #[test]
+    fn a_diverging_arm_still_destroys_what_it_owns() {
+        let order = drops(&format!(
+            "variant Fail {{ Bad }} {DECLS} \
+             func diverging(take maybe: Maybe[File]) -> i64 raises Fail {{ \
+               return match maybe {{ \
+                 Some(file) => {{ drop file; raise Fail.Bad; }}, \
+                 None => 5, \
+               }} \
+             }} \
+             func main() -> i64 {{ \
+               return handle diverging(Maybe[File].Some(File {{ descriptor: 1 }})) {{ \
+                 success v => v, \
+                 failure Fail.Bad => 100, \
+               }} \
+             }}"
+        ));
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_match_whose_arms_all_diverge_accounts_for_each_path() {
+        let decls = format!(
+            "{DECLS} func all_diverging(take maybe: Maybe[File]) -> i64 {{ \
+               match maybe {{ \
+                 Some(file) => {{ return sink(file); }}, \
+                 None => {{ return 0; }}, \
+               }} \
+             }} "
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return all_diverging(Maybe[File].Some(File {{ descriptor: 1 }})) \
+                 }}"
+            )),
+            vec!["drop:0"]
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ return all_diverging(Maybe[File].None) }}"
+            )),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Two payload positions, one bound and one ignored: both are
+    /// claimed by the same decomposition, and destroyed in reverse
+    /// payload declaration order.
+    #[test]
+    fn two_payload_positions_are_each_claimed_exactly_once() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func first(take pair: Pair) -> i64 { \
+                 return match pair { \
+                     Both(left, _) => sink(left), \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return first(Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 )) \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "the ignored position is destroyed first, then the bound one by its consumer"
+        );
+    }
+
+    #[test]
+    fn the_destruction_order_is_identical_across_repeated_runs() {
+        let text = format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               value a = dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})); \
+               value b = dispose(false, Maybe[File].Some(File {{ descriptor: 2 }})); \
+               return a + b \
+             }}"
+        );
+        let first = drops(&text);
+        let second = drops(&text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed in a different order"
+        );
+        assert_eq!(first, vec!["drop:0", "drop:1"]);
+    }
+}

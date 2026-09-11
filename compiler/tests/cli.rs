@@ -1180,3 +1180,38 @@ fn a_recovered_self_referential_layout_terminates_instead_of_hanging() {
         );
     }
 }
+
+// -- Alpha 0.1.8 path-sensitive variant ownership (`rfcs/0012`) ---------
+//
+// Variant ownership is per *path*: one branch may destroy the whole
+// value while a disjoint branch takes it apart and owns the payload, and
+// neither may suppress or discharge the other's obligations.
+
+#[test]
+fn resource_branch_local_variant_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_branch_local_variant.npt", "36");
+}
+
+#[test]
+fn resource_variant_decomposition_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_decomposition.npt", "134");
+}
+
+/// Textual NIR shows the decomposition explicitly, on the arm's own
+/// path -- the ownership event a function-global consumption scan used
+/// to stand in for.
+#[test]
+fn textual_nir_shows_variant_decomposition_on_the_claiming_path() {
+    let output = napitia(&["ir", &example("resource_branch_local_variant.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("decompose "),
+        "expected an explicit decomposition in textual NIR: {text}"
+    );
+    // The branch that drops the whole value must not decompose it.
+    assert!(
+        text.contains("drop "),
+        "expected the sibling branch's whole-value drop: {text}"
+    );
+}

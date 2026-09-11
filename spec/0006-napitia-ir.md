@@ -121,15 +121,48 @@ A place is a root value plus a chain of stable field projections
 (`Place<ValueId>`, `compiler/src/place.rs` — the same generic
 representation `resourceck`'s own HIR-rooted places share). There is no
 separate `drop.place`: a structural drop is `move.place` immediately
-followed by an ordinary `drop` of its result. The verifier independently
-re-validates every projection (unknown field owner, out-of-range field
-index, projection through the wrong or a non-aggregate type, move of a
-non-affine place — `V0083`–`V0086`) and independently re-derives each
-place's own move/reinitialization state via the identical
-reachable-union dataflow shape `V0082` already uses (`V0087`/`V0088`),
-keyed by place rather than by bare value, canonicalized through the same
+followed by an ordinary `drop` of its result. `drop` is *structural*: it
+destroys its operand and every descendant still owned through it, which
+is what makes a parent drop valid after one of its own children was
+already moved out. A `move.place` whose only use anywhere in the
+function is as a `drop` operand is therefore a destruction rather than a
+transfer, and is legal on a partially moved parent; one feeding anything
+else requires a complete value.
+
+Each projection step substitutes the owner's own type arguments (taken
+from the place's current type at that step) into the selected field's
+declared type before the walk continues, so a place through a generic
+aggregate resolves to its concrete type rather than the declaration's
+`Ty::Param`.
+
+The verifier independently re-validates every projection (unknown field
+owner, out-of-range field index, projection through the wrong or a
+non-aggregate type, move of a non-affine place, generic type-argument
+arity mismatch — `V0083`–`V0086`, `V0089`) and independently re-derives
+ownership over the whole place *tree*, via the identical reachable-union
+dataflow shape `V0082` already uses, canonicalized through the same
 `Load`-origin unification the whole-value pass already needs for a
-`mutable` local reloaded more than once.
+`mutable` local reloaded more than once:
+
+- a place's effective state is its *shortest* non-full ancestor prefix,
+  so moving or dropping a parent consumes its entire descendant subtree
+  and a child used afterwards is `V0087`;
+- a whole-value use additionally requires no strict descendant to be
+  consumed, so a partially moved parent used as a value is `V0090`
+  while remaining usable for an unaffected sibling, a reinitialized
+  empty child, or a structural drop of what remains;
+- a reinitializing store into a place not definitely empty is `V0088`,
+  a whole-value destruction or transfer of something already consumed
+  is `V0092`, and a transitively affine value still owning affine
+  descendants at a reachable exit is `V0091`.
+
+Ownership facts come from `take` parameters, `Move`, `DeferCapture`,
+`PlaceRead`, `StorePlace`, `Store`, `RecordCreate`, `VariantCreate`,
+`Call`/`Invoke` take arguments, `Switch`, `Return`, `Raise` and `Drop`,
+all gated on *transitive* affinity rather than nominal resource-ness.
+Joins take the union of both predecessors' keys, so the result never
+depends on predecessor discovery order, block vector order, or `HashMap`
+order.
 
 `[<type-args>]` (Alpha 0.1.4, `rfcs/0008`) is present only when the
 callee/record/variant is generic — a call/construction against a

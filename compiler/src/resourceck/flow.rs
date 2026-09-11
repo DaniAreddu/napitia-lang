@@ -287,7 +287,7 @@ pub struct FlowChecker<'a> {
     /// finishes, on every exit from it -- an observing defer's own
     /// protection only ever lasts until the deferred call itself would
     /// actually run.
-    defer_scopes: Vec<HashSet<LocalId>>,
+    defer_scopes: Vec<HashSet<Place<LocalId>>>,
     /// Every bare `loop`'s own body block id (Blocker: infinite-loop
     /// reachability) for which [`Self::finish_loop`] found no reachable
     /// `break` at all -- a `loop` with no exit of its own genuinely never
@@ -473,10 +473,9 @@ impl<'a> FlowChecker<'a> {
     fn released_snapshot(&self, from_scope: usize) -> PlaceStates {
         let mut states = self.states.clone();
         for scope in &self.defer_scopes[from_scope.min(self.defer_scopes.len())..] {
-            for local in scope {
-                let place = Place::root(*local);
-                if let Some(ResourceState::DropScheduled) = states.get(&place) {
-                    states.insert(place, ResourceState::Available);
+            for place in scope {
+                if let Some(ResourceState::DropScheduled) = states.get(place) {
+                    states.insert(place.clone(), ResourceState::Available);
                 }
             }
         }
@@ -935,8 +934,7 @@ impl<'a> FlowChecker<'a> {
         self.defer_scopes.push(HashSet::new());
         self.check_block_ctx_inner(block, kind);
         let scope = self.defer_scopes.pop().expect("pushed immediately above");
-        for local in scope {
-            let place = Place::root(local);
+        for place in scope {
             if let Some(ResourceState::DropScheduled) = self.states.get(&place) {
                 self.states.insert(place, ResourceState::Available);
             }
@@ -1102,6 +1100,19 @@ impl<'a> FlowChecker<'a> {
                         }
                     })
                     .collect();
+                // Each argument's own exact place (`rfcs/0012`), in
+                // declaration order -- see `CheckedDeferPlan::
+                // arg_places`.
+                let arg_places: Vec<Option<Place<LocalId>>> = args
+                    .iter()
+                    .map(|a| {
+                        if self.is_affine_expr(a.id()) {
+                            self.resolve_place(a)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let registration_order = self.next_defer_registration;
                 self.next_defer_registration += 1;
                 self.defer_plans.insert(
@@ -1110,6 +1121,7 @@ impl<'a> FlowChecker<'a> {
                         callee: *item,
                         arg_modes,
                         arg_types,
+                        arg_places,
                         return_type,
                         registration_order,
                     },
@@ -1122,21 +1134,53 @@ impl<'a> FlowChecker<'a> {
         // replays this cleanup action, rather than this stage trying
         // to describe a NIR-level call itself.
         self.pending_cleanup.push(CleanupAction::Defer(expr.id()));
-        let mut observed = HashSet::new();
-        collect_observed_locals(expr, &mut observed);
-        for local in observed {
-            let place = Place::root(local);
-            if let Some(ResourceState::Available) = self.states.get(&place) {
-                self.states.insert(place, ResourceState::DropScheduled);
+        // The *exact* places this `defer` observes (`rfcs/0012`), not
+        // merely the roots they are reached through: `defer
+        // inspect(session.input)` protects `session.input` alone, so an
+        // unaffected sibling (`session.output`) stays freely movable
+        // while the parent as a whole does not (see
+        // `reject_partial_whole_use`, which reports a defer-protected
+        // descendant as its own violation rather than a partial move).
+        let observed = self.observed_places(expr);
+        for place in observed {
+            if self.place_state(&place) == ResourceState::Available {
+                self.states
+                    .insert(place.clone(), ResourceState::DropScheduled);
                 // Blocker 9: remembered against *this* defer's own
                 // enclosing block so `check_block_ctx` can release this
                 // exact protection once that block's own walk ends,
                 // rather than leaving it protected indefinitely.
                 if let Some(scope) = self.defer_scopes.last_mut() {
-                    scope.insert(local);
+                    scope.insert(place);
                 }
             }
         }
+    }
+
+    /// Every exact place this `defer` argument expression observes
+    /// (`rfcs/0012`). A field access chain that resolves to a stable
+    /// affine place contributes that whole place; anything else
+    /// contributes whatever roots it reaches through, exactly as
+    /// before. Collected through this stage's own `resolve_place`, so a
+    /// place recorded here is the identical key `apply_place_move`/
+    /// `check_place_read` already compare against -- never a
+    /// second, parallel notion of "the same field".
+    fn observed_places(&self, expr: &HirExpr) -> Vec<Place<LocalId>> {
+        let mut out = Vec::new();
+        collect_observed_places(self, expr, &mut out);
+        out
+    }
+
+    /// `true` iff some place strictly *under* `root` is currently held
+    /// by a pending observing `defer` (`rfcs/0012`) -- what makes an
+    /// otherwise-complete parent unusable as a whole value: moving or
+    /// dropping it would destroy the very descendant that `defer` still
+    /// needs to observe when it runs. A boolean `any`, so `self.states`'
+    /// own iteration order cannot affect the answer.
+    fn has_defer_protected_descendant(&self, root: &Place<LocalId>) -> bool {
+        self.states.iter().any(|(key, state)| {
+            key != root && root.is_ancestor_of(key) && *state == ResourceState::DropScheduled
+        })
     }
 
     fn check_drop(&mut self, expr: &HirExpr, span: Span) {
@@ -1183,6 +1227,26 @@ impl<'a> FlowChecker<'a> {
             // identity itself (if this is a declared `resource`) is
             // included by that same walk, last.
             ResourceState::Available => {
+                // A descendant an observing `defer` is still holding
+                // makes this whole-value destruction illegal
+                // (`rfcs/0012`): LIFO replay runs that defer *after*
+                // this drop, so it would observe a field this very
+                // statement destroyed. Rejected here rather than left
+                // for the runtime to discover.
+                if self.has_defer_protected_descendant(&root) {
+                    self.diagnose(
+                        MOVE_AFTER_DEFER_CAPTURED,
+                        span,
+                        format!(
+                            "`{}` has a field a pending `defer` still needs and cannot be dropped \
+                             yet",
+                            self.local_name(*local, *name)
+                        ),
+                        "a field is still needed by a pending defer",
+                    );
+                    self.set_place_state(&root, ResourceState::Error);
+                    return;
+                }
                 // Structurally destroys exactly `root`'s own still-live
                 // descendants (`rfcs/0012`) -- computed *before*
                 // transitioning `root` itself, so it still reflects
@@ -2080,6 +2144,24 @@ impl<'a> FlowChecker<'a> {
         if self.place_is_wholly_available(root, &ty) {
             return false;
         }
+        // A descendant an observing `defer` is still holding is not a
+        // *partially moved* parent (`rfcs/0012`): the field is entirely
+        // intact, and this parent becomes usable as a whole again the
+        // moment that defer's own scope ends. Reported as its own
+        // violation so the diagnostic names the real reason.
+        if self.has_defer_protected_descendant(root) {
+            self.diagnose(
+                MOVE_AFTER_DEFER_CAPTURED,
+                span,
+                format!(
+                    "`{}` has a field a pending `defer` still needs and cannot be moved or \
+                     dropped as a whole yet",
+                    self.local_name(local, name)
+                ),
+                "a field is still needed by a pending defer",
+            );
+            return true;
+        }
         self.diagnose(
             PARTIAL_PARENT_USED_AS_WHOLE,
             span,
@@ -2575,7 +2657,21 @@ fn join_branch_states(entry: &PlaceStates, branches: &[(PlaceStates, bool)]) -> 
 /// `defer` still needs whenever it is observed through anything other
 /// than a bare call argument, letting a later `drop`/move of it slip
 /// past this stage's own `U0004` check undetected.
-fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
+/// Appends `place` unless it is already recorded -- a `Vec` rather than
+/// a `HashSet` specifically so the protected places stay in a
+/// deterministic, source-order sequence no `HashMap`/`HashSet`
+/// iteration order can perturb.
+fn push_place(out: &mut Vec<Place<LocalId>>, place: Place<LocalId>) {
+    if !out.contains(&place) {
+        out.push(place);
+    }
+}
+
+fn collect_observed_places(
+    checker: &FlowChecker,
+    expr: &HirExpr,
+    out: &mut Vec<Place<LocalId>>,
+) {
     match expr {
         HirExpr::Int { .. }
         | HirExpr::Float { .. }
@@ -2587,96 +2683,117 @@ fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
         | HirExpr::ProtocolMethodRef { .. }
         | HirExpr::Continue { .. }
         | HirExpr::Error { .. } => {}
-        HirExpr::Local { local, .. } => {
-            out.insert(*local);
-        }
+        HirExpr::Local { local, .. } => push_place(out, Place::root(*local)),
         HirExpr::Unary { operand, .. }
         | HirExpr::Cast { expr: operand, .. }
-        | HirExpr::Try { expr: operand, .. } => collect_observed_locals(operand, out),
+        | HirExpr::Try { expr: operand, .. } => collect_observed_places(checker, operand, out),
         HirExpr::Binary { left, right, .. } => {
-            collect_observed_locals(left, out);
-            collect_observed_locals(right, out);
+            collect_observed_places(checker, left, out);
+            collect_observed_places(checker, right, out);
         }
         HirExpr::Assign { target, value, .. } => {
-            collect_observed_locals(target, out);
-            collect_observed_locals(value, out);
+            collect_observed_places(checker, target, out);
+            collect_observed_places(checker, value, out);
         }
         HirExpr::Call { callee, args, .. } => {
-            collect_observed_locals(callee, out);
+            collect_observed_places(checker, callee, out);
             for arg in args {
-                collect_observed_locals(arg, out);
+                collect_observed_places(checker, arg, out);
             }
         }
-        HirExpr::Field { base, .. } => collect_observed_locals(base, out),
+        // The exact place, when this access resolves to a stable affine
+        // one (`rfcs/0012`): `defer inspect(session.input)` protects
+        // `session.input` itself, never the whole `session` root it is
+        // reached through -- an unaffected sibling (`session.output`)
+        // must stay freely movable while the defer is pending. Anything
+        // else (a non-affine field, or a chain rooted in a temporary)
+        // keeps the original root-granularity behavior.
+        HirExpr::Field { base, .. } => {
+            if checker.is_affine_expr(expr.id())
+                && let Some(place) = checker.resolve_place(expr)
+            {
+                push_place(out, place);
+            } else {
+                collect_observed_places(checker, base, out);
+            }
+        }
         HirExpr::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            collect_observed_locals(condition, out);
-            collect_observed_locals_block(then_branch, out);
+            collect_observed_places(checker, condition, out);
+            collect_observed_places_block(checker, then_branch, out);
             match else_branch {
-                Some(HirElse::Block(block)) => collect_observed_locals_block(block, out),
-                Some(HirElse::If(inner)) => collect_observed_locals(inner, out),
+                Some(HirElse::Block(block)) => collect_observed_places_block(checker, block, out),
+                Some(HirElse::If(inner)) => collect_observed_places(checker, inner, out),
                 None => {}
             }
         }
         HirExpr::Match {
             scrutinee, arms, ..
         } => {
-            collect_observed_locals(scrutinee, out);
+            collect_observed_places(checker, scrutinee, out);
             for arm in arms {
-                collect_observed_locals_arm_body(&arm.body, out);
+                collect_observed_places_arm_body(checker, &arm.body, out);
             }
         }
-        HirExpr::Block(block) => collect_observed_locals_block(block, out),
+        HirExpr::Block(block) => collect_observed_places_block(checker, block, out),
         HirExpr::Return { value, .. } | HirExpr::Break { value, .. } => {
             if let Some(value) = value {
-                collect_observed_locals(value, out);
+                collect_observed_places(checker, value, out);
             }
         }
         HirExpr::RecordLiteral { fields, .. } => {
             for field in fields {
-                collect_observed_locals(&field.value, out);
+                collect_observed_places(checker, &field.value, out);
             }
         }
-        HirExpr::Raise { operand, .. } => collect_observed_locals(operand, out),
+        HirExpr::Raise { operand, .. } => collect_observed_places(checker, operand, out),
         HirExpr::Handle { operand, arms, .. } => {
-            collect_observed_locals(operand, out);
+            collect_observed_places(checker, operand, out);
             for arm in arms {
-                collect_observed_locals_arm_body(&arm.body, out);
+                collect_observed_places_arm_body(checker, &arm.body, out);
             }
         }
     }
 }
 
-fn collect_observed_locals_arm_body(body: &HirMatchArmBody, out: &mut HashSet<LocalId>) {
+fn collect_observed_places_arm_body(
+    checker: &FlowChecker,
+    body: &HirMatchArmBody,
+    out: &mut Vec<Place<LocalId>>,
+) {
     match body {
-        HirMatchArmBody::Expr(e) => collect_observed_locals(e, out),
-        HirMatchArmBody::Block(block) => collect_observed_locals_block(block, out),
+        HirMatchArmBody::Expr(e) => collect_observed_places(checker, e, out),
+        HirMatchArmBody::Block(block) => collect_observed_places_block(checker, block, out),
     }
 }
 
-fn collect_observed_locals_block(block: &HirBlock, out: &mut HashSet<LocalId>) {
+fn collect_observed_places_block(
+    checker: &FlowChecker,
+    block: &HirBlock,
+    out: &mut Vec<Place<LocalId>>,
+) {
     for stmt in &block.statements {
         match stmt {
-            HirStmt::Binding(b) => collect_observed_locals(&b.value, out),
-            HirStmt::Expr(e) => collect_observed_locals(e, out),
+            HirStmt::Binding(b) => collect_observed_places(checker, &b.value, out),
+            HirStmt::Expr(e) => collect_observed_places(checker, e, out),
             HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => {
-                collect_observed_locals(expr, out)
+                collect_observed_places(checker, expr, out)
             }
             HirStmt::While {
                 condition, body, ..
             } => {
-                collect_observed_locals(condition, out);
-                collect_observed_locals_block(body, out);
+                collect_observed_places(checker, condition, out);
+                collect_observed_places_block(checker, body, out);
             }
-            HirStmt::Loop { body, .. } => collect_observed_locals_block(body, out),
+            HirStmt::Loop { body, .. } => collect_observed_places_block(checker, body, out),
         }
     }
     if let Some(tail) = &block.tail {
-        collect_observed_locals(tail, out);
+        collect_observed_places(checker, tail, out);
     }
 }
 

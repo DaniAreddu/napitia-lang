@@ -6079,8 +6079,25 @@ fn verify_structural_places(
                             }
                         }
                     }
-                    ValueKind::RecordField { base, .. } => {
-                        observe_root(&facts, &mut violations, &is_affine, &origin, *base, *result);
+                    ValueKind::RecordField {
+                        base,
+                        record,
+                        field,
+                    } if is_affine(*base) => {
+                        // Observes one *specific* field, so it requires
+                        // only that field to still hold its own value
+                        // -- never the whole aggregate. Reading an
+                        // unaffected (or non-affine) field of a
+                        // partially moved parent stays legal, which is
+                        // exactly what makes a partial move usable at
+                        // all; reading any field after the parent
+                        // itself was consumed is still rejected,
+                        // because the ancestor's own state dominates.
+                        let place = Place::root(origin(*base))
+                            .field(*record, crate::place::FieldId(*field as u32));
+                        if resolve_place_state(&facts, &place) != FieldState::Full {
+                            violations.push(OwnershipViolation::UseAfterMove(*result));
+                        }
                     }
                     _ => {}
                 },

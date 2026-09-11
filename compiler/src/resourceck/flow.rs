@@ -1913,6 +1913,21 @@ impl<'a> FlowChecker<'a> {
                             self.reject_leaked_temporary(base);
                         }
                     }
+                } else if let Some(place) = self.resolve_place(expr) {
+                    // A *non-affine* field of an affine aggregate
+                    // (`session.count`) reached through a stable place
+                    // chain (`rfcs/0012`): what must still be intact is
+                    // the chain reaching it, not the whole aggregate --
+                    // reading an unaffected field of a partially moved
+                    // parent is exactly what a partial move is supposed
+                    // to leave possible, and is what `U0014`'s own
+                    // advice tells the user to do. Walking `base`
+                    // through the ordinary whole-value read path
+                    // instead would reject it. A use after the *parent*
+                    // itself was moved or dropped is still rejected:
+                    // `place_state`'s own prefix walk lets the
+                    // ancestor's state dominate.
+                    self.check_place_read(&place, expr);
                 } else {
                     self.check_expr(base);
                     self.reject_leaked_temporary(base);

@@ -1151,6 +1151,15 @@ impl<'a> Interpreter<'a> {
                 // declaration's symbolic `Ty::Param(T)` would find
                 // nothing affine and leak the `File` it holds.
                 let field_types = self.record_field_types(item, &type_args)?;
+                // A value whose own field count disagrees with its
+                // declaration is malformed metadata, not a value with
+                // some untyped extras: skipping the surplus would skip
+                // exactly the fields nothing can say the affinity of.
+                if field_types.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime record value's own field count disagrees with its declaration",
+                    ));
+                }
                 for index in (0..fields.len()).rev() {
                     let Some(ty) = field_types.get(index) else {
                         continue;
@@ -1178,6 +1187,15 @@ impl<'a> Interpreter<'a> {
                 // a `Maybe[File]` destroys the `File` its declaration
                 // only ever calls `T`.
                 let payload_types = self.case_payload_types(item, &type_args, case)?;
+                // See the record arm: a payload count disagreeing with
+                // the active case's own declaration is malformed
+                // metadata, never a value with untyped extras.
+                if payload_types.len() != payload.len() {
+                    return Err(invalid(
+                        "a runtime variant value's own payload count disagrees with its active \
+                         case's declaration",
+                    ));
+                }
                 for index in (0..payload.len()).rev() {
                     let Some(ty) = payload_types.get(index) else {
                         continue;
@@ -4846,6 +4864,102 @@ mod generic_destruction {
             fields: vec![Value::Int(1)],
         };
         assert_eq!(interpreter.is_affine_value(&plain), Ok(false));
+    }
+
+    // -- malformed runtime *shape*, as opposed to malformed type args --
+
+    #[test]
+    fn a_record_value_with_more_fields_than_its_declaration_is_refused() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        // `Box` declares exactly one field; this value carries two, so
+        // the second has no declared type to answer affinity from.
+        // Skipping it would skip exactly the field nothing can classify.
+        let malformed = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            fields: vec![Value::Int(1), Value::Resource(handle)],
+        };
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "a field count disagreeing with the declaration must be refused"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a refused destruction must not have destroyed anything"
+        );
+    }
+
+    #[test]
+    fn a_variant_value_with_the_wrong_payload_count_is_refused() {
+        let name = Symbol(0);
+        let module = Module {
+            functions: Vec::new(),
+            records: vec![(
+                ItemId(90),
+                crate::nir::RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(name, Ty::I64)],
+                    affine: true,
+                },
+            )],
+            variants: vec![(
+                ItemId(95),
+                crate::nir::VariantLayout {
+                    name,
+                    type_params: Vec::new(),
+                    cases: vec![crate::nir::CaseLayout {
+                        name,
+                        payload: vec![Ty::Named(ItemId(90), name)],
+                    }],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        let malformed = Value::Variant {
+            item: ItemId(95),
+            type_args: Vec::new(),
+            case: 0,
+            payload: vec![Value::Resource(handle), Value::Int(2)],
+        };
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "a payload count disagreeing with the active case must be refused"
+        );
+        assert!(interpreter.resources.borrow().observe(handle).is_ok());
+    }
+
+    #[test]
+    fn a_variant_value_naming_an_out_of_range_case_is_refused() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let malformed = Value::Variant {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            case: 7,
+            payload: Vec::new(),
+        };
+        assert!(matches!(
+            interpreter.drop_value(malformed),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
     }
 }
 

@@ -1290,6 +1290,117 @@ fn verify_function(
                         ));
                     }
                 }
+                // Declaration identity, case index, payload indexes and
+                // every claimed value's own type are revalidated here
+                // rather than trusted from lowering: this instruction
+                // names storage, so a malformed one would move ownership
+                // of something that does not exist.
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    taken,
+                } => {
+                    require_value(*value, diagnostics);
+                    for (_, owner) in taken {
+                        require_value(*owner, diagnostics);
+                    }
+                    let base_ok = value_types.get(value).is_some_and(|ty| {
+                        matches!(ty, Ty::Named(item, _) | Ty::Applied(item, _) if item == variant)
+                    });
+                    if !base_ok {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PLACE_PROJECTION_THROUGH_NON_RECORD,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart as variant {}, which is \
+                                 not its own declared type",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    }
+                    let Some(layout) = agg
+                        .variants
+                        .get(variant)
+                        .and_then(|v| v.cases.get(*case))
+                        .cloned()
+                    else {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_PLACE_FIELD,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart into case {case} of \
+                                 variant {}, which has no such case",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    };
+                    let args: Vec<Ty> = match value_types.get(value) {
+                        Some(Ty::Applied(_, args)) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let Ok(subst) = item_substitution(*variant, &args, agg) else {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PLACE_GENERIC_ARITY_MISMATCH,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart as variant {}, whose \
+                                 declared type parameters disagree with its own type arguments",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    };
+                    let mut seen: HashSet<usize> = HashSet::new();
+                    for (index, owner) in taken {
+                        let Some(payload_ty) = layout.payload.get(*index) else {
+                            diagnostics.push(Diagnostic::error(
+                                codes::UNKNOWN_PLACE_FIELD,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} claims payload position {index} of a \
+                                     case that has no such position",
+                                    owner.0
+                                ),
+                            ));
+                            continue;
+                        };
+                        // One position claimed twice would hand the same
+                        // storage to two owners.
+                        if !seen.insert(*index) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DUPLICATE_STRUCTURAL_CLEANUP,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: payload position {index} of %{} is \
+                                     claimed more than once by one decomposition",
+                                    value.0
+                                ),
+                            ));
+                            continue;
+                        }
+                        let expected = substitute(payload_ty, &subst);
+                        if value_types.get(owner) != Some(&expected) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::STORE_TYPE_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is declared a different type from the \
+                                     payload position it claims",
+                                    owner.0
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Instruction::Drop { value } => {
                     require_value(*value, diagnostics);
                     let is_resource = value_types
@@ -1905,6 +2016,12 @@ fn verify_dominance(
                 }
                 Instruction::Drop { value } => {
                     check_use(*value, block.id, idx, diagnostics);
+                }
+                Instruction::DecomposeVariant { value, taken, .. } => {
+                    check_use(*value, block.id, idx, diagnostics);
+                    for (_, owner) in taken {
+                        check_use(*owner, block.id, idx, diagnostics);
+                    }
                 }
                 Instruction::StorePlace { place, value } => {
                     check_use(place.root, block.id, idx, diagnostics);
@@ -3889,6 +4006,91 @@ fn resolve_place_ty(
 /// variant `.1`.
 type RefinementFact = (ValueId, ItemId, usize);
 
+/// Every case refinement each block is *guaranteed* on arrival
+/// (`rfcs/0010`, `rfcs/0012`): the intersection of what every incoming
+/// edge independently proves, never their union.
+///
+/// A block reached through two different cases of the same switch, or
+/// through a switch edge and a plain branch, is guaranteed nothing about
+/// which case is live -- which is exactly right, since it is genuinely
+/// reachable either way. A block with no incoming edge at all (the entry
+/// block, or an unreachable one) is guaranteed nothing either.
+///
+/// Shared by `verify_payload_refinement`, which rejects an extraction
+/// outside its own case, and by the structural obligation check, which
+/// decomposes a variant by the case that is live at an exit.
+fn case_refinements(function: &Function) -> HashMap<BlockId, HashSet<RefinementFact>> {
+    let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
+    for block in &function.blocks {
+        match &block.terminator {
+            Terminator::Branch(target) => {
+                incoming.entry(*target).or_default().push(HashSet::new());
+            }
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                incoming
+                    .entry(*then_block)
+                    .or_default()
+                    .push(HashSet::new());
+                incoming
+                    .entry(*else_block)
+                    .or_default()
+                    .push(HashSet::new());
+            }
+            Terminator::Switch {
+                scrutinee,
+                variant,
+                cases,
+            } => {
+                for (case_index, target) in cases.iter().enumerate() {
+                    let mut fact = HashSet::new();
+                    fact.insert((*scrutinee, *variant, case_index));
+                    incoming.entry(*target).or_default().push(fact);
+                }
+            }
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                incoming.entry(*ok_target).or_default().push(HashSet::new());
+                for target in err_targets {
+                    incoming
+                        .entry(target.target)
+                        .or_default()
+                        .push(HashSet::new());
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+    }
+
+    let mut out = HashMap::new();
+    for block in &function.blocks {
+        let guaranteed = match incoming.get(&block.id) {
+            Some(edges) => {
+                let mut edges = edges.iter();
+                match edges.next() {
+                    Some(first) => {
+                        let mut acc = first.clone();
+                        for edge in edges {
+                            acc.retain(|fact| edge.contains(fact));
+                        }
+                        acc
+                    }
+                    None => HashSet::new(),
+                }
+            }
+            None => HashSet::new(),
+        };
+        out.insert(block.id, guaranteed);
+    }
+    out
+}
+
 fn verify_payload_refinement(
     function: &Function,
     agg: &AggregateContext,
@@ -5270,6 +5472,23 @@ fn verify_resource_ownership(
                         legal,
                     );
                 }
+                // Reads the shell without consuming it: the payload it
+                // hands over is tracked as its own value by this pass
+                // already, from its own `VariantPayload` definition.
+                // The structural place this moves is `verify_structural_
+                // places`' own concern, not this whole-value lattice's.
+                Instruction::DecomposeVariant { value, .. } => {
+                    let legal = alias_safe!(*value, false, false);
+                    check_use(
+                        *value,
+                        &is_resource,
+                        &origin,
+                        &mut facts,
+                        &mut live,
+                        &mut violations,
+                        legal,
+                    );
+                }
             }
         }
         match &block.terminator {
@@ -5757,6 +5976,10 @@ enum OwnershipViolation {
     /// A whole-value destruction or transfer of something already
     /// consumed on a path reaching it: structural double cleanup.
     DoubleCleanup(ValueId),
+    /// A variant decomposition that leaves at least one affine payload
+    /// position of its own live case unclaimed -- a resource the shell
+    /// no longer owns and nothing else does either.
+    IncompleteDecomposition(ValueId),
 }
 
 /// Path-sensitive structural ownership verification (`rfcs/0012`),
@@ -5942,6 +6165,15 @@ fn verify_structural_places(
                         otherwise_used.insert(place.root);
                         otherwise_used.insert(*value);
                     }
+                    // Reading the shell is an ordinary use; naming the
+                    // transferred value is the ownership event for it,
+                    // not an additional read -- but both are recorded,
+                    // since this set only ever gates `PlaceRead`
+                    // results, which neither of these can be.
+                    Instruction::DecomposeVariant { value, taken, .. } => {
+                        otherwise_used.insert(*value);
+                        otherwise_used.extend(taken.iter().map(|(_, owner)| *owner));
+                    }
                 }
             }
             match &block.terminator {
@@ -6012,6 +6244,73 @@ fn verify_structural_places(
                     }
                     if *mode == crate::nir::OwnershipMode::Transfer {
                         set_place_state(&mut facts, &place, FieldState::Empty);
+                    }
+                }
+                // Taking a variant apart into one specific case, on
+                // this path alone (`rfcs/0012`). The shell is consumed
+                // here and each claimed payload becomes its own owned
+                // value from here on -- so a whole-value `Drop` or
+                // transfer of the same variant on a *disjoint* path is
+                // completely independent: neither can suppress or
+                // discharge the other, which is exactly what a
+                // function-global "was this consumed anywhere" test got
+                // wrong.
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    taken,
+                } => {
+                    let shell = Place::root(origin(*value));
+                    if resolve_place_state(&facts, &shell) != FieldState::Full {
+                        violations.push(OwnershipViolation::DoubleCleanup(*value));
+                        continue;
+                    }
+                    if !place_is_whole(&facts, &shell) {
+                        violations.push(OwnershipViolation::PartialWhole(*value));
+                        continue;
+                    }
+                    // Every *affine* payload position of this case must
+                    // be claimed exactly once: one left out would be a
+                    // resource the shell no longer owns and nothing else
+                    // does either.
+                    let args: Vec<Ty> = match value_types.get(value) {
+                        Some(Ty::Applied(_, args)) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let payload_tys: Vec<Ty> = agg
+                        .variants
+                        .get(variant)
+                        .and_then(|v| v.cases.get(*case))
+                        .map(|c| c.payload.clone())
+                        .unwrap_or_default();
+                    let subst = item_substitution(*variant, &args, agg);
+                    let mut incomplete = false;
+                    if let Ok(subst) = &subst {
+                        for (index, payload_ty) in payload_tys.iter().enumerate() {
+                            if !is_affine_in(&substitute(payload_ty, subst), agg) {
+                                continue;
+                            }
+                            let claims = taken.iter().filter(|(i, _)| *i == index).count();
+                            if claims != 1 {
+                                incomplete = true;
+                            }
+                        }
+                    } else {
+                        incomplete = true;
+                    }
+                    if incomplete {
+                        violations.push(OwnershipViolation::IncompleteDecomposition(*value));
+                        continue;
+                    }
+                    set_place_state(&mut facts, &shell, FieldState::Empty);
+                    // Each claimed payload is this frame's own from
+                    // here: seeded `Full` so a later consumption of it
+                    // is checked against a real state, never a default.
+                    for (_, owner) in taken {
+                        if is_affine(*owner) && origin(*owner) == *owner {
+                            set_place_state(&mut facts, &Place::root(*owner), FieldState::Full);
+                        }
                     }
                 }
                 Instruction::StorePlace { place, value } => {
@@ -6286,24 +6585,15 @@ fn verify_structural_places(
         }
     }
 
-    let owned_roots = structural_cleanup_obligations(function, value_types, agg, &origin);
-    // An obligation only exists at an exit its own definition actually
-    // reaches: a value defined in one branch is not leaked by the
-    // *other* branch's own `Return`, where it was never created at all.
-    // Dominance is exactly that question, and is already computed the
-    // same way for `verify_dominance`.
+    let owned_roots = structural_cleanup_obligations(function, value_types, agg);
+    let payloads = extracted_payloads(function);
+    let refinements = case_refinements(function);
+    // An obligation only exists at an exit the block ownership *begins*
+    // in actually reaches: a value owned only inside one branch is not
+    // leaked by the *other* branch's own `Return`, where ownership of it
+    // never started. Dominance is exactly that question, and is already
+    // computed the same way for `verify_dominance`.
     let dominators = compute_dominators(function);
-    let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            if let Instruction::Value { result, .. } = instruction {
-                def_block.entry(*result).or_insert(block.id);
-            }
-        }
-    }
-    for param in &function.params {
-        def_block.entry(param.value).or_insert(entry);
-    }
 
     // Every malformed edge the fixpoint refused to join, reported once
     // each and in a deterministic order, rather than defaulted away.
@@ -6371,6 +6661,11 @@ fn verify_structural_places(
                     v,
                     "destroys or transfers a place that was already consumed on a path reaching it",
                 ),
+                OwnershipViolation::IncompleteDecomposition(v) => (
+                    codes::MISSING_STRUCTURAL_CLEANUP,
+                    v,
+                    "is taken apart into a case whose own affine payload positions are not each \n                     claimed exactly once",
+                ),
             };
             diagnostics.push(Diagnostic::error(
                 code,
@@ -6388,14 +6683,20 @@ fn verify_structural_places(
             Terminator::Return(None) => None,
             _ => continue,
         };
-        for (root, ty) in &owned_roots {
+        let empty_refinements = HashSet::new();
+        let cases = VariantCaseContext {
+            refinements: refinements.get(&block.id).unwrap_or(&empty_refinements),
+            payloads: &payloads,
+        };
+        for (root, ty, owned_from) in &owned_roots {
             let root_origin = origin(*root);
             if returned == Some(root_origin) {
                 continue;
             }
-            let reaches_this_exit = def_block.get(root).is_some_and(|def| {
-                *def == block.id || dominators.get(&block.id).is_some_and(|d| d.contains(def))
-            });
+            let reaches_this_exit = *owned_from == block.id
+                || dominators
+                    .get(&block.id)
+                    .is_some_and(|d| d.contains(owned_from));
             if !reaches_this_exit {
                 continue;
             }
@@ -6405,6 +6706,7 @@ fn verify_structural_places(
                 &Place::root(root_origin),
                 ty,
                 agg,
+                &cases,
                 0,
                 &mut obligations,
             );
@@ -6501,167 +6803,118 @@ fn observe_root(
 /// payloads, each of which is tracked in its own right from that point
 /// on, so demanding a separate destruction of the scrutinee too would
 /// double-count the very same obligation.
+/// Every root this function itself owns and must therefore have fully
+/// cleaned up by any reachable exit, paired with its own type and with
+/// the block ownership *begins* in (`rfcs/0012`).
+///
+/// Ownership is read straight off the instruction that establishes it,
+/// with no function-global reasoning whatsoever: a `take` parameter owns
+/// from entry, a construction/move/call/place-transfer owns from its own
+/// block, and a variant payload owns from the block its
+/// `TakeVariantPayload` appears in -- never from the shared extraction
+/// that merely read it. That last distinction is the whole point: the
+/// extraction is common to every arm reachable through a case, while the
+/// transfer is emitted only on the one path that actually claims the
+/// payload. An earlier design instead scanned the whole function for
+/// "is this value consumed anywhere", which let a whole-value drop in
+/// one branch silently cancel a sibling branch's payload obligations.
+///
+/// Deliberately excludes a nominal `resource` root --
+/// [`verify_resource_ownership`] already owns that obligation end to
+/// end, and reporting it here too would double-report the identical leak
+/// under a second code.
 fn structural_cleanup_obligations(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
     agg: &AggregateContext,
-    origin: &impl Fn(ValueId) -> ValueId,
-) -> Vec<(ValueId, Ty)> {
-    // Every value some instruction consumes *as a whole* anywhere in
-    // this function. A `VariantPayload` extraction copies its payload
-    // out without emptying the base, so when the base itself is still
-    // destroyed or transferred somewhere, that destruction covers the
-    // payload too and the extracted copy owns nothing of its own --
-    // demanding a separate destruction of it would be a double count.
-    let mut consumed_whole: HashSet<ValueId> = HashSet::new();
-    let consume = |v: ValueId, set: &mut HashSet<ValueId>| {
-        set.insert(origin(v));
-    };
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            match instruction {
-                Instruction::Drop { value } => consume(*value, &mut consumed_whole),
-                Instruction::Store {
-                    value,
-                    mode: crate::nir::OwnershipMode::Transfer,
-                    ..
-                } => consume(*value, &mut consumed_whole),
-                Instruction::StorePlace { value, .. } => consume(*value, &mut consumed_whole),
-                Instruction::Value { kind, .. } => match kind {
-                    ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
-                        consume(*source, &mut consumed_whole)
-                    }
-                    ValueKind::RecordCreate(_, _, fields) => {
-                        for field in fields {
-                            consume(*field, &mut consumed_whole);
-                        }
-                    }
-                    ValueKind::VariantCreate { payload, .. } => {
-                        for field in payload {
-                            consume(*field, &mut consumed_whole);
-                        }
-                    }
-                    ValueKind::Call(_, _, args, _) => {
-                        for arg in args {
-                            consume(*arg, &mut consumed_whole);
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-        match &block.terminator {
-            Terminator::Return(Some(v)) => consume(*v, &mut consumed_whole),
-            Terminator::Raise { value } => consume(*value, &mut consumed_whole),
-            Terminator::Invoke { args, .. } => {
-                for arg in args {
-                    consume(*arg, &mut consumed_whole);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // A value a `match`'s own decision tree took apart: its ownership
-    // was handed to whichever payloads were extracted from it, each
-    // tracked in its own right from that point on -- so demanding a
-    // separate destruction of the scrutinee too would double-count the
-    // same obligation. Only when the base is *not* also consumed whole
-    // somewhere, which is the case in which the extracted payload
-    // really is the sole owner.
-    let mut decomposed: HashSet<ValueId> = HashSet::new();
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            if let Instruction::Value {
-                kind: ValueKind::VariantPayload { base, .. },
-                ..
-            } = instruction
-                && !consumed_whole.contains(&origin(*base))
-            {
-                decomposed.insert(origin(*base));
-            }
-        }
-        if let Terminator::Switch { scrutinee, .. } = &block.terminator
-            && !consumed_whole.contains(&origin(*scrutinee))
-        {
-            decomposed.insert(origin(*scrutinee));
-        }
-    }
-    // Every payload extracted out of a base nothing else ever consumes:
-    // that extraction *is* the transfer of ownership, so the payload is
-    // this function's own obligation from there on.
-    let mut payload_owners: Vec<ValueId> = Vec::new();
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            if let Instruction::Value {
-                result,
-                kind: ValueKind::VariantPayload { base, .. },
-                ..
-            } = instruction
-                && decomposed.contains(&origin(*base))
-            {
-                payload_owners.push(*result);
-            }
-        }
-    }
-
+) -> Vec<(ValueId, Ty, BlockId)> {
     let owns = |v: ValueId| -> Option<Ty> {
         let ty = value_types.get(&v)?;
         if !is_affine_in(ty, agg) {
             return None;
         }
-        // A nominal `resource` root belongs to the other pass.
         if matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)) {
-            return None;
-        }
-        if decomposed.contains(&origin(v)) {
             return None;
         }
         Some(ty.clone())
     };
 
-    let mut roots: Vec<(ValueId, Ty)> = Vec::new();
+    let entry = BlockId(0);
+    let mut roots: Vec<(ValueId, Ty, BlockId)> = Vec::new();
     for param in &function.params {
         if param.take
             && let Some(ty) = owns(param.value)
         {
-            roots.push((param.value, ty));
+            roots.push((param.value, ty, entry));
         }
     }
     for block in &function.blocks {
         for instruction in &block.instructions {
-            let Instruction::Value { result, kind, .. } = instruction else {
-                continue;
-            };
-            let produces_owner = matches!(
-                kind,
-                ValueKind::RecordCreate(..)
-                    | ValueKind::VariantCreate { .. }
-                    | ValueKind::Move { .. }
-                    | ValueKind::DeferCapture { .. }
-                    // A callee that returns an affine value transfers
-                    // ownership of it out to this frame, exactly like a
-                    // construction does.
-                    | ValueKind::Call(..)
-                    | ValueKind::PlaceRead {
-                        mode: crate::nir::OwnershipMode::Transfer,
-                        ..
+            match instruction {
+                Instruction::Value { result, kind, .. } => {
+                    let produces_owner = matches!(
+                        kind,
+                        ValueKind::RecordCreate(..)
+                            | ValueKind::VariantCreate { .. }
+                            | ValueKind::Move { .. }
+                            | ValueKind::DeferCapture { .. }
+                            // A callee that returns an affine value
+                            // transfers ownership of it out to this
+                            // frame, exactly like a construction does.
+                            | ValueKind::Call(..)
+                            | ValueKind::PlaceRead {
+                                mode: crate::nir::OwnershipMode::Transfer,
+                                ..
+                            }
+                    );
+                    if produces_owner && let Some(ty) = owns(*result) {
+                        roots.push((*result, ty, block.id));
                     }
-            );
-            if produces_owner && let Some(ty) = owns(*result) {
-                roots.push((*result, ty));
+                }
+                // Ownership of an extracted payload begins *here*, at
+                // the transfer, not at the extraction that read it.
+                Instruction::DecomposeVariant { taken, .. } => {
+                    for (_, owner) in taken {
+                        if let Some(ty) = owns(*owner) {
+                            roots.push((*owner, ty, block.id));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
-    for result in payload_owners {
-        if let Some(ty) = owns(result) {
-            roots.push((result, ty));
+    roots.sort_by_key(|(v, _, _)| *v);
+    roots.dedup_by_key(|(v, _, _)| *v);
+    roots
+}
+
+/// Every payload position this function extracts, keyed by the
+/// `(base, case, index)` it was read out of and mapping to the value the
+/// extraction produced (`rfcs/0012`).
+///
+/// Read back when a variant's remaining obligations are computed: a
+/// payload the shell still owns is only "nothing owed" if the value
+/// standing for it owes nothing in turn, and answering that needs the
+/// payload's own value to consult its own case refinement from.
+fn extracted_payloads(function: &Function) -> HashMap<(ValueId, usize, usize), ValueId> {
+    let mut out = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind:
+                    ValueKind::VariantPayload {
+                        base, case, index, ..
+                    },
+                ..
+            } = instruction
+            {
+                out.entry((*base, *case, *index)).or_insert(*result);
+            }
         }
     }
-    roots.sort_by_key(|(v, _)| *v);
-    roots.dedup_by_key(|(v, _)| *v);
-    roots
+    out
 }
 
 /// Every remaining *owned* affine obligation reachable through `place`,
@@ -6678,6 +6931,7 @@ fn remaining_obligations(
     place: &Place<ValueId>,
     ty: &Ty,
     agg: &AggregateContext,
+    cases: &VariantCaseContext,
     depth: usize,
     out: &mut Vec<Place<ValueId>>,
 ) {
@@ -6695,9 +6949,66 @@ fn remaining_obligations(
         Ty::Applied(item, args) => (*item, args.clone()),
         _ => return,
     };
+    if let Some(variant) = agg.variants.get(&item) {
+        // A variant only owns the payload of the case that is actually
+        // live. Which case that is, is a *path* fact: on a case-refined
+        // edge the switch already proved it, and this exit is on exactly
+        // one such path. Decomposing by it is what lets one branch hand
+        // its payload to an arm while a disjoint branch destroys the
+        // whole value, with neither affecting the other.
+        //
+        // Without a refinement there is nothing to decompose by, so the
+        // variant stays one opaque obligation -- never silently
+        // discharged.
+        let Some(case) = cases.refined_case(place) else {
+            out.push(place.clone());
+            return;
+        };
+        let Some(layout) = variant.cases.get(case) else {
+            out.push(place.clone());
+            return;
+        };
+        let Ok(subst) = item_substitution(item, &args, agg) else {
+            out.push(place.clone());
+            return;
+        };
+        for (index, payload_ty) in layout.payload.iter().enumerate().rev() {
+            let payload_ty = substitute(payload_ty, &subst);
+            if !is_affine_in(&payload_ty, agg) {
+                continue;
+            }
+            let payload_place = place.variant_field(
+                item,
+                crate::place::CaseId(case as u32),
+                crate::place::FieldId(index as u32),
+            );
+            if resolve_place_state(facts, &payload_place) != FieldState::Full {
+                // Already transferred out on this path: whoever took it
+                // owns it now, and owes its cleanup in its own right.
+                continue;
+            }
+            // Still held by the shell. What it owes in turn is answered
+            // through the value the extraction produced for it, which
+            // carries its own case refinement; with no such value there
+            // is nothing finer to say, so it is one opaque obligation.
+            match cases.extracted_value(place, case, index) {
+                Some(payload_value) => remaining_obligations(
+                    facts,
+                    &Place::root(payload_value),
+                    &payload_ty,
+                    agg,
+                    cases,
+                    depth + 1,
+                    out,
+                ),
+                None => out.push(payload_place),
+            }
+        }
+        return;
+    }
     let Some(layout) = agg.records.get(&item) else {
-        // A variant, or an item with no record layout at all: one
-        // opaque obligation, never decomposed.
+        // An item with no layout at all: one opaque obligation, never
+        // decomposed.
         out.push(place.clone());
         return;
     };
@@ -6716,12 +7027,65 @@ fn remaining_obligations(
             &place.field(item, crate::place::FieldId(index as u32)),
             &field_ty,
             agg,
+            cases,
             depth + 1,
             out,
         );
     }
     if declared_resource {
         out.push(place.clone());
+    }
+}
+
+/// Everything a variant obligation needs in order to decompose by the
+/// case that is actually live at one exit (`rfcs/0012`): the case
+/// refinements this exit's own block is on the receiving end of, and the
+/// values this function extracted for each payload position.
+///
+/// Both are path facts read back at a specific block, never
+/// function-global ownership conclusions: the refinement is whatever
+/// every incoming edge of that block independently guarantees, and the
+/// extraction map is mechanical instruction data.
+struct VariantCaseContext<'a> {
+    refinements: &'a HashSet<RefinementFact>,
+    payloads: &'a HashMap<(ValueId, usize, usize), ValueId>,
+}
+
+impl VariantCaseContext<'_> {
+    /// The case this place's own root value is refined to at this exit,
+    /// when it is a bare root and exactly one refinement names it. A
+    /// projected place has no value to refine, and a value refined to
+    /// more than one case is not refined at all.
+    fn refined_case(&self, place: &Place<ValueId>) -> Option<usize> {
+        if !place.projections.is_empty() {
+            return None;
+        }
+        let mut found: Option<usize> = None;
+        for (value, _, case) in self.refinements {
+            if *value != place.root {
+                continue;
+            }
+            match found {
+                None => found = Some(*case),
+                Some(previous) if previous == *case => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// The value this function's own extraction produced for one payload
+    /// position of one case, if it extracted it at all.
+    fn extracted_value(
+        &self,
+        place: &Place<ValueId>,
+        case: usize,
+        index: usize,
+    ) -> Option<ValueId> {
+        if !place.projections.is_empty() {
+            return None;
+        }
+        self.payloads.get(&(place.root, case, index)).copied()
     }
 }
 

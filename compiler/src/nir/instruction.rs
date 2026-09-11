@@ -206,6 +206,41 @@ pub enum Instruction {
     /// already have been the operand of another `Drop` on any path
     /// reaching this one (`nir::verify`'s own job, not lowering's).
     Drop { value: ValueId },
+    /// Takes a variant apart into one specific case, transferring that
+    /// case's own payload positions to the values that now own them
+    /// (`rfcs/0012`).
+    ///
+    /// This is the one and only point a `match` arm's ownership of a
+    /// payload begins. `ValueKind::VariantPayload` is deliberately just
+    /// a *read*: the decision tree extracts every payload position of a
+    /// case up front, in that case's own block, before it knows which
+    /// arm will win -- and whether ownership moves depends entirely on
+    /// that. A row that binds the payload, or ignores it with `_` and
+    /// therefore has to destroy it, claims it; a row that bound the
+    /// *whole* variant instead does not. One extraction is shared by
+    /// every arm reachable through that case, so it cannot carry the
+    /// answer; this instruction is emitted at the exact point the
+    /// decision tree commits to an arm, on that arm's own path alone.
+    ///
+    /// `nir::verify` treats it as consuming `value`'s whole place and as
+    /// the point each entry in `taken` becomes this frame's own
+    /// obligation -- path-sensitively, like every other structural
+    /// place. A whole-value `Drop` or transfer of the same variant on a
+    /// *disjoint* path is therefore completely independent: neither can
+    /// suppress or discharge the other, which is precisely what a
+    /// function-global "was this consumed anywhere" test got wrong.
+    ///
+    /// `taken` lists `(payload index, owning value)` in declaration
+    /// order. Every *affine* payload position of `case` must appear
+    /// exactly once: a missing one would be a resource the shell no
+    /// longer owns and nothing else does either, so the verifier
+    /// requires completeness rather than trusting lowering.
+    DecomposeVariant {
+        value: ValueId,
+        variant: ItemId,
+        case: usize,
+        taken: Vec<(usize, ValueId)>,
+    },
     /// Reinitializes the affine place `place` with `value` (`rfcs/0012`):
     /// `session.input = open_file()`'s own structural counterpart to
     /// `Store`'s ordinary whole-slot assignment. Always a transfer of

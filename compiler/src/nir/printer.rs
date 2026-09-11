@@ -386,6 +386,23 @@ fn format_instruction(
             }
         },
         Instruction::Drop { value } => format!("drop %{}", value.0),
+        Instruction::DecomposeVariant {
+            value,
+            variant,
+            case,
+            taken,
+        } => {
+            let moved: Vec<String> = taken
+                .iter()
+                .map(|(index, owner)| format!("{index}: %{}", owner.0))
+                .collect();
+            format!(
+                "decompose %{} : {}.{case} [{}]",
+                value.0,
+                registry.qualified_name(*variant, interner),
+                moved.join(", ")
+            )
+        }
         Instruction::StorePlace { place, value } => {
             format!(
                 "store.place {}, %{}",

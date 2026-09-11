@@ -14414,3 +14414,1323 @@ mod tests {
         }
     }
 }
+
+/// Adversarial hand-built NIR for the structural ownership lattice
+/// (`rfcs/0012`), written against `verify_module` directly rather than
+/// through `nir::lower`: every one of these modules is malformed in a
+/// way no source program can express, which is exactly the point --
+/// `nir::verify` must reject malformed ownership independently, even
+/// when NIR bypasses source checking entirely.
+///
+/// Every assertion is made against the *set of structural codes*
+/// (`V0083`-`V0092`) rather than the complete diagnostic list, so an
+/// unrelated pre-existing check firing on the same fixture never makes
+/// one of these tests pass or fail for the wrong reason.
+#[cfg(test)]
+mod structural_ownership {
+    use super::*;
+    use crate::hir::TypeParamId;
+    use crate::nir::{BasicBlock, CaseLayout, OwnershipMode, Param};
+    use crate::place::FieldId;
+    use crate::source::SourceMap;
+
+    const FILE: ItemId = ItemId(200);
+    const SESSION: ItemId = ItemId(201);
+    const ENVELOPE: ItemId = ItemId(202);
+    const BOXY: ItemId = ItemId(203);
+    const HOLDER: ItemId = ItemId(204);
+    const PLAIN: ItemId = ItemId(205);
+    const SELF: ItemId = ItemId(300);
+    const SINK: ItemId = ItemId(301);
+    const OBSERVE: ItemId = ItemId(302);
+    const T: TypeParamId = TypeParamId(0);
+
+    struct Fixture {
+        interner: Interner,
+        records: Vec<(ItemId, RecordLayout)>,
+        variants: Vec<(ItemId, VariantLayout)>,
+        file: Ty,
+        session: Ty,
+        envelope: Ty,
+        holder: Ty,
+        box_file: Ty,
+        plain: Ty,
+    }
+
+    /// `File` (a declared `resource`), `Session` (a `resource` with two
+    /// `File` fields), `Envelope` (an ordinary `record` with one `File`
+    /// field, so transitively affine but never nominally a resource),
+    /// `Box[T]` (generic), `Holder` (a variant carrying an `Envelope`),
+    /// and `Plain` (an ordinary non-affine record).
+    fn fixture() -> Fixture {
+        let mut interner = Interner::new();
+        let file = interner.intern("File");
+        let session = interner.intern("Session");
+        let envelope = interner.intern("Envelope");
+        let boxy = interner.intern("Box");
+        let holder = interner.intern("Holder");
+        let plain = interner.intern("Plain");
+        let descriptor = interner.intern("descriptor");
+        let input = interner.intern("input");
+        let output = interner.intern("output");
+        let item = interner.intern("item");
+        let full = interner.intern("Full");
+        let empty = interner.intern("Empty");
+
+        let file_ty = Ty::Named(FILE, file);
+        let envelope_ty = Ty::Named(ENVELOPE, envelope);
+        let records = vec![
+            (
+                FILE,
+                RecordLayout {
+                    name: file,
+                    type_params: Vec::new(),
+                    fields: vec![(descriptor, Ty::I64)],
+                    affine: true,
+                },
+            ),
+            (
+                SESSION,
+                RecordLayout {
+                    name: session,
+                    type_params: Vec::new(),
+                    fields: vec![(input, file_ty.clone()), (output, file_ty.clone())],
+                    affine: true,
+                },
+            ),
+            (
+                ENVELOPE,
+                RecordLayout {
+                    name: envelope,
+                    type_params: Vec::new(),
+                    fields: vec![(item, file_ty.clone())],
+                    affine: false,
+                },
+            ),
+            (
+                BOXY,
+                RecordLayout {
+                    name: boxy,
+                    type_params: vec![(T, item)],
+                    fields: vec![(item, Ty::Param(T, item))],
+                    affine: false,
+                },
+            ),
+            (
+                PLAIN,
+                RecordLayout {
+                    name: plain,
+                    type_params: Vec::new(),
+                    fields: vec![(descriptor, Ty::I64)],
+                    affine: false,
+                },
+            ),
+        ];
+        let variants = vec![(
+            HOLDER,
+            VariantLayout {
+                name: holder,
+                type_params: Vec::new(),
+                cases: vec![
+                    CaseLayout {
+                        name: full,
+                        payload: vec![envelope_ty.clone()],
+                    },
+                    CaseLayout {
+                        name: empty,
+                        payload: Vec::new(),
+                    },
+                ],
+            },
+        )];
+
+        Fixture {
+            interner,
+            records,
+            variants,
+            file: file_ty.clone(),
+            session: Ty::Named(SESSION, session),
+            envelope: envelope_ty,
+            holder: Ty::Named(HOLDER, holder),
+            box_file: Ty::Applied(BOXY, vec![file_ty]),
+            plain: Ty::Named(PLAIN, plain),
+        }
+    }
+
+    /// `sink(take File) -> unit`, for a genuinely consuming call
+    /// argument, and `observe(File) -> i64`, for a merely-observing one.
+    fn helpers(fx: &mut Fixture) -> Vec<Function> {
+        let sink = fx.interner.intern("sink");
+        let observe = fx.interner.intern("observe");
+        vec![
+            Function {
+                id: SINK,
+                name: sink,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: true,
+                }],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Return(None),
+                }],
+            },
+            Function {
+                id: OBSERVE,
+                name: observe,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: false,
+                }],
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(0)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                }],
+            },
+        ]
+    }
+
+    fn under_test(params: Vec<Param>, return_type: Ty, blocks: Vec<BasicBlock>) -> Function {
+        Function {
+            id: SELF,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    /// Only the structural ownership family, sorted -- a deterministic
+    /// multiset two permutations of the same module can be compared
+    /// against directly.
+    fn structural_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        let mut codes: Vec<&'static str> =
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| d.code)
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        codes::PLACE_PROJECTION_THROUGH_NON_RECORD
+                            | codes::INVALID_PLACE_FIELD_OWNER
+                            | codes::UNKNOWN_PLACE_FIELD
+                            | codes::MOVE_OF_NON_AFFINE_PLACE
+                            | codes::PLACE_USE_AFTER_MOVE
+                            | codes::PLACE_OVERWRITE_OF_LIVE_FIELD
+                            | codes::PLACE_GENERIC_ARITY_MISMATCH
+                            | codes::PARTIAL_PLACE_USED_AS_WHOLE
+                            | codes::MISSING_STRUCTURAL_CLEANUP
+                            | codes::DUPLICATE_STRUCTURAL_CLEANUP
+                    )
+                })
+                .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    fn take_session(fx: &Fixture) -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: fx.session.clone(),
+            take: true,
+        }]
+    }
+
+    fn session_field(index: u32) -> Place<ValueId> {
+        Place::root(ValueId(0)).field(SESSION, FieldId(index))
+    }
+
+    fn read(result: u32, ty: Ty, place: Place<ValueId>, mode: OwnershipMode) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::PlaceRead { place, mode },
+        }
+    }
+
+    fn drop_of(value: u32) -> Instruction {
+        Instruction::Drop {
+            value: ValueId(value),
+        }
+    }
+
+    fn int(result: u32, value: u128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value)),
+        }
+    }
+
+    // -- the place tree: ancestors, descendants, siblings ---------------
+
+    #[test]
+    fn a_child_moved_then_the_parent_moved_as_a_whole_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    // Moving the parent *as a value* after one of its
+                    // own children left: nothing may transfer an
+                    // incomplete aggregate.
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(2),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "moving a partially moved parent as a whole must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_moved_then_the_parent_observed_as_a_whole_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.session.clone(),
+                        Place::root(ValueId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "observing a partially moved parent as a whole must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_read_after_its_parent_was_transferred_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(1),
+                    // `session` is gone: every place reachable through
+                    // it went with it, whether or not this exact field
+                    // was ever individually tracked.
+                    read(2, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "reading a child after its parent was transferred must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_read_after_its_parent_was_dropped_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    drop_of(0),
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "reading a child after its parent was dropped must be rejected"
+        );
+    }
+
+    #[test]
+    fn moving_one_child_leaves_its_sibling_freely_readable() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unaffected sibling must stay available after its sibling moved"
+        );
+    }
+
+    #[test]
+    fn a_partially_moved_parent_may_still_be_structurally_dropped() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    // Only `output` and the outer identity are left --
+                    // a structural drop destroys exactly those.
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a structural drop after a partial move must be accepted"
+        );
+    }
+
+    #[test]
+    fn reinitializing_an_empty_child_restores_the_parents_completeness() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 7),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: fx.file.clone(),
+                        kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(2)]),
+                    },
+                    Instruction::StorePlace {
+                        place: session_field(0),
+                        value: ValueId(3),
+                    },
+                    // Complete again: a whole-value transfer is legal
+                    // once more.
+                    Instruction::Value {
+                        result: ValueId(4),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(4),
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a reinitialized child must restore its parent's completeness"
+        );
+    }
+
+    #[test]
+    fn dropping_the_same_structural_field_twice_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "destroying the same structural field twice must be rejected"
+        );
+    }
+
+    #[test]
+    fn dropping_the_same_whole_value_twice_is_duplicate_structural_cleanup() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![drop_of(0), drop_of(0), int(1, 0)],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "a second whole-value destruction must be rejected"
+        );
+    }
+
+    // -- missing cleanup for a transitively affine aggregate -----------
+
+    #[test]
+    fn a_taken_affine_record_parameter_left_undestroyed_is_reported_as_leaked() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(1, 0)],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a taken affine record left undestroyed must be reported"
+        );
+    }
+
+    #[test]
+    fn a_taken_affine_record_parameter_destroyed_field_by_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(ENVELOPE, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an affine record whose own affine field was destroyed owes nothing further"
+        );
+    }
+
+    #[test]
+    fn a_record_construction_consuming_an_affine_record_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                    },
+                    read(
+                        2,
+                        fx.file.clone(),
+                        Place::root(ValueId(1)).field(ENVELOPE, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "constructing an affine record from an owned field, then destroying it, is complete"
+        );
+    }
+
+    #[test]
+    fn a_record_construction_from_an_already_consumed_field_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    drop_of(0),
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                    },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "an aggregate built from an already-destroyed field must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_variant_construction_consuming_an_affine_record_payload_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            fx.holder.clone(),
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.holder.clone(),
+                    kind: ValueKind::VariantCreate {
+                        variant: HOLDER,
+                        case: 0,
+                        type_args: Vec::new(),
+                        payload: vec![ValueId(0)],
+                    },
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a variant taking ownership of an affine payload and returning it owes nothing"
+        );
+    }
+
+    #[test]
+    fn a_take_argument_consuming_an_affine_record_discharges_its_obligation() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::Unit,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(0)], Vec::new()),
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a take argument must discharge its own structural obligation"
+        );
+    }
+
+    #[test]
+    fn an_observing_argument_of_a_partially_moved_parent_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::Call(OBSERVE, Vec::new(), vec![ValueId(0)], Vec::new()),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "passing a partially moved parent to an observing parameter must be rejected"
+        );
+    }
+
+    // -- malformed projection metadata ---------------------------------
+
+    #[test]
+    fn a_place_projecting_an_unknown_field_owner_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(ItemId(9999), FieldId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        let codes = structural_codes(&mut fx, f);
+        assert!(
+            codes.contains(&codes::PLACE_PROJECTION_THROUGH_NON_RECORD)
+                || codes.contains(&codes::INVALID_PLACE_FIELD_OWNER),
+            "an unknown field owner must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_a_field_index_out_of_range_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(SESSION, FieldId(9)),
+                        OwnershipMode::Observe,
+                    ),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNKNOWN_PLACE_FIELD),
+            "a field index out of range must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_a_non_affine_field_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.plain.clone(),
+                take: false,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        Ty::I64,
+                        Place::root(ValueId(0)).field(PLAIN, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MOVE_OF_NON_AFFINE_PLACE),
+            "moving an ordinary, freely copyable field must be rejected"
+        );
+    }
+
+    // -- generics -------------------------------------------------------
+
+    #[test]
+    fn a_substituted_generic_field_place_resolves_to_its_concrete_affine_type() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "`Box[File].item` must resolve to the affine `File`, not a bare type parameter"
+        );
+    }
+
+    #[test]
+    fn a_generic_place_with_the_wrong_type_argument_arity_is_rejected() {
+        let mut fx = fixture();
+        let wrong = Ty::Applied(BOXY, vec![fx.file.clone(), fx.file.clone()]);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: wrong,
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_GENERIC_ARITY_MISMATCH),
+            "a generic place whose arity disagrees with its own declaration must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_generic_place_with_no_recorded_type_parameters_is_rejected_not_defaulted() {
+        let mut fx = fixture();
+        // Strip `Box`'s own type-parameter list, leaving the place's
+        // own single type argument with nothing to bind to. The
+        // substitution must fail loudly rather than silently become
+        // empty and leave `item` typed as a never-affine `Ty::Param`.
+        for (id, layout) in fx.records.iter_mut() {
+            if *id == BOXY {
+                layout.type_params.clear();
+            }
+        }
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_GENERIC_ARITY_MISMATCH),
+            "missing generic metadata must be rejected, never treated as an empty substitution"
+        );
+    }
+
+    // -- joins, orderings, and permutation invariance -------------------
+
+    /// `f(cond) { if cond { move session.input; drop it } ; read
+    /// session.input }` -- empty on exactly one predecessor, so the
+    /// join is the absorbing `Maybe` and the later read is rejected.
+    fn field_empty_on_one_predecessor(fx: &Fixture) -> Vec<BasicBlock> {
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: vec![
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                ],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![
+                    read(
+                        3,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(3),
+                    drop_of(0),
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            },
+        ]
+    }
+
+    fn cond_params(fx: &Fixture) -> Vec<Param> {
+        vec![
+            Param {
+                value: ValueId(0),
+                ty: fx.session.clone(),
+                take: true,
+            },
+            Param {
+                value: ValueId(1),
+                ty: Ty::Bool,
+                take: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_field_empty_on_only_one_predecessor_is_rejected_at_the_join() {
+        let mut fx = fixture();
+        let blocks = field_empty_on_one_predecessor(&fx);
+        let f = under_test(cond_params(&fx), Ty::I64, blocks);
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a field emptied on only one path must not be usable after the join"
+        );
+    }
+
+    #[test]
+    fn a_reversed_block_vector_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(
+            a, b,
+            "block vector order must not change which structural diagnostics fire"
+        );
+        assert!(
+            !a.is_empty(),
+            "the fixture must actually diagnose something"
+        );
+    }
+
+    #[test]
+    fn a_reversed_predecessor_order_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        // The join block's two predecessors are discovered in the order
+        // the block vector lists them; swapping the two `CondBranch`
+        // targets (and the bodies with them) reverses that discovery
+        // order without changing the program's meaning.
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut swapped = forward.clone();
+        swapped[0].terminator = Terminator::CondBranch {
+            condition: ValueId(1),
+            then_block: BlockId(2),
+            else_block: BlockId(1),
+        };
+        swapped[1].terminator = Terminator::Branch(BlockId(2));
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, swapped));
+        assert_eq!(
+            a, b,
+            "predecessor discovery order must not change which structural diagnostics fire"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_predecessor_contributes_no_structural_facts() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        drop_of(0),
+                        int(3, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+                // Never reached from the entry block at all: its own
+                // (nonsense) facts must not leak into anything.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        read(
+                            4,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(4),
+                    ],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unreachable block (including an unreachable cycle) must contribute nothing"
+        );
+    }
+
+    #[test]
+    fn a_loop_that_moves_and_reinitializes_the_same_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            cond_params(&fx),
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        int(3, 1),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                        },
+                        Instruction::StorePlace {
+                            place: session_field(0),
+                            value: ValueId(4),
+                        },
+                    ],
+                    // Back edge: the field is `Full` again, so a second
+                    // iteration may move it again.
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![drop_of(0), int(5, 0)],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a loop that restores what it moved must be accepted on every iteration"
+        );
+    }
+
+    #[test]
+    fn a_deep_alternating_projection_chain_is_tracked_without_panicking() {
+        let mut fx = fixture();
+        // `Session.input.descriptor` is not affine, so the deepest
+        // *affine* place is two levels down; the chain below goes
+        // deliberately deeper than any declaration allows, which must
+        // be diagnosed rather than panic or hang.
+        let deep = Place::root(ValueId(0))
+            .field(SESSION, FieldId(0))
+            .field(FILE, FieldId(0))
+            .field(FILE, FieldId(0));
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(1, fx.file.clone(), deep, OwnershipMode::Transfer),
+                    drop_of(1),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        let codes = structural_codes(&mut fx, f);
+        assert!(
+            !codes.is_empty(),
+            "an over-deep projection chain must be diagnosed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn the_entry_block_listed_last_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut rotated = forward.clone();
+        let head = rotated.remove(0);
+        rotated.push(head);
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, rotated));
+        assert_eq!(
+            a, b,
+            "the entry block's position in the vector must not change the result"
+        );
+    }
+
+    // -- lattice laws ---------------------------------------------------
+
+    #[test]
+    fn an_ancestors_state_dominates_every_descendant() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let grandchild = child.field(FILE, FieldId(0));
+        set_place_state(&mut facts, &parent, FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &child), FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &grandchild), FieldState::Empty);
+    }
+
+    #[test]
+    fn a_consumed_descendant_makes_every_ancestor_partial_but_not_consumed() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let sibling = parent.field(SESSION, FieldId(1));
+        set_place_state(&mut facts, &child, FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &parent), FieldState::Full);
+        assert!(!place_is_whole(&facts, &parent));
+        assert!(place_is_whole(&facts, &sibling));
+    }
+
+    #[test]
+    fn setting_an_ancestor_clears_every_stale_descendant_fact() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        set_place_state(&mut facts, &child, FieldState::Empty);
+        set_place_state(&mut facts, &parent, FieldState::Full);
+        assert!(
+            place_is_whole(&facts, &parent),
+            "restoring a parent must retire every stale descendant fact"
+        );
+    }
+
+    #[test]
+    fn a_join_over_the_union_of_keys_is_commutative_and_absorbing() {
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let mut a = PlaceFacts::new();
+        a.insert(child.clone(), FieldState::Empty);
+        let b = PlaceFacts::new();
+        let left = merge_place_facts(&a, &b);
+        let right = merge_place_facts(&b, &a);
+        assert_eq!(left, right, "the join must be commutative");
+        assert_eq!(
+            left.get(&child),
+            Some(&FieldState::Maybe),
+            "a key present on only one side must join to the absorbing state"
+        );
+    }
+}

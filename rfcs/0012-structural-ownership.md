@@ -170,9 +170,20 @@ sibling, reinserting into the empty field, or structural cleanup.
 ```napitia
 inspect(session.input)   // U0002 (or U0001): field already moved
 inspect(session.output)  // valid: an unaffected sibling
+session.count            // valid: an ordinary, non-affine field
 inspect_session(session) // U0014: whole aggregate partially moved
-drop session              // valid: drops only the remaining owned fields
+drop session             // valid: drops only the remaining owned fields
 ```
+
+Reading an *ordinary, non-affine* field of a partially moved aggregate
+is checked as the place it is -- what must still be intact is the chain
+reaching it, not the whole parent. Checking the base as a whole-value
+read instead would reject exactly the thing `U0014`'s own advice tells
+the user to do. A use after the *parent* itself was moved or dropped is
+still rejected, because the ancestor's own state dominates its
+descendants'; `nir::verify`'s own `RecordField` check applies the
+identical rule, so the two stages agree on precisely which programs this
+admits.
 
 ### Reinsertion
 
@@ -348,6 +359,17 @@ Ownership facts are contributed by every path that actually moves one --
 arguments, `Switch`, `Return`, `Raise`, `Drop` -- and are gated on
 *transitive* affinity throughout, never on nominal `is_resource`: an
 affine record owns real resources and is tracked in its own right.
+
+What *becomes* an obligation is every root this function itself owns: a
+`take` parameter, an aggregate it constructs, a value it moves or
+captures, a field it transfers out of a place, an affine value a callee
+returns to it, and a variant payload extracted from a base nothing else
+ever consumes. That last distinction matters because `variant.payload`
+copies its payload out without emptying the base: when the base is
+itself destroyed or transferred somewhere, that destruction already
+covers the payload and demanding a second one would double-count the
+same obligation; when nothing else consumes the base, the extraction
+*is* the transfer and the payload is this function's own.
 `V0091` complements `V0077` rather than duplicating it: `V0077` covers a
 nominally resource-typed root, and this one covers the gap that lattice
 cannot see, a record that merely *contains* affine fields and is

@@ -17051,4 +17051,370 @@ mod structural_ownership {
              so it is not this invariant, got {codes:?}"
         );
     }
+
+    // -- path-sensitive variant decomposition, hand-built --------------
+
+    /// `f(take holder: Holder, cond: bool)`: one branch drops the shell
+    /// whole, the other takes it apart into case `Full` and claims its
+    /// `Envelope` payload. Neither may affect the other.
+    fn branch_local_variant(
+        fx: &Fixture,
+        drop_first: bool,
+        claim_payload: bool,
+        destroy_claim: bool,
+    ) -> Vec<BasicBlock> {
+        let mut decompose_block = vec![Instruction::Value {
+            result: ValueId(2),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::VariantPayload {
+                base: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                index: 0,
+            },
+        }];
+        decompose_block.push(Instruction::DecomposeVariant {
+            value: ValueId(0),
+            variant: HOLDER,
+            case: 0,
+            taken: if claim_payload {
+                vec![(0, ValueId(2))]
+            } else {
+                Vec::new()
+            },
+        });
+        if destroy_claim {
+            decompose_block.push(drop_of(2));
+        }
+        decompose_block.push(int(3, 2));
+
+        let drop_block = vec![drop_of(0), int(4, 1)];
+        let (then_block, else_block) = if drop_first {
+            (drop_block, decompose_block)
+        } else {
+            (decompose_block, drop_block)
+        };
+        let then_result = if drop_first { ValueId(4) } else { ValueId(3) };
+        let else_result = if drop_first { ValueId(3) } else { ValueId(4) };
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: then_block,
+                terminator: Terminator::Return(Some(then_result)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: else_block,
+                terminator: Terminator::Return(Some(else_result)),
+            },
+        ]
+    }
+
+    fn holder_params(fx: &Fixture) -> Vec<Param> {
+        vec![
+            Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            },
+            Param {
+                value: ValueId(1),
+                ty: Ty::Bool,
+                take: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_whole_drop_in_one_branch_does_not_discharge_a_sibling_decomposition() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        // The decomposing branch claims the payload but never destroys
+        // it: that branch alone must be reported, and the sibling
+        // branch's whole drop must not excuse it.
+        let blocks = branch_local_variant(&fx, true, true, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a claimed payload left undestroyed on its own path must be reported"
+        );
+    }
+
+    #[test]
+    fn a_whole_drop_in_one_branch_and_a_complete_match_in_the_other_is_accepted() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let blocks = branch_local_variant(&fx, true, true, true);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "disjoint branches each account for the shell exactly once"
+        );
+    }
+
+    #[test]
+    fn reversing_the_branch_order_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let forward = branch_local_variant(&fx, true, true, true);
+        let reversed = branch_local_variant(&fx, false, true, true);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(a, b, "which branch comes first must not matter");
+        assert_eq!(a, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn reversing_the_block_vector_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let forward = branch_local_variant(&fx, true, true, true);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(a, b, "block vector order must not matter");
+    }
+
+    #[test]
+    fn a_decomposition_leaving_an_affine_payload_unclaimed_is_reported() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        // `Full`'s own `Envelope` payload is affine and is claimed by
+        // nobody: the shell no longer owns it and nothing else does.
+        let blocks = branch_local_variant(&fx, true, false, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "every affine payload position must be claimed exactly once"
+        );
+    }
+
+    #[test]
+    fn decomposing_a_shell_twice_on_one_path_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: Vec::new(),
+                    },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "a shell already taken apart cannot be taken apart again"
+        );
+    }
+
+    #[test]
+    fn dropping_a_shell_already_decomposed_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "the shell is spent once its payloads have been taken"
+        );
+    }
+
+    #[test]
+    fn an_inactive_case_owning_nothing_discharges_the_shell() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    // Case 1 (`Empty`) carries no payload at all.
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 1,
+                        taken: Vec::new(),
+                    },
+                    int(1, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "taking a payload-less case apart leaves nothing owed"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_naming_a_case_out_of_range_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 9,
+                        taken: Vec::new(),
+                    },
+                    int(1, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNKNOWN_PLACE_FIELD),
+            "a case index out of range must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_claiming_one_position_twice_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1)), (0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "one payload position cannot be handed to two owners"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_of_a_value_that_is_not_that_variant_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    // `%0` is a `Session`, not a `Holder`.
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 1,
+                        taken: Vec::new(),
+                    },
+                    int(1, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_PROJECTION_THROUGH_NON_RECORD),
+            "the decomposed value must actually be the named variant"
+        );
+    }
 }

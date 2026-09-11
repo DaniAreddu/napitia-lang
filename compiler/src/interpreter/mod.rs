@@ -23,7 +23,7 @@ use crate::types::{Evidence, Ty};
 /// A resource record's own identity within one [`Interpreter`]'s own
 /// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
 /// lives at, stable for that resource's entire runtime lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ResourceId(u32);
 
 /// A capability to observe or consume one resource record, as of a
@@ -351,6 +351,20 @@ impl ResourceTable {
 struct AccessResult {
     extracted: Value,
     container: Value,
+}
+
+/// A complete, not-yet-applied plan for one structural store
+/// (`rfcs/0012`): every resource identity the source graph carries and
+/// the generation each one moves to, collected before anything is
+/// mutated.
+///
+/// `moving` exists to make a duplicated identity visible: validating
+/// values recursively cannot see it, because each occurrence
+/// independently observes the one live handle and passes.
+#[derive(Default)]
+struct StorePlan {
+    moving: HashSet<ResourceId>,
+    transitions: Vec<(ResourceId, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -706,15 +720,38 @@ impl<'a> Interpreter<'a> {
         let root = get(values, &root_id)?;
         let incoming = get(values, &source)?;
 
-        // Phase 1 -- validation only; nothing below this point mutates.
+        // Phase A -- validation and planning. Nothing below this point
+        // mutates anything, and the plan is complete before it does:
+        // every identity the source carries, the generation each one
+        // moves to, and the fully rebuilt value to install.
+        let mut plan = StorePlan::default();
+        let rebuilt = self.plan_transfer(&incoming, &mut plan)?;
         self.validate_store_target(&root, &place.projections)?;
-        self.validate_transferable(&incoming)?;
+        // Traversing the destination reads resources of its own. If the
+        // source carries one of those same identities, transferring it
+        // would invalidate the very handle the install has to reach
+        // through -- so the two graphs must be disjoint.
+        let mut destination = Vec::new();
+        self.destination_identities(&root, &place.projections, &mut destination)?;
+        for id in destination {
+            if plan.moving.contains(&id) {
+                return Err(invalid(
+                    "a structural store's own source and destination share a resource identity",
+                ));
+            }
+        }
 
-        // Phase 2 -- the only phase that bumps a generation.
-        let owned = self.transfer_if_resource(incoming)?;
-
-        // Phase 3 -- commit.
-        let updated_root = self.store_projections(root, &place.projections, owned)?;
+        // Phase B -- atomic commit. Every fallible question was already
+        // answered above: the generation transitions are applied
+        // together, and the install walks the exact chain
+        // `validate_store_target` just proved reachable and empty.
+        {
+            let mut table = self.resources.borrow_mut();
+            for (id, generation) in &plan.transitions {
+                table.records[id.0 as usize].generation = *generation;
+            }
+        }
+        let updated_root = self.store_projections(root, &place.projections, rebuilt)?;
         values.insert(root_id, updated_root);
         values.insert(source, Value::Moved);
         values.insert(source_id, Value::Moved);
@@ -874,14 +911,34 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    /// Proves every resource identity reachable through `value` can be
-    /// transferred, without transferring any of them (`rfcs/0011`) --
-    /// the other read-only half of phase 1. Checking the whole tree up
-    /// front is what makes a nested aggregate's transfer all-or-nothing:
-    /// bumping the first child's generation and then discovering the
-    /// second is stale would leave the value half-transferred with no
-    /// way back.
-    fn validate_transferable(&self, value: &Value) -> Result<(), InterpreterError> {
+    /// Builds the complete transfer plan for `value` and returns the
+    /// value rebuilt around the handles it will own *after* the commit
+    /// (`rfcs/0011`, `rfcs/0012`) -- validating the whole graph without
+    /// mutating any of it.
+    ///
+    /// Validates, in one traversal: the declaration exists and its kind
+    /// matches the runtime value, generic type-argument arity resolves,
+    /// the runtime field/payload count equals the declared one, the
+    /// active variant case exists, every handle is a live current owner,
+    /// and no resource identity appears twice anywhere in the graph.
+    ///
+    /// That last check is why this exists at all. Validating values
+    /// recursively is not enough: a malformed graph carrying the *same*
+    /// identity in two positions passes a per-value check twice, because
+    /// each occurrence independently sees the one live handle. The
+    /// transfer then moves the first, and the second -- now stale --
+    /// fails partway through, leaving the runtime half-mutated with the
+    /// new owner unreachable. Collecting identities makes the duplicate
+    /// visible before anything moves.
+    ///
+    /// The post-transfer generation is *computed*, never applied, so
+    /// the rebuilt value can be constructed in full while the resource
+    /// table still holds its pre-transfer state.
+    fn plan_transfer(
+        &self,
+        value: &Value,
+        plan: &mut StorePlan,
+    ) -> Result<Value, InterpreterError> {
         match value {
             Value::Resource(handle) => {
                 if handle.role != RuntimeOwnershipRole::Owner {
@@ -896,16 +953,108 @@ impl<'a> Interpreter<'a> {
                         "cannot transfer ownership of a resource that was already dropped",
                     ));
                 }
-                Ok(())
+                if !plan.moving.insert(handle.id) {
+                    return Err(invalid(
+                        "a structural store's own source carries the same resource identity more \
+                         than once",
+                    ));
+                }
+                let generation = record.generation + 1;
+                plan.transitions.push((handle.id, generation));
+                Ok(Value::Resource(ResourceHandle {
+                    id: handle.id,
+                    generation,
+                    role: RuntimeOwnershipRole::Owner,
+                }))
             }
-            Value::Record { fields, .. } => fields
-                .iter()
-                .try_for_each(|field| self.validate_transferable(field)),
-            Value::Variant { payload, .. } => payload
-                .iter()
-                .try_for_each(|field| self.validate_transferable(field)),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => {
+                let declared = self.record_field_types(*item, type_args)?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a structural store's own source record carries a field count its \
+                         declaration does not declare",
+                    ));
+                }
+                let rebuilt = fields
+                    .iter()
+                    .map(|field| self.plan_transfer(field, plan))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Record {
+                    item: *item,
+                    type_args: type_args.clone(),
+                    fields: rebuilt,
+                })
+            }
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => {
+                let declared = self.case_payload_types(*item, type_args, *case)?;
+                if declared.len() != payload.len() {
+                    return Err(invalid(
+                        "a structural store's own source variant carries a payload count its \
+                         active case does not declare",
+                    ));
+                }
+                let rebuilt = payload
+                    .iter()
+                    .map(|field| self.plan_transfer(field, plan))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Variant {
+                    item: *item,
+                    type_args: type_args.clone(),
+                    case: *case,
+                    payload: rebuilt,
+                })
+            }
             Value::Moved => Err(invalid("transfer of a value that was already moved")),
             Value::Dropped => Err(invalid("transfer of a value that was already destroyed")),
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Every resource identity the *destination* traversal has to reach
+    /// through, in deterministic order (`rfcs/0012`) -- the root itself
+    /// when it is resource-backed, and every intermediate the
+    /// projections pass through. Never the final field being written,
+    /// which holds a tombstone by the time this runs.
+    ///
+    /// Compared against the source's own identities so a store can never
+    /// invalidate the very handle the install has to reach through.
+    fn destination_identities(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+        out: &mut Vec<ResourceId>,
+    ) -> Result<(), InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(());
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                out.push(handle.id);
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                self.destination_identities(&inner, rest, out)
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                self.destination_identities(slot, rest, out)
+            }
             _ => Ok(()),
         }
     }
@@ -5093,9 +5242,18 @@ mod store_place_transfer {
     const FILE: ItemId = ItemId(60);
     const HOLDER: ItemId = ItemId(61);
     const BOXY: ItemId = ItemId(62);
+    const PAIR: ItemId = ItemId(63);
+    const HOLDERS: ItemId = ItemId(64);
+    const MIXED: ItemId = ItemId(65);
+    const SESSION: ItemId = ItemId(66);
+    const MAYBE: ItemId = ItemId(67);
 
     /// `File` (a declared `resource`), `Holder` (an ordinary record with
-    /// one `File` field), and `Box[T]` (generic, one field).
+    /// one `File` field), `Box[T]` (generic, one field), `Pair` (two
+    /// `File` fields), `Holders` (two `Holder` fields), `Mixed` (a
+    /// `File` and a `Maybe[File]`), `Session` (a `resource` with one
+    /// `File` field, used as a destination spine) and the generic
+    /// variant `Maybe[T]`.
     fn module() -> Module {
         let name = Symbol(0);
         let param = crate::hir::TypeParamId(0);
@@ -5129,8 +5287,66 @@ mod store_place_transfer {
                         affine: false,
                     },
                 ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name)), (name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    HOLDERS,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(HOLDER, name)),
+                            (name, Ty::Named(HOLDER, name)),
+                        ],
+                        affine: false,
+                    },
+                ),
+                (
+                    MIXED,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(FILE, name)),
+                            (name, Ty::Applied(MAYBE, vec![Ty::Named(FILE, name)])),
+                        ],
+                        affine: false,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
             ],
-            variants: Vec::new(),
+            variants: vec![(
+                MAYBE,
+                crate::nir::VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
             protocols: Vec::new(),
             extends: Vec::new(),
         }
@@ -5489,6 +5705,54 @@ mod store_place_transfer {
         );
     }
 
+    /// A malformed source graph carrying the *same* resource identity
+    /// twice validated twice -- each check looked at the one live
+    /// handle independently -- and only failed partway through the
+    /// transfer, after the first occurrence had already been moved.
+    #[test]
+    fn a_duplicate_identity_in_the_source_is_refused_without_mutation() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(HOLDER, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        // The same resource identity in both of `Pair`'s own fields.
+        values.insert(
+            ValueId(1),
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(shared), Value::Resource(shared)],
+            },
+        );
+        let before = values.clone();
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(BOXY, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a duplicated resource identity must be refused, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused store must mutate nothing");
+        assert!(
+            interpreter.resources.borrow().observe(shared).is_ok(),
+            "no generation may have been bumped"
+        );
+    }
+
     #[test]
     fn a_refused_store_reports_the_identical_error_every_time() {
         let module = module();
@@ -5507,6 +5771,366 @@ mod store_place_transfer {
             ValueId(1),
         );
         assert_eq!(first, second, "the same refusal must be deterministic");
+    }
+
+    // -- transactional rejection: nothing may change on any failure ----
+
+    /// Every refused store must leave the frame value map, the resource
+    /// table, every generation and every Alive/Moved/Dropped status
+    /// exactly as it found them. Asserted by comparing the whole
+    /// observable state before and after.
+    fn assert_refused_without_mutation(
+        interpreter: &Interpreter<'_>,
+        values: &mut HashMap<ValueId, Value>,
+        place: &Place<ValueId>,
+        source: ValueId,
+        watched: &[ResourceHandle],
+        what: &str,
+    ) {
+        let before_values = values.clone();
+        let before_table: Vec<(ItemId, u64, bool, Vec<Value>)> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+
+        let result = interpreter.store_place_transfer(values, &HashMap::new(), place, source);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            *values, before_values,
+            "{what}: the frame value map changed"
+        );
+        let after_table: Vec<(ItemId, u64, bool, Vec<Value>)> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            before_table, after_table,
+            "{what}: the resource table changed"
+        );
+        for handle in watched {
+            assert!(
+                interpreter.resources.borrow().observe(*handle).is_ok(),
+                "{what}: a watched handle went stale"
+            );
+        }
+
+        // The identical error, with the state still unchanged, on a
+        // second attempt.
+        let again = interpreter.store_place_transfer(values, &HashMap::new(), place, source);
+        assert_eq!(result, again, "{what}: the refusal is not deterministic");
+        assert_eq!(*values, before_values, "{what}: the retry mutated state");
+    }
+
+    /// An empty `Box` destination plus whatever source the caller wants
+    /// to try storing into it.
+    fn destination_and(source: Value) -> (HashMap<ValueId, Value>, Place<ValueId>) {
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(HOLDER, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), source);
+        (values, place(0, field(BOXY, 0)))
+    }
+
+    #[test]
+    fn a_duplicate_handle_nested_inside_records_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // The same identity reached through two separate `Holder`
+        // records nested in one `Box`.
+        let holder = |handle| Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        let (mut values, destination) = destination_and(Value::Record {
+            item: HOLDERS,
+            type_args: Vec::new(),
+            fields: vec![holder(shared), holder(shared)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "duplicate identity nested in records",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_handle_across_record_and_variant_nesting_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let (mut values, destination) = destination_and(Value::Record {
+            item: MIXED,
+            type_args: Vec::new(),
+            fields: vec![
+                Value::Resource(shared),
+                Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(shared)],
+                },
+            ],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "duplicate identity across record and variant",
+        );
+    }
+
+    #[test]
+    fn a_source_sharing_an_identity_with_the_destination_path_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // The destination is reached *through* this resource, and the
+        // source carries the same identity: transferring it would
+        // invalidate the handle the install has to walk through.
+        let spine = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(spine));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine],
+            "source and destination path share an identity",
+        );
+    }
+
+    #[test]
+    fn a_stale_child_after_a_valid_sibling_is_refused_without_moving_the_sibling() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let stale = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        // Make the second child's handle stale by transferring it away.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale handle");
+        let (mut values, destination) = destination_and(Value::Record {
+            item: PAIR,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(good), Value::Resource(stale)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[good],
+            "stale child after a valid sibling",
+        );
+    }
+
+    #[test]
+    fn a_source_whose_field_count_disagrees_with_its_declaration_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // `Holder` declares one field; this value carries three.
+        let (mut values, destination) = destination_and(Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(live), Value::Int(1), Value::Int(2)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "field count disagreeing with the declaration",
+        );
+    }
+
+    #[test]
+    fn a_source_with_mismatched_generic_type_arguments_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // `Box` declares one type parameter; this value carries two.
+        let (mut values, destination) = destination_and(Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::I64, Ty::I64],
+            fields: vec![Value::Resource(live)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "mismatched generic type arguments",
+        );
+    }
+
+    #[test]
+    fn a_source_variant_with_the_wrong_payload_count_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let (mut values, destination) = destination_and(Value::Variant {
+            item: MAYBE,
+            type_args: vec![Ty::Named(FILE, Symbol(0))],
+            case: 0,
+            payload: vec![Value::Resource(live), Value::Int(2)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "variant payload count disagreeing with its active case",
+        );
+    }
+
+    #[test]
+    fn a_destination_traversed_through_a_stale_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(spine)
+            .expect("transferring to make the spine handle stale");
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(1), Value::Resource(replacement));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[replacement],
+            "destination traversed through a stale resource",
+        );
+    }
+
+    #[test]
+    fn a_successful_nested_generic_store_transfers_every_resource_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let second = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let (mut values, destination) = destination_and(Value::Record {
+            item: MIXED,
+            type_args: Vec::new(),
+            fields: vec![
+                Value::Resource(first),
+                Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(second)],
+                },
+            ],
+        });
+
+        interpreter
+            .store_place_transfer(&mut values, &HashMap::new(), &destination, ValueId(1))
+            .expect("a well-formed nested store must succeed");
+
+        // Every identity moved exactly once: the caller's own handles
+        // are stale, and the installed graph's are current.
+        for stale in [first, second] {
+            assert!(
+                interpreter.resources.borrow().observe(stale).is_err(),
+                "each transferred identity must have moved exactly once"
+            );
+        }
+        assert_eq!(values.get(&ValueId(1)), Some(&Value::Moved));
+        let stored = values.remove(&ValueId(0)).expect("the destination");
+        assert!(
+            interpreter
+                .is_affine_value(&stored)
+                .expect("well-formed metadata"),
+            "the destination owns the transferred graph"
+        );
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
     }
 }
 

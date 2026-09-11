@@ -1115,3 +1115,41 @@ fn a_partially_moved_parent_still_permits_what_u0014_suggests() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(stderr(&rejected).contains("error[U0014]"));
 }
+
+// -- Alpha 0.1.8 generic runtime ownership (`rfcs/0008`, `rfcs/0012`) ---
+//
+// A runtime aggregate carries its own concrete type arguments, so
+// destroying one asks what *this instantiation* owns rather than what
+// its declaration's symbolic parameter owns. Both examples destroy
+// generic aggregates as a whole, which is the shape that reaches the
+// runtime's own structural drop -- and the shape under which a
+// discarded type argument leaks silently.
+
+#[test]
+fn resource_generic_whole_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_whole_drop.npt", "14");
+}
+
+#[test]
+fn resource_generic_nested_ownership_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_nested_ownership.npt", "0");
+}
+
+/// Textual NIR carries each construction's own concrete type arguments,
+/// which is what the interpreter reads them back from -- a regression
+/// dropping them from the printed form would mean they were dropped
+/// from the instruction too.
+#[test]
+fn textual_nir_shows_a_generic_constructions_type_arguments() {
+    let output = napitia(&["ir", &example("resource_generic_whole_drop.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("record.create @Box") && text.contains("[File"),
+        "expected a generic record construction to print its type arguments: {text}"
+    );
+    assert!(
+        text.contains("variant.create @Maybe") && text.contains("[File"),
+        "expected a generic variant construction to print its type arguments: {text}"
+    );
+}

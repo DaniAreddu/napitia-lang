@@ -83,9 +83,44 @@ the same generic declaration can be affine for one instantiation
 because a real use site's type arguments are always already fully
 resolved by the time affinity is asked about them.
 
-The one case this milestone does not support: a **generic function**
-whose own body is checked once, symbolically, and shared unchanged by
-every instantiation (`rfcs/0008`) -- nothing would ever track a bare
+Substitution is applied *at every projection step*, in the same order
+in every stage -- `typeck`, `resourceck`, cleanup planning, `nir::lower`,
+`nir::verify`, and the interpreter:
+
+1. validate the owner against the place's own current type;
+2. retrieve the owner's stable declared type parameters;
+3. require exact arity;
+4. build the substitution;
+5. substitute the selected field/payload type;
+6. continue the walk from the substituted type.
+
+Without step 5 a `Box[File]`'s own `item` field resolves to the bare,
+never-affine `Ty::Param(T)` the declaration was written with, and a
+genuinely owned resource is treated as a freely-copyable value. A
+missing type-parameter list, or one whose arity disagrees with the
+arguments a use supplies, is **never** papered over with an empty or
+partial substitution: `nir::verify` reports it as `V0089`
+(`PLACE_GENERIC_ARITY_MISMATCH`), and every affinity query that has no
+diagnostic channel of its own fails *closed* -- answering "affine", so
+every ownership obligation is still demanded -- rather than the "not
+affine" an unsubstituted `Ty::Param` would otherwise produce, which is
+the one direction that leaks.
+
+A generic *aggregate* is therefore supported end to end: `Box[File]` is
+affine and `Box[i64]` is not, `Box[File].item` moves and reinitializes
+like any other structural field, `Box[Box[File]]` is affine through two
+levels of substitution, and a generic variant's payload is owned at an
+affine instantiation whether it is bound or ignored.
+
+A generic *`resource`* declaration (`resource Cell[T] { .. }`) is not
+parseable in this milestone's grammar, so the question does not arise:
+generic parameters are accepted on `record` and `variant` declarations
+only, and `resource Cell[T]` is a parse error at `check`.
+
+What a generic *aggregate*'s completeness does **not** extend to is a
+**generic function**, whose own body is checked once, symbolically, and
+shared unchanged by every instantiation (`rfcs/0008`) -- nothing would
+ever track a bare
 `T`-typed value's ownership if some call site substitutes `T` with an
 affine type, since that body is never re-checked per instantiation the
 way a concrete function is. Instantiating (or calling) a generic
@@ -210,13 +245,38 @@ never left `Available` for its own separate implicit cleanup to also
 try to destroy the very payload a pattern binding already took
 ownership of.
 
-**Known limitation**: a case matched through a wildcard (`_`) rather
-than a binding pattern, whose payload is itself affine, is not
-independently diagnosed or separately cleaned up this milestone --
-covering that fully requires per-case structural cleanup planning
-(knowing, for a case never bound at all, which of its own payload
-positions are affine and destroying them unconditionally) that is
-deferred to a later milestone.
+### Ignored payloads
+
+A payload position matched by `_` (or by a literal) rather than a
+binding is still *owned* by the arm that matched: nothing else will ever
+destroy it. It is therefore destroyed, exactly once, the instant the
+decision tree commits to that arm -- **before** the arm's body runs.
+
+```napitia
+match result {
+    Found(_) => 1,   // the `File` payload is destroyed here
+    Missing  => 0,   // the inactive case is never touched
+}
+```
+
+`nir::lower`'s own pattern matrix carries, per row, every occurrence
+that row reached and left unclaimed. An occurrence is unclaimed when its
+own parent was decomposed by a real case test and its own position is
+matched by `_` or a literal. An occurrence some *ancestor* pattern bound
+as a whole value is marked `PatternSlot::Owned` instead and is never
+discarded -- that binding's own scope cleanup already destroys
+everything reachable through it, and destroying it here too would be a
+double drop. A variant occurrence no row tests at all is discarded as
+one opaque whole, and the runtime's structural drop then destroys
+whichever case is actually live.
+
+Destroying at the commitment point, rather than on each way out of the
+body, is what makes this correct for an arm that returns, raises,
+propagates with `?`, handles, breaks, or continues -- without
+enumerating any of them: the payload is gone before the body starts, and
+`_` gives it no name through which anything could observe it. Discarded
+occurrences are destroyed in reverse of the order the decision tree
+consumed them, which is exactly reverse payload declaration order.
 
 ## NIR
 
@@ -231,15 +291,82 @@ instead of a HIR local. There is no separate `drop.place` instruction:
 a structural drop is `move.place` immediately followed by the ordinary,
 already-existing `Instruction::Drop` -- "read the value, then drop it"
 already composes the two primitives this RFC's own conceptual sketch
-only lists separately. `nir::verify` independently re-validates every
-place it sees (unknown field owner, out-of-range field index,
-projection through the wrong or a non-aggregate type, move of a
-non-affine place -- `V0083`-`V0086`) and independently re-derives
-per-place move/reinitialization state (`V0087`/`V0088`) via the
-identical reachable-union worklist shape `V0082` already uses, keyed by
-`Place<ValueId>` instead of a bare root, and canonicalized through the
-same `Load`-origin unification `nir::verify`'s whole-value pass already
-needs for a `mutable` local reloaded more than once.
+only lists separately.
+
+### `Drop` is structural
+
+One coherent model, enforced identically in lowering, the verifier, the
+printer, the interpreter and the tests: **`Drop` destroys its operand
+and every descendant it still owns.** A parent dropped after one of its
+own children was already moved out is therefore valid and destroys only
+what is left; a child read after its parent was dropped is a use of
+something already consumed. The alternative model -- requiring explicit
+child cleanup in NIR and making a direct parent `Drop` reject live
+descendants -- is not viable here, because which case of a variant is
+live (and therefore which payload a drop must destroy) is only ever a
+runtime fact.
+
+Because the same `move.place` instruction expresses both "move this
+field out to use it" and "take this field out to destroy it", the
+verifier distinguishes them by what the result is used for: a
+`PlaceRead { mode: Transfer }` whose *only* use anywhere in the function
+is as a `Drop` operand is a destruction, and is therefore legal on a
+partially moved parent; one feeding anything else is a real transfer and
+requires a complete value.
+
+### The structural ownership lattice
+
+`nir::verify` independently re-validates every place it sees (unknown
+field owner, out-of-range field index, projection through the wrong or a
+non-aggregate type, move of a non-affine place, generic arity mismatch
+-- `V0083`-`V0086`, `V0089`) and independently re-derives per-place
+ownership over the whole place **tree**, not merely per exact key:
+
+- `resolve_place_state` returns the *shortest* non-`Full` ancestor
+  prefix, so moving or dropping a parent consumes its entire descendant
+  subtree whether or not each descendant was ever individually tracked.
+  A child read after its parent was transferred or dropped is rejected
+  by exactly the same check a child read after its own transfer is
+  (`V0087`).
+- `place_is_whole` additionally requires no strict descendant to be
+  consumed, so a partially moved parent is rejected wherever a *whole*
+  value is required -- observed, transferred, returned, raised, or
+  consumed into an aggregate (`V0090`) -- while staying usable for an
+  unaffected sibling, a reinitialized empty child, or a structural drop
+  of what remains. Reinitializing a child retires every stale descendant
+  fact, which is what restores its ancestors' completeness.
+- A reinitializing store into a place not definitely empty is `V0088`;
+  a whole-value destruction or transfer of something already consumed on
+  a path reaching it is `V0092` (duplicate structural cleanup); and a
+  transitively affine value this function owns that still has remaining
+  owned affine descendants at a reachable exit is `V0091` (missing
+  structural cleanup).
+
+Ownership facts are contributed by every path that actually moves one --
+`take` parameters, `Move`, `DeferCapture`, `PlaceRead`, `StorePlace`,
+`Store`, `RecordCreate`, `VariantCreate`, `Call`/`Invoke` take
+arguments, `Switch`, `Return`, `Raise`, `Drop` -- and are gated on
+*transitive* affinity throughout, never on nominal `is_resource`: an
+affine record owns real resources and is tracked in its own right.
+`V0091` complements `V0077` rather than duplicating it: `V0077` covers a
+nominally resource-typed root, and this one covers the gap that lattice
+cannot see, a record that merely *contains* affine fields and is
+therefore never a key there at all. The missing-cleanup check skips
+every root the other pass already owns, so no leak is reported twice.
+
+A value-producing instruction resets its own result's facts, so a
+resource constructed inside a loop body and destroyed at the end of that
+same iteration is not mistaken for a double cleanup on the next one. An
+obligation is only demanded at an exit its own definition dominates, so
+a value created in one branch is not reported as leaked by the other
+branch's `Return`. Everything is computed through the identical
+reachable-union worklist shape `V0082` already uses, with joins taken
+over the *union* of both predecessors' keys -- so a place touched on
+only one side still joins to the absorbing disagreement state, making
+the result independent of predecessor discovery order, block vector
+order and `HashMap` order alike. Places are canonicalized through the
+same `Load`-origin unification the whole-value pass already needs for a
+`mutable` local reloaded more than once.
 
 ## Runtime
 
@@ -249,23 +376,146 @@ mode: Transfer }` (or a recursive structural destruction) just emptied
 -- reading either is a structured runtime error, an independent
 backstop `nir::verify` already statically guarantees is unreachable for
 verified NIR. A `resource`'s own fields are never held inline (they
-live in the shared `ResourceTable`'s own per-record `fields: Vec<Value>`,
-mutated in place through `observe_field`/`take_field`/`set_field`); a
-plain, non-resource `Record`/`Variant`'s own fields are held directly,
-by value, and a place access through one is rebuilt and written back
-into the SSA value that held it. `RecordCreate`/`VariantCreate` transfer
-(not merely clone) every affine field/payload argument, recursing into
-a nested `Record`/`Variant` value too -- otherwise a source `ValueId`
-whose value was consumed into a fresh aggregate would still look like a
-live, undestroyed obligation of the same frame.
+live in the shared `ResourceTable`'s own per-record `fields: Vec<Value>`);
+a plain, non-resource `Record`/`Variant`'s own fields are held directly,
+by value. `RecordCreate`/`VariantCreate` transfer (not merely clone)
+every affine field/payload argument, recursing into a nested
+`Record`/`Variant` value too -- otherwise a source `ValueId` whose value
+was consumed into a fresh aggregate would still look like a live,
+undestroyed obligation of the same frame.
+
+### Mixed-container traversal
+
+Because those two storage disciplines differ, a place walking a chain
+that *alternates* between them needs one explicit result shape rather
+than an `Option` doing double duty:
+
+```rust
+struct AccessResult {
+    extracted: Value,   // what the place's final step yielded
+    container: Value,   // what must now be written back where it came from
+}
+```
+
+`container` is always present and always meaningful. For an inline
+`Record` it is the rebuilt record; for a `Resource` it is that same
+handle, unchanged, because the mutation already happened directly in the
+resource table. An `Option` whose `None` meant both "already mutated in
+place" and "this container's ownership disappeared" is exactly what made
+a `record` -> `resource` chain lose the whole intermediate handle.
+
+Three separate walks, with three separate guarantees:
+
+- **Observing** (`observe_projections`) mutates nothing at any depth: no
+  ancestor is tombstoned, no inline record is rebuilt, no resource field
+  is written. Cloning an intermediate is safe because a `Value::Resource`
+  carries only a cheap `(id, generation, role)` handle, and observing
+  never bumps a generation.
+- **Transferring** (`take_projections`) tombstones only the *final*
+  selected place. Every intermediate inline record is handed back
+  rebuilt, and every intermediate resource handle stays in its owner's
+  field.
+- **Reinitializing** (`store_projections`) writes only the final place.
+
+An intermediate resource field goes back through a dedicated internal
+`restore_field`, deliberately **distinct** from the user-facing
+`set_field` that `StorePlace` lowers to: `set_field` correctly refuses
+to overwrite a field that still owns a live value, which is right for a
+reinitialization and wrong for putting back the very container the walk
+just read *through*. Conflating them is what made a `resource` ->
+`record` chain report a bogus live-overwrite error. Every step recurses
+on a clone and writes back only once the recursion succeeded, so a
+failure deeper in the chain leaves every container on the path exactly
+as it was rather than half-mutated.
+
+Place roots are canonicalized through the frame's own `Load`/slot map
+before any read or write, exactly as `nir::verify` canonicalizes them: a
+`mutable` binding reloads its whole current value as a fresh `ValueId`
+every time a place projects into it, so tombstoning a field in the
+load's own cached copy -- rather than in the slot every later load reads
+back from -- would lose the mutation entirely.
+
+### Structural destruction at runtime
+
+One operation covers every transitively affine runtime value: a
+`Resource`, a `Record` containing affine fields, a `Variant` whose
+active case carries an affine payload, an instantiated generic
+aggregate, and any nesting of those. It visits live affine fields in
+reverse declaration order, recurses into nested affine aggregates, skips
+`Moved`/`Dropped` tombstones (so a child NIR already destroyed
+individually is never destroyed twice), destroys only the active variant
+case, and destroys a declared `resource`'s own outer identity *after*
+its remaining children. Each child is tombstoned `Dropped` before its
+recursive destruction rather than after, so a failure partway through
+cannot leave one reachable for a second attempt. Double drop is rejected
+deterministically by the resource table itself. Rust's own `Drop` is
+never involved.
+
+Silently ignoring an affine `Value::Record` -- as an earlier draft did
+-- leaked every resource a variant's record payload carried.
+
+## Deferred actions capture exact places
+
+`defer inspect(session.input)` protects `session.input` **itself**, not
+the whole `session` root it is reached through. `CheckedDeferPlan`
+retains, per argument and in declaration order, the exact stable place,
+its resolved substituted type, its `Observe`/`Transfer` mode, the
+resolved callee, and this `defer`'s own registration order; `nir::lower`
+independently re-resolves each argument's place and rejects a
+disagreement rather than trusting the plan.
+
+At registration, an observing `defer` protects the exact captured place,
+and a consuming one transfers it immediately. An unaffected sibling
+therefore stays freely movable:
+
+```napitia
+defer inspect(session.input)
+value output = session.output   // valid: an unaffected sibling
+```
+
+while the parent as a whole does not -- moving or dropping `session`
+there is rejected (`U0004`), because LIFO replay runs that deferred call
+*after* the destruction and would hand it a field the destruction
+already consumed. That rejection reports the real reason rather than
+reusing the partial-move diagnostic: the field is entirely intact, and
+the parent becomes whole again the moment the defer's own scope ends.
+
+At cleanup, the deferred call is invoked exactly once, its exact-place
+protection is released, LIFO order is preserved, and the remaining
+structural cleanup runs after it.
+
+## Explicit `drop`
+
+`drop <expr>` accepts any transitively affine operand, not only a
+declared `resource`: a record or variant that merely contains one owns
+real resources too, and `drop` on it performs exactly the structural
+destruction the compiler already applies at its owning scope's exit,
+named explicitly. `drop <place>` destroys one structural field in its
+own right -- the field becomes `Dropped`, not `Moved`, so a second
+`drop` of it is a real double drop (`U0003`) and a later use is a
+use-after-drop (`U0002`). A primitive, `str`, or ordinary non-affine
+aggregate is still `T0061`: there is no owned state there to destroy.
 
 ## Non-goals
 
 Unchanged from `rfcs/0011`: no native heap allocation, no general
 borrowing, no lifetime inference, no shared ownership, no garbage
-collection, no thread safety guarantees, no FFI cleanup. Also out of
-scope for this milestone specifically: record-destructuring pattern
-syntax (not introduced), per-case cleanup of an affine payload
-discarded through a wildcard pattern (see "Patterns" above), and
-resource-affine generic *function* instantiation (rejected with
-`T0068` rather than supported).
+collection, no thread safety guarantees, no FFI cleanup.
+
+Out of scope for this milestone specifically, each a *source-level*
+restriction rather than an accepted program that misbehaves:
+
+- record-destructuring pattern syntax (not introduced; none existed
+  before this milestone either);
+- generic parameters on a `resource` declaration (`resource Cell[T]` is
+  a parse error -- `record` and `variant` only);
+- resource-affine generic *function* instantiation, rejected with
+  `T0068` rather than supported, because a generic function body is
+  checked once symbolically and shared by every instantiation, so
+  nothing would track a bare `T`-typed value's ownership if some call
+  site substituted an affine type for it;
+- a resource-typed `if`/`match`/`handle` used in a consuming position
+  other than `return`, rejected with `U0008` because `nir::lower` has no
+  per-branch sink for it;
+- a `defer` whose callee is generic, fallible, or returns a resource,
+  rejected with `T0066`.

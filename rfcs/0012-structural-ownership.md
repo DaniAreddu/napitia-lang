@@ -117,6 +117,16 @@ parseable in this milestone's grammar, so the question does not arise:
 generic parameters are accepted on `record` and `variant` declarations
 only, and `resource Cell[T]` is a parse error at `check`.
 
+The cycle guard every one of these queries carries is keyed by bare
+`ItemId`, which cannot tell a genuine cycle apart from a legitimately
+nested instantiation of the same declaration: `Box[Box[Box[File]]]`
+reaches `Box` three times with different arguments and must answer from
+the innermost one. Every stage therefore bounds the *instantiation* walk
+by depth instead, and keeps `visiting` for the non-generic case where it
+is keyed correctly. `typeck::cycles` independently rejects a genuinely
+cyclic layout as infinite before any body is checked, so the depth bound
+is a backstop rather than the only guard.
+
 What a generic *aggregate*'s completeness does **not** extend to is a
 **generic function**, whose own body is checked once, symbolically, and
 shared unchanged by every instantiation (`rfcs/0008`) -- nothing would
@@ -381,14 +391,47 @@ resource constructed inside a loop body and destroyed at the end of that
 same iteration is not mistaken for a double cleanup on the next one. An
 obligation is only demanded at an exit its own definition dominates, so
 a value created in one branch is not reported as leaked by the other
-branch's `Return`. Everything is computed through the identical
-reachable-union worklist shape `V0082` already uses, with joins taken
-over the *union* of both predecessors' keys -- so a place touched on
-only one side still joins to the absorbing disagreement state, making
-the result independent of predecessor discovery order, block vector
-order and `HashMap` order alike. Places are canonicalized through the
-same `Load`-origin unification the whole-value pass already needs for a
+branch's `Return`. Places are canonicalized through the same
+`Load`-origin unification the whole-value pass already needs for a
 `mutable` local reloaded more than once.
+
+### The fixed point
+
+The out-state map holds an entry for a block **only once that block's
+own out-state has actually been computed**, so "not computed yet" is the
+*absence* of a key and cannot be confused with a block genuinely
+computed to hold no facts. Pre-seeding every block with an empty map
+erases exactly that distinction, and lets an unprocessed loop back-edge
+predecessor contribute a fact set nothing ever proved.
+
+Three cases are therefore kept apart explicitly when a block's in-state
+is joined:
+
+* the **entry** block has no predecessors, and its empty in-state is the
+  analysis's one real boundary condition;
+* a **reachable but not yet computed** predecessor contributes nothing
+  and is revisited later, rather than being read as having proven an
+  empty fact set;
+* an **unreachable** predecessor contributes nothing at all, so a dead
+  CFG fragment can never seed reachable ownership.
+
+An edge naming a block the function never declared is a genuine
+invariant violation, reported as `V0094` -- and the block it feeds is
+then skipped entirely rather than judged from a fabricated state.
+
+Joins take the *union* of both predecessors' keys, so a place touched on
+only one side still joins to the absorbing disagreement state. Together
+with seeding the worklist in declaration order, that makes the result
+independent of predecessor discovery order, block vector order and
+`HashMap` order alike.
+
+Termination needs no pass limit and has none. Every transfer either
+records a fixed state for a place or -- when its own guard fails on a
+worse in-state -- records nothing and leaves the joined state standing,
+so a worse in-state can only ever produce an equal-or-worse out-state.
+That makes the transfer monotone in the order `Full`/`Empty` below the
+absorbing `Maybe`; the tracked place set is bounded by the places the
+instructions actually name, and each one's state can rise at most twice.
 
 ## Runtime
 
@@ -405,6 +448,68 @@ every affine field/payload argument, recursing into a nested
 `Record`/`Variant` value too -- otherwise a source `ValueId` whose value
 was consumed into a fresh aggregate would still look like a live,
 undestroyed obligation of the same frame.
+
+### Runtime type arguments
+
+A runtime `Record`/`Variant` carries its own **concrete type arguments**
+alongside its `ItemId`:
+
+```rust
+Value::Record  { item, type_args: Vec<Ty>, fields }
+Value::Variant { item, type_args: Vec<Ty>, case, payload }
+```
+
+They are load-bearing, not decoration: `item` alone cannot say what a
+value owns, because `Box`'s own declared field type is the symbolic
+`Ty::Param(T)`, which is affine for *no* instantiation at all. Asking
+the declaration therefore answers "owns nothing" for a `Box[File]` that
+plainly owns a resource -- which skipped it during structural
+destruction, and made `drop` of a `Maybe[File]` fail outright at run
+time after `check` had accepted it.
+
+They are never inferred from the payload values either: a moved-out
+field is a tombstone with no type left to read, so a value that has
+already given up a field could no longer say what it is.
+
+Every path that rebuilds an aggregate carries them across unchanged --
+place traversal, reconstruction after a partial move, `StorePlace`,
+ownership transfer, and the call/return boundary. Affinity and
+destruction then resolve field and payload types through the value's own
+instantiation: retrieve the declaration's parameter list, require exact
+arity, build a complete substitution, substitute, and decide from the
+result. Missing metadata or an arity disagreement is a structured,
+deterministic interpreter error -- never an empty or partial
+substitution, which would skip exactly the fields whose types went
+missing.
+
+### `StorePlace` is a transfer
+
+Reinitializing a place *transfers* ownership into it. The interpreter
+runs three strictly ordered phases, so the operation is transactional:
+
+1. **Validate**, mutating nothing: the destination chain must be
+   reachable and its final field provably empty, and every resource
+   reachable through the source must be a live, current, owning handle.
+   Checking the source's whole tree up front is what makes a nested
+   aggregate's transfer all-or-nothing -- bumping the first child's
+   generation and then discovering the second is stale would leave it
+   half-transferred with no way back.
+2. **Transfer**: the only phase that bumps a generation, and it cannot
+   fail, because phase 1 already proved every child transferable.
+3. **Commit**: write the transferred value into the place, and tombstone
+   the source -- both by its exact id and by the storage it
+   canonicalizes to, since a `Load` result and the slot it read share
+   one identity.
+
+A failure in phase 1 therefore leaves the source valid, the destination
+unchanged, and no generation bumped; the refusal is deterministic.
+Without the transfer, the source and the destination both held an
+apparently-current owner handle for the same resource -- two live owners
+of one identity.
+
+Storing a value into a place rooted at that very value is rejected in
+both stages: `V0093` statically, and at run time for the same shape
+reached through a `Load` of the destination's own slot.
 
 ### Mixed-container traversal
 
@@ -540,4 +645,15 @@ restriction rather than an accepted program that misbehaves:
   other than `return`, rejected with `U0008` because `nir::lower` has no
   per-branch sink for it;
 - a `defer` whose callee is generic, fallible, or returns a resource,
-  rejected with `T0066`.
+  rejected with `T0066`;
+- a *declared field or payload* whose type reaches the same generic
+  declaration again, even with strictly smaller arguments
+  (`variant Holder { Carry(Box[Box[File]]) }`), rejected as an infinite
+  layout by `typeck::cycles` (`T0020`). That check is keyed by
+  declaration rather than by instantiation, which is sound -- it rejects
+  every genuinely infinite layout -- but conservative: it also rejects
+  this finite, shrinking one. Proving termination for a shrinking
+  recurrence needs a size-decrease argument this milestone does not
+  implement, and guessing it wrong would accept a genuinely infinite
+  layout. The same nesting is accepted wherever it is *not* a declared
+  field type, e.g. as a local's own type.

@@ -783,6 +783,97 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Takes a variant apart into one specific case, moving each claimed
+    /// payload position out of the shell that still holds it
+    /// (`rfcs/0012`).
+    ///
+    /// Validated completely before anything is written: the shell must
+    /// be a live variant value of the named declaration, currently in
+    /// the named case, every claimed position must exist, none may
+    /// already have moved, no position may be claimed twice, and every
+    /// value receiving a payload must be one this frame actually
+    /// computed. A failure therefore leaves the shell exactly as it was.
+    ///
+    /// The values receiving the payloads are *not* re-materialized here:
+    /// the preceding `VariantPayload` reads produced them, and the read
+    /// plus this transfer together are one move -- the read hands the
+    /// value over, this tombstones the storage so the shell can no
+    /// longer be said to own it too. Without it, a later structural
+    /// destruction of the shell would destroy what the arm now owns.
+    fn decompose_variant(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        value: ValueId,
+        variant: ItemId,
+        case: usize,
+        taken: &[(usize, ValueId)],
+    ) -> Result<(), InterpreterError> {
+        let shell_id = canonical_root(load_origin, value);
+        let shell = get(values, &shell_id)?;
+        let Value::Variant {
+            item,
+            type_args,
+            case: active_case,
+            mut payload,
+        } = shell
+        else {
+            return Err(invalid(
+                "a variant decomposition names a value that is not a variant",
+            ));
+        };
+        if item != variant {
+            return Err(invalid(
+                "a variant decomposition names a different variant than its own value holds",
+            ));
+        }
+        if active_case != case {
+            return Err(invalid(
+                "a variant decomposition names a case other than the one actually live",
+            ));
+        }
+        // Phase 1 -- validate every claim before writing any of them, so
+        // a bad claim partway through cannot leave the shell with some
+        // positions moved and others not.
+        let mut seen: HashSet<usize> = HashSet::new();
+        for (index, owner) in taken {
+            if !values.contains_key(owner) {
+                return Err(invalid(
+                    "a variant decomposition hands a payload to a value this frame never computed",
+                ));
+            }
+            if !seen.insert(*index) {
+                return Err(invalid(
+                    "a variant decomposition claims the same payload position more than once",
+                ));
+            }
+            let Some(slot) = payload.get(*index) else {
+                return Err(invalid(
+                    "a variant decomposition claims a payload position out of range for its case",
+                ));
+            };
+            if matches!(slot, Value::Moved | Value::Dropped) {
+                return Err(invalid(
+                    "a variant decomposition claims a position whose ownership already moved",
+                ));
+            }
+        }
+        // Phase 2 -- commit.
+        for (index, _) in taken {
+            payload[*index] = Value::Moved;
+        }
+        values.insert(
+            shell_id,
+            Value::Variant {
+                item,
+                type_args,
+                case: active_case,
+                payload,
+            },
+        );
+        Ok(())
+    }
+
     /// Proves every resource identity reachable through `value` can be
     /// transferred, without transferring any of them (`rfcs/0011`) --
     /// the other read-only half of phase 1. Checking the whole tree up
@@ -1593,6 +1684,29 @@ impl<'a> Interpreter<'a> {
                             self.eval(kind, &values, &evidence)?
                         };
                         values.insert(*result, value);
+                    }
+                    // Ownership of one active case's payload position
+                    // genuinely moves out of the shell here
+                    // (`rfcs/0012`): the slot it came from is
+                    // tombstoned, so a later structural destruction of
+                    // the shell skips it instead of destroying what the
+                    // arm now owns, and a second transfer of the same
+                    // position is a structured error rather than a
+                    // silent duplicate owner.
+                    crate::nir::Instruction::DecomposeVariant {
+                        value,
+                        variant,
+                        case,
+                        taken,
+                    } => {
+                        self.decompose_variant(
+                            &mut values,
+                            &load_origin,
+                            *value,
+                            *variant,
+                            *case,
+                            taken,
+                        )?;
                     }
                     crate::nir::Instruction::Store { slot, value, mode } => {
                         let v = get(&values, value)?;

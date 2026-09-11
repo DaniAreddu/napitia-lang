@@ -404,20 +404,32 @@ computed to hold no facts. Pre-seeding every block with an empty map
 erases exactly that distinction, and lets an unprocessed loop back-edge
 predecessor contribute a fact set nothing ever proved.
 
-Three cases are therefore kept apart explicitly when a block's in-state
-is joined:
+Three cases are therefore kept apart explicitly, as the variants of an
+`IncomingState` type rather than as values of `PlaceFacts`, when a
+block's in-state is joined:
 
-* the **entry** block has no predecessors, and its empty in-state is the
-  analysis's one real boundary condition;
-* a **reachable but not yet computed** predecessor contributes nothing
-  and is revisited later, rather than being read as having proven an
-  empty fact set;
-* an **unreachable** predecessor contributes nothing at all, so a dead
+* `Entry` -- the **entry** block has no predecessors, and its empty
+  in-state is the analysis's one real boundary condition;
+* `Ready` -- at least one reachable predecessor has produced an
+  out-state, and this is the join of every such predecessor's;
+* `Pending` -- no reachable predecessor has produced an out-state yet.
+  This is not a fact set at all: the block runs no transfer and records
+  no out-state, so nothing downstream can read facts nothing proved. An
+  **unreachable** predecessor likewise contributes nothing, so a dead
   CFG fragment can never seed reachable ownership.
 
-An edge naming a block the function never declared is a genuine
-invariant violation, reported as `V0094` -- and the block it feeds is
-then skipped entirely rather than judged from a fabricated state.
+`Pending` is deliberately not representable as `Default::default()`, an
+empty map or `Option::unwrap_or_default()`, because each of those is
+also a perfectly valid analysis state. Every reachable block leaves
+`Pending` exactly once: it is reached from the entry, whose out-state is
+fixed before the worklist starts, and a predecessor's out-state landing
+re-enqueues it.
+
+A malformed CFG is owned one layer up, and reported there once: a
+terminator naming a block the function does not declare is
+`UNKNOWN_BRANCH_TARGET`, and a repeated block id is
+`DUPLICATE_BLOCK_ID`. This pass simply never reaches past such an edge,
+and invents no ownership state for it.
 
 Joins take the *union* of both predecessors' keys, so a place touched on
 only one side still joins to the absorbing disagreement state. Together

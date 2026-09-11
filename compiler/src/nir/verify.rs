@@ -459,13 +459,18 @@ mod codes {
     /// transfer had just made stale, so this is rejected outright
     /// rather than left to fail unpredictably at run time.
     pub const STORE_PLACE_SELF_ALIAS: &str = "V0093";
-    /// A structural ownership state invariant this pass maintains was
-    /// found violated (`rfcs/0012`): a control-flow edge named a block
-    /// this function does not declare, so there was no out-state to
-    /// join from it. Never silently defaulted to an empty fact set --
-    /// that would let a malformed CFG fragment seed reachable ownership
-    /// with facts nothing ever proved.
-    pub const STRUCTURAL_STATE_INVARIANT: &str = "V0094";
+    // `V0094` is deliberately not assigned. It claimed a structural
+    // ownership state invariant -- "a control-flow edge named a block
+    // this function does not declare" -- that no `.npt` source and no
+    // hand-built NIR can actually produce: a block's predecessors are
+    // derived by walking the declared blocks' own terminators, so a
+    // predecessor is always itself declared. The two malformed-CFG
+    // shapes that *are* reachable already have owners one layer up: a
+    // terminator naming an undeclared successor is `UNKNOWN_BRANCH_
+    // TARGET`, and a repeated block id is `DUPLICATE_BLOCK_ID`. Rather
+    // than keep a code whose coverage was a dead branch, the
+    // distinction it existed to protect is now carried by the
+    // `IncomingState` type itself.
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -6531,7 +6536,6 @@ fn verify_structural_places(
     // empty by definition, so its out-state is fixed and never
     // recomputed.
     let mut out: HashMap<BlockId, PlaceFacts> = HashMap::from([(entry, entry_out)]);
-    let declared_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
 
     // Standard worklist ("chaotic iteration") over reachable non-entry
     // blocks, seeded in declaration order so the exact same CFG is
@@ -6554,24 +6558,24 @@ fn verify_structural_places(
         .filter(|id| *id != entry && reachable.contains(id))
         .collect();
     let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
-    let mut invariant_violations: Vec<BlockId> = Vec::new();
     while let Some(id) = worklist.pop_front() {
         queued.remove(&id);
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = match in_state_for_places(
-            id,
-            entry,
-            &incoming_edges,
-            (&reachable, &declared_blocks),
-            &out,
-        ) {
-            Ok(state) => state,
-            Err(bad) => {
-                invariant_violations.push(bad);
-                continue;
-            }
+        let in_state = match in_state_for_places(id, entry, &incoming_edges, &reachable, &out) {
+            IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+            // Nothing has proven anything about this block yet, so it
+            // runs no transfer and records no out-state: the absence of
+            // a key is exactly what keeps "not computed" apart from
+            // "computed to nothing". Popping a block before its own
+            // predecessors is ordinary -- the worklist is seeded in
+            // declaration order, which says nothing about control flow
+            // -- and a predecessor's out-state landing later re-enqueues
+            // it. Every reachable block is reached from the entry,
+            // whose out-state is fixed before this loop starts, so no
+            // reachable block can stay `Pending` once this drains.
+            IncomingState::Pending => continue,
         };
         let (new_out, _) = transfer(block, &in_state);
         let changed = out.get(&id) != Some(&new_out);
@@ -6595,39 +6599,18 @@ fn verify_structural_places(
     // computed the same way for `verify_dominance`.
     let dominators = compute_dominators(function);
 
-    // Every malformed edge the fixpoint refused to join, reported once
-    // each and in a deterministic order, rather than defaulted away.
-    invariant_violations.sort_unstable_by_key(|b| b.0);
-    invariant_violations.dedup();
-    for bad in invariant_violations {
-        diagnostics.push(Diagnostic::error(
-            codes::STRUCTURAL_STATE_INVARIANT,
-            source,
-            Span::dummy(),
-            format!(
-                "function `{function_name}`: a control-flow edge names block bb{}, which this \
-                 function does not declare, so no ownership state could be joined from it",
-                bad.0
-            ),
-        ));
-    }
-
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            // A malformed edge into this block already produced its own
-            // `V0094` above. Reporting ownership violations from a state
-            // that could not be soundly joined would be guesswork, so
-            // this block is skipped entirely rather than judged from a
-            // fabricated empty one.
-            match in_state_for_places(
-                block.id,
-                entry,
-                &incoming_edges,
-                (&reachable, &declared_blocks),
-                &out,
-            ) {
-                Ok(state) => state,
-                Err(_) => continue,
+            match in_state_for_places(block.id, entry, &incoming_edges, &reachable, &out) {
+                IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+                // The fixpoint above has converged, so every reachable
+                // block has a computed predecessor by now and this
+                // cannot be observed. Were it ever observed, judging
+                // ownership from a state nothing proved would be
+                // guesswork, so the block is skipped rather than
+                // fabricated -- which is the whole point of keeping
+                // `Pending` out of `PlaceFacts`.
+                IncomingState::Pending => continue,
             }
         } else {
             // An unreachable block is walked purely so its own
@@ -7105,11 +7088,35 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
         .collect()
 }
 
+/// What a block's own incoming ownership state actually *is*
+/// (`rfcs/0012`).
+///
+/// Kept as its own type precisely because one of these answers is not a
+/// state at all, and every value that could stand in for it -- an empty
+/// map, `Default::default()`, `Option::unwrap_or_default()` -- is also
+/// a perfectly valid analysis state. Collapsing the two is what lets a
+/// fixed point be seeded with facts nothing ever proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncomingState {
+    /// The entry block: no predecessors by definition, and an empty
+    /// fact set that is the analysis's one real boundary condition -- a
+    /// *proven* state, not a placeholder.
+    Entry(PlaceFacts),
+    /// At least one reachable predecessor has produced an out-state,
+    /// and this is the join of every such predecessor's.
+    Ready(PlaceFacts),
+    /// No reachable predecessor has produced an out-state yet. Not a
+    /// fact set: no transfer runs on it, and no out-state is recorded
+    /// from it, so nothing downstream can read facts nothing proved.
+    Pending,
+}
+
 /// This block's own in-state: the join of every *reachable, already
 /// computed* predecessor's out-state (`rfcs/0012`).
 ///
-/// Three cases are deliberately kept apart, because collapsing them is
-/// what lets a fixed point be seeded with facts nothing proved:
+/// The three answers are deliberately kept apart, because collapsing
+/// any of them into a `PlaceFacts` is what lets a fixed point be seeded
+/// with facts nothing proved:
 ///
 /// * the **entry** block has no predecessors by definition, and its
 ///   empty in-state is the analysis's one real boundary condition;
@@ -7119,30 +7126,32 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
 /// * an **unreachable** predecessor contributes nothing either, so a
 ///   dead CFG fragment can never seed reachable ownership.
 ///
-/// A block with no computed predecessor at all is not yet ready and
-/// yields an empty in-state, which the worklist will revisit once one
-/// of its predecessors lands. `Err(pred)` is a genuine invariant
-/// violation -- an edge naming a block this function never declared --
-/// reported as `V0094` rather than defaulted away.
+/// A block none of whose predecessors has landed yet is therefore
+/// `Pending`, never an empty state. It is always revisited: every
+/// reachable block is reached from the entry, whose own out-state is
+/// fixed before the worklist starts, and a predecessor's out-state
+/// appearing re-enqueues it.
+///
+/// There is deliberately no "malformed edge" answer. Every predecessor
+/// in `incoming_edges` is, by construction, the id of a block this
+/// function declares -- the map is built by walking exactly those
+/// blocks' own terminators -- so an undeclared *predecessor* is not a
+/// question this can be asked. A terminator naming an undeclared
+/// *successor* is real, and is reported once, at the terminator layer,
+/// as `UNKNOWN_BRANCH_TARGET`; this pass simply never reaches past it,
+/// and never invents ownership state for it.
 fn in_state_for_places(
     block_id: BlockId,
     entry: BlockId,
     incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
-    reachable_and_declared: (&HashSet<BlockId>, &HashSet<BlockId>),
+    reachable: &HashSet<BlockId>,
     out: &HashMap<BlockId, PlaceFacts>,
-) -> Result<PlaceFacts, BlockId> {
-    let (reachable, declared) = reachable_and_declared;
+) -> IncomingState {
     if block_id == entry {
-        return Ok(PlaceFacts::new());
+        return IncomingState::Entry(PlaceFacts::new());
     }
-    let Some(edges) = incoming_edges.get(&block_id) else {
-        return Ok(PlaceFacts::new());
-    };
     let mut acc: Option<PlaceFacts> = None;
-    for pred in edges {
-        if !declared.contains(pred) {
-            return Err(*pred);
-        }
+    for pred in incoming_edges.get(&block_id).into_iter().flatten() {
         if !reachable.contains(pred) {
             continue;
         }
@@ -7157,7 +7166,10 @@ fn in_state_for_places(
             Some(previous) => merge_place_facts(&previous, facts),
         });
     }
-    Ok(acc.unwrap_or_default())
+    match acc {
+        Some(facts) => IncomingState::Ready(facts),
+        None => IncomingState::Pending,
+    }
 }
 
 fn verify_invoke_slot_initialization(
@@ -15289,6 +15301,31 @@ mod structural_ownership {
         codes
     }
 
+    /// Every diagnostic the whole verifier reports, unfiltered and
+    /// sorted -- for asserting which *layer* owns a malformed CFG, and
+    /// that no second layer reports the same defect again.
+    fn all_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        let mut codes: Vec<&'static str> =
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| d.code)
+                .collect();
+        codes.sort_unstable();
+        codes
+    }
+
     fn take_session(fx: &Fixture) -> Vec<Param> {
         vec![Param {
             value: ValueId(0),
@@ -16996,7 +17033,7 @@ mod structural_ownership {
     }
 
     #[test]
-    fn an_edge_naming_an_undeclared_block_is_its_own_invariant_diagnostic() {
+    fn an_edge_naming_an_undeclared_block_is_owned_by_the_terminator_layer() {
         let mut fx = fixture();
         let params = cond_params(&fx);
         let f = under_test(
@@ -17041,14 +17078,25 @@ mod structural_ownership {
                 },
             ],
         );
-        // bb2 is never declared: the CFG edge to it is already its own
-        // pre-existing diagnostic, and this pass must not additionally
-        // invent ownership state for it.
-        let codes = structural_codes(&mut fx, f);
+        // bb2 is never declared. That is a genuine malformed CFG, and
+        // exactly one layer owns it: the terminator check, as
+        // `UNKNOWN_BRANCH_TARGET`. The structural pass never reaches
+        // past that edge and must invent no ownership state for it --
+        // bb1 cleans `session` up completely, so there is nothing for
+        // it to report and no second diagnostic for the same defect.
+        let structural = structural_codes(&mut fx, f.clone());
         assert!(
-            !codes.contains(&codes::STRUCTURAL_STATE_INVARIANT),
-            "an edge to an undeclared *successor* has no predecessor state to join, \
-             so it is not this invariant, got {codes:?}"
+            structural.is_empty(),
+            "an undeclared successor must not make this pass invent ownership state, \
+             got {structural:?}"
+        );
+        let all = all_codes(&mut fx, f);
+        assert_eq!(
+            all.iter()
+                .filter(|code| **code == codes::UNKNOWN_BRANCH_TARGET)
+                .count(),
+            1,
+            "the undeclared target is reported once, by the layer that owns it, got {all:?}"
         );
     }
 

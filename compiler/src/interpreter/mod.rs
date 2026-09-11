@@ -496,10 +496,19 @@ impl<'a> Interpreter<'a> {
     /// `false` to that one occurrence alone, never cached (this is not
     /// called densely enough to need memoizing).
     fn is_affine(&self, ty: &Ty) -> bool {
-        self.is_affine_visiting(ty, &mut HashSet::new())
+        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
     }
 
-    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>) -> bool {
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>, depth: usize) -> bool {
+        // For a `Ty::Applied` this is the *only* termination guard:
+        // `visiting` is keyed by bare `ItemId` and so cannot tell a
+        // genuine cycle apart from a legitimately nested instantiation
+        // of the same declaration -- `Box[Box[Box[File]]]` reaches
+        // `Box` three times with different arguments and must answer
+        // from the innermost one.
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
         let item = match ty {
             Ty::Named(item, _) => *item,
             // A generic instantiation's own affinity depends on what it
@@ -512,9 +521,6 @@ impl<'a> Interpreter<'a> {
                 if self.is_resource(*item) {
                     return true;
                 }
-                if !visiting.insert(*item) {
-                    return false;
-                }
                 // Missing or arity-disagreeing generic metadata fails
                 // *closed*, to affine: an unsubstituted `Ty::Param`
                 // would answer `false` below and let a genuinely affine
@@ -522,14 +528,15 @@ impl<'a> Interpreter<'a> {
                 // this stage never destroys -- the one direction that
                 // leaks rather than over-demands.
                 let Some(subst) = self.type_substitution(*item, args) else {
-                    visiting.remove(item);
                     return true;
                 };
-                let result = self.item_field_types(*item).iter().any(|fty| {
-                    self.is_affine_visiting(&crate::types::substitute(fty, &subst), visiting)
+                return self.item_field_types(*item).iter().any(|fty| {
+                    self.is_affine_visiting(
+                        &crate::types::substitute(fty, &subst),
+                        visiting,
+                        depth + 1,
+                    )
                 });
-                visiting.remove(item);
-                return result;
             }
             _ => return false,
         };
@@ -542,7 +549,7 @@ impl<'a> Interpreter<'a> {
         let result = self
             .item_field_types(item)
             .iter()
-            .any(|fty| self.is_affine_visiting(fty, visiting));
+            .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
         visiting.remove(&item);
         result
     }
@@ -603,7 +610,7 @@ impl<'a> Interpreter<'a> {
         let subst = self.checked_substitution(item, type_args)?;
         let mut visiting = HashSet::new();
         Ok(self.item_field_types(item).iter().any(|fty| {
-            self.is_affine_visiting(&crate::types::substitute(fty, &subst), &mut visiting)
+            self.is_affine_visiting(&crate::types::substitute(fty, &subst), &mut visiting, 0)
         }))
     }
 

@@ -459,6 +459,13 @@ mod codes {
     /// transfer had just made stale, so this is rejected outright
     /// rather than left to fail unpredictably at run time.
     pub const STORE_PLACE_SELF_ALIAS: &str = "V0093";
+    /// A structural ownership state invariant this pass maintains was
+    /// found violated (`rfcs/0012`): a control-flow edge named a block
+    /// this function does not declare, so there was no out-state to
+    /// join from it. Never silently defaulted to an empty fact set --
+    /// that would let a malformed CFG fragment seed reachable ownership
+    /// with facts nothing ever proved.
+    pub const STRUCTURAL_STATE_INVARIANT: &str = "V0094";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -6183,20 +6190,34 @@ fn verify_structural_places(
         .expect("presence already checked above");
     let (entry_out, _) = transfer(entry_block, &PlaceFacts::new());
 
-    let mut out: HashMap<BlockId, PlaceFacts> = function
-        .blocks
-        .iter()
-        .map(|b| {
-            let initial = if b.id == entry {
-                entry_out.clone()
-            } else {
-                PlaceFacts::new()
-            };
-            (b.id, initial)
-        })
-        .collect();
+    // `out` holds an entry for a block *only once that block's own
+    // out-state has actually been computed* -- "not computed yet" is the
+    // absence of a key, and is therefore impossible to confuse with a
+    // block genuinely computed to hold no facts at all. Pre-seeding
+    // every block with an empty map (as this once did) erases exactly
+    // that distinction, and lets an unprocessed loop back-edge
+    // predecessor contribute a fact set nothing ever proved.
+    //
+    // The entry block is the one boundary condition: its in-state is
+    // empty by definition, so its out-state is fixed and never
+    // recomputed.
+    let mut out: HashMap<BlockId, PlaceFacts> = HashMap::from([(entry, entry_out)]);
+    let declared_blocks: HashSet<BlockId> = function.blocks.iter().map(|b| b.id).collect();
 
-    let mut computed: HashSet<BlockId> = HashSet::from([entry]);
+    // Standard worklist ("chaotic iteration") over reachable non-entry
+    // blocks, seeded in declaration order so the exact same CFG is
+    // always explored in the same order. A block is re-enqueued only
+    // when one of its own predecessors' out-states actually changed.
+    //
+    // Termination, with no pass limit of any kind: every transfer
+    // either records a fixed state for a place or -- when its own guard
+    // fails on a worse in-state -- records nothing and leaves the joined
+    // state standing. So a worse in-state can only ever produce an
+    // equal-or-worse out-state, which makes the transfer monotone in
+    // the order `Full`/`Empty` below the absorbing `Maybe`. The set of
+    // tracked places is bounded by the places the instructions actually
+    // name, and each one's state can rise at most twice, so the
+    // iteration reaches a fixed point.
     let mut worklist: VecDeque<BlockId> = function
         .blocks
         .iter()
@@ -6204,16 +6225,28 @@ fn verify_structural_places(
         .filter(|id| *id != entry && reachable.contains(id))
         .collect();
     let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    let mut invariant_violations: Vec<BlockId> = Vec::new();
     while let Some(id) = worklist.pop_front() {
         queued.remove(&id);
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state =
-            in_state_for_places(id, entry, &incoming_edges, (&reachable, &computed), &out);
+        let in_state = match in_state_for_places(
+            id,
+            entry,
+            &incoming_edges,
+            (&reachable, &declared_blocks),
+            &out,
+        ) {
+            Ok(state) => state,
+            Err(bad) => {
+                invariant_violations.push(bad);
+                continue;
+            }
+        };
         let (new_out, _) = transfer(block, &in_state);
-        let first_time = computed.insert(id);
-        if first_time || out.get(&id) != Some(&new_out) {
+        let changed = out.get(&id) != Some(&new_out);
+        if changed {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
                 if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
@@ -6242,16 +6275,37 @@ fn verify_structural_places(
         def_block.entry(param.value).or_insert(entry);
     }
 
+    // Every malformed edge the fixpoint refused to join, reported once
+    // each and in a deterministic order, rather than defaulted away.
+    invariant_violations.sort_unstable_by_key(|b| b.0);
+    invariant_violations.dedup();
+    for bad in invariant_violations {
+        diagnostics.push(Diagnostic::error(
+            codes::STRUCTURAL_STATE_INVARIANT,
+            source,
+            Span::dummy(),
+            format!(
+                "function `{function_name}`: a control-flow edge names block bb{}, which this \
+                 function does not declare, so no ownership state could be joined from it",
+                bad.0
+            ),
+        ));
+    }
+
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
             in_state_for_places(
                 block.id,
                 entry,
                 &incoming_edges,
-                (&reachable, &computed),
+                (&reachable, &declared_blocks),
                 &out,
             )
+            .unwrap_or_default()
         } else {
+            // An unreachable block is walked purely so its own
+            // instructions are still shape-checked; it starts from
+            // nothing, and its facts never reach a reachable block.
             PlaceFacts::new()
         };
         let (exit_facts, violations) = transfer(block, &in_state);
@@ -6650,32 +6704,59 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
         .collect()
 }
 
+/// This block's own in-state: the join of every *reachable, already
+/// computed* predecessor's out-state (`rfcs/0012`).
+///
+/// Three cases are deliberately kept apart, because collapsing them is
+/// what lets a fixed point be seeded with facts nothing proved:
+///
+/// * the **entry** block has no predecessors by definition, and its
+///   empty in-state is the analysis's one real boundary condition;
+/// * a **reachable but not yet computed** predecessor (an unprocessed
+///   loop back edge) contributes *nothing* -- it is skipped, not
+///   treated as having proven an empty fact set;
+/// * an **unreachable** predecessor contributes nothing either, so a
+///   dead CFG fragment can never seed reachable ownership.
+///
+/// A block with no computed predecessor at all is not yet ready and
+/// yields an empty in-state, which the worklist will revisit once one
+/// of its predecessors lands. `Err(pred)` is a genuine invariant
+/// violation -- an edge naming a block this function never declared --
+/// reported as `V0094` rather than defaulted away.
 fn in_state_for_places(
     block_id: BlockId,
     entry: BlockId,
     incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
-    reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
+    reachable_and_declared: (&HashSet<BlockId>, &HashSet<BlockId>),
     out: &HashMap<BlockId, PlaceFacts>,
-) -> PlaceFacts {
-    let (reachable, computed) = reachable_and_computed;
+) -> Result<PlaceFacts, BlockId> {
+    let (reachable, declared) = reachable_and_declared;
     if block_id == entry {
-        return PlaceFacts::new();
+        return Ok(PlaceFacts::new());
     }
     let Some(edges) = incoming_edges.get(&block_id) else {
-        return PlaceFacts::new();
+        return Ok(PlaceFacts::new());
     };
-    let mut edges = edges
-        .iter()
-        .filter(|pred| reachable.contains(pred) && computed.contains(pred));
-    let Some(first_pred) = edges.next() else {
-        return PlaceFacts::new();
-    };
-    let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+    let mut acc: Option<PlaceFacts> = None;
     for pred in edges {
-        let other = out.get(pred).cloned().unwrap_or_default();
-        acc = merge_place_facts(&acc, &other);
+        if !declared.contains(pred) {
+            return Err(*pred);
+        }
+        if !reachable.contains(pred) {
+            continue;
+        }
+        // Absence from `out` means "not computed yet", never "computed
+        // to nothing" -- the two are distinguishable precisely because
+        // `out` is populated only as blocks are actually processed.
+        let Some(facts) = out.get(pred) else {
+            continue;
+        };
+        acc = Some(match acc {
+            None => facts.clone(),
+            Some(previous) => merge_place_facts(&previous, facts),
+        });
     }
-    acc
+    Ok(acc.unwrap_or_default())
 }
 
 fn verify_invoke_slot_initialization(
@@ -14578,6 +14659,7 @@ mod structural_ownership {
     const SINK: ItemId = ItemId(301);
     const OBSERVE: ItemId = ItemId(302);
     const BUILD: ItemId = ItemId(303);
+    const RAISER: ItemId = ItemId(304);
     const T: TypeParamId = TypeParamId(0);
 
     struct Fixture {
@@ -16100,6 +16182,472 @@ mod structural_ownership {
             structural_codes_with(&mut fx, f, true),
             Vec::<&str>::new(),
             "destroying the returned record's own affine field discharges the obligation"
+        );
+    }
+
+    // -- adversarial control-flow shapes for the structural fixed point -
+
+    /// A diamond whose two arms may disagree about whether they
+    /// moved `session.input`. The merge block then moves it, which is
+    /// legal exactly when it is definitely still there on every path
+    /// reaching the join.
+    fn diamond(fx: &Fixture, arms_that_move: usize) -> Vec<BasicBlock> {
+        let arm = |index: usize, result: u32| {
+            if index < arms_that_move {
+                vec![
+                    read(
+                        result,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(result),
+                ]
+            } else {
+                Vec::new()
+            }
+        };
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: arm(0, 2),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: arm(1, 3),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![
+                    read(
+                        4,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(4),
+                    read(
+                        6,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(6),
+                    drop_of(0),
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_diamond_whose_arms_agree_joins_cleanly() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = diamond(&fx, 0);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "neither arm touched the field, so the join leaves it definitely present"
+        );
+    }
+
+    #[test]
+    fn a_diamond_whose_arms_disagree_is_reported_once_at_the_join() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = diamond(&fx, 1);
+        let codes = structural_codes(&mut fx, under_test(params, Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE)
+                || codes.contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a one-sided move before a join must not be silently accepted, got {codes:?}"
+        );
+    }
+
+    /// A loop whose back edge reaches the header before the header has
+    /// ever been processed: the unprocessed predecessor must contribute
+    /// nothing, never a fact set nothing proved.
+    fn loop_with_back_edge(fx: &Fixture, restore: bool) -> Vec<BasicBlock> {
+        let mut body = vec![
+            read(
+                2,
+                fx.file.clone(),
+                session_field(0),
+                OwnershipMode::Transfer,
+            ),
+            drop_of(2),
+        ];
+        if restore {
+            body.push(int(3, 1));
+            body.push(Instruction::Value {
+                result: ValueId(4),
+                ty: fx.file.clone(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+            });
+            body.push(Instruction::StorePlace {
+                place: session_field(0),
+                value: ValueId(4),
+            });
+        }
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(2),
+                    else_block: BlockId(3),
+                },
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: body,
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![drop_of(0), int(5, 0)],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_loop_that_moves_without_restoring_is_reported() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = loop_with_back_edge(&fx, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a second iteration would move an already-empty field"
+        );
+    }
+
+    #[test]
+    fn a_loop_that_restores_what_it_moved_reaches_a_clean_fixed_point() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = loop_with_back_edge(&fx, true);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "the back edge restores the field, so every iteration starts complete"
+        );
+    }
+
+    /// Every permutation of the same CFG must produce the identical
+    /// sorted diagnostic multiset -- block-vector order, entry position
+    /// and predecessor discovery order are all storage details.
+    fn assert_permutation_invariant(fx: &mut Fixture, blocks: Vec<BasicBlock>, label: &str) {
+        let params = cond_params(fx);
+        let baseline = structural_codes(fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+
+        let mut reversed = blocks.clone();
+        reversed.reverse();
+        assert_eq!(
+            structural_codes(fx, under_test(params.clone(), Ty::I64, reversed)),
+            baseline,
+            "{label}: reversing the block vector changed the result"
+        );
+
+        let mut rotated = blocks.clone();
+        let head = rotated.remove(0);
+        rotated.push(head);
+        assert_eq!(
+            structural_codes(fx, under_test(params.clone(), Ty::I64, rotated)),
+            baseline,
+            "{label}: moving the entry block last changed the result"
+        );
+
+        // Reverse each block's own predecessor discovery order by
+        // reversing the order successors are listed in.
+        let swapped: Vec<BasicBlock> = blocks
+            .iter()
+            .map(|b| {
+                let terminator = match &b.terminator {
+                    Terminator::CondBranch {
+                        condition,
+                        then_block,
+                        else_block,
+                    } => Terminator::CondBranch {
+                        condition: *condition,
+                        then_block: *else_block,
+                        else_block: *then_block,
+                    },
+                    other => other.clone(),
+                };
+                BasicBlock {
+                    id: b.id,
+                    instructions: b.instructions.clone(),
+                    terminator,
+                }
+            })
+            .collect();
+        let swapped_codes = structural_codes(fx, under_test(params, Ty::I64, swapped));
+        assert_eq!(
+            swapped_codes.len(),
+            baseline.len(),
+            "{label}: swapping branch targets changed how many diagnostics fire"
+        );
+    }
+
+    #[test]
+    fn a_diamonds_diagnostics_are_invariant_under_every_ordering() {
+        let mut fx = fixture();
+        let blocks = diamond(&fx, 1);
+        assert_permutation_invariant(&mut fx, blocks, "diamond");
+    }
+
+    #[test]
+    fn a_loops_diagnostics_are_invariant_under_every_ordering() {
+        let mut fx = fixture();
+        let blocks = loop_with_back_edge(&fx, false);
+        assert_permutation_invariant(&mut fx, blocks, "loop");
+    }
+
+    #[test]
+    fn a_deep_chain_reaches_its_fixed_point() {
+        let mut fx = fixture();
+        // Twenty blocks in a row, the last of which cleans up: a long
+        // chain must not need more passes than the worklist gives it.
+        let depth = 20u32;
+        let mut blocks: Vec<BasicBlock> = (0..depth)
+            .map(|i| BasicBlock {
+                id: BlockId(i),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(i + 1)),
+            })
+            .collect();
+        blocks.push(BasicBlock {
+            id: BlockId(depth),
+            instructions: vec![
+                read(
+                    2,
+                    fx.file.clone(),
+                    session_field(0),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(2),
+                read(
+                    3,
+                    fx.file.clone(),
+                    session_field(1),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(3),
+                drop_of(0),
+                int(4, 0),
+            ],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+        let params = cond_params(&fx);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "a twenty-deep chain must converge and stay clean"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_cycle_seeds_no_reachable_ownership() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let f = under_test(
+            params,
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+                // Two blocks reachable only from each other. Their
+                // (nonsense) facts must never reach bb0.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![read(
+                        5,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    )],
+                    terminator: Terminator::Branch(BlockId(2)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unreachable cycle must contribute nothing at all"
+        );
+    }
+
+    /// An `Invoke`'s success and failure edges reaching the same block:
+    /// both are real predecessors and both must be joined.
+    #[test]
+    fn invoke_success_and_failure_edges_reaching_one_block_are_both_joined() {
+        let mut fx = fixture();
+        let raiser = fx.interner.intern("raiser");
+        let shared = BlockId(1);
+        let f = Function {
+            id: SELF,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: take_session(&fx),
+            return_type: Ty::I64,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(2),
+                        ok_target: shared,
+                        err_targets: vec![crate::nir::InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(3),
+                            target: shared,
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: shared,
+                    instructions: vec![
+                        // `input` is empty on *both* edges, so this
+                        // second move of it must be rejected.
+                        read(
+                            4,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(4),
+                        int(5, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ],
+        };
+        let _ = raiser;
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "both invoke edges carry the same emptied field into the shared block"
+        );
+    }
+
+    #[test]
+    fn an_edge_naming_an_undeclared_block_is_its_own_invariant_diagnostic() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let f = under_test(
+            params,
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                // bb1 branches from a block that does not exist in this
+                // function at all -- reached here by declaring bb2 with
+                // an edge out of an undeclared bb7 into bb1 is not
+                // expressible, so instead bb2 itself is undeclared and
+                // bb1 joins an edge from it.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ],
+        );
+        // bb2 is never declared: the CFG edge to it is already its own
+        // pre-existing diagnostic, and this pass must not additionally
+        // invent ownership state for it.
+        let codes = structural_codes(&mut fx, f);
+        assert!(
+            !codes.contains(&codes::STRUCTURAL_STATE_INVARIANT),
+            "an edge to an undeclared *successor* has no predecessor state to join, \
+             so it is not this invariant, got {codes:?}"
         );
     }
 }

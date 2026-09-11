@@ -1398,7 +1398,7 @@ impl<'a> Lowering<'a> {
                 if !visiting.insert(*item) {
                     return false;
                 }
-                let type_params: Vec<TypeParamId> = self
+                let type_params: Option<Vec<TypeParamId>> = self
                     .records
                     .get(item)
                     .map(|r| r.type_params.iter().map(|(id, _)| *id).collect())
@@ -1406,8 +1406,19 @@ impl<'a> Lowering<'a> {
                         self.variants
                             .get(item)
                             .map(|v| v.type_params.iter().map(|(id, _)| *id).collect())
-                    })
-                    .unwrap_or_default();
+                    });
+                // Missing or arity-disagreeing generic metadata is
+                // never an *empty* substitution: an unsubstituted
+                // `Ty::Param` answers `false` here, which would let a
+                // genuinely affine instantiation be lowered as a
+                // freely-copyable value. Fail closed instead -- treat
+                // it as affine, so the ownership machinery demands an
+                // explicit owner and the mismatch surfaces as a
+                // structured diagnostic rather than a silent leak.
+                let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
+                    visiting.remove(item);
+                    return true;
+                };
                 let subst: HashMap<TypeParamId, Ty> =
                     type_params.into_iter().zip(args.iter().cloned()).collect();
                 let result = field_types(item).iter().any(|fty| {
@@ -1492,6 +1503,21 @@ impl<'a> Lowering<'a> {
                      structural places never produce",
                 ));
             };
+            // A generic aggregate's own declared field type is still
+            // symbolic (`Ty::Param`) -- substituted here with whatever
+            // arguments *this* place's own current type carries, so the
+            // NIR instruction this place feeds is typed `File`, not a
+            // bare `T` that escapes its own declaration (`rfcs/0008`).
+            let args: Vec<Ty> = match &ty {
+                Ty::Named(item, _) if item == owner => Vec::new(),
+                Ty::Applied(item, args) if item == owner => args.clone(),
+                other => {
+                    return Err(self.internal_error(&format!(
+                        "a checked place projects a field of {owner:?} through a value of a \
+                         different type ({other:?})"
+                    )));
+                }
+            };
             let Some(record) = self.records.get(owner) else {
                 return Err(self.internal_error(&format!(
                     "a checked place projects through unknown record {owner:?}"
@@ -1502,7 +1528,21 @@ impl<'a> Lowering<'a> {
                     "a checked place projects field {field:?}, out of range for record {owner:?}"
                 )));
             };
-            ty = field_ty.clone();
+            if record.type_params.len() != args.len() {
+                return Err(self.internal_error(&format!(
+                    "a checked place projects through {owner:?}, which declares {} type \
+                     parameter(s) but is applied to {} type argument(s)",
+                    record.type_params.len(),
+                    args.len()
+                )));
+            }
+            let subst: HashMap<crate::hir::TypeParamId, Ty> = record
+                .type_params
+                .iter()
+                .map(|(id, _)| *id)
+                .zip(args)
+                .collect();
+            ty = crate::types::substitute(field_ty, &subst);
         }
         Ok((
             Place {

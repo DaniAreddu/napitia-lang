@@ -418,6 +418,16 @@ mod codes {
     /// it is still holding a live value on at least one of them, which
     /// this store would silently leak.
     pub const PLACE_OVERWRITE_OF_LIVE_FIELD: &str = "V0088";
+    /// A structural place projects through a *generic* aggregate whose
+    /// own recorded type-parameter list disagrees with the number of
+    /// type arguments the place's own current type carries
+    /// (`rfcs/0008`, `rfcs/0012`) -- a `Box[i64, str]` reaching a
+    /// one-parameter `Box`, or a `Box[File]` reaching a declaration this
+    /// module recorded no parameters for at all. Never papered over
+    /// with an empty or partial substitution: an unsubstituted
+    /// `Ty::Param` leaking out of a projection would make a genuinely
+    /// affine field look freely copyable.
+    pub const PLACE_GENERIC_ARITY_MISMATCH: &str = "V0089";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -3586,6 +3596,8 @@ enum PlaceError {
     UnknownFieldOwner(ItemId),
     ProjectionThroughNonRecord(Ty),
     UnknownField(ItemId, usize),
+    /// `(owner, declared parameter count, supplied argument count)`.
+    GenericArityMismatch(ItemId, usize, usize),
 }
 
 impl PlaceError {
@@ -3612,6 +3624,14 @@ impl PlaceError {
                     result.0, owner.0
                 ),
             ),
+            PlaceError::GenericArityMismatch(owner, declared, supplied) => (
+                codes::PLACE_GENERIC_ARITY_MISMATCH,
+                format!(
+                    "function `{function_name}`: %{} projects through record {}, which declares \
+                     {declared} type parameter(s) but is applied to {supplied} type argument(s)",
+                    result.0, owner.0
+                ),
+            ),
         };
         Diagnostic::error(code, source, Span::dummy(), message)
     }
@@ -3630,8 +3650,18 @@ fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
 }
 
 fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet<ItemId>) -> bool {
-    let Ty::Named(item, _) = ty else {
-        return false;
+    // A generic instantiation's own affinity is decided by what it was
+    // instantiated *with* (`rfcs/0008`, `rfcs/0012`): `Box[File]` is
+    // affine, `Box[i64]` is not, and the same declaration answers both
+    // -- so its own arguments are substituted into the declaration's
+    // field types before recursing. Answering `false` for every
+    // `Ty::Applied` (as this once did) is what let a `Box[File]` reach
+    // `Drop`/`PlaceRead` looking like an ordinary, freely-copyable
+    // value.
+    let (item, args): (&ItemId, &[Ty]) = match ty {
+        Ty::Named(item, _) => (item, &[]),
+        Ty::Applied(item, args) => (item, args.as_slice()),
+        _ => return false,
     };
     if agg.records.get(item).is_some_and(|r| r.affine) {
         return true;
@@ -3639,6 +3669,19 @@ fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet
     if !visiting.insert(*item) {
         return false;
     }
+    let subst = match item_substitution(*item, args, agg) {
+        Ok(subst) => subst,
+        // A malformed arity is reported as its own structured
+        // diagnostic wherever a *place* projects through it
+        // (`PLACE_GENERIC_ARITY_MISMATCH`); this pure query has no
+        // diagnostic channel, so it refuses to guess rather than
+        // fabricating a partial substitution that could answer `false`
+        // for a genuinely affine field.
+        Err(()) => {
+            visiting.remove(item);
+            return false;
+        }
+    };
     let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
         record.fields.iter().map(|(_, t)| t.clone()).collect()
     } else if let Some(variant) = agg.variants.get(item) {
@@ -3652,9 +3695,40 @@ fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet
     };
     let result = field_types
         .iter()
-        .any(|fty| is_affine_in_visiting(fty, agg, visiting));
+        .any(|fty| is_affine_in_visiting(&crate::types::substitute(fty, &subst), agg, visiting));
     visiting.remove(item);
     result
+}
+
+/// `item`'s own declared type parameters paired with `args`
+/// (`rfcs/0008`), for substituting a generic aggregate's declared field
+/// types down to one concrete instantiation. `Err(())` on any arity
+/// disagreement -- including a non-generic declaration handed type
+/// arguments, or a generic one handed none -- never a partial or empty
+/// map: an unsubstituted `Ty::Param` escaping a projection would make a
+/// genuinely affine field look freely copyable.
+fn item_substitution(
+    item: ItemId,
+    args: &[Ty],
+    agg: &AggregateContext,
+) -> Result<HashMap<TypeParamId, Ty>, ()> {
+    let params: Vec<TypeParamId> = if let Some(record) = agg.records.get(&item) {
+        record.type_params.iter().map(|(id, _)| *id).collect()
+    } else if let Some(variant) = agg.variants.get(&item) {
+        variant.type_params.iter().map(|(id, _)| *id).collect()
+    } else if args.is_empty() {
+        // An item this module registered no layout for at all is
+        // already reported by whichever check actually needs the
+        // layout; with no arguments to substitute there is nothing to
+        // get wrong here.
+        return Ok(HashMap::new());
+    } else {
+        return Err(());
+    };
+    if params.len() != args.len() {
+        return Err(());
+    }
+    Ok(params.into_iter().zip(args.iter().cloned()).collect())
 }
 
 /// Resolves a structural place's own final type, starting from
@@ -3662,12 +3736,15 @@ fn is_affine_in_visiting(ty: &Ty, agg: &AggregateContext, visiting: &mut HashSet
 /// declared record layouts -- independently re-validating owner/field
 /// identity exactly like `ValueKind::RecordField`'s own check does for
 /// a single-step, non-affine projection, generalized to a whole chain.
-/// Deliberately does not substitute a generic record's own type
-/// parameters the way `RecordField`'s check does (`Place`'s own
-/// `Projection` carries no type-argument list of its own) -- a known,
-/// narrower scope for a structural place through a *generic* affine
-/// record than an ordinary single-step `RecordField` projection gets;
-/// see this milestone's own generic-affine-aggregate restriction.
+/// Each step substitutes the owner's own type arguments into the
+/// selected field's declared type before continuing from it
+/// (`rfcs/0008`, `rfcs/0012`), in this exact order: validate the owner,
+/// retrieve its stable type parameters, require exact arity, build the
+/// substitution, substitute, continue. `Projection` itself carries no
+/// type-argument list -- the arguments come from the place's own
+/// *current* type at that step, which is precisely why the walk has to
+/// thread the substituted type forward rather than reading each field's
+/// declared type in isolation.
 fn resolve_place_ty(
     root_ty: &Ty,
     projections: &[crate::place::Projection],
@@ -3681,18 +3758,31 @@ fn resolve_place_ty(
                 crate::place::Projection::Field { owner, .. } => *owner,
             }));
         };
-        let matches_owner =
-            matches!(&ty, Ty::Named(item, _) | Ty::Applied(item, _) if item == owner);
-        if !matches_owner {
-            return Err(PlaceError::ProjectionThroughNonRecord(ty));
-        }
+        let args: Vec<Ty> = match &ty {
+            Ty::Named(item, _) if item == owner => Vec::new(),
+            Ty::Applied(item, args) if item == owner => args.clone(),
+            _ => return Err(PlaceError::ProjectionThroughNonRecord(ty)),
+        };
         let Some(layout) = agg.records.get(owner) else {
             return Err(PlaceError::UnknownFieldOwner(*owner));
         };
         let Some((_, field_ty)) = layout.fields.get(field.0 as usize) else {
             return Err(PlaceError::UnknownField(*owner, field.0 as usize));
         };
-        ty = field_ty.clone();
+        if layout.type_params.len() != args.len() {
+            return Err(PlaceError::GenericArityMismatch(
+                *owner,
+                layout.type_params.len(),
+                args.len(),
+            ));
+        }
+        let subst: HashMap<TypeParamId, Ty> = layout
+            .type_params
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(args)
+            .collect();
+        ty = crate::types::substitute(field_ty, &subst);
     }
     Ok(ty)
 }

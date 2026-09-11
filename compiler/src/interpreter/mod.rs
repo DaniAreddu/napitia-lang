@@ -583,9 +583,15 @@ impl<'a> Interpreter<'a> {
     fn access_place(
         &self,
         values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
         place: &Place<ValueId>,
         mode: OwnershipMode,
     ) -> Result<Value, InterpreterError> {
+        let root_id = canonical_root(load_origin, place.root);
+        let place = &Place {
+            root: root_id,
+            projections: place.projections.clone(),
+        };
         let root = get(values, &place.root)?;
         match mode {
             // Observing never writes anything back -- not the root, not
@@ -610,12 +616,14 @@ impl<'a> Interpreter<'a> {
     fn store_place(
         &self,
         values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
         place: &Place<ValueId>,
         value: Value,
     ) -> Result<(), InterpreterError> {
-        let root = get(values, &place.root)?;
+        let root_id = canonical_root(load_origin, place.root);
+        let root = get(values, &root_id)?;
         let updated_root = self.store_projections(root, &place.projections, value)?;
-        values.insert(place.root, updated_root);
+        values.insert(root_id, updated_root);
         Ok(())
     }
 
@@ -1202,6 +1210,22 @@ impl<'a> Interpreter<'a> {
             .filter(|p| !p.take)
             .map(|p| p.value)
             .collect();
+        // Every `Load`'s own result paired with the slot it reads --
+        // see `canonical_root`. Built once per frame from the whole
+        // function, exactly like `nir::verify` builds its own.
+        let load_origin: HashMap<ValueId, ValueId> = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                crate::nir::Instruction::Value {
+                    result,
+                    kind: ValueKind::Load(slot),
+                    ..
+                } => Some((*result, *slot)),
+                _ => None,
+            })
+            .collect();
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
             // A `take` parameter transfers ownership into this call
@@ -1243,7 +1267,7 @@ impl<'a> Interpreter<'a> {
                 match instruction {
                     crate::nir::Instruction::Value { result, kind, .. } => {
                         let value = if let ValueKind::PlaceRead { place, mode } = kind {
-                            self.access_place(&mut values, place, *mode)?
+                            self.access_place(&mut values, &load_origin, place, *mode)?
                         } else {
                             self.eval(kind, &values, &evidence)?
                         };
@@ -1307,7 +1331,7 @@ impl<'a> Interpreter<'a> {
                     }
                     crate::nir::Instruction::StorePlace { place, value } => {
                         let v = get(&values, value)?;
-                        self.store_place(&mut values, place, v)?;
+                        self.store_place(&mut values, &load_origin, place, v)?;
                     }
                 }
             }
@@ -1687,6 +1711,30 @@ impl<'a> Interpreter<'a> {
             },
         }
     }
+}
+
+/// The storage location a place's own root actually names: a `Load`'s
+/// own result shares its identity with the slot it loaded from
+/// (`rfcs/0012`), exactly as `nir::verify::verify_structural_places`
+/// already canonicalizes it. A `mutable` binding reloads its whole
+/// current value as a *fresh* `ValueId` every time a place projects
+/// into it, so tombstoning a field in the load's own cached copy --
+/// rather than in the slot every later load reads back from -- would
+/// lose the mutation entirely, and a later reinitialization would find
+/// the field still live.
+///
+/// Follows a chain of loads to its fixed point, bounded by the number
+/// of entries so a hand-built cyclic `load` chain terminates instead of
+/// spinning.
+fn canonical_root(load_origin: &HashMap<ValueId, ValueId>, root: ValueId) -> ValueId {
+    let mut current = root;
+    for _ in 0..=load_origin.len() {
+        match load_origin.get(&current) {
+            Some(next) if *next != current => current = *next,
+            _ => return current,
+        }
+    }
+    current
 }
 
 fn get(values: &HashMap<ValueId, Value>, id: &ValueId) -> Result<Value, InterpreterError> {

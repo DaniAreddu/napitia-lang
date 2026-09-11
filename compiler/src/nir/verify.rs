@@ -6324,14 +6324,21 @@ fn verify_structural_places(
 
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            in_state_for_places(
+            // A malformed edge into this block already produced its own
+            // `V0094` above. Reporting ownership violations from a state
+            // that could not be soundly joined would be guesswork, so
+            // this block is skipped entirely rather than judged from a
+            // fabricated empty one.
+            match in_state_for_places(
                 block.id,
                 entry,
                 &incoming_edges,
                 (&reachable, &declared_blocks),
                 &out,
-            )
-            .unwrap_or_default()
+            ) {
+                Ok(state) => state,
+                Err(_) => continue,
+            }
         } else {
             // An unreachable block is walked purely so its own
             // instructions are still shape-checked; it starts from

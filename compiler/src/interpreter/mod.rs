@@ -289,6 +289,68 @@ impl ResourceTable {
         *slot = value;
         Ok(())
     }
+
+    /// Writes `container` back into `handle`'s own field at `index`
+    /// after a place traversal passed *through* it (`rfcs/0012`) --
+    /// deliberately **not** [`Self::set_field`]: that one is the
+    /// user-facing structural reinitialization primitive `StorePlace`
+    /// lowers to, and correctly refuses to overwrite a field that still
+    /// owns a live value. This one is the internal, transactional
+    /// counterpart: the field genuinely *is* still live here (the
+    /// traversal only ever reached deeper *through* it), and what is
+    /// being written back is that very same container with at most one
+    /// of its own descendants tombstoned. Conflating the two is exactly
+    /// what made a mixed `resource` -> `record` chain report a bogus
+    /// live-overwrite error.
+    ///
+    /// Still `Owner`-gated, exactly like [`Self::take_field`]/
+    /// [`Self::set_field`]: a merely-observing handle must never be able
+    /// to write through an intermediate container either, or a
+    /// `record` -> `resource` -> `field` transfer reached through an
+    /// observer would silently grant itself ownership. Only ever called
+    /// *after* the recursion it accompanies already succeeded, so a
+    /// failure deeper in the chain leaves this field exactly as it was
+    /// rather than half-mutated.
+    fn restore_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+        container: Value,
+    ) -> Result<(), InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot write through a merely-observing resource handle",
+            ));
+        }
+        self.observe(handle)?;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        *slot = container;
+        Ok(())
+    }
+}
+
+/// One recursive place-traversal step's own complete result
+/// (`rfcs/0012`): the value actually read or removed at the place's own
+/// final projection, *and* the container this step was handed, in
+/// exactly the state it must now be written back into whatever slot it
+/// came from.
+///
+/// `container` is always present, and always meaningful -- never an
+/// `Option` doing double duty for both "the caller must write this
+/// back" and "this container's own ownership disappeared." For a
+/// `resource` intermediate the mutation already happened directly in
+/// the resource table, and `container` is that same
+/// [`Value::Resource`] handle, unchanged, so the caller reinserting it
+/// into its own parent slot keeps the handle exactly where it belongs
+/// instead of tombstoning a live resource out of its owner.
+struct AccessResult {
+    extracted: Value,
+    container: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -468,11 +530,20 @@ impl<'a> Interpreter<'a> {
         mode: OwnershipMode,
     ) -> Result<Value, InterpreterError> {
         let root = get(values, &place.root)?;
-        let (result, updated_root) = self.access_projections(root, &place.projections, mode)?;
-        if let Some(updated_root) = updated_root {
-            values.insert(place.root, updated_root);
+        match mode {
+            // Observing never writes anything back -- not the root, not
+            // any intermediate inline record, and not any intermediate
+            // resource's own field storage (`rfcs/0012`). Reading
+            // `outer.inner.file` must leave `outer` byte-for-byte as it
+            // was, however many `record`/`resource` layers alternate on
+            // the way there.
+            OwnershipMode::Observe => self.observe_projections(&root, &place.projections),
+            OwnershipMode::Transfer => {
+                let result = self.take_projections(root, &place.projections)?;
+                values.insert(place.root, result.container);
+                Ok(result.extracted)
+            }
         }
-        Ok(result)
     }
 
     /// Writes `value` into `place`'s own final projection step
@@ -491,70 +562,135 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    /// Returns `(the accessed value, Some(the rebuilt container) if it
-    /// was a plain record held by value, or None if the mutation --
-    /// `Transfer` only -- already happened directly in the resource
-    /// table instead)`.
-    fn access_projections(
+    /// Reads the value at `projections`' own final step out of
+    /// `container` without mutating anything at all, at any depth
+    /// (`rfcs/0012`): no ancestor is tombstoned, no inline record is
+    /// rebuilt, and no resource's own field storage is written -- an
+    /// observation is a pure read, whatever mixture of inline `Record`
+    /// and resource-table-backed `Resource` containers it passes
+    /// through on the way. Cloning an intermediate is always safe here:
+    /// a `Value::Resource` carries only a cheap `(id, generation, role)`
+    /// handle, never the resource's own identity or data, and observing
+    /// never bumps a generation.
+    fn observe_projections(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+    ) -> Result<Value, InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(container.clone());
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                self.observe_projections(&inner, rest)
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                self.observe_projections(slot, rest)
+            }
+            Value::Moved => Err(invalid("use of a field after it was already moved")),
+            Value::Dropped => Err(invalid("use of a field after it was already dropped")),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// Removes the value at `projections`' own final step out of
+    /// `container`, tombstoning **only** that one final field and
+    /// returning the container itself for its own caller to reinsert
+    /// (`rfcs/0012`).
+    ///
+    /// Every intermediate is preserved, whichever kind it is: an inline
+    /// `Record` is handed back rebuilt (with its own descendant's
+    /// updated state in place), and a `Resource` is handed back as the
+    /// very same handle, with the update already applied directly to
+    /// its own field storage through [`ResourceTable::restore_field`]
+    /// -- never through the user-facing `set_field`, which would
+    /// (correctly, for its own purpose) reject the still-live
+    /// intermediate as an overwrite.
+    ///
+    /// Transactional: the recursion runs to completion on a *clone* of
+    /// the intermediate before anything is written back, so a failure
+    /// deeper in the chain leaves every container on the path exactly
+    /// as it was rather than half-mutated.
+    fn take_projections(
         &self,
         container: Value,
         projections: &[Projection],
-        mode: OwnershipMode,
-    ) -> Result<(Value, Option<Value>), InterpreterError> {
+    ) -> Result<AccessResult, InterpreterError> {
         let Some((first, rest)) = projections.split_first() else {
-            return match mode {
-                OwnershipMode::Observe => Ok((container.clone(), Some(container))),
-                OwnershipMode::Transfer => Ok((container, None)),
-            };
+            // A zero-projection place is the whole root value itself:
+            // there is no container above it to tombstone a field in,
+            // and `nir::verify` tracks a bare root through its own
+            // whole-value ownership lattice rather than this one.
+            return Ok(AccessResult {
+                extracted: container.clone(),
+                container,
+            });
         };
-        let Projection::Field { field, .. } = first else {
-            return Err(invalid(
-                "a place projects through a variant field, which this milestone's runtime never \
-                 produces",
-            ));
-        };
-        let index = field.0 as usize;
+        let index = Self::projection_index(first)?;
         match container {
             Value::Resource(handle) => {
-                let value = if rest.is_empty() {
-                    match mode {
-                        OwnershipMode::Observe => {
-                            self.resources.borrow().observe_field(handle, index)?
-                        }
-                        OwnershipMode::Transfer => {
-                            self.resources.borrow_mut().take_field(handle, index)?
-                        }
-                    }
-                } else {
-                    let inner = self.resources.borrow().observe_field(handle, index)?;
-                    let (value, updated_inner) = self.access_projections(inner, rest, mode)?;
-                    if let Some(updated_inner) = updated_inner {
+                if rest.is_empty() {
+                    let extracted = self.resources.borrow_mut().take_field(handle, index)?;
+                    if matches!(extracted, Value::Moved | Value::Dropped) {
+                        // Put the tombstone back exactly as it was:
+                        // this took nothing, and must not look like it
+                        // did.
                         self.resources
                             .borrow_mut()
-                            .set_field(handle, index, updated_inner)?;
+                            .restore_field(handle, index, extracted)?;
+                        return Err(invalid(
+                            "transfer of a resource field that was already moved or dropped",
+                        ));
                     }
-                    value
-                };
-                Ok((value, None))
+                    Ok(AccessResult {
+                        extracted,
+                        container: Value::Resource(handle),
+                    })
+                } else {
+                    let inner = self.resources.borrow().observe_field(handle, index)?;
+                    let inner = self.take_projections(inner, rest)?;
+                    self.resources
+                        .borrow_mut()
+                        .restore_field(handle, index, inner.container)?;
+                    Ok(AccessResult {
+                        extracted: inner.extracted,
+                        container: Value::Resource(handle),
+                    })
+                }
             }
             Value::Record { item, mut fields } => {
-                let Some(slot) = fields.get_mut(index) else {
+                if fields.len() <= index {
                     return Err(invalid(
                         "a place projects a field index out of range for this record",
                     ));
-                };
-                let value = if rest.is_empty() {
-                    match mode {
-                        OwnershipMode::Observe => slot.clone(),
-                        OwnershipMode::Transfer => std::mem::replace(slot, Value::Moved),
+                }
+                if rest.is_empty() {
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "transfer of a record field that was already moved or dropped",
+                        ));
                     }
+                    let extracted = std::mem::replace(&mut fields[index], Value::Moved);
+                    Ok(AccessResult {
+                        extracted,
+                        container: Value::Record { item, fields },
+                    })
                 } else {
-                    let inner = std::mem::replace(slot, Value::Moved);
-                    let (value, updated_inner) = self.access_projections(inner, rest, mode)?;
-                    *slot = updated_inner.unwrap_or(Value::Moved);
-                    value
-                };
-                Ok((value, Some(Value::Record { item, fields })))
+                    let inner = self.take_projections(fields[index].clone(), rest)?;
+                    fields[index] = inner.container;
+                    Ok(AccessResult {
+                        extracted: inner.extracted,
+                        container: Value::Record { item, fields },
+                    })
+                }
             }
             Value::Moved => Err(invalid("use of a field after it was already moved")),
             Value::Dropped => Err(invalid("use of a field after it was already dropped")),
@@ -562,6 +698,21 @@ impl<'a> Interpreter<'a> {
                 "a place projects through a non-aggregate value ({})",
                 kind_name(&other)
             ))),
+        }
+    }
+
+    /// One projection step's own field index, rejecting the
+    /// `VariantField` shape this milestone's runtime never produces
+    /// (a variant payload is only ever reached through a
+    /// `ValueKind::VariantPayload` extraction on its own case-refined
+    /// edge, never through a `Place`).
+    fn projection_index(projection: &Projection) -> Result<usize, InterpreterError> {
+        match projection {
+            Projection::Field { field, .. } => Ok(field.0 as usize),
+            Projection::VariantField { .. } => Err(invalid(
+                "a place projects through a variant field, which this milestone's runtime never \
+                 produces",
+            )),
         }
     }
 
@@ -578,47 +729,59 @@ impl<'a> Interpreter<'a> {
         let Some((first, rest)) = projections.split_first() else {
             return Ok(value);
         };
-        let Projection::Field { field, .. } = first else {
-            return Err(invalid(
-                "a place projects through a variant field, which this milestone's runtime never \
-                 produces",
-            ));
-        };
-        let index = field.0 as usize;
+        let index = Self::projection_index(first)?;
         match container {
             Value::Resource(handle) => {
                 if rest.is_empty() {
+                    // The one genuine reinitialization in this whole
+                    // walk: the *final* step, which really must find a
+                    // provably-empty slot (`rfcs/0012`).
                     self.resources
                         .borrow_mut()
                         .set_field(handle, index, value)?;
                 } else {
+                    // An *intermediate* resource field is still live by
+                    // construction -- this walk only reached deeper
+                    // through it -- so it goes back through the
+                    // internal `restore_field`, never `set_field`,
+                    // which would reject it as a live overwrite.
                     let inner = self.resources.borrow().observe_field(handle, index)?;
                     let updated_inner = self.store_projections(inner, rest, value)?;
                     self.resources
                         .borrow_mut()
-                        .set_field(handle, index, updated_inner)?;
+                        .restore_field(handle, index, updated_inner)?;
                 }
                 Ok(Value::Resource(handle))
             }
             Value::Record { item, mut fields } => {
-                let Some(slot) = fields.get_mut(index) else {
+                if fields.len() <= index {
                     return Err(invalid(
                         "a place projects a field index out of range for this record",
                     ));
-                };
+                }
                 if rest.is_empty() {
-                    if !matches!(slot, Value::Moved | Value::Dropped) {
+                    if !matches!(fields[index], Value::Moved | Value::Dropped) {
                         return Err(invalid(
                             "cannot overwrite a record field that still owns a live value",
                         ));
                     }
-                    *slot = value;
+                    fields[index] = value;
                 } else {
-                    let inner = std::mem::replace(slot, Value::Moved);
-                    *slot = self.store_projections(inner, rest, value)?;
+                    // Recurse on a clone and only write back once it
+                    // succeeded, exactly like `take_projections`: a
+                    // failure deeper in the chain must never leave this
+                    // record holding a `Moved` tombstone where a live
+                    // intermediate used to be.
+                    fields[index] = self.store_projections(fields[index].clone(), rest, value)?;
                 }
                 Ok(Value::Record { item, fields })
             }
+            Value::Moved => Err(invalid(
+                "a place reinitializes through a field that was already moved",
+            )),
+            Value::Dropped => Err(invalid(
+                "a place reinitializes through a field that was already dropped",
+            )),
             other => Err(invalid(format!(
                 "a place projects through a non-aggregate value ({})",
                 kind_name(&other)

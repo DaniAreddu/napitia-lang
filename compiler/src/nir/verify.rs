@@ -428,6 +428,30 @@ mod codes {
     /// `Ty::Param` leaking out of a projection would make a genuinely
     /// affine field look freely copyable.
     pub const PLACE_GENERIC_ARITY_MISMATCH: &str = "V0089";
+    /// A place is used as a *whole* value -- observed, transferred,
+    /// returned, raised, or consumed into an aggregate -- while one of
+    /// its own affine descendants has already been moved out or dropped
+    /// (`rfcs/0012`). Only accessing an unaffected sibling,
+    /// reinitializing an empty child, or structurally dropping what
+    /// remains is still permitted on a partially moved parent; this is
+    /// `nir::verify`'s own independent reconstruction of the same rule
+    /// `resourceck`'s `PARTIAL_PARENT_USED_AS_WHOLE` (U0014) applies at
+    /// the source level.
+    pub const PARTIAL_PLACE_USED_AS_WHOLE: &str = "V0090";
+    /// A transitively affine value this function owns still has
+    /// remaining owned affine descendants at a reachable
+    /// `Return`/`Raise` (`rfcs/0012`) -- a structural leak.
+    /// Complements `RESOURCE_LEAKED_ON_EXIT` (V0077), which covers the
+    /// same obligation for a *nominally* resource-typed root: this one
+    /// covers the gap that lattice cannot see, a record that merely
+    /// *contains* affine fields and is therefore never a key there.
+    pub const MISSING_STRUCTURAL_CLEANUP: &str = "V0091";
+    /// A place is destroyed or transferred whole after it was already
+    /// consumed on a path reaching it (`rfcs/0012`) -- duplicate
+    /// structural cleanup, including destroying a child whose own
+    /// parent was already dropped, or dropping the same structural
+    /// field twice.
+    pub const DUPLICATE_STRUCTURAL_CLEANUP: &str = "V0092";
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1744,7 +1768,15 @@ fn verify_function(
         &name,
         diagnostics,
     );
-    verify_structural_places(function, source, &name, diagnostics);
+    verify_structural_places(
+        function,
+        &value_types,
+        known_functions,
+        agg,
+        source,
+        &name,
+        diagnostics,
+    );
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -5582,35 +5614,119 @@ fn merge_field(a: FieldState, b: FieldState) -> FieldState {
     }
 }
 
-/// Path-sensitive tracking of every individual structural (projected)
-/// place's own "does it currently still hold its own value" state
-/// (`rfcs/0012`) -- independent of, and complementary to, [`verify_
-/// resource_ownership`]'s own whole-value provenance lattice just above
-/// (which continues to track every plain root `ValueId` completely
-/// unchanged): a place with at least one projection is never a key
-/// there at all, and `PlaceRead`/`StorePlace` are the only two
-/// instructions this pass concerns itself with.
+/// Every structural place fact one program point holds, keyed by the
+/// exact [`Place`] (`rfcs/0012`). A key absent here is *not* a missing
+/// answer: it is the initial, untouched [`FieldState::Full`], which is
+/// exactly what a freshly constructed aggregate's own fields all start
+/// as. Facts are always read back through [`resolve_place_state`]/
+/// [`place_is_whole`], never a bare `get`, so an ancestor's own state
+/// always dominates its descendants' and a consumed descendant always
+/// makes its ancestors partial.
+type PlaceFacts = HashMap<Place<ValueId>, FieldState>;
+
+/// This place's own effective state within one structural ownership
+/// lattice (`rfcs/0012`): the *shortest* ancestor prefix (including
+/// itself) recorded as anything other than `Full`, or `Full` when no
+/// prefix was ever touched at all.
 ///
-/// Three states, exactly mirroring `LocationState`'s own three-way
-/// shape and for the identical underlying reason (see its own doc
-/// comment above): [`FieldState::Full`] (still holds its own value --
-/// the default for any place this pass never recorded anything for at
-/// all, since a fresh aggregate's own fields all start this way),
-/// [`FieldState::Empty`] (moved out, or not yet reinitialized after
-/// being moved out, on *every* reachable path), and [`FieldState::
-/// Maybe`] (moved out on only *some* of several reachable paths --
-/// absorbing, exactly like `MaybeUninitialized` is: a join can never
-/// upgrade back out of it once introduced, and neither a read/move
-/// -- which requires `Full` -- nor a reinitializing store -- which
-/// requires `Empty` -- ever accepts it). Reached via the identical
-/// reachable-union worklist shape, with the identical `computed`-set
-/// fixpoint-initialization discipline `RESOURCE_LOCATION_NOT_
-/// DEFINITELY_INITIALIZED`'s own fix required (see `in_state_for`'s own
-/// doc comment above): an as-yet-unprocessed loop back-edge predecessor
-/// must contribute nothing to a join, never be mistaken for a
-/// *computed* predecessor that has definitively proven a place `Empty`.
+/// This is what makes moving or dropping a parent consume its entire
+/// descendant subtree, whether or not each descendant ever got a key of
+/// its own -- a child read after its parent was transferred or dropped
+/// is rejected by exactly the same check a child read after its *own*
+/// transfer is. Walks a bounded prefix chain in a fixed order, so no
+/// `HashMap` iteration order can affect the answer.
+fn resolve_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
+    for len in 0..=place.projections.len() {
+        let prefix = Place {
+            root: place.root,
+            projections: place.projections[..len].to_vec(),
+        };
+        match facts.get(&prefix) {
+            Some(FieldState::Full) | None => {}
+            Some(state) => return *state,
+        }
+    }
+    FieldState::Full
+}
+
+/// `true` iff `place` itself *and* every place reachable through it
+/// still hold their own values -- what a *whole-value* use requires
+/// (`rfcs/0012`): observed, transferred, returned, raised, or consumed
+/// into an aggregate. A parent with a moved-out child fails this while
+/// still passing [`resolve_place_state`], which is precisely the
+/// difference between "you may not use this as a value" and "you may
+/// still reach an unaffected sibling through it, reinitialize an empty
+/// child, or structurally drop what remains". A boolean `any`, so
+/// `facts`' own iteration order cannot affect the answer.
+fn place_is_whole(facts: &PlaceFacts, place: &Place<ValueId>) -> bool {
+    if resolve_place_state(facts, place) != FieldState::Full {
+        return false;
+    }
+    !facts
+        .iter()
+        .any(|(key, state)| key != place && place.is_ancestor_of(key) && *state != FieldState::Full)
+}
+
+/// Records `place`'s own new leaf state, first clearing every strictly
+/// deeper key it now supersedes -- consuming or restoring a place
+/// settles everything reachable through it, so a stale finer-grained
+/// fact recorded before this point must never be consulted again.
+/// Reinitializing an empty child through this is exactly what restores
+/// its ancestors' own completeness.
+fn set_place_state(facts: &mut PlaceFacts, place: &Place<ValueId>, state: FieldState) {
+    facts.retain(|key, _| key == place || !place.is_ancestor_of(key));
+    facts.insert(place.clone(), state);
+}
+
+/// One structural ownership violation, recorded during a block's own
+/// transfer and reported once afterwards, so the dataflow fixpoint
+/// never reports the same instruction twice (`rfcs/0012`).
+#[derive(Clone, Copy)]
+enum OwnershipViolation {
+    /// A place read or moved where it is not definitely still holding
+    /// its own value -- including a child reached through an ancestor
+    /// already transferred or dropped.
+    UseAfterMove(ValueId),
+    /// A `StorePlace` targeting a place that is not definitely empty.
+    OverwriteLive(ValueId),
+    /// A place used as a *whole* value while one of its own affine
+    /// descendants is already consumed.
+    PartialWhole(ValueId),
+    /// A whole-value destruction or transfer of something already
+    /// consumed on a path reaching it: structural double cleanup.
+    DoubleCleanup(ValueId),
+}
+
+/// Path-sensitive structural ownership verification (`rfcs/0012`),
+/// independent of `resourceck` and reconstructed from NIR alone -- so
+/// hand-built NIR that never passed source checking is rejected on
+/// exactly the same terms as lowered NIR.
+///
+/// Complements [`verify_resource_ownership`], which tracks every *whole*
+/// nominally-resource value's own provenance, role and aliasing. This
+/// pass owns the two things that lattice deliberately does not model:
+/// the place *tree* (see [`resolve_place_state`]/[`place_is_whole`]),
+/// and the cleanup obligation of a *transitively* affine record, which
+/// is never itself a nominal resource and so is never a key there at
+/// all. The two never report the same value: the missing-cleanup check
+/// below deliberately skips every root the other pass already owns.
+///
+/// Uses the identical reachable-union worklist shape, with the identical
+/// `computed`-set fixpoint discipline `RESOURCE_LOCATION_NOT_DEFINITELY_
+/// INITIALIZED`'s own fix required: an as-yet-unprocessed loop back-edge
+/// predecessor contributes nothing to a join, and is never mistaken for
+/// a *computed* predecessor that has definitively proven a place
+/// consumed. A join takes the union of both sides' keys -- so a place
+/// touched on only one predecessor still joins to `Maybe` against the
+/// other's implicit `Full` -- which is what makes the result
+/// independent of predecessor discovery order, block vector order and
+/// `HashMap` order alike.
+#[allow(clippy::too_many_arguments)]
 fn verify_structural_places(
     function: &Function,
+    value_types: &HashMap<ValueId, Ty>,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
     source: SourceId,
     function_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -5685,15 +5801,14 @@ fn verify_structural_places(
     }
 
     // Every `Load`'s own result shares its own place-tracking identity
-    // with the slot it loads from (`rfcs/0012`), mirroring `verify_
-    // resource_ownership`'s own identical `load_origin`/`origin`: a
-    // `mutable` local reloads its own current whole value fresh, as a
-    // *new* `ValueId`, every time a place projects into it (`session.
-    // input`, then later `session.output`, are two entirely separate
-    // `Load(%slot)` results) -- without canonicalizing back to the one
-    // shared slot they both actually reach into, two places that are
-    // structurally the very same field would never compare equal here
-    // at all, breaking every one of this pass's own checks for it.
+    // with the slot it loads from (`rfcs/0012`): a `mutable` local
+    // reloads its own current whole value fresh, as a *new* `ValueId`,
+    // every time a place projects into it (`session.input`, then later
+    // `session.output`, are two entirely separate `Load(%slot)`
+    // results) -- without canonicalizing back to the one shared slot
+    // they both actually reach into, two places that are structurally
+    // the very same field would never compare equal here at all,
+    // breaking every one of this pass's own checks for it.
     let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
     for block in &function.blocks {
         for instruction in &block.instructions {
@@ -5715,93 +5830,308 @@ fn verify_structural_places(
         }
     };
 
-    type PlaceStates = HashMap<Place<ValueId>, FieldState>;
-
-    fn merge_place_states(a: &PlaceStates, b: &PlaceStates) -> PlaceStates {
-        let keys: std::collections::BTreeSet<Place<ValueId>> =
-            a.keys().chain(b.keys()).cloned().collect();
-        keys.into_iter()
-            .map(|key| {
-                let left = a.get(&key).copied().unwrap_or(FieldState::Full);
-                let right = b.get(&key).copied().unwrap_or(FieldState::Full);
-                (key, merge_field(left, right))
-            })
-            .collect()
-    }
-
-    fn in_state_for(
-        block_id: BlockId,
-        entry: BlockId,
-        incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
-        reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
-        out: &HashMap<BlockId, PlaceStates>,
-    ) -> PlaceStates {
-        let (reachable, computed) = reachable_and_computed;
-        if block_id == entry {
-            return PlaceStates::new();
+    // Whether a `Call`/`Invoke` argument at index `i` transfers
+    // ownership -- structural malformation is handled conservatively
+    // (every argument treated as consumed), for the identical reason
+    // `verify_resource_ownership`'s own copy of this is: wrongly
+    // assuming a mere observation could let a value an unknown callee
+    // actually took ownership of keep looking live afterwards.
+    let consumes_arg = |take: Option<&[bool]>, args_len: usize, i: usize| -> bool {
+        match take {
+            Some(flags) if flags.len() == args_len => flags.get(i).copied().unwrap_or(true),
+            _ => true,
         }
-        let Some(edges) = incoming_edges.get(&block_id) else {
-            return PlaceStates::new();
-        };
-        let mut edges = edges
-            .iter()
-            .filter(|pred| reachable.contains(pred) && computed.contains(pred));
-        let Some(first_pred) = edges.next() else {
-            return PlaceStates::new();
-        };
-        let mut acc = out.get(first_pred).cloned().unwrap_or_default();
-        for pred in edges {
-            let other = out.get(pred).cloned().unwrap_or_default();
-            acc = merge_place_states(&acc, &other);
+    };
+
+    // Deliberately *transitive*, never nominal `is_resource`: an affine
+    // record or variant owns real resources, and is exactly what this
+    // pass exists to track. An ordinary, freely-copyable value never
+    // enters this lattice at all.
+    let is_affine =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
+
+    // Every value whose *only* use anywhere in this function is as a
+    // `Drop` operand (`rfcs/0012`). A structural destruction of one
+    // field is expressed as a `Transfer` read of it immediately
+    // followed by a `Drop` of the result -- the two primitives
+    // composed, since there is no separate `drop.place` instruction --
+    // so such a read is a *destruction*, not a transfer, and is
+    // therefore legal on a partially moved parent: it destroys exactly
+    // what is left, which is the whole point of a structural drop. A
+    // `Transfer` read feeding anything else really is moving a value
+    // out to be used, and does require a complete one.
+    let drop_only_reads: HashSet<ValueId> = {
+        let mut dropped: HashSet<ValueId> = HashSet::new();
+        let mut otherwise_used: HashSet<ValueId> = HashSet::new();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Drop { value } => {
+                        dropped.insert(*value);
+                    }
+                    Instruction::Value { kind, .. } => {
+                        otherwise_used.extend(operands_of(kind));
+                    }
+                    Instruction::Store { slot, value, .. } => {
+                        otherwise_used.insert(*slot);
+                        otherwise_used.insert(*value);
+                    }
+                    Instruction::StorePlace { place, value } => {
+                        otherwise_used.insert(place.root);
+                        otherwise_used.insert(*value);
+                    }
+                }
+            }
+            match &block.terminator {
+                Terminator::Return(Some(v)) => {
+                    otherwise_used.insert(*v);
+                }
+                Terminator::Raise { value, .. } => {
+                    otherwise_used.insert(*value);
+                }
+                Terminator::CondBranch { condition, .. } => {
+                    otherwise_used.insert(*condition);
+                }
+                Terminator::Switch { scrutinee, .. } => {
+                    otherwise_used.insert(*scrutinee);
+                }
+                Terminator::Invoke { args, .. } => {
+                    otherwise_used.extend(args.iter().copied());
+                }
+                Terminator::Return(None) | Terminator::Branch(_) => {}
+            }
         }
-        acc
-    }
+        dropped.difference(&otherwise_used).copied().collect()
+    };
 
     let transfer = |block: &BasicBlock,
-                    in_state: &PlaceStates|
-     -> (PlaceStates, Vec<(ValueId, Place<ValueId>, bool)>) {
-        let mut states = in_state.clone();
-        // `(root, place, is_store)` -- `is_store` distinguishes a
-        // `PLACE_OVERWRITE_OF_LIVE_FIELD` (`StorePlace`, requires
-        // `Empty`) from a `PLACE_USE_AFTER_MOVE` (`PlaceRead`, requires
-        // `Full`) at the single reporting site below, keeping this
-        // closure's own per-block loop the one place either is ever
-        // actually decided.
-        let mut violations: Vec<(ValueId, Place<ValueId>, bool)> = Vec::new();
+                    in_state: &PlaceFacts|
+     -> (PlaceFacts, Vec<OwnershipViolation>) {
+        let mut facts = in_state.clone();
+        let mut violations: Vec<OwnershipViolation> = Vec::new();
+
         for instruction in &block.instructions {
+            // A value-producing instruction *defines* its own result
+            // afresh every time it executes, so any fact about that
+            // same id left over from a previous iteration -- carried
+            // back around a loop's own back edge -- is stale and must
+            // not survive into this definition (`rfcs/0012`). Without
+            // this, a resource constructed inside a loop body and
+            // destroyed at the end of that same iteration would look
+            // like a double cleanup on the second iteration. Skipped
+            // for a `Load`, whose canonical root is the slot it reads
+            // (defined by its own `Alloc`/`Store`), not this result.
+            if let Instruction::Value { result, .. } = instruction
+                && is_affine(*result)
+                && origin(*result) == *result
+            {
+                set_place_state(&mut facts, &Place::root(*result), FieldState::Full);
+            }
             match instruction {
                 Instruction::Value {
                     result,
                     kind: ValueKind::PlaceRead { place, mode },
                     ..
                 } => {
-                    if place.projections.is_empty() {
+                    let place = canonical(place);
+                    if resolve_place_state(&facts, &place) != FieldState::Full {
+                        violations.push(OwnershipViolation::UseAfterMove(*result));
                         continue;
                     }
-                    let place = canonical(place);
-                    let state = states.get(&place).copied().unwrap_or(FieldState::Full);
-                    if state != FieldState::Full {
-                        violations.push((*result, place, false));
-                    } else if *mode == crate::nir::OwnershipMode::Transfer {
-                        states.insert(place, FieldState::Empty);
+                    // Reading or moving a place *as a whole* requires
+                    // every affine descendant of it to still be there
+                    // -- unless this read exists purely to destroy it
+                    // (see `drop_only_reads`), which is exactly the
+                    // shape a structural drop of a partially moved
+                    // parent takes.
+                    if !drop_only_reads.contains(result) && !place_is_whole(&facts, &place) {
+                        violations.push(OwnershipViolation::PartialWhole(*result));
+                        continue;
+                    }
+                    if *mode == crate::nir::OwnershipMode::Transfer {
+                        set_place_state(&mut facts, &place, FieldState::Empty);
                     }
                 }
                 Instruction::StorePlace { place, value } => {
-                    if place.projections.is_empty() {
+                    let place = canonical(place);
+                    if resolve_place_state(&facts, &place) != FieldState::Empty {
+                        violations.push(OwnershipViolation::OverwriteLive(*value));
                         continue;
                     }
-                    let place = canonical(place);
-                    let state = states.get(&place).copied().unwrap_or(FieldState::Full);
-                    if state != FieldState::Empty {
-                        violations.push((*value, place, true));
-                    } else {
-                        states.insert(place, FieldState::Full);
-                    }
+                    // Storing a nested affine value creates exactly the
+                    // descendant obligations that value itself carries:
+                    // the place becomes `Full` and every stale deeper
+                    // fact recorded before it was emptied is cleared, so
+                    // an ancestor emptied only by this child's own move
+                    // becomes complete again.
+                    set_place_state(&mut facts, &place, FieldState::Full);
+                    consume_root(
+                        &mut facts,
+                        &mut violations,
+                        &is_affine,
+                        &origin,
+                        *value,
+                        true,
+                        *value,
+                    );
                 }
-                _ => {}
+                Instruction::Drop { value } => {
+                    // A structural `Drop` destroys this value *and*
+                    // every remaining descendant under it (`rfcs/0012`'s
+                    // chosen coherent model), which is exactly what
+                    // clearing every deeper key expresses -- so a
+                    // parent dropped after one of its own children was
+                    // already moved out is valid, and destroys only
+                    // what is left.
+                    consume_root(
+                        &mut facts,
+                        &mut violations,
+                        &is_affine,
+                        &origin,
+                        *value,
+                        false,
+                        *value,
+                    );
+                }
+                Instruction::Store { slot, value, mode } => match mode {
+                    crate::nir::OwnershipMode::Transfer => {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            *value,
+                            true,
+                            *value,
+                        );
+                        if is_affine(*slot) {
+                            set_place_state(
+                                &mut facts,
+                                &Place::root(origin(*slot)),
+                                FieldState::Full,
+                            );
+                        }
+                    }
+                    crate::nir::OwnershipMode::Observe => {
+                        observe_root(&facts, &mut violations, &is_affine, &origin, *value, *value);
+                    }
+                },
+                Instruction::Value { result, kind, .. } => match kind {
+                    ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            *source,
+                            true,
+                            *result,
+                        );
+                    }
+                    ValueKind::RecordCreate(_, _, fields) => {
+                        for field in fields {
+                            consume_root(
+                                &mut facts,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                *field,
+                                true,
+                                *result,
+                            );
+                        }
+                    }
+                    ValueKind::VariantCreate { payload, .. } => {
+                        for field in payload {
+                            consume_root(
+                                &mut facts,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                *field,
+                                true,
+                                *result,
+                            );
+                        }
+                    }
+                    ValueKind::Call(callee, _, args, _) => {
+                        let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                        for (i, arg) in args.iter().enumerate() {
+                            if consumes_arg(take, args.len(), i) {
+                                consume_root(
+                                    &mut facts,
+                                    &mut violations,
+                                    &is_affine,
+                                    &origin,
+                                    *arg,
+                                    true,
+                                    *result,
+                                );
+                            } else {
+                                observe_root(
+                                    &facts,
+                                    &mut violations,
+                                    &is_affine,
+                                    &origin,
+                                    *arg,
+                                    *result,
+                                );
+                            }
+                        }
+                    }
+                    ValueKind::RecordField { base, .. } => {
+                        observe_root(&facts, &mut violations, &is_affine, &origin, *base, *result);
+                    }
+                    _ => {}
+                },
             }
         }
-        (states, violations)
+
+        match &block.terminator {
+            Terminator::Return(Some(value)) => {
+                consume_root(
+                    &mut facts,
+                    &mut violations,
+                    &is_affine,
+                    &origin,
+                    *value,
+                    true,
+                    *value,
+                );
+            }
+            Terminator::Raise { value, .. } => {
+                consume_root(
+                    &mut facts,
+                    &mut violations,
+                    &is_affine,
+                    &origin,
+                    *value,
+                    true,
+                    *value,
+                );
+            }
+            Terminator::Invoke { callee, args, .. } => {
+                let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                for (i, arg) in args.iter().enumerate() {
+                    if consumes_arg(take, args.len(), i) {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            *arg,
+                            true,
+                            *arg,
+                        );
+                    } else {
+                        observe_root(&facts, &mut violations, &is_affine, &origin, *arg, *arg);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        (facts, violations)
     };
 
     let entry_block = function
@@ -5809,16 +6139,16 @@ fn verify_structural_places(
         .iter()
         .find(|b| b.id == entry)
         .expect("presence already checked above");
-    let (entry_out, _) = transfer(entry_block, &PlaceStates::new());
+    let (entry_out, _) = transfer(entry_block, &PlaceFacts::new());
 
-    let mut out: HashMap<BlockId, PlaceStates> = function
+    let mut out: HashMap<BlockId, PlaceFacts> = function
         .blocks
         .iter()
         .map(|b| {
             let initial = if b.id == entry {
                 entry_out.clone()
             } else {
-                PlaceStates::new()
+                PlaceFacts::new()
             };
             (b.id, initial)
         })
@@ -5837,7 +6167,8 @@ fn verify_structural_places(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = in_state_for(id, entry, &incoming_edges, (&reachable, &computed), &out);
+        let in_state =
+            in_state_for_places(id, entry, &incoming_edges, (&reachable, &computed), &out);
         let (new_out, _) = transfer(block, &in_state);
         let first_time = computed.insert(id);
         if first_time || out.get(&id) != Some(&new_out) {
@@ -5850,9 +6181,28 @@ fn verify_structural_places(
         }
     }
 
+    let owned_roots = structural_cleanup_obligations(function, value_types, agg, &origin);
+    // An obligation only exists at an exit its own definition actually
+    // reaches: a value defined in one branch is not leaked by the
+    // *other* branch's own `Return`, where it was never created at all.
+    // Dominance is exactly that question, and is already computed the
+    // same way for `verify_dominance`.
+    let dominators = compute_dominators(function);
+    let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value { result, .. } = instruction {
+                def_block.entry(*result).or_insert(block.id);
+            }
+        }
+    }
+    for param in &function.params {
+        def_block.entry(param.value).or_insert(entry);
+    }
+
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            in_state_for(
+            in_state_for_places(
                 block.id,
                 entry,
                 &incoming_edges,
@@ -5860,33 +6210,338 @@ fn verify_structural_places(
                 &out,
             )
         } else {
-            PlaceStates::new()
+            PlaceFacts::new()
         };
-        let (_, violations) = transfer(block, &in_state);
-        for (value, place, is_store) in violations {
-            let _ = &place;
-            let (code, verb) = if is_store {
-                (codes::PLACE_OVERWRITE_OF_LIVE_FIELD, "reinitializes")
-            } else {
-                (codes::PLACE_USE_AFTER_MOVE, "reads or moves")
+        let (exit_facts, violations) = transfer(block, &in_state);
+        for violation in violations {
+            let (code, value, detail) = match violation {
+                OwnershipViolation::UseAfterMove(v) => (
+                    codes::PLACE_USE_AFTER_MOVE,
+                    v,
+                    "reads or moves a structural place that is not definitely still holding its \
+                     own value on every path reaching it",
+                ),
+                OwnershipViolation::OverwriteLive(v) => (
+                    codes::PLACE_OVERWRITE_OF_LIVE_FIELD,
+                    v,
+                    "reinitializes a structural place that is not definitely empty on every path \
+                     reaching it",
+                ),
+                OwnershipViolation::PartialWhole(v) => (
+                    codes::PARTIAL_PLACE_USED_AS_WHOLE,
+                    v,
+                    "uses a place as a whole value while one of its own affine descendants is \
+                     already moved or dropped",
+                ),
+                OwnershipViolation::DoubleCleanup(v) => (
+                    codes::DUPLICATE_STRUCTURAL_CLEANUP,
+                    v,
+                    "destroys or transfers a place that was already consumed on a path reaching it",
+                ),
             };
             diagnostics.push(Diagnostic::error(
                 code,
                 source,
                 Span::dummy(),
-                format!(
-                    "function `{function_name}`: %{} {verb} a structural field that is not \
-                     definitely {} on every path reaching it",
-                    value.0,
-                    if is_store {
-                        "empty"
-                    } else {
-                        "still holding its own value"
-                    }
-                ),
+                format!("function `{function_name}`: %{} {detail}", value.0),
             ));
         }
+        if !reachable.contains(&block.id) {
+            continue;
+        }
+        let returned = match &block.terminator {
+            Terminator::Return(Some(v)) => Some(origin(*v)),
+            Terminator::Raise { value, .. } => Some(origin(*value)),
+            Terminator::Return(None) => None,
+            _ => continue,
+        };
+        for (root, ty) in &owned_roots {
+            let root_origin = origin(*root);
+            if returned == Some(root_origin) {
+                continue;
+            }
+            let reaches_this_exit = def_block.get(root).is_some_and(|def| {
+                *def == block.id || dominators.get(&block.id).is_some_and(|d| d.contains(def))
+            });
+            if !reaches_this_exit {
+                continue;
+            }
+            let mut obligations = Vec::new();
+            remaining_obligations(
+                &exit_facts,
+                &Place::root(root_origin),
+                ty,
+                agg,
+                0,
+                &mut obligations,
+            );
+            if !obligations.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::MISSING_STRUCTURAL_CLEANUP,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} still owns {} affine descendant(s) that \
+                         were never destroyed or transferred out when this exit is reached",
+                        root.0,
+                        obligations.len()
+                    ),
+                ));
+            }
+        }
     }
+}
+
+/// Consumes `value`'s own whole root place -- a `Drop`, a
+/// `Move`/`DeferCapture` source, an aggregate construction operand, a
+/// `take` argument, or a returned/raised operand (`rfcs/0012`).
+///
+/// `require_whole` separates a *transfer* (which needs a complete
+/// value, and so rejects a partially moved parent) from a structural
+/// `Drop` (which is explicitly allowed on a partially moved parent, and
+/// destroys exactly what is left). A consumption of something already
+/// consumed on this path is duplicate structural cleanup, reported
+/// against `reporter` -- the instruction result, where there is one, so
+/// the diagnostic names the operation rather than its operand.
+#[allow(clippy::too_many_arguments)]
+fn consume_root(
+    facts: &mut PlaceFacts,
+    violations: &mut Vec<OwnershipViolation>,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+    value: ValueId,
+    require_whole: bool,
+    reporter: ValueId,
+) {
+    if !is_affine(value) {
+        return;
+    }
+    let place = Place::root(origin(value));
+    if resolve_place_state(facts, &place) != FieldState::Full {
+        violations.push(OwnershipViolation::DoubleCleanup(reporter));
+        return;
+    }
+    if require_whole && !place_is_whole(facts, &place) {
+        violations.push(OwnershipViolation::PartialWhole(reporter));
+        return;
+    }
+    set_place_state(facts, &place, FieldState::Empty);
+}
+
+/// Observes `value`'s own whole root place without consuming it -- still
+/// requires it to be intact, since a partially moved aggregate has no
+/// whole value left to observe (`rfcs/0012`).
+fn observe_root(
+    facts: &PlaceFacts,
+    violations: &mut Vec<OwnershipViolation>,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+    value: ValueId,
+    reporter: ValueId,
+) {
+    if !is_affine(value) {
+        return;
+    }
+    let place = Place::root(origin(value));
+    if resolve_place_state(facts, &place) != FieldState::Full {
+        violations.push(OwnershipViolation::UseAfterMove(reporter));
+    } else if !place_is_whole(facts, &place) {
+        violations.push(OwnershipViolation::PartialWhole(reporter));
+    }
+}
+
+/// Every root this function itself owns and must therefore have fully
+/// cleaned up by any reachable exit (`rfcs/0012`), paired with its own
+/// type: a `take` parameter, and every instruction result that
+/// *produces* a new owned affine value.
+///
+/// Deliberately excludes a nominal `resource` root --
+/// [`verify_resource_ownership`] already owns that obligation end to
+/// end, and reporting it here too would double-report the identical
+/// leak under a second code. What is left is exactly the gap that
+/// lattice cannot see: a transitively affine *record*, which is never a
+/// key there at all.
+///
+/// Also excludes any root a `Terminator::Switch` or a
+/// `ValueKind::VariantPayload` reaches into: a `match`'s own decision
+/// tree takes ownership of the scrutinee and hands it to the extracted
+/// payloads, each of which is tracked in its own right from that point
+/// on, so demanding a separate destruction of the scrutinee too would
+/// double-count the very same obligation.
+fn structural_cleanup_obligations(
+    function: &Function,
+    value_types: &HashMap<ValueId, Ty>,
+    agg: &AggregateContext,
+    origin: &impl Fn(ValueId) -> ValueId,
+) -> Vec<(ValueId, Ty)> {
+    let mut decomposed: HashSet<ValueId> = HashSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                kind: ValueKind::VariantPayload { base, .. },
+                ..
+            } = instruction
+            {
+                decomposed.insert(origin(*base));
+            }
+        }
+        if let Terminator::Switch { scrutinee, .. } = &block.terminator {
+            decomposed.insert(origin(*scrutinee));
+        }
+    }
+
+    let owns = |v: ValueId| -> Option<Ty> {
+        let ty = value_types.get(&v)?;
+        if !is_affine_in(ty, agg) {
+            return None;
+        }
+        // A nominal `resource` root belongs to the other pass.
+        if matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)) {
+            return None;
+        }
+        if decomposed.contains(&origin(v)) {
+            return None;
+        }
+        Some(ty.clone())
+    };
+
+    let mut roots: Vec<(ValueId, Ty)> = Vec::new();
+    for param in &function.params {
+        if param.take
+            && let Some(ty) = owns(param.value)
+        {
+            roots.push((param.value, ty));
+        }
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let Instruction::Value { result, kind, .. } = instruction else {
+                continue;
+            };
+            let produces_owner = matches!(
+                kind,
+                ValueKind::RecordCreate(..)
+                    | ValueKind::VariantCreate { .. }
+                    | ValueKind::Move { .. }
+                    | ValueKind::DeferCapture { .. }
+                    | ValueKind::PlaceRead {
+                        mode: crate::nir::OwnershipMode::Transfer,
+                        ..
+                    }
+            );
+            if produces_owner && let Some(ty) = owns(*result) {
+                roots.push((*result, ty));
+            }
+        }
+    }
+    roots.sort_by_key(|(v, _)| *v);
+    roots.dedup_by_key(|(v, _)| *v);
+    roots
+}
+
+/// Every remaining *owned* affine obligation reachable through `place`,
+/// given its own current type (`rfcs/0012`): a declared `resource` is
+/// one obligation in its own right, an ordinary affine record
+/// decomposes into its own affine fields (in reverse declaration order,
+/// matching the destruction order the rest of the pipeline uses), and a
+/// variant -- whose live case is a runtime fact -- or an item with
+/// malformed generic metadata stays one opaque obligation. Mirrors
+/// `resourceck::flow::structural_drop_targets`, recomputed here from
+/// NIR alone rather than trusted from it.
+fn remaining_obligations(
+    facts: &PlaceFacts,
+    place: &Place<ValueId>,
+    ty: &Ty,
+    agg: &AggregateContext,
+    depth: usize,
+    out: &mut Vec<Place<ValueId>>,
+) {
+    if depth >= MAX_GENERIC_DEPTH {
+        return;
+    }
+    if resolve_place_state(facts, place) != FieldState::Full {
+        return;
+    }
+    if !is_affine_in(ty, agg) {
+        return;
+    }
+    let (item, args): (ItemId, Vec<Ty>) = match ty {
+        Ty::Named(item, _) => (*item, Vec::new()),
+        Ty::Applied(item, args) => (*item, args.clone()),
+        _ => return,
+    };
+    let Some(layout) = agg.records.get(&item) else {
+        // A variant, or an item with no record layout at all: one
+        // opaque obligation, never decomposed.
+        out.push(place.clone());
+        return;
+    };
+    let declared_resource = layout.affine;
+    let Ok(subst) = item_substitution(item, &args, agg) else {
+        out.push(place.clone());
+        return;
+    };
+    for (index, (_, field_ty)) in layout.fields.iter().enumerate().rev() {
+        let field_ty = substitute(field_ty, &subst);
+        if !is_affine_in(&field_ty, agg) {
+            continue;
+        }
+        remaining_obligations(
+            facts,
+            &place.field(item, crate::place::FieldId(index as u32)),
+            &field_ty,
+            agg,
+            depth + 1,
+            out,
+        );
+    }
+    if declared_resource {
+        out.push(place.clone());
+    }
+}
+
+/// The pairwise join of two reachable predecessors' own place facts --
+/// over the *union* of both sides' keys, so a place touched on only one
+/// of them still joins to `Maybe` against the other's implicit `Full`.
+/// Collected through a `BTreeSet`, so the result never depends on
+/// either map's own iteration order.
+fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
+    let keys: BTreeSet<Place<ValueId>> = a.keys().chain(b.keys()).cloned().collect();
+    keys.into_iter()
+        .map(|key| {
+            let left = a.get(&key).copied().unwrap_or(FieldState::Full);
+            let right = b.get(&key).copied().unwrap_or(FieldState::Full);
+            (key, merge_field(left, right))
+        })
+        .collect()
+}
+
+fn in_state_for_places(
+    block_id: BlockId,
+    entry: BlockId,
+    incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
+    reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
+    out: &HashMap<BlockId, PlaceFacts>,
+) -> PlaceFacts {
+    let (reachable, computed) = reachable_and_computed;
+    if block_id == entry {
+        return PlaceFacts::new();
+    }
+    let Some(edges) = incoming_edges.get(&block_id) else {
+        return PlaceFacts::new();
+    };
+    let mut edges = edges
+        .iter()
+        .filter(|pred| reachable.contains(pred) && computed.contains(pred));
+    let Some(first_pred) = edges.next() else {
+        return PlaceFacts::new();
+    };
+    let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+    for pred in edges {
+        let other = out.get(pred).cloned().unwrap_or_default();
+        acc = merge_place_facts(&acc, &other);
+    }
+    acc
 }
 
 fn verify_invoke_slot_initialization(

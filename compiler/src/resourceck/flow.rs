@@ -762,8 +762,9 @@ impl<'a> FlowChecker<'a> {
         let mut targets = Vec::new();
         for (index, field_ty) in fields.iter().enumerate().rev() {
             if self.is_affine(field_ty) {
-                targets
-                    .extend(self.structural_drop_targets(&place.field(item, FieldId(index as u32))));
+                targets.extend(
+                    self.structural_drop_targets(&place.field(item, FieldId(index as u32))),
+                );
             }
         }
         if self.affine.declared_resources.contains(&item) {
@@ -2667,11 +2668,7 @@ fn push_place(out: &mut Vec<Place<LocalId>>, place: Place<LocalId>) {
     }
 }
 
-fn collect_observed_places(
-    checker: &FlowChecker,
-    expr: &HirExpr,
-    out: &mut Vec<Place<LocalId>>,
-) {
+fn collect_observed_places(checker: &FlowChecker, expr: &HirExpr, out: &mut Vec<Place<LocalId>>) {
     match expr {
         HirExpr::Int { .. }
         | HirExpr::Float { .. }

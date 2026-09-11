@@ -482,33 +482,90 @@ impl<'a> Interpreter<'a> {
     }
 
     fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>) -> bool {
-        let Ty::Named(item, _) = ty else {
-            return false;
+        let item = match ty {
+            Ty::Named(item, _) => *item,
+            // A generic instantiation's own affinity depends on what it
+            // was instantiated *with* (`Box[File]` is affine, `Box[i64]`
+            // is not), so its own arguments are substituted into the
+            // declaration's field types before recursing -- never
+            // silently answered `false`, which would leave a
+            // `Box[File]` looking freely copyable at runtime.
+            Ty::Applied(item, args) => {
+                if self.is_resource(*item) {
+                    return true;
+                }
+                if !visiting.insert(*item) {
+                    return false;
+                }
+                let subst = self.type_substitution(*item, args);
+                let result = self.item_field_types(*item).iter().any(|fty| {
+                    self.is_affine_visiting(&crate::types::substitute(fty, &subst), visiting)
+                });
+                visiting.remove(item);
+                return result;
+            }
+            _ => return false,
         };
-        if self.is_resource(*item) {
+        if self.is_resource(item) {
             return true;
         }
-        if !visiting.insert(*item) {
+        if !visiting.insert(item) {
             return false;
         }
-        let field_types: Vec<Ty> = if let Some((_, record)) =
-            self.module.records.iter().find(|(id, _)| id == item)
-        {
-            record.fields.iter().map(|(_, t)| t.clone()).collect()
-        } else if let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| id == item) {
-            variant
-                .cases
-                .iter()
-                .flat_map(|c| c.payload.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let result = field_types
+        let result = self
+            .item_field_types(item)
             .iter()
             .any(|fty| self.is_affine_visiting(fty, visiting));
-        visiting.remove(item);
+        visiting.remove(&item);
         result
+    }
+
+    /// `item`'s own declared type parameters paired with `args`, for
+    /// substituting a generic aggregate's own declared field types down
+    /// to this one instantiation's concrete shape (`rfcs/0008`). An
+    /// arity disagreement produces a *partial* map rather than a
+    /// fabricated one: an unmapped `Ty::Param` stays symbolic and is
+    /// answered `false` by [`Self::is_affine_visiting`], never silently
+    /// defaulted to some other type.
+    fn type_substitution(
+        &self,
+        item: ItemId,
+        args: &[Ty],
+    ) -> std::collections::HashMap<crate::hir::TypeParamId, Ty> {
+        let params: Vec<crate::hir::TypeParamId> = self
+            .module
+            .records
+            .iter()
+            .find(|(id, _)| *id == item)
+            .map(|(_, r)| r.type_params.iter().map(|(id, _)| *id).collect())
+            .or_else(|| {
+                self.module
+                    .variants
+                    .iter()
+                    .find(|(id, _)| *id == item)
+                    .map(|(_, v)| v.type_params.iter().map(|(id, _)| *id).collect())
+            })
+            .unwrap_or_default();
+        params.into_iter().zip(args.iter().cloned()).collect()
+    }
+
+    /// `true` iff this *runtime* value is transitively affine -- what
+    /// makes it a legal structural `Drop` target (`rfcs/0012`).
+    /// Answered from the value's own dynamic item identity, never from
+    /// a static type this stage would otherwise have to be handed.
+    fn is_affine_value(&self, value: &Value) -> bool {
+        match value {
+            Value::Resource(_) => true,
+            Value::Record { item, .. } | Value::Variant { item, .. } => {
+                let mut visiting = HashSet::new();
+                self.is_resource(*item)
+                    || self
+                        .item_field_types(*item)
+                        .iter()
+                        .any(|fty| self.is_affine_visiting(fty, &mut visiting))
+            }
+            _ => false,
+        }
     }
 
     /// Reads or removes the value at `place`'s own final projection step
@@ -805,6 +862,45 @@ impl<'a> Interpreter<'a> {
     fn drop_value(&self, value: Value) -> Result<(), InterpreterError> {
         match value {
             Value::Resource(handle) => {
+                // A declared `resource`'s own remaining live children
+                // are destroyed first, in reverse declaration order,
+                // and its own outer identity last (`rfcs/0012`). Every
+                // child this frame's own NIR already destroyed
+                // individually (the ordinary case: `resourceck`'s own
+                // cleanup planning expands a resource place into its
+                // affine fields before the place itself) is a `Moved`/
+                // `Dropped` tombstone by now and is skipped here, so
+                // the two never double-destroy the same child. This
+                // recursion is what keeps a resource reached *without*
+                // that expansion -- a resource nested in a variant
+                // payload, whose live case is only known at runtime --
+                // from leaking its own children.
+                let (item, arity) = {
+                    let table = self.resources.borrow();
+                    let record = table.observe(handle)?;
+                    (record.item, record.fields.len())
+                };
+                let field_types = self.item_field_types(item);
+                for index in (0..arity).rev() {
+                    let Some(ty) = field_types.get(index) else {
+                        continue;
+                    };
+                    if !self.is_affine(ty) {
+                        continue;
+                    }
+                    let field = self.resources.borrow().observe_field(handle, index)?;
+                    if matches!(field, Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    // Tombstoned *before* the recursive destruction, not
+                    // after: a failure partway through destroying this
+                    // child must never leave it reachable for a second
+                    // destruction attempt through the same parent.
+                    self.resources
+                        .borrow_mut()
+                        .restore_field(handle, index, Value::Dropped)?;
+                    self.drop_value(field)?;
+                }
                 self.resources.borrow_mut().drop_resource(handle)?;
                 #[cfg(test)]
                 self.event_log
@@ -812,10 +908,36 @@ impl<'a> Interpreter<'a> {
                     .push(format!("drop:{}", handle.id.0));
                 Ok(())
             }
+            Value::Record { item, mut fields } => {
+                // An ordinary `record` that merely *contains* affine
+                // fields has no separate runtime identity of its own to
+                // destroy -- only its own live affine fields, in
+                // reverse declaration order. Silently ignoring this
+                // shape is exactly what let a variant carrying an
+                // affine record leak that record's own resources.
+                if !self.module.records.iter().any(|(id, _)| *id == item) {
+                    return Err(invalid("drop of a value naming an unknown record"));
+                }
+                let field_types = self.item_field_types(item);
+                for index in (0..fields.len()).rev() {
+                    let Some(ty) = field_types.get(index) else {
+                        continue;
+                    };
+                    if !self.is_affine(ty) {
+                        continue;
+                    }
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    let field = std::mem::replace(&mut fields[index], Value::Dropped);
+                    self.drop_value(field)?;
+                }
+                Ok(())
+            }
             Value::Variant {
                 item,
                 case,
-                payload,
+                mut payload,
             } => {
                 let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item)
                 else {
@@ -826,16 +948,49 @@ impl<'a> Interpreter<'a> {
                         "drop of a variant value naming an out-of-range case",
                     ));
                 };
+                // Only the active case, and only its own live payload
+                // fields, in reverse declaration order (`rfcs/0012`).
                 let payload_types = case_layout.payload.clone();
-                for (field, ty) in payload.into_iter().zip(payload_types) {
-                    if self.is_affine(&ty) && !matches!(field, Value::Moved | Value::Dropped) {
-                        self.drop_value(field)?;
+                for index in (0..payload.len()).rev() {
+                    let Some(ty) = payload_types.get(index) else {
+                        continue;
+                    };
+                    if !self.is_affine(ty) {
+                        continue;
                     }
+                    if matches!(payload[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    let field = std::mem::replace(&mut payload[index], Value::Dropped);
+                    self.drop_value(field)?;
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            Value::Moved => Err(invalid("drop of a field that was already moved")),
+            Value::Dropped => Err(invalid("double drop: this value was already destroyed")),
+            other => Err(invalid(format!(
+                "drop of a non-affine value ({})",
+                kind_name(&other)
+            ))),
         }
+    }
+
+    /// Every field type of the declared record/`resource` `item`, or
+    /// every payload type of the variant `item` flattened across its own
+    /// cases, in declaration order -- empty for an unknown item. Read
+    /// straight off this module's own layouts rather than re-derived.
+    fn item_field_types(&self, item: ItemId) -> Vec<Ty> {
+        if let Some((_, record)) = self.module.records.iter().find(|(id, _)| *id == item) {
+            return record.fields.iter().map(|(_, t)| t.clone()).collect();
+        }
+        if let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item) {
+            return variant
+                .cases
+                .iter()
+                .flat_map(|c| c.payload.clone())
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Transfers ownership of `value` if it is a resource (Blocker 8),
@@ -1128,13 +1283,22 @@ impl<'a> Interpreter<'a> {
                         // the same underlying record (not just the same
                         // `ValueId`) is independently caught here too,
                         // never silently treated as a fresh drop.
+                        // Every *transitively affine* value is a legal
+                        // structural drop target (`rfcs/0012`), not
+                        // just a declared `resource` or a variant: an
+                        // ordinary `record` carrying an affine field
+                        // owns real resources too, and silently
+                        // accepting it as a no-op leaked them.
                         match get(&values, value)? {
-                            v @ (Value::Resource(_) | Value::Variant { .. }) => {
-                                self.drop_value(v)?;
+                            v @ Value::Resource(_) => self.drop_value(v)?,
+                            v @ (Value::Record { .. } | Value::Variant { .. })
+                                if self.is_affine_value(&v) =>
+                            {
+                                self.drop_value(v)?
                             }
                             other => {
                                 return Err(invalid(format!(
-                                    "drop of a non-resource value ({})",
+                                    "drop of a non-affine value ({})",
                                     kind_name(&other)
                                 )));
                             }

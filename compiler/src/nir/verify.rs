@@ -5645,10 +5645,16 @@ fn verify_resource_ownership(
         // "Computed" is the presence of an `out` entry, and nothing
         // else: `out` holds a block only once `transfer` has actually
         // produced its state, so the two can never drift apart.
-        let mut edges = edges
-            .iter()
-            .filter(|(pred, _)| reachable.contains(pred) && out.contains_key(pred));
-        let Some((first_pred, first_extra)) = edges.next() else {
+        // Yields each usable edge together with the out-state it
+        // carries, so there is no second lookup that could ever need a
+        // default standing in for a state.
+        let mut edges = edges.iter().filter_map(|(pred, extra)| {
+            if !reachable.contains(pred) {
+                return None;
+            }
+            out.get(pred).map(|state| (state, extra))
+        });
+        let Some((first_state, first_extra)) = edges.next() else {
             // Nothing has been proven about this block yet. That is not
             // an empty state: an empty `provenance` map disagrees with
             // every real one, and `merge_provenance` reads disagreement
@@ -5666,8 +5672,7 @@ fn verify_resource_ownership(
         // that block's own success edge alone, never folded into any
         // sibling failure edge that happens to reach this same block
         // (`rfcs/0011`).
-        // The filter above already proved this key present.
-        let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+        let mut acc = first_state.clone();
         if let Some(slot) = first_extra
             && is_resource(*slot)
         {
@@ -5677,9 +5682,8 @@ fn verify_resource_ownership(
                 LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
             );
         }
-        for (pred, extra) in edges {
-            let (other_facts, mut other_live, other_dropped, mut other_prov) =
-                out.get(pred).cloned().unwrap_or_default();
+        for (state, extra) in edges {
+            let (other_facts, mut other_live, other_dropped, mut other_prov) = state.clone();
             if let Some(slot) = extra
                 && is_resource(*slot)
             {
@@ -6304,12 +6308,19 @@ fn verify_structural_places(
                         Some(Ty::Applied(_, args)) => args.clone(),
                         _ => Vec::new(),
                     };
-                    let payload_tys: Vec<Ty> = agg
-                        .variants
-                        .get(variant)
-                        .and_then(|v| v.cases.get(*case))
-                        .map(|c| c.payload.clone())
-                        .unwrap_or_default();
+                    let payload_tys: Vec<Ty> =
+                        match agg.variants.get(variant).and_then(|v| v.cases.get(*case)) {
+                            Some(layout) => layout.payload.clone(),
+                            // There is no declaration to check claims
+                            // against. This pass's own validation arm
+                            // already rejects a `DecomposeVariant` naming
+                            // an unknown variant or a case out of range and
+                            // owns that diagnostic, so demanding claims
+                            // here would only report the same defect twice.
+                            // Nothing is silently discharged: the program
+                            // is rejected either way.
+                            None => Vec::new(),
+                        };
                     let subst = item_substitution(*variant, &args, agg);
                     let mut incomplete = false;
                     if let Ok(subst) = &subst {

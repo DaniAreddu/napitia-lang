@@ -3718,6 +3718,7 @@ impl<'a> Lowering<'a> {
                 arm_index: i,
                 patterns: vec![PatternSlot::Real(&arm.pattern)],
                 bindings: Vec::new(),
+                discarded: Vec::new(),
             })
             .collect();
         let occurrences = vec![Occurrence {
@@ -3780,6 +3781,7 @@ impl<'a> Lowering<'a> {
                 arm_index: i,
                 patterns: vec![PatternSlot::Real(&arm.pattern)],
                 bindings: Vec::new(),
+                discarded: Vec::new(),
             })
             .collect();
         let occurrences = vec![Occurrence {
@@ -3829,6 +3831,22 @@ impl<'a> Lowering<'a> {
             for (local, value) in &winner.bindings {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(*value));
+            }
+            // Every affine payload position this winning row left
+            // unclaimed is destroyed right here, before the arm body
+            // runs (`rfcs/0012`) -- in *reverse* of the order the
+            // decision tree consumed them, which is exactly reverse
+            // payload declaration order. Emitting it here, rather than
+            // on each way out of the body, is what makes it correct for
+            // an arm that returns, raises, propagates with `?`, handles,
+            // breaks, or continues without enumerating any of them: by
+            // the time the body starts, the discarded payload is
+            // already gone, and nothing could have observed it (it was
+            // matched by `_`, so it has no name).
+            for occ in winner.discarded.iter().rev() {
+                if self.is_affine(&occ.ty) {
+                    fb.push_instruction(crate::nir::Instruction::Drop { value: occ.value });
+                }
             }
             let arm = &arms[winner.arm_index];
             let body_id = match &arm.body {
@@ -3903,13 +3921,16 @@ impl<'a> Lowering<'a> {
             let mut new_rows = Vec::with_capacity(rows.len());
             for r in rows {
                 let mut bindings = r.bindings;
-                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
-                    bindings.push((local, occ.value));
+                let mut discarded = r.discarded;
+                match self.classify(&r.patterns[0]) {
+                    Classified::Bind(local) => bindings.push((local, occ.value)),
+                    _ => discard_unclaimed(&mut discarded, &r.patterns[0], &occ),
                 }
                 new_rows.push(MatrixRow {
                     arm_index: r.arm_index,
                     patterns: r.patterns[1..].to_vec(),
                     bindings,
+                    discarded,
                 });
             }
             return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
@@ -3933,6 +3954,7 @@ impl<'a> Lowering<'a> {
                             arm_index: r.arm_index,
                             patterns: r.patterns[1..].to_vec(),
                             bindings: r.bindings.clone(),
+                            discarded: r.discarded.clone(),
                         });
                     }
                     Classified::Literal(LiteralTest::Bool(_)) => {}
@@ -3943,13 +3965,17 @@ impl<'a> Lowering<'a> {
                             arm_index: r.arm_index,
                             patterns: r.patterns[1..].to_vec(),
                             bindings,
+                            discarded: r.discarded.clone(),
                         });
                     }
                     Classified::Wildcard => {
+                        let mut discarded = r.discarded.clone();
+                        discard_unclaimed(&mut discarded, &r.patterns[0], &occ);
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns: r.patterns[1..].to_vec(),
                             bindings: r.bindings.clone(),
+                            discarded,
                         });
                     }
                     _ => {}
@@ -4002,16 +4028,26 @@ impl<'a> Lowering<'a> {
             .iter()
             .any(|r| matches!(self.classify(&r.patterns[0]), Classified::Case { .. }));
         if !any_real_test {
+            // This occurrence is never decomposed: no case block, no
+            // payload extraction. A row that binds it owns the whole
+            // value; a row that merely wildcards it owns it too --
+            // nothing else will ever destroy it -- so it is discarded
+            // here as one opaque whole (the interpreter's own
+            // structural drop then destroys whichever case turns out to
+            // be live, `rfcs/0012`).
             let mut new_rows = Vec::with_capacity(rows.len());
             for r in rows {
                 let mut bindings = r.bindings;
-                if let Classified::Bind(local) = self.classify(&r.patterns[0]) {
-                    bindings.push((local, occ.value));
+                let mut discarded = r.discarded;
+                match self.classify(&r.patterns[0]) {
+                    Classified::Bind(local) => bindings.push((local, occ.value)),
+                    _ => discard_unclaimed(&mut discarded, &r.patterns[0], &occ),
                 }
                 new_rows.push(MatrixRow {
                     arm_index: r.arm_index,
                     patterns: r.patterns[1..].to_vec(),
                     bindings,
+                    discarded,
                 });
             }
             return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
@@ -4078,31 +4114,53 @@ impl<'a> Lowering<'a> {
                         let mut patterns: Vec<PatternSlot<'h>> =
                             args.iter().map(PatternSlot::Real).collect();
                         patterns.extend(rest);
+                        // The occurrence itself is decomposed here, so
+                        // it is *not* discarded: its own payload
+                        // positions inherit the obligation, each one
+                        // individually.
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns,
                             bindings: r.bindings.clone(),
+                            discarded: r.discarded.clone(),
                         });
                     }
                     Classified::Case { .. } => {}
                     Classified::Bind(local) => {
                         let mut bindings = r.bindings.clone();
                         bindings.push((local, occ.value));
-                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        // The binding owns the whole variant value --
+                        // payload included -- so these synthesized
+                        // slots are `Owned`, never discardable: the
+                        // binding's own scope cleanup already destroys
+                        // everything reachable through it.
+                        let mut patterns = vec![PatternSlot::Owned; arity];
                         patterns.extend(rest);
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns,
                             bindings,
+                            discarded: r.discarded.clone(),
                         });
                     }
                     Classified::Wildcard => {
-                        let mut patterns = vec![PatternSlot::Wildcard; arity];
+                        // An unclaimed occurrence that *is* decomposed
+                        // hands its obligation down to its own payload
+                        // positions; one an ancestor binding already
+                        // owns keeps handing that ownership down
+                        // instead.
+                        let slot = if matches!(r.patterns[0], PatternSlot::Owned) {
+                            PatternSlot::Owned
+                        } else {
+                            PatternSlot::Wildcard
+                        };
+                        let mut patterns = vec![slot; arity];
                         patterns.extend(rest);
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns,
                             bindings: r.bindings.clone(),
+                            discarded: r.discarded.clone(),
                         });
                     }
                     // A literal pattern against a variant-typed
@@ -4169,10 +4227,13 @@ impl<'a> Lowering<'a> {
         };
         match self.classify(&first.patterns[0]) {
             Classified::Wildcard => {
+                let mut discarded = first.discarded.clone();
+                discard_unclaimed(&mut discarded, &first.patterns[0], &occ);
                 let new_rows = vec![MatrixRow {
                     arm_index: first.arm_index,
                     patterns: first.patterns[1..].to_vec(),
                     bindings: first.bindings.clone(),
+                    discarded,
                 }];
                 self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
@@ -4183,6 +4244,7 @@ impl<'a> Lowering<'a> {
                     arm_index: first.arm_index,
                     patterns: first.patterns[1..].to_vec(),
                     bindings,
+                    discarded: first.discarded.clone(),
                 }];
                 self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
@@ -4205,13 +4267,17 @@ impl<'a> Lowering<'a> {
                                 arm_index: r.arm_index,
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings: r.bindings.clone(),
+                                discarded: r.discarded.clone(),
                             });
                         }
                         Classified::Wildcard => {
+                            let mut discarded = r.discarded.clone();
+                            discard_unclaimed(&mut discarded, &r.patterns[0], &occ);
                             then_rows.push(MatrixRow {
                                 arm_index: r.arm_index,
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings: r.bindings.clone(),
+                                discarded,
                             });
                         }
                         Classified::Bind(local) => {
@@ -4221,6 +4287,7 @@ impl<'a> Lowering<'a> {
                                 arm_index: r.arm_index,
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings,
+                                discarded: r.discarded.clone(),
                             });
                         }
                         _ => {}
@@ -4259,7 +4326,7 @@ impl<'a> Lowering<'a> {
 
     fn classify<'h>(&self, slot: &PatternSlot<'h>) -> Classified<'h> {
         let pattern = match slot {
-            PatternSlot::Wildcard => return Classified::Wildcard,
+            PatternSlot::Wildcard | PatternSlot::Owned => return Classified::Wildcard,
             PatternSlot::Real(p) => *p,
         };
         match pattern {
@@ -4483,7 +4550,18 @@ impl<'a> Lowering<'a> {
 #[derive(Clone, Copy)]
 enum PatternSlot<'h> {
     Real(&'h HirPattern),
+    /// A synthesized wildcard for an occurrence *nothing* in this row
+    /// claims -- if the occurrence is affine, this row is the one and
+    /// only owner of it, and must destroy it (`rfcs/0012`).
     Wildcard,
+    /// A synthesized wildcard for an occurrence some *ancestor* pattern
+    /// of this row already bound as a whole value. Classified exactly
+    /// like [`PatternSlot::Wildcard`] for every matching decision --
+    /// the two differ only in ownership: this one's value belongs to
+    /// that ancestor binding, so destroying it here would double-drop
+    /// the very thing the binding's own scope cleanup is already going
+    /// to destroy.
+    Owned,
 }
 
 #[derive(Clone)]
@@ -4496,6 +4574,28 @@ struct MatrixRow<'h> {
     arm_index: usize,
     patterns: Vec<PatternSlot<'h>>,
     bindings: Vec<(LocalId, ValueId)>,
+    /// Every occurrence this row reached and left *unclaimed* -- a
+    /// payload position matched by `_` (or by a literal), whose parent
+    /// was itself decomposed rather than bound whole (`rfcs/0012`).
+    /// Accumulated in the order the decision tree consumed them, so
+    /// destroying them in reverse gives exactly reverse payload
+    /// declaration order. An affine occurrence listed here is destroyed
+    /// the instant this row wins, *before* its own arm body runs, so
+    /// every way out of that body -- normal completion, `return`,
+    /// `raise`, `?`, `handle`, `break`, `continue` -- is covered by
+    /// construction rather than by enumerating exits.
+    discarded: Vec<Occurrence>,
+}
+
+/// Records `occ` as unclaimed by the row whose leading slot is `slot`
+/// -- unless that slot is [`PatternSlot::Owned`], meaning an ancestor
+/// pattern already bound the value this occurrence came out of, and
+/// destroying it here would double-drop what that binding's own scope
+/// cleanup already destroys (`rfcs/0012`).
+fn discard_unclaimed(discarded: &mut Vec<Occurrence>, slot: &PatternSlot, occ: &Occurrence) {
+    if !matches!(slot, PatternSlot::Owned) {
+        discarded.push(occ.clone());
+    }
 }
 
 enum Classified<'h> {

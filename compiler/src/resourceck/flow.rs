@@ -511,14 +511,22 @@ impl<'a> FlowChecker<'a> {
                 if self.affine.declared_resources.contains(item) {
                     return true;
                 }
-                let type_params = self
-                    .affine
-                    .item_type_params
-                    .get(item)
-                    .cloned()
-                    .unwrap_or_default();
-                let subst: HashMap<TypeParamId, Ty> =
-                    type_params.into_iter().zip(args.iter().cloned()).collect();
+                // Missing or arity-disagreeing generic metadata is never
+                // an *empty* substitution (`rfcs/0008`): an
+                // unsubstituted `Ty::Param` answers `false`, which
+                // would let a genuinely affine instantiation be treated
+                // as a freely-copyable value with no ownership to
+                // track. Fail closed -- treat it as affine, so every
+                // ownership obligation is still demanded.
+                let type_params = self.affine.item_type_params.get(item);
+                let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
+                    return true;
+                };
+                let subst: HashMap<TypeParamId, Ty> = type_params
+                    .iter()
+                    .copied()
+                    .zip(args.iter().cloned())
+                    .collect();
                 self.affine
                     .aggregate_field_types
                     .get(item)
@@ -568,29 +576,20 @@ impl<'a> FlowChecker<'a> {
         if self.place_state(place) != ResourceState::Available {
             return false;
         }
-        let Ty::Named(item, _) = ty else {
-            // A `Ty::Applied` (generic) instantiation is tracked as a
-            // single whole-value place only (see `is_affine`'s own doc
-            // comment) -- `place_state` above already answered the
-            // whole question for it.
+        // A variant (whose live case is only a runtime fact), or an
+        // item with malformed generic metadata, is not decomposed at
+        // all -- `place_state` above already answered the whole
+        // question for it. A generic *record* instantiation now is
+        // decomposed, through its own substituted field types.
+        let Some((item, fields)) = self.decomposable_fields(ty) else {
             return true;
         };
-        if self.variant_items.contains(item) {
-            // A variant's own payload is never individually addressable
-            // (see `variant_items`'s own doc comment) -- `place_state`
-            // above already answered the whole question for it too,
-            // exactly like a generic instantiation.
-            return true;
-        }
-        self.affine
-            .aggregate_field_types
-            .get(item)
-            .into_iter()
-            .flatten()
+        fields
+            .iter()
             .enumerate()
             .filter(|(_, fty)| self.is_affine(fty))
             .all(|(index, fty)| {
-                self.place_is_wholly_available(&place.field(*item, FieldId(index as u32)), fty)
+                self.place_is_wholly_available(&place.field(item, FieldId(index as u32)), fty)
             })
     }
 
@@ -644,14 +643,69 @@ impl<'a> FlowChecker<'a> {
             let Projection::Field { owner, field } = projection else {
                 return None;
             };
-            ty = self
+            // The owner's own type arguments come from this place's
+            // *current* type at this exact step, and are substituted
+            // into the selected field's declared type before the walk
+            // continues from it (`rfcs/0008`, `rfcs/0012`) -- otherwise
+            // `Box[File]`'s own `item` field would resolve to a bare,
+            // never-affine `Ty::Param`.
+            let args: Vec<Ty> = match &ty {
+                Ty::Named(item, _) if item == owner => Vec::new(),
+                Ty::Applied(item, args) if item == owner => args.clone(),
+                _ => return None,
+            };
+            let field_ty = self
                 .affine
                 .aggregate_field_types
                 .get(owner)?
                 .get(field.0 as usize)?
                 .clone();
+            ty = self.substitute_field(*owner, &args, &field_ty)?;
         }
         Some(ty)
+    }
+
+    /// `field_ty` with `owner`'s own declared type parameters replaced
+    /// by `args` (`rfcs/0008`). `None` -- never a partial or empty
+    /// substitution -- when `owner` has no recorded type-parameter list
+    /// at all (an item `typeck` never registered; every real
+    /// record/variant always gets one, empty for a non-generic
+    /// declaration) or when its arity disagrees with `args`: an
+    /// unsubstituted `Ty::Param` escaping here would answer "not
+    /// affine" for a genuinely affine field.
+    fn substitute_field(&self, owner: ItemId, args: &[Ty], field_ty: &Ty) -> Option<Ty> {
+        let params = self.affine.item_type_params.get(&owner)?;
+        if params.len() != args.len() {
+            return None;
+        }
+        let subst: HashMap<TypeParamId, Ty> =
+            params.iter().copied().zip(args.iter().cloned()).collect();
+        Some(crate::types::substitute(field_ty, &subst))
+    }
+
+    /// `place`'s own declared aggregate item, its concrete type
+    /// arguments, and its already-substituted field types -- the shared
+    /// shape both [`Self::place_is_wholly_available`] and
+    /// [`Self::structural_drop_targets`] decompose an affine aggregate
+    /// through, generic or not. `None` for anything that is not a
+    /// decomposable record/resource: a primitive, a variant (whose live
+    /// case is a runtime fact -- see `variant_items`), or an item with
+    /// malformed generic metadata.
+    fn decomposable_fields(&self, ty: &Ty) -> Option<(ItemId, Vec<Ty>)> {
+        let (item, args): (ItemId, Vec<Ty>) = match ty {
+            Ty::Named(item, _) => (*item, Vec::new()),
+            Ty::Applied(item, args) => (*item, args.clone()),
+            _ => return None,
+        };
+        if self.variant_items.contains(&item) {
+            return None;
+        }
+        let declared = self.affine.aggregate_field_types.get(&item)?;
+        let substituted = declared
+            .iter()
+            .map(|fty| self.substitute_field(item, &args, fty))
+            .collect::<Option<Vec<Ty>>>()?;
+        Some((item, substituted))
     }
 
     /// Every place `place` structurally owns that is currently still
@@ -689,39 +743,31 @@ impl<'a> FlowChecker<'a> {
         let Some(ty) = self.place_ty(place) else {
             return Vec::new();
         };
-        let Ty::Named(item, _) = &ty else {
-            // Either a non-affine leaf (never reached: the caller only
-            // ever calls this on an affine place) or a generic
-            // instantiation, tracked whole-value-only.
+        // A variant's own live payload can only be identified at
+        // runtime (whichever case is actually active) -- never
+        // decomposed into `aggregate_field_types`'s own flattened,
+        // cross-case payload list as if it were one record's own named
+        // fields (see `variant_items`'s own doc comment). Contributed
+        // as a single opaque target regardless of `declared_resources`
+        // (a variant is never itself declared `resource`, but still
+        // needs exactly one "destroy whatever is actually live inside"
+        // action of its own): `nir::lower` reads this back as a place
+        // to move-then-drop as a whole, and the interpreter recursively
+        // destroys only the active case's own affine payload fields
+        // when that drop actually runs. Same single-target treatment
+        // for an item with malformed generic metadata, which is never
+        // decomposed on a substitution nobody could build.
+        let Some((item, fields)) = self.decomposable_fields(&ty) else {
             return vec![place.clone()];
         };
-        if self.variant_items.contains(item) {
-            // A variant's own live payload can only be identified at
-            // runtime (whichever case is actually active) -- never
-            // decomposed into `aggregate_field_types`'s own flattened,
-            // cross-case payload list as if it were one record's own
-            // named fields (see `variant_items`'s own doc comment).
-            // Contributed as a single opaque target regardless of
-            // `declared_resources` (a variant is never itself declared
-            // `resource`, but still needs exactly one "destroy whatever
-            // is actually live inside" action of its own): `nir::lower`
-            // reads this back as a place to move-then-drop as a whole,
-            // and the interpreter recursively destroys only the active
-            // case's own affine payload fields when that drop actually
-            // runs.
-            return vec![place.clone()];
-        }
         let mut targets = Vec::new();
-        if let Some(fields) = self.affine.aggregate_field_types.get(item) {
-            for (index, field_ty) in fields.iter().enumerate().rev() {
-                if self.is_affine(field_ty) {
-                    targets.extend(
-                        self.structural_drop_targets(&place.field(*item, FieldId(index as u32))),
-                    );
-                }
+        for (index, field_ty) in fields.iter().enumerate().rev() {
+            if self.is_affine(field_ty) {
+                targets
+                    .extend(self.structural_drop_targets(&place.field(item, FieldId(index as u32))));
             }
         }
-        if self.affine.declared_resources.contains(item) {
+        if self.affine.declared_resources.contains(&item) {
             targets.push(place.clone());
         }
         targets

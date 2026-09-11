@@ -305,6 +305,7 @@ consumed them, which is exactly reverse payload declaration order.
 %1 = load.place %0.@Session#1.0     ; ValueKind::PlaceRead { mode: Observe }
 %2 = move.place %0.@Session#1.0     ; ValueKind::PlaceRead { mode: Transfer }
 store.place %0.@Session#1.0, %3     ; Instruction::StorePlace
+decompose %0 : @Holder.0 [0: %4]    ; Instruction::DecomposeVariant
 ```
 
 `Place<ValueId>` is the same generic `Place` rooted at a NIR value
@@ -334,6 +335,53 @@ verifier distinguishes them by what the result is used for: a
 is as a `Drop` operand is a destruction, and is therefore legal on a
 partially moved parent; one feeding anything else is a real transfer and
 requires a complete value.
+
+### Decomposition is an instruction, not an inference
+
+Taking a variant apart is an **ownership transfer**, and it is written
+down as one. `ValueKind::VariantPayload` is only a *read*: one payload
+extraction is shared by every arm reachable through a case, so it can
+appear in a block that dominates arms which do and do not claim it.
+Nothing about it says who now owns what.
+
+`Instruction::DecomposeVariant { value, variant, case, taken }` says
+exactly that, and is emitted where the decision tree *commits* to a
+case:
+
+* the shell `value` must be `Full` and whole, and becomes `Empty`;
+* every affine payload position of `case` must be claimed exactly once
+  across `taken` -- a binding, a discarded `_`, or a payload that is
+  itself decomposed further;
+* each claimed value becomes `Full` from that block, and owes its own
+  cleanup from there.
+
+Because it is an instruction, the consumption *flows*: it is a fact on
+the path it happened on, joined at merges like any other, and never
+re-derived at an exit where the case refinement no longer holds (two
+arms meeting at a shared block agree on no case at all). The function-
+global "was this value consumed anywhere?" scan this replaced was
+path-insensitive and unsound in exactly the shape below -- a whole-value
+drop in one branch cancelled a disjoint sibling branch's payload
+ownership:
+
+```napitia
+fn dispose(cond: bool, take maybe: Maybe[File]) -> i64 {
+    if cond {
+        drop maybe;          // the shell, as one whole value
+    } else {
+        match maybe {        // decomposed, and the payload is owned here
+            Some(file) => drop file,
+            None => {}
+        }
+    }
+    0
+}
+```
+
+Ownership that begins inside one branch is also only ever demanded at
+exits that branch actually reaches: each obligation records the block
+its ownership *began* in, and is checked at an exit only when that block
+dominates it.
 
 ### The structural ownership lattice
 
@@ -497,24 +545,43 @@ missing.
 ### `StorePlace` is a transfer
 
 Reinitializing a place *transfers* ownership into it. The interpreter
-runs three strictly ordered phases, so the operation is transactional:
+runs two phases, and the first one answers every fallible question, so
+the operation is transactional:
 
-1. **Validate**, mutating nothing: the destination chain must be
-   reachable and its final field provably empty, and every resource
-   reachable through the source must be a live, current, owning handle.
-   Checking the source's whole tree up front is what makes a nested
-   aggregate's transfer all-or-nothing -- bumping the first child's
-   generation and then discovering the second is stale would leave it
-   half-transferred with no way back.
-2. **Transfer**: the only phase that bumps a generation, and it cannot
-   fail, because phase 1 already proved every child transferable.
-3. **Commit**: write the transferred value into the place, and tombstone
-   the source -- both by its exact id and by the storage it
-   canonicalizes to, since a `Load` result and the slot it read share
-   one identity.
+**Phase A -- validate and plan**, mutating nothing. One traversal of the
+source builds a complete plan: the declaration exists and its kind
+matches the runtime value, generic type-argument arity resolves, every
+runtime field and payload count equals its declared one, the active
+variant case exists, every handle is a live current owner, the
+destination chain is reachable with its final field provably empty, and
+the rebuilt value is constructed around the handles it *will* own --
+each post-transfer generation computed, never applied.
 
-A failure in phase 1 therefore leaves the source valid, the destination
-unchanged, and no generation bumped; the refusal is deterministic.
+Two checks need the plan rather than the recursion, and are the reason
+it exists:
+
+* **no resource identity may appear twice** anywhere in the source.
+  Validating values recursively cannot see this: each occurrence
+  independently observes the one live handle and passes. The transfer
+  then moves the first, and the second -- now stale -- fails partway
+  through, leaving the runtime half-mutated with the new owner
+  unreachable. `[Resource(h), Resource(h)]` is exactly that shape.
+* **the source and the destination may not share an identity.**
+  Traversing the destination reads resources of its own; transferring
+  one of those would invalidate the very handle the install has to
+  reach through.
+
+**Phase B -- commit**, which cannot fail: apply every generation
+transition together, write the rebuilt value into the place, and
+tombstone the source -- both by its exact id and by the storage it
+canonicalizes to, since a `Load` result and the slot it read share one
+identity.
+
+A refusal in phase A therefore leaves the frame's value map, the
+resource table, every generation, every `Alive`/`Moved`/`Dropped`
+status, the canonical owner information and the event log all exactly as
+it found them, and the refusal is deterministic: the same store refused
+twice reports the identical error, with the state still unchanged.
 Without the transfer, the source and the destination both held an
 apparently-current owner handle for the same resource -- two live owners
 of one identity.
@@ -579,19 +646,38 @@ back from -- would lose the mutation entirely.
 One operation covers every transitively affine runtime value: a
 `Resource`, a `Record` containing affine fields, a `Variant` whose
 active case carries an affine payload, an instantiated generic
-aggregate, and any nesting of those. It visits live affine fields in
-reverse declaration order, recurses into nested affine aggregates, skips
-`Moved`/`Dropped` tombstones (so a child NIR already destroyed
-individually is never destroyed twice), destroys only the active variant
-case, and destroys a declared `resource`'s own outer identity *after*
-its remaining children. Each child is tombstoned `Dropped` before its
-recursive destruction rather than after, so a failure partway through
-cannot leave one reachable for a second attempt. Double drop is rejected
-deterministically by the resource table itself. Rust's own `Drop` is
-never involved.
+aggregate, and any nesting of those. It is a transaction, for the same
+reason `StorePlace` is: the complete destruction graph is validated and
+ordered *before* any status changes and before any event is emitted.
 
-Silently ignoring an affine `Value::Record` -- as an earlier draft did
--- leaked every resource a variant's record payload carried.
+**Phase A -- plan**, mutating nothing. At every level: the declaration
+exists and its kind matches the runtime value, generic type-argument
+arity resolves and substitutes, the runtime field count equals the
+declared field count, the active variant case exists and carries exactly
+its declared payload count, every handle is a live current owner, and no
+resource identity is reachable twice (which alone would destroy one
+identity twice). The plan is the destruction order itself: live affine
+fields in reverse declaration order, each fully expanded first,
+`Moved`/`Dropped` tombstones skipped (so a child NIR already destroyed
+individually is never destroyed twice), only the active case of a
+variant visited, and a declared `resource`'s own outer identity after
+all of its remaining children.
+
+**Phase B -- execute** the plan, which can no longer fail partway.
+
+**Nothing is ever skipped.** A shape that disagrees with its declaration
+is an error, not a field to pass over. Looking each declared field type
+up and continuing past a miss -- as an earlier implementation did --
+let a value carrying a field its declaration does not declare have that
+field silently ignored: the outer resource was destroyed while a live
+resource in the extra field leaked, and the drop reported success.
+Silently ignoring an affine `Value::Record` likewise leaked every
+resource a variant's record payload carried.
+
+A refused destruction therefore changes no status, no generation and no
+event at all, and reports the identical error every time. Double drop is
+rejected deterministically by the resource table itself. Rust's own
+`Drop` is never involved.
 
 ## Deferred actions capture exact places
 

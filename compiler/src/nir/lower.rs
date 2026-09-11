@@ -942,6 +942,15 @@ struct FnBuilder {
     /// matching `defer`'s own "never delays argument evaluation, only
     /// the call's own side effect" rule.
     defer_calls: HashMap<ExprId, PendingDefer>,
+    /// Every variant payload occurrence this function has extracted,
+    /// keyed by the value the extraction produced, paired with the
+    /// exact case payload position it came out of (`rfcs/0012`).
+    ///
+    /// Purely mechanical bookkeeping -- a value identifies exactly one
+    /// extraction instruction -- so the ownership *transfer* can be
+    /// emitted later, on the one path whose winning arm actually
+    /// claims that payload. No ownership decision is recorded here.
+    payload_sources: HashMap<ValueId, PayloadSource>,
 }
 
 impl FnBuilder {
@@ -959,6 +968,7 @@ impl FnBuilder {
             loop_stack: Vec::new(),
             return_ty,
             defer_calls: HashMap::new(),
+            payload_sources: HashMap::new(),
         }
     }
 
@@ -3793,6 +3803,7 @@ impl<'a> Lowering<'a> {
                 patterns: vec![PatternSlot::Real(&arm.pattern)],
                 bindings: Vec::new(),
                 discarded: Vec::new(),
+                decomposed: Vec::new(),
             })
             .collect();
         let occurrences = vec![Occurrence {
@@ -3856,6 +3867,7 @@ impl<'a> Lowering<'a> {
                 patterns: vec![PatternSlot::Real(&arm.pattern)],
                 bindings: Vec::new(),
                 discarded: Vec::new(),
+                decomposed: Vec::new(),
             })
             .collect();
         let occurrences = vec![Occurrence {
@@ -3871,6 +3883,57 @@ impl<'a> Lowering<'a> {
             0,
         )?;
         Ok(LoweredExpr::Diverged)
+    }
+
+    /// Emits one `DecomposeVariant` per shell this winning row actually
+    /// took apart, on this arm's own path alone (`rfcs/0012`).
+    ///
+    /// A row that bound the *whole* variant instead decomposed nothing,
+    /// so nothing is emitted for it and the binding keeps ownership of
+    /// the shell -- which is exactly what lets a sibling branch drop the
+    /// same variant whole without either path affecting the other.
+    ///
+    /// Outermost shell first, so each decomposition's own claimed
+    /// payloads are already owned by the time a deeper one takes them
+    /// apart in turn.
+    fn emit_variant_decomposition(&self, fb: &mut FnBuilder, winner: &MatrixRow<'_>) {
+        for (shell, variant, case) in &winner.decomposed {
+            // Exactly the payload positions this winning row claims out
+            // of this shell -- bound to a local, or ignored by `_` and
+            // therefore destroyed right after. A position it decomposes
+            // further is claimed by its own deeper decomposition
+            // instead, and is deliberately absent here.
+            let mut taken: Vec<(usize, ValueId)> = Vec::new();
+            let claimed: Vec<ValueId> = winner
+                .bindings
+                .iter()
+                .map(|(_, value)| *value)
+                .chain(winner.discarded.iter().map(|occ| occ.value))
+                // A payload this row takes apart *further* is claimed
+                // too: ownership passes to it here, and its own
+                // decomposition passes it on again. Leaving it out
+                // would make this decomposition incomplete for a
+                // payload that is in fact fully accounted for.
+                .chain(winner.decomposed.iter().map(|(shell, _, _)| *shell))
+                .collect();
+            for value in claimed {
+                if let Some(source) = fb.payload_sources.get(&value)
+                    && source.base == *shell
+                    && source.variant == *variant
+                    && source.case == *case
+                {
+                    taken.push((source.index, value));
+                }
+            }
+            taken.sort_unstable();
+            taken.dedup();
+            fb.push_instruction(crate::nir::Instruction::DecomposeVariant {
+                value: *shell,
+                variant: *variant,
+                case: *case,
+                taken,
+            });
+        }
     }
 
     fn lower_decision<'h>(
@@ -3906,6 +3969,18 @@ impl<'a> Lowering<'a> {
                 fb.local_bindings
                     .insert(*local, LocalBinding::Direct(*value));
             }
+            // Ownership of a payload moves at the exact point an arm
+            // *claims* it, on that arm's own path alone (`rfcs/0012`).
+            // The extraction itself happened earlier, in the case
+            // block, before the decision tree knew which arm would win
+            // -- and whether ownership moves depends entirely on that:
+            // a row that binds the payload claims it, a row that bound
+            // the *whole* variant instead does not, and a row that
+            // decomposes it further leaves the claim to whichever
+            // position finally binds. So the transfer is emitted here,
+            // once the winner is known, and never from the shared
+            // extraction.
+            self.emit_variant_decomposition(fb, winner);
             // Every affine payload position this winning row left
             // unclaimed is destroyed right here, before the arm body
             // runs (`rfcs/0012`) -- in *reverse* of the order the
@@ -3996,6 +4071,7 @@ impl<'a> Lowering<'a> {
             for r in rows {
                 let mut bindings = r.bindings;
                 let mut discarded = r.discarded;
+                let decomposed = r.decomposed;
                 match self.classify(&r.patterns[0]) {
                     Classified::Bind(local) => bindings.push((local, occ.value)),
                     _ => discard_unclaimed(&mut discarded, &r.patterns[0], &occ),
@@ -4005,6 +4081,7 @@ impl<'a> Lowering<'a> {
                     patterns: r.patterns[1..].to_vec(),
                     bindings,
                     discarded,
+                    decomposed,
                 });
             }
             return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
@@ -4029,6 +4106,7 @@ impl<'a> Lowering<'a> {
                             patterns: r.patterns[1..].to_vec(),
                             bindings: r.bindings.clone(),
                             discarded: r.discarded.clone(),
+                            decomposed: r.decomposed.clone(),
                         });
                     }
                     Classified::Literal(LiteralTest::Bool(_)) => {}
@@ -4040,16 +4118,19 @@ impl<'a> Lowering<'a> {
                             patterns: r.patterns[1..].to_vec(),
                             bindings,
                             discarded: r.discarded.clone(),
+                            decomposed: r.decomposed.clone(),
                         });
                     }
                     Classified::Wildcard => {
                         let mut discarded = r.discarded.clone();
+                        let decomposed = r.decomposed.clone();
                         discard_unclaimed(&mut discarded, &r.patterns[0], &occ);
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns: r.patterns[1..].to_vec(),
                             bindings: r.bindings.clone(),
                             discarded,
+                            decomposed,
                         });
                     }
                     _ => {}
@@ -4113,6 +4194,7 @@ impl<'a> Lowering<'a> {
             for r in rows {
                 let mut bindings = r.bindings;
                 let mut discarded = r.discarded;
+                let decomposed = r.decomposed;
                 match self.classify(&r.patterns[0]) {
                     Classified::Bind(local) => bindings.push((local, occ.value)),
                     _ => discard_unclaimed(&mut discarded, &r.patterns[0], &occ),
@@ -4122,6 +4204,7 @@ impl<'a> Lowering<'a> {
                     patterns: r.patterns[1..].to_vec(),
                     bindings,
                     discarded,
+                    decomposed,
                 });
             }
             return self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1);
@@ -4191,12 +4274,17 @@ impl<'a> Lowering<'a> {
                         // The occurrence itself is decomposed here, so
                         // it is *not* discarded: its own payload
                         // positions inherit the obligation, each one
-                        // individually.
+                        // individually. Recorded on this row alone, so
+                        // a sibling row that binds the whole variant
+                        // instead keeps owning the shell.
+                        let mut decomposed = r.decomposed.clone();
+                        decomposed.push((occ.value, variant_item, case_index));
                         new_rows.push(MatrixRow {
                             arm_index: r.arm_index,
                             patterns,
                             bindings: r.bindings.clone(),
                             discarded: r.discarded.clone(),
+                            decomposed,
                         });
                     }
                     Classified::Case { .. } => {}
@@ -4215,6 +4303,7 @@ impl<'a> Lowering<'a> {
                             patterns,
                             bindings,
                             discarded: r.discarded.clone(),
+                            decomposed: r.decomposed.clone(),
                         });
                     }
                     Classified::Wildcard => {
@@ -4235,6 +4324,7 @@ impl<'a> Lowering<'a> {
                             patterns,
                             bindings: r.bindings.clone(),
                             discarded: r.discarded.clone(),
+                            decomposed: r.decomposed.clone(),
                         });
                     }
                     // A literal pattern against a variant-typed
@@ -4257,6 +4347,19 @@ impl<'a> Lowering<'a> {
                 let v = fb.push_value(
                     ty.clone(),
                     ValueKind::VariantPayload {
+                        base: occ.value,
+                        variant: variant_item,
+                        case: case_index,
+                        index: i,
+                    },
+                );
+                // Extraction alone is only a *read*: which arm (if any)
+                // takes ownership is not known until the decision tree
+                // commits. Remembering where this occurrence came from
+                // is what lets the transfer be emitted there instead.
+                fb.payload_sources.insert(
+                    v,
+                    PayloadSource {
                         base: occ.value,
                         variant: variant_item,
                         case: case_index,
@@ -4302,12 +4405,14 @@ impl<'a> Lowering<'a> {
         match self.classify(&first.patterns[0]) {
             Classified::Wildcard => {
                 let mut discarded = first.discarded.clone();
+                let decomposed = first.decomposed.clone();
                 discard_unclaimed(&mut discarded, &first.patterns[0], &occ);
                 let new_rows = vec![MatrixRow {
                     arm_index: first.arm_index,
                     patterns: first.patterns[1..].to_vec(),
                     bindings: first.bindings.clone(),
                     discarded,
+                    decomposed,
                 }];
                 self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
@@ -4319,6 +4424,7 @@ impl<'a> Lowering<'a> {
                     patterns: first.patterns[1..].to_vec(),
                     bindings,
                     discarded: first.discarded.clone(),
+                    decomposed: first.decomposed.clone(),
                 }];
                 self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
@@ -4342,16 +4448,19 @@ impl<'a> Lowering<'a> {
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings: r.bindings.clone(),
                                 discarded: r.discarded.clone(),
+                                decomposed: r.decomposed.clone(),
                             });
                         }
                         Classified::Wildcard => {
                             let mut discarded = r.discarded.clone();
+                            let decomposed = r.decomposed.clone();
                             discard_unclaimed(&mut discarded, &r.patterns[0], &occ);
                             then_rows.push(MatrixRow {
                                 arm_index: r.arm_index,
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings: r.bindings.clone(),
                                 discarded,
+                                decomposed,
                             });
                         }
                         Classified::Bind(local) => {
@@ -4362,6 +4471,7 @@ impl<'a> Lowering<'a> {
                                 patterns: r.patterns[1..].to_vec(),
                                 bindings,
                                 discarded: r.discarded.clone(),
+                                decomposed: r.decomposed.clone(),
                             });
                         }
                         _ => {}
@@ -4644,6 +4754,19 @@ struct Occurrence {
     ty: Ty,
 }
 
+/// The exact variant case payload position one extracted occurrence was
+/// read out of (`rfcs/0012`) -- everything
+/// `Instruction::TakeVariantPayload` needs to name that storage, kept so
+/// the ownership transfer can be emitted later, at the point an arm
+/// actually claims the payload, rather than at the shared extraction.
+#[derive(Clone, Copy)]
+struct PayloadSource {
+    base: ValueId,
+    variant: ItemId,
+    case: usize,
+    index: usize,
+}
+
 struct MatrixRow<'h> {
     arm_index: usize,
     patterns: Vec<PatternSlot<'h>>,
@@ -4659,6 +4782,15 @@ struct MatrixRow<'h> {
     /// `raise`, `?`, `handle`, `break`, `continue` -- is covered by
     /// construction rather than by enumerating exits.
     discarded: Vec<Occurrence>,
+    /// Every variant shell this row took apart on the way here, as
+    /// `(shell value, variant, case)`, outermost first (`rfcs/0012`).
+    ///
+    /// Only a row that actually tested a case decomposes: a row that
+    /// bound the whole variant instead keeps owning the shell, and
+    /// records nothing. That distinction is exactly what makes a
+    /// sibling branch's whole-value drop independent of this one's
+    /// payload ownership.
+    decomposed: Vec<(ValueId, ItemId, usize)>,
 }
 
 /// Records `occ` as unclaimed by the row whose leading slot is `slot`

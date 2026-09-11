@@ -97,6 +97,26 @@ impl<Root: Copy> Place<Root> {
         }
     }
 
+    /// Appends one payload position of one specific variant case
+    /// (`rfcs/0012`) -- the storage a `match` arm takes ownership out of
+    /// when it claims that payload. Never reached through source-level
+    /// `.field` syntax: a variant's payload is only ever named by a
+    /// pattern, so this exists so ownership of *one case's* own payload
+    /// position can be tracked as its own place, path-sensitively, the
+    /// same way a record field already is.
+    pub fn variant_field(&self, variant: ItemId, case: CaseId, field: FieldId) -> Self {
+        let mut projections = self.projections.clone();
+        projections.push(Projection::VariantField {
+            variant,
+            case,
+            field,
+        });
+        Place {
+            root: self.root,
+            projections,
+        }
+    }
+
     /// `true` iff `self` is `other`, or a place `other` was projected
     /// out of (directly or transitively) -- `session` is an ancestor of
     /// `session.input`, and of itself.

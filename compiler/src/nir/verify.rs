@@ -5591,15 +5591,10 @@ fn verify_resource_ownership(
         entry: BlockId,
         entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, LocationState>),
         incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
-        // `(reachable, computed)`: bundled into one tuple (matching
-        // `entry_seed`, above) purely to stay under clippy's
-        // `too_many_arguments` limit -- see each set's own doc comment
-        // below for what it actually means.
-        reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
+        reachable: &HashSet<BlockId>,
         out: &HashMap<BlockId, State>,
         is_resource: &impl Fn(ValueId) -> bool,
-    ) -> State {
-        let (reachable, computed) = reachable_and_computed;
+    ) -> IncomingState<State> {
         if block_id == entry {
             // Every `take`-flagged resource parameter is already live the
             // moment this function begins -- an entry block that itself
@@ -5609,15 +5604,15 @@ fn verify_resource_ownership(
             // successors, needs it folded in separately -- see
             // `entry_out`, below).
             let (entry_live, entry_provenance) = entry_seed;
-            return (
+            return IncomingState::Entry((
                 HashSet::new(),
                 entry_live.clone(),
                 HashSet::new(),
                 entry_provenance.clone(),
-            );
+            ));
         }
         let Some(edges) = incoming_edges.get(&block_id) else {
-            return State::default();
+            return IncomingState::Pending;
         };
         // A predecessor the worklist has never actually run `transfer`
         // on yet contributes nothing to this merge at all -- not the
@@ -5631,16 +5626,25 @@ fn verify_resource_ownership(
         // worklist has not reached it yet -- would permanently poison
         // every block downstream of it, regardless of what that
         // predecessor's own eventually-computed state actually turns
-        // out to be. Excluding an uncomputed predecessor here instead
-        // (and unconditionally re-queuing every successor the very
-        // first time any block *becomes* computed, see below) lets the
+        // out to be. Excluding an uncomputed predecessor here lets the
         // fixpoint converge on each edge's own real contribution once,
         // and only once, it is actually known.
+        //
+        // "Computed" is the presence of an `out` entry, and nothing
+        // else: `out` holds a block only once `transfer` has actually
+        // produced its state, so the two can never drift apart.
         let mut edges = edges
             .iter()
-            .filter(|(pred, _)| reachable.contains(pred) && computed.contains(pred));
+            .filter(|(pred, _)| reachable.contains(pred) && out.contains_key(pred));
         let Some((first_pred, first_extra)) = edges.next() else {
-            return State::default();
+            // Nothing has been proven about this block yet. That is not
+            // an empty state: an empty `provenance` map disagrees with
+            // every real one, and `merge_provenance` reads disagreement
+            // as the absorbing `MaybeUninitialized` it never recovers
+            // from -- so recording a state here would poison an entire
+            // loop permanently, and did, depending on nothing but the
+            // order the block vector happened to list its blocks in.
+            return IncomingState::Pending;
         };
         // Union, not intersection, matching `verify_drop_state`: a
         // resource already consumed (or still live) on *any* reachable
@@ -5650,6 +5654,7 @@ fn verify_resource_ownership(
         // that block's own success edge alone, never folded into any
         // sibling failure edge that happens to reach this same block
         // (`rfcs/0011`).
+        // The filter above already proved this key present.
         let mut acc = out.get(first_pred).cloned().unwrap_or_default();
         if let Some(slot) = first_extra
             && is_resource(*slot)
@@ -5677,7 +5682,7 @@ fn verify_resource_ownership(
             acc.2.extend(other_dropped);
             acc.3 = merge_provenance(&acc.3, &other_prov);
         }
-        acc
+        IncomingState::Ready(acc)
     }
 
     // Every `take`-flagged resource parameter is already owned the
@@ -5723,26 +5728,20 @@ fn verify_resource_ownership(
         ),
     );
 
-    let mut out: HashMap<BlockId, State> = function
-        .blocks
-        .iter()
-        .map(|b| {
-            let initial = if b.id == entry {
-                entry_out.clone()
-            } else {
-                State::default()
-            };
-            (b.id, initial)
-        })
-        .collect();
-
-    // Every block whose `out` entry has actually been produced by
-    // `transfer` at least once -- `entry` always starts in this set,
-    // since `entry_out` is already fully computed above; every other
-    // reachable block joins it the first time the worklist processes
-    // it. `in_state_for` only ever merges a predecessor edge once its
-    // own source block is in this set (see its own doc comment).
-    let mut computed: HashSet<BlockId> = HashSet::from([entry]);
+    // `out` holds a block *only once its own out-state has actually
+    // been computed*: "not computed yet" is the absence of a key, and
+    // is therefore impossible to confuse with a block genuinely
+    // computed to hold no facts. Pre-seeding every block with
+    // `State::default()` (as this once did) erases exactly that
+    // distinction, and an empty state is not this lattice's bottom --
+    // an empty `provenance` map disagrees with every real one, and
+    // `merge_provenance` reads disagreement as the absorbing
+    // `MaybeUninitialized` it never recovers from.
+    //
+    // The entry block is the one boundary condition: its in-state is
+    // the parameter seed by definition, so its out-state is fixed and
+    // never recomputed.
+    let mut out: HashMap<BlockId, State> = HashMap::from([(entry, entry_out)]);
 
     let mut worklist: VecDeque<BlockId> = function
         .blocks
@@ -5756,26 +5755,28 @@ fn verify_resource_ownership(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = in_state_for(
+        let in_state = match in_state_for(
             id,
             entry,
             (&entry_live, &entry_provenance),
             &incoming_edges,
-            (&reachable, &computed),
+            &reachable,
             &out,
             &is_resource,
-        );
+        ) {
+            IncomingState::Entry(state) | IncomingState::Ready(state) => state,
+            // Nothing has proven anything about this block yet, so it
+            // runs no transfer and records no out-state. A predecessor
+            // landing later re-enqueues it, and every reachable block
+            // is reached from the entry, whose out-state is fixed
+            // before this loop starts.
+            IncomingState::Pending => continue,
+        };
         let (new_out, ..) = transfer(block, &in_state);
-        // `computed.insert(id)` becoming newly true here means this is
-        // the very first time `id` has ever been computed -- its own
-        // successors must be re-queued regardless of whether `new_out`
-        // happens to coincide with the placeholder `State::default()`
-        // they were already seeded with, since what changed is *not*
-        // `id`'s own value but whether `in_state_for` may now finally
-        // merge `id`'s own real (if otherwise unremarkable) edge in at
-        // all, rather than skipping it as not-yet-computed.
-        let first_time = computed.insert(id);
-        if first_time || out.get(&id) != Some(&new_out) {
+        // An `out` entry appearing for the first time is itself a
+        // change: `out.get(&id)` is `None` until then, so successors
+        // are re-queued exactly when this block first becomes joinable.
+        if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
                 if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
@@ -5787,15 +5788,23 @@ fn verify_resource_ownership(
 
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            in_state_for(
+            match in_state_for(
                 block.id,
                 entry,
                 (&entry_live, &entry_provenance),
                 &incoming_edges,
-                (&reachable, &computed),
+                &reachable,
                 &out,
                 &is_resource,
-            )
+            ) {
+                IncomingState::Entry(state) | IncomingState::Ready(state) => state,
+                // The fixpoint above has converged, so every reachable
+                // block has a computed predecessor by now. Judging
+                // ownership from a state nothing proved would be
+                // guesswork, so the block is skipped rather than
+                // fabricated.
+                IncomingState::Pending => continue,
+            }
         } else {
             State::default()
         };
@@ -7097,14 +7106,14 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
 /// a perfectly valid analysis state. Collapsing the two is what lets a
 /// fixed point be seeded with facts nothing ever proved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum IncomingState {
-    /// The entry block: no predecessors by definition, and an empty
-    /// fact set that is the analysis's one real boundary condition -- a
-    /// *proven* state, not a placeholder.
-    Entry(PlaceFacts),
+enum IncomingState<F> {
+    /// The entry block: no predecessors by definition, and a fact set
+    /// that is the analysis's one real boundary condition -- a *proven*
+    /// state, not a placeholder.
+    Entry(F),
     /// At least one reachable predecessor has produced an out-state,
     /// and this is the join of every such predecessor's.
-    Ready(PlaceFacts),
+    Ready(F),
     /// No reachable predecessor has produced an out-state yet. Not a
     /// fact set: no transfer runs on it, and no out-state is recorded
     /// from it, so nothing downstream can read facts nothing proved.
@@ -7146,7 +7155,7 @@ fn in_state_for_places(
     incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
     reachable: &HashSet<BlockId>,
     out: &HashMap<BlockId, PlaceFacts>,
-) -> IncomingState {
+) -> IncomingState<PlaceFacts> {
     if block_id == entry {
         return IncomingState::Entry(PlaceFacts::new());
     }
@@ -17464,5 +17473,495 @@ mod structural_ownership {
             structural_codes(&mut fx, f).contains(&codes::PLACE_PROJECTION_THROUGH_NON_RECORD),
             "the decomposed value must actually be the named variant"
         );
+    }
+
+    /// Adversarial control-flow shapes for the structural ownership fixed
+    /// point (`rfcs/0012`).
+    ///
+    /// The defect these exist for: the join used to end in
+    /// `Ok(acc.unwrap_or_default())`, so a block none of whose reachable
+    /// predecessors had landed yet was handed a real, empty `PlaceFacts` --
+    /// a perfectly valid state meaning "every place is still whole" -- ran
+    /// its transfer on it, and recorded an out-state its successors then
+    /// joined. `IncomingState::Pending` is a distinct answer that runs no
+    /// transfer and records no out-state, and the shapes below pin down
+    /// both that distinction and the convergence it has to preserve.
+    #[cfg(test)]
+    mod structural_fixpoint {
+        use super::*;
+
+        // -- the Pending answer itself -------------------------------------
+
+        #[test]
+        fn the_entry_block_is_its_own_proven_boundary_condition() {
+            let incoming = HashMap::new();
+            let reachable = HashSet::from([BlockId(0)]);
+            let out = HashMap::new();
+            assert_eq!(
+                in_state_for_places(BlockId(0), BlockId(0), &incoming, &reachable, &out),
+                IncomingState::Entry(PlaceFacts::new()),
+                "the entry block's empty in-state is proven, not a placeholder"
+            );
+        }
+
+        #[test]
+        fn a_block_waiting_for_every_predecessor_is_pending_not_an_empty_state() {
+            // bb2 joins bb0 and bb1. Neither has produced an out-state.
+            let incoming = HashMap::from([(BlockId(2), vec![BlockId(0), BlockId(1)])]);
+            let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::new()
+                ),
+                IncomingState::Pending,
+                "nothing has been computed, which is not the same as having computed nothing"
+            );
+            // The same block, once a predecessor has genuinely computed an
+            // empty out-state, is a different answer entirely -- which is
+            // exactly what `unwrap_or_default` used to erase.
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(1), PlaceFacts::new())])
+                ),
+                IncomingState::Ready(PlaceFacts::new()),
+                "a computed empty out-state is a real state, and must not compare equal to Pending"
+            );
+        }
+
+        #[test]
+        fn a_block_waiting_for_one_predecessor_joins_only_the_ones_that_landed() {
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            // bb2's back edge from bb1 has not been processed yet; bb0 has.
+            let incoming = HashMap::from([(BlockId(2), vec![BlockId(0), BlockId(1)])]);
+            let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(0), consumed.clone())])
+                ),
+                IncomingState::Ready(consumed),
+                "an unprocessed back edge contributes nothing, and never dilutes what did land"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_predecessors_computed_out_state_is_never_joined() {
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            let incoming = HashMap::from([(BlockId(2), vec![BlockId(1)])]);
+            // bb1 has an out-state, but nothing reaches it from the entry.
+            let reachable = HashSet::from([BlockId(0), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(1), consumed)])
+                ),
+                IncomingState::Pending,
+                "a dead CFG fragment may not seed reachable ownership, even having computed facts"
+            );
+        }
+
+        // -- convergence under adversarial control flow --------------------
+
+        #[test]
+        fn a_self_looping_block_reaches_a_fixed_point() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    // bb1 is its own predecessor: on the very first visit
+                    // its only landed predecessor is bb0, and the back edge
+                    // contributes nothing until it has been computed.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                            read(
+                                3,
+                                fx.file.clone(),
+                                session_field(1),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(3),
+                            drop_of(0),
+                            int(4, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a self-loop that owns nothing must converge and stay clean"
+            );
+        }
+
+        #[test]
+        fn a_self_looping_block_that_consumes_a_field_is_still_reported() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    // The second iteration reaches this same move with the
+                    // field already emptied by the first.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                        ],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![drop_of(0), int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the self-loop's own back edge must carry its consumption back to its head"
+            );
+        }
+
+        /// bb1 loops through bb2 and back, so bb1 is its own indirect
+        /// predecessor and neither block can be computed before the other.
+        fn mutually_recursive_loop(fx: &Fixture, consume_in_the_loop: bool) -> Vec<BasicBlock> {
+            let body = if consume_in_the_loop {
+                vec![
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                ]
+            } else {
+                Vec::new()
+            };
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: body,
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ]
+        }
+
+        #[test]
+        fn mutually_recursive_loop_blocks_reach_a_fixed_point() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, false);
+            let f = under_test(cond_params(&fx), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a loop that consumes nothing must converge and stay clean"
+            );
+        }
+
+        #[test]
+        fn a_consumption_inside_a_mutually_recursive_loop_reaches_its_own_head() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, true);
+            let f = under_test(cond_params(&fx), Ty::I64, blocks);
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the move must be seen again on the iteration that re-enters through bb2"
+            );
+        }
+
+        #[test]
+        fn a_deep_reverse_ordered_chain_reaches_the_same_fixed_point() {
+            let mut fx = fixture();
+            let depth = 20u32;
+            let mut forward: Vec<BasicBlock> = (0..depth)
+                .map(|i| BasicBlock {
+                    id: BlockId(i),
+                    // The entry empties `input`; that fact then has to
+                    // travel the whole chain to the exit below.
+                    instructions: if i == 0 {
+                        vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    terminator: Terminator::Branch(BlockId(i + 1)),
+                })
+                .collect();
+            forward.push(BasicBlock {
+                id: BlockId(depth),
+                // Twenty blocks later, `input` is moved a second time. Only
+                // a fact that actually travelled the chain can catch it.
+                instructions: vec![
+                    read(
+                        3,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(3),
+                    drop_of(0),
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            });
+            // Declared last-to-first, so every block in the chain is popped
+            // before the predecessor it depends on.
+            let mut reversed = forward.clone();
+            reversed.reverse();
+            let params = cond_params(&fx);
+            let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+            let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+            assert_eq!(
+                a, b,
+                "a chain explored entirely backwards must reach the same fixed point"
+            );
+            assert!(
+                a.contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the move in the entry block must still be visible twenty blocks later, got {a:?}"
+            );
+        }
+
+        #[test]
+        fn a_diverging_arm_owes_nothing_at_the_other_arms_exit() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    // This arm diverges: it is reachable, it is part of the
+                    // fixed point, and it never reaches any exit at all, so
+                    // it owes nothing and must impose nothing.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![
+                            read(
+                                5,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(5),
+                            read(
+                                6,
+                                fx.file.clone(),
+                                session_field(1),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(6),
+                            drop_of(0),
+                            int(7, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(7))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a diverging arm must not disturb the arm that actually reaches the exit"
+            );
+        }
+
+        // -- determinism ---------------------------------------------------
+
+        /// Every diagnostic this pass reports, rendered as `code: message`
+        /// in the exact order it was emitted -- so two runs can be compared
+        /// byte for byte, not merely as a set of codes.
+        fn rendered(fx: &mut Fixture, function: Function) -> Vec<String> {
+            let helpers = helpers(fx);
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let mut functions = vec![function];
+            functions.extend(helpers);
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions,
+                records: fx.records.clone(),
+                variants: fx.variants.clone(),
+            };
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect()
+        }
+
+        #[test]
+        fn verifying_one_adversarial_module_twice_reports_byte_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, true);
+            let params = cond_params(&fx);
+            let first = rendered(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            let second = rendered(&mut fx, under_test(params, Ty::I64, blocks));
+            assert_eq!(
+                first, second,
+                "the same module must produce byte-identical diagnostics on every run"
+            );
+            assert!(
+                !first.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+
+        /// Every rotation of `blocks`, plus the full reversal: the entry
+        /// block ends up first, last and everywhere between, and each block
+        /// is popped both before and after the predecessors it depends on.
+        ///
+        /// Compares *every* diagnostic the verifier reports, rendered in
+        /// emission order -- not just the structural family -- because the
+        /// fixed points in this file share one discipline and a regression
+        /// in any of them is a regression in all of them.
+        fn assert_order_independent(fx: &mut Fixture, blocks: Vec<BasicBlock>, label: &str) {
+            let params = cond_params(fx);
+            let expected = rendered(fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    rendered(fx, under_test(params.clone(), Ty::I64, rotated)),
+                    expected,
+                    "{label}: rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                rendered(fx, under_test(params, Ty::I64, reversed)),
+                expected,
+                "{label}: reversing the block vector changed the diagnostics"
+            );
+        }
+
+        #[test]
+        fn every_block_vector_permutation_reports_byte_identical_diagnostics() {
+            let mut fx = fixture();
+            // A loop whose body consumes a field used to poison itself
+            // permanently when the block vector happened to list the loop
+            // before the entry: the loop's own uncomputed head was read as
+            // a *computed* empty state, and `merge_provenance`'s absorbing
+            // `MaybeUninitialized` never recovers from that.
+            let loops = mutually_recursive_loop(&fx, true);
+            assert_order_independent(&mut fx, loops, "a mutually recursive loop that consumes");
+            let clean_loop = mutually_recursive_loop(&fx, false);
+            assert_order_independent(
+                &mut fx,
+                clean_loop,
+                "a mutually recursive loop that does not",
+            );
+            let joined = field_empty_on_one_predecessor(&fx);
+            assert_order_independent(&mut fx, joined, "a join whose predecessors disagree");
+            for arms in 0..=2 {
+                let shape = diamond(&fx, arms);
+                assert_order_independent(&mut fx, shape, "a diamond");
+            }
+            for restore in [false, true] {
+                let shape = loop_with_back_edge(&fx, restore);
+                assert_order_independent(&mut fx, shape, "a loop with a back edge");
+            }
+        }
     }
 }

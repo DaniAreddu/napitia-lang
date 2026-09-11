@@ -1,5 +1,8 @@
-// Dropping the same structural field twice is rejected, exactly like
-// dropping the same whole local twice already was (`rfcs/0012`).
+// Dropping the same *structural field* twice is rejected, exactly like
+// dropping the same whole local twice already was (`rfcs/0012`). The
+// field itself is the drop target here -- not a local extracted out of
+// it first -- so this exercises the field-level double-drop diagnostic
+// rather than the whole-local one it would otherwise fall back to.
 resource File {
     descriptor: i64,
 }
@@ -10,13 +13,12 @@ resource Session {
 }
 
 func main() -> i64 {
-    mutable session = Session {
+    value session = Session {
         input: File { descriptor: 1 },
         output: File { descriptor: 2 },
     };
-    value input = session.input;
-    drop input;
-    drop input;
+    drop session.input;
+    drop session.input;
     drop session;
     return 0;
 }

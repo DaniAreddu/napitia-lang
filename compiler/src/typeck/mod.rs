@@ -2667,15 +2667,31 @@ impl<'a> Checker<'a> {
         let (item, subst): (ItemId, HashMap<TypeParamId, Ty>) = match &base_ty {
             Ty::Named(item, _) => (*item, HashMap::new()),
             Ty::Applied(item, args) => {
-                let type_params = self
-                    .records
-                    .get(item)
-                    .map(|r| r.type_params.clone())
-                    .unwrap_or_default();
-                (
-                    *item,
-                    type_params.into_iter().zip(args.iter().cloned()).collect(),
-                )
+                // A partial `zip` here would leave the selected field
+                // typed by an unsubstituted `Ty::Param`, which every
+                // later stage reads as "not affine" -- so a malformed
+                // arity must produce a diagnostic, never a half-built
+                // substitution. `GENERIC_ARITY_MISMATCH` is already
+                // reported wherever the type itself was written; this
+                // stops the bad type from also silently deciding
+                // ownership.
+                let Some(subst) = self.checked_substitution(*item, args) else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::GENERIC_ARITY_MISMATCH,
+                            self.source,
+                            span,
+                            format!(
+                                "`{}` is applied to a number of type arguments its own \
+                                 declaration does not accept",
+                                self.display_for_diagnostic(&base_ty)
+                            ),
+                        )
+                        .with_primary_label("type argument count disagrees with the declaration"),
+                    );
+                    return Ty::Error;
+                };
+                (*item, subst)
             }
             _ => {
                 self.diagnostics.push(
@@ -3683,18 +3699,20 @@ impl<'a> Checker<'a> {
                 let (item, subst): (ItemId, HashMap<TypeParamId, Ty>) = match &resolved_scrutinee {
                     Ty::Named(item, _) => (*item, HashMap::new()),
                     Ty::Applied(item, applied_args) => {
-                        let type_params = self
-                            .variants
-                            .get(item)
-                            .map(|v| v.type_params.clone())
-                            .unwrap_or_default();
-                        (
-                            *item,
-                            type_params
-                                .into_iter()
-                                .zip(applied_args.iter().cloned())
-                                .collect(),
-                        )
+                        // See the identical guard on record field
+                        // access: a partial `zip` would bind this
+                        // pattern's own sub-patterns to unsubstituted
+                        // `Ty::Param`s, which answer "not affine" and
+                        // would let a bound payload carry an ownership
+                        // obligation nothing tracks.
+                        let Some(subst) = self.checked_substitution(*item, applied_args) else {
+                            self.push_incompatible_pattern(*span, &resolved_scrutinee);
+                            for a in args {
+                                self.check_pattern_at_depth(a, &Ty::Error, depth + 1);
+                            }
+                            return (ResolvedPattern::Wildcard, false);
+                        };
+                        (*item, subst)
                     }
                     _ => {
                         if !matches!(resolved_scrutinee, Ty::Error) {

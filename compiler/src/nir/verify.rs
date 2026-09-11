@@ -6524,6 +6524,10 @@ fn structural_cleanup_obligations(
                     | ValueKind::VariantCreate { .. }
                     | ValueKind::Move { .. }
                     | ValueKind::DeferCapture { .. }
+                    // A callee that returns an affine value transfers
+                    // ownership of it out to this frame, exactly like a
+                    // construction does.
+                    | ValueKind::Call(..)
                     | ValueKind::PlaceRead {
                         mode: crate::nir::OwnershipMode::Transfer,
                         ..
@@ -14548,6 +14552,7 @@ mod structural_ownership {
     const SELF: ItemId = ItemId(300);
     const SINK: ItemId = ItemId(301);
     const OBSERVE: ItemId = ItemId(302);
+    const BUILD: ItemId = ItemId(303);
     const T: TypeParamId = TypeParamId(0);
 
     struct Fixture {
@@ -14728,11 +14733,23 @@ mod structural_ownership {
     /// multiset two permutations of the same module can be compared
     /// against directly.
     fn structural_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+        structural_codes_with(fx, function, false)
+    }
+
+    /// `with_builder` additionally links in `build`, a callee that
+    /// transfers an affine record out to its caller.
+    fn structural_codes_with(
+        fx: &mut Fixture,
+        function: Function,
+        with_builder: bool,
+    ) -> Vec<&'static str> {
         let helpers = helpers(fx);
+        let builder = with_builder.then(|| builder(fx));
         let mut map = SourceMap::new();
         let source = map.add_file("t.npt", "");
         let mut functions = vec![function];
         functions.extend(helpers);
+        functions.extend(builder);
         let module = Module {
             protocols: Vec::new(),
             extends: Vec::new(),
@@ -15976,6 +15993,88 @@ mod structural_ownership {
             structural_codes(&mut fx, f),
             Vec::<&str>::new(),
             "a scrutinee destroyed as a whole already covers its own extracted payload"
+        );
+    }
+
+    // -- a call's own returned affine value -----------------------------
+
+    /// `build() -> Envelope`, for a callee that transfers an affine
+    /// record out to its caller.
+    fn builder(fx: &mut Fixture) -> Function {
+        let build = fx.interner.intern("build");
+        Function {
+            id: BUILD,
+            name: build,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            return_type: fx.envelope.clone(),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.envelope.clone(),
+                    kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        }
+    }
+
+    fn calls_builder(fx: &Fixture, destroy: bool) -> Function {
+        let mut instructions = vec![Instruction::Value {
+            result: ValueId(1),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::Call(BUILD, Vec::new(), vec![ValueId(0)], Vec::new()),
+        }];
+        if destroy {
+            instructions.push(read(
+                2,
+                fx.file.clone(),
+                Place::root(ValueId(1)).field(ENVELOPE, FieldId(0)),
+                OwnershipMode::Transfer,
+            ));
+            instructions.push(drop_of(2));
+        }
+        instructions.push(int(3, 0));
+        under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        )
+    }
+
+    #[test]
+    fn an_affine_record_returned_by_a_call_and_left_undestroyed_is_reported() {
+        let mut fx = fixture();
+        let f = calls_builder(&fx, false);
+        assert!(
+            structural_codes_with(&mut fx, f, true).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a callee transfers its affine result out to this frame, which then owns it"
+        );
+    }
+
+    #[test]
+    fn an_affine_record_returned_by_a_call_and_destroyed_is_accepted() {
+        let mut fx = fixture();
+        let f = calls_builder(&fx, true);
+        assert_eq!(
+            structural_codes_with(&mut fx, f, true),
+            Vec::<&str>::new(),
+            "destroying the returned record's own affine field discharges the obligation"
         );
     }
 }

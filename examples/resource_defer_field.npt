@@ -1,0 +1,35 @@
+// An observing `defer` protects the *exact* place it captures, never
+// the whole root it is reached through (`rfcs/0012`): an unaffected
+// sibling field stays freely movable while the deferred call is still
+// pending, and the protected field is destroyed only after that call
+// has actually run.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    // Protects `session.input` alone.
+    defer inspect(session.input);
+    // `session.output` is a completely unaffected sibling.
+    value output = session.output;
+    return sink(output);
+}

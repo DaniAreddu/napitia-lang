@@ -775,11 +775,27 @@ impl<'a> FlowChecker<'a> {
 
     /// The field name/span this diagnostic is reported against --
     /// `expr` is always the exact `HirExpr::Field` [`Self::resolve_place`]
-    /// just resolved `place` from.
-    fn field_name_and_span(expr: &HirExpr) -> (Symbol, Span) {
+    /// just resolved `place` from, but this stays *total* rather than
+    /// asserting that: every call site here is reached from a
+    /// structural match on `HirExpr::Field`, yet a panic primitive on a
+    /// path a hand-built HIR could ever reach is exactly what this
+    /// milestone's own no-panic-on-malformed-input rule forbids. An
+    /// unnamed target falls back to the expression's own span and a
+    /// generic label, which still produces a well-formed diagnostic.
+    fn field_name_and_span(expr: &HirExpr) -> (Option<Symbol>, Span) {
         match expr {
-            HirExpr::Field { name, span, .. } => (*name, *span),
-            _ => unreachable!("only ever called with the `HirExpr::Field` `resolve_place` saw"),
+            HirExpr::Field { name, span, .. } => (Some(*name), *span),
+            other => (None, other.span()),
+        }
+    }
+
+    /// How a structural field is named in a diagnostic -- its declared
+    /// name, or a generic stand-in when the target was not a named
+    /// field access at all (see [`Self::field_name_and_span`]).
+    fn field_display(&self, name: Option<Symbol>) -> String {
+        match name {
+            Some(name) => self.interner.resolve(name).to_string(),
+            None => "this field".to_string(),
         }
     }
 
@@ -800,7 +816,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` was already moved and cannot be used",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "use after move",
                 );
@@ -812,7 +828,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` was already dropped and cannot be used",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "use after drop",
                 );
@@ -841,7 +857,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` was already moved and cannot be moved again",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "use after move",
                 );
@@ -853,7 +869,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` was already dropped and cannot be moved",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "use after drop",
                 );
@@ -865,7 +881,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` is still needed by a pending `defer` and cannot be moved away",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "moved before its defer ran",
                 );
@@ -1343,7 +1359,7 @@ impl<'a> FlowChecker<'a> {
                         format!(
                             "`{}` has a field a pending `defer` still needs and cannot be dropped \
                              yet",
-                            self.interner.resolve(name)
+                            self.field_display(name)
                         ),
                         "a field is still needed by a pending defer",
                     );
@@ -1365,7 +1381,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` was already moved and cannot be dropped",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "drop after move",
                 );
@@ -1375,7 +1391,7 @@ impl<'a> FlowChecker<'a> {
                 self.diagnose(
                     DOUBLE_DROP,
                     span,
-                    format!("`{}` was already dropped", self.interner.resolve(name)),
+                    format!("`{}` was already dropped", self.field_display(name)),
                     "double drop",
                 );
                 self.set_place_state(place, ResourceState::Error);
@@ -1386,7 +1402,7 @@ impl<'a> FlowChecker<'a> {
                     span,
                     format!(
                         "`{}` is still needed by a pending `defer` and cannot be dropped early",
-                        self.interner.resolve(name)
+                        self.field_display(name)
                     ),
                     "dropped before its defer ran",
                 );

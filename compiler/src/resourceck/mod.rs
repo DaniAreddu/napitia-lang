@@ -122,13 +122,25 @@ fn is_affine_ty(
             if !visiting.insert(*item) {
                 return false;
             }
-            let type_params = affine
-                .item_type_params
-                .get(item)
-                .cloned()
-                .unwrap_or_default();
-            let subst: HashMap<TypeParamId, Ty> =
-                type_params.into_iter().zip(args.iter().cloned()).collect();
+            // Missing or arity-disagreeing generic metadata is never an
+            // *empty* substitution (`rfcs/0008`): an unsubstituted
+            // `Ty::Param` answers `false` below, which would let a
+            // genuinely affine instantiation be treated as an ordinary,
+            // freely-copyable value with no ownership to track at all.
+            // Fail closed -- answer *affine*, so every ownership
+            // obligation is still demanded -- exactly as
+            // `flow::FlowChecker::is_affine` and `nir::lower`'s own copy
+            // of this query do.
+            let type_params = affine.item_type_params.get(item);
+            let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
+                visiting.remove(item);
+                return true;
+            };
+            let subst: HashMap<TypeParamId, Ty> = type_params
+                .iter()
+                .copied()
+                .zip(args.iter().cloned())
+                .collect();
             let result = affine
                 .aggregate_field_types
                 .get(item)
@@ -1753,5 +1765,95 @@ mod tests {
              }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+}
+
+/// Missing-metadata fail-closed behavior (`rfcs/0008`, `rfcs/0012`):
+/// this stage's own affinity query must never answer "not affine" just
+/// because a generic declaration's own type-parameter list is absent or
+/// disagrees with the arguments a use supplies. Answering `false` there
+/// would let a genuinely affine instantiation be treated as an
+/// ordinary, freely-copyable value with no ownership tracked at all --
+/// the one direction that leaks rather than over-demands.
+#[cfg(test)]
+mod missing_metadata {
+    use super::*;
+
+    const BOXY: ItemId = ItemId(70);
+    const FILE: ItemId = ItemId(71);
+
+    /// The four owned tables an [`AffineContext`] borrows, kept alive
+    /// by the caller for exactly as long as the borrow it hands out.
+    struct Tables {
+        fields: HashMap<ItemId, Vec<Ty>>,
+        resources: HashSet<ItemId>,
+        params: HashMap<ItemId, Vec<TypeParamId>>,
+        projections: HashMap<ExprId, (ItemId, usize)>,
+    }
+
+    fn context(type_params: Option<Vec<TypeParamId>>) -> Tables {
+        let param = TypeParamId(0);
+        let name = crate::symbol::Symbol(0);
+        let mut fields = HashMap::new();
+        fields.insert(BOXY, vec![Ty::Param(param, name)]);
+        fields.insert(FILE, vec![Ty::I64]);
+        let mut resources = HashSet::new();
+        resources.insert(FILE);
+        let mut params = HashMap::new();
+        if let Some(declared) = type_params {
+            params.insert(BOXY, declared);
+        }
+        params.insert(FILE, Vec::new());
+        Tables {
+            fields,
+            resources,
+            params,
+            projections: HashMap::new(),
+        }
+    }
+
+    fn affine_with(type_params: Option<Vec<TypeParamId>>, args: Vec<Ty>) -> bool {
+        let tables = context(type_params);
+        let affine = AffineContext {
+            aggregate_field_types: &tables.fields,
+            declared_resources: &tables.resources,
+            item_type_params: &tables.params,
+            field_projections: &tables.projections,
+        };
+        is_affine_ty(
+            &Ty::Applied(BOXY, args),
+            &affine,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_well_formed_generic_instantiation_answers_from_its_substituted_field() {
+        let file = Ty::Named(FILE, crate::symbol::Symbol(0));
+        assert!(
+            affine_with(Some(vec![TypeParamId(0)]), vec![file]),
+            "`Box[File]` must be affine"
+        );
+        assert!(
+            !affine_with(Some(vec![TypeParamId(0)]), vec![Ty::I64]),
+            "`Box[i64]` must not be affine"
+        );
+    }
+
+    #[test]
+    fn a_missing_type_parameter_list_fails_closed_to_affine() {
+        assert!(
+            affine_with(None, vec![Ty::I64]),
+            "missing generic metadata must never be answered as an empty substitution"
+        );
+    }
+
+    #[test]
+    fn an_arity_disagreement_fails_closed_to_affine() {
+        assert!(
+            affine_with(Some(vec![TypeParamId(0)]), vec![Ty::I64, Ty::I64]),
+            "an arity disagreement must never be answered as a partial substitution"
+        );
     }
 }

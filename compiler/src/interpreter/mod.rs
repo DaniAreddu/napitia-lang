@@ -1319,99 +1319,123 @@ impl<'a> Interpreter<'a> {
     /// one already `Moved`/`Dropped`) is left untouched -- the caller is
     /// responsible for only ever calling this on something it already
     /// knows is still live.
+    /// Destroys `value` and everything it still owns (`rfcs/0012`), as a
+    /// transaction: the complete destruction graph is validated and
+    /// ordered *before* any resource status changes or any event is
+    /// emitted, so a malformed graph changes nothing at all.
+    ///
+    /// The earlier implementation looked each field's declared type up
+    /// with `get(index)` and skipped past a miss, which let a value
+    /// carrying an extra runtime field have its outer resource destroyed
+    /// while a live resource in that extra field leaked -- reported as
+    /// success. Nothing is ever skipped now: a shape that disagrees with
+    /// its declaration is an error.
     fn drop_value(&self, value: Value) -> Result<(), InterpreterError> {
+        let mut plan = Vec::new();
+        let mut seen = HashSet::new();
+        self.plan_drop(&value, &mut seen, &mut plan, 0)?;
+        // Phase B: every question was answered above, so this cannot
+        // fail partway and leave the graph half-destroyed.
+        for handle in plan {
+            self.resources.borrow_mut().drop_resource(handle)?;
+            #[cfg(test)]
+            self.event_log
+                .borrow_mut()
+                .push(format!("drop:{}", handle.id.0));
+        }
+        Ok(())
+    }
+
+    /// Validates the complete destruction graph reachable through
+    /// `value` and appends every resource identity to `plan` in the
+    /// exact order it must be destroyed (`rfcs/0012`) -- mutating
+    /// nothing.
+    ///
+    /// Validates at every level: the declaration exists and its kind
+    /// matches the runtime value, generic type-argument arity resolves,
+    /// the runtime field count equals the declared field count, the
+    /// active variant case exists with the exact declared payload count,
+    /// every handle is a live current owner, and no resource identity
+    /// appears twice anywhere in the graph -- which alone would make one
+    /// identity destroyed twice.
+    ///
+    /// Order is deterministic and is the destruction order itself: a
+    /// value's own live affine fields in *reverse* declaration order,
+    /// each fully expanded first, and a declared `resource`'s own outer
+    /// identity after all of its remaining children. Only the active
+    /// case of a variant is ever visited.
+    fn plan_drop(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        plan: &mut Vec<ResourceHandle>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a destruction graph is nested more deeply than this milestone supports",
+            ));
+        }
         match value {
             Value::Resource(handle) => {
-                // A declared `resource`'s own remaining live children
-                // are destroyed first, in reverse declaration order,
-                // and its own outer identity last (`rfcs/0012`). Every
-                // child this frame's own NIR already destroyed
-                // individually (the ordinary case: `resourceck`'s own
-                // cleanup planning expands a resource place into its
-                // affine fields before the place itself) is a `Moved`/
-                // `Dropped` tombstone by now and is skipped here, so
-                // the two never double-destroy the same child. This
-                // recursion is what keeps a resource reached *without*
-                // that expansion -- a resource nested in a variant
-                // payload, whose live case is only known at runtime --
-                // from leaking its own children.
-                let (item, arity) = {
-                    let table = self.resources.borrow();
-                    let record = table.observe(handle)?;
-                    (record.item, record.fields.len())
-                };
-                // A declared `resource` is never generic in this
-                // milestone's grammar, so its own declared field types
-                // are already concrete -- but they are still resolved
-                // through the same checked path, so an unknown item or
-                // a malformed layout is an error rather than an empty
-                // list that would silently skip every field.
-                let field_types = self.record_field_types(item, &[])?;
-                for index in (0..arity).rev() {
-                    let Some(ty) = field_types.get(index) else {
-                        continue;
-                    };
-                    if !self.is_affine(ty) {
-                        continue;
-                    }
-                    let field = self.resources.borrow().observe_field(handle, index)?;
-                    if matches!(field, Value::Moved | Value::Dropped) {
-                        continue;
-                    }
-                    // Tombstoned *before* the recursive destruction, not
-                    // after: a failure partway through destroying this
-                    // child must never leave it reachable for a second
-                    // destruction attempt through the same parent.
-                    self.resources
-                        .borrow_mut()
-                        .restore_field(handle, index, Value::Dropped)?;
-                    self.drop_value(field)?;
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot drop a resource through a merely-observing resource handle",
+                    ));
                 }
-                self.resources.borrow_mut().drop_resource(handle)?;
-                #[cfg(test)]
-                self.event_log
-                    .borrow_mut()
-                    .push(format!("drop:{}", handle.id.0));
+                if !seen.insert(handle.id) {
+                    return Err(invalid(
+                        "a destruction graph reaches the same resource identity twice",
+                    ));
+                }
+                let (item, fields) = {
+                    let table = self.resources.borrow();
+                    // Rejects a stale handle and an already-dropped
+                    // record alike, before anything is planned.
+                    let record = table.observe(*handle)?;
+                    (record.item, record.fields.clone())
+                };
+                let declared = self.record_field_types(item, &[])?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime resource's own field count disagrees with its declaration",
+                    ));
+                }
+                for index in (0..fields.len()).rev() {
+                    if !self.is_affine(&declared[index]) {
+                        continue;
+                    }
+                    // A child this frame's own NIR already destroyed or
+                    // moved out is not this graph's to destroy.
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    self.plan_drop(&fields[index], seen, plan, depth + 1)?;
+                }
+                // The outer identity goes last: after every child it
+                // delegates to has been accounted for.
+                plan.push(*handle);
                 Ok(())
             }
             Value::Record {
                 item,
                 type_args,
-                mut fields,
+                fields,
             } => {
-                // An ordinary `record` that merely *contains* affine
-                // fields has no separate runtime identity of its own to
-                // destroy -- only its own live affine fields, in
-                // reverse declaration order. Silently ignoring this
-                // shape is exactly what let a variant carrying an
-                // affine record leak that record's own resources.
-                //
-                // The field types come from this value's *own*
-                // instantiation: a `Box[File]` destroyed through its
-                // declaration's symbolic `Ty::Param(T)` would find
-                // nothing affine and leak the `File` it holds.
-                let field_types = self.record_field_types(item, &type_args)?;
-                // A value whose own field count disagrees with its
-                // declaration is malformed metadata, not a value with
-                // some untyped extras: skipping the surplus would skip
-                // exactly the fields nothing can say the affinity of.
-                if field_types.len() != fields.len() {
+                let declared = self.record_field_types(*item, type_args)?;
+                if declared.len() != fields.len() {
                     return Err(invalid(
                         "a runtime record value's own field count disagrees with its declaration",
                     ));
                 }
                 for index in (0..fields.len()).rev() {
-                    let Some(ty) = field_types.get(index) else {
-                        continue;
-                    };
-                    if !self.is_affine(ty) {
+                    if !self.is_affine(&declared[index]) {
                         continue;
                     }
                     if matches!(fields[index], Value::Moved | Value::Dropped) {
                         continue;
                     }
-                    let field = std::mem::replace(&mut fields[index], Value::Dropped);
-                    self.drop_value(field)?;
+                    self.plan_drop(&fields[index], seen, plan, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1419,35 +1443,25 @@ impl<'a> Interpreter<'a> {
                 item,
                 type_args,
                 case,
-                mut payload,
+                payload,
             } => {
-                // Only the active case, and only its own live payload
-                // fields, in reverse declaration order (`rfcs/0012`) --
-                // substituted with this value's own type arguments, so
-                // a `Maybe[File]` destroys the `File` its declaration
-                // only ever calls `T`.
-                let payload_types = self.case_payload_types(item, &type_args, case)?;
-                // See the record arm: a payload count disagreeing with
-                // the active case's own declaration is malformed
-                // metadata, never a value with untyped extras.
-                if payload_types.len() != payload.len() {
+                // Only the active case: a case that was never
+                // constructed owns nothing.
+                let declared = self.case_payload_types(*item, type_args, *case)?;
+                if declared.len() != payload.len() {
                     return Err(invalid(
                         "a runtime variant value's own payload count disagrees with its active \
                          case's declaration",
                     ));
                 }
                 for index in (0..payload.len()).rev() {
-                    let Some(ty) = payload_types.get(index) else {
-                        continue;
-                    };
-                    if !self.is_affine(ty) {
+                    if !self.is_affine(&declared[index]) {
                         continue;
                     }
                     if matches!(payload[index], Value::Moved | Value::Dropped) {
                         continue;
                     }
-                    let field = std::mem::replace(&mut payload[index], Value::Dropped);
-                    self.drop_value(field)?;
+                    self.plan_drop(&payload[index], seen, plan, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1455,7 +1469,7 @@ impl<'a> Interpreter<'a> {
             Value::Dropped => Err(invalid("double drop: this value was already destroyed")),
             other => Err(invalid(format!(
                 "drop of a non-affine value ({})",
-                kind_name(&other)
+                kind_name(other)
             ))),
         }
     }
@@ -6412,5 +6426,413 @@ mod branch_local_variants {
             "the same program destroyed in a different order"
         );
         assert_eq!(first, vec!["drop:0", "drop:1"]);
+    }
+}
+
+/// Destruction is a transaction (`rfcs/0012`): the complete graph is
+/// validated and ordered before any resource status changes or any event
+/// is emitted, so a malformed graph changes nothing at all.
+///
+/// An earlier implementation looked each field's declared type up with
+/// `get(index)` and skipped past a miss, which let a value carrying an
+/// extra runtime field have its outer resource destroyed while a live
+/// resource in that extra field leaked -- reported as success.
+#[cfg(test)]
+mod drop_transaction {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(70);
+    const SESSION: ItemId = ItemId(71);
+    const ENVELOPE: ItemId = ItemId(72);
+    const BOXY: ItemId = ItemId(73);
+    const MAYBE: ItemId = ItemId(74);
+    const PAIR: ItemId = ItemId(75);
+
+    /// `File` (a `resource` with one `i64`), `Session` (a `resource`
+    /// with one `File`), `Envelope` (a record with one `File`), `Box[T]`
+    /// (generic) and `Maybe[T]` (a generic variant).
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    ENVELOPE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name)), (name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// One resource record, reduced to everything a failed
+    /// destruction must leave untouched.
+    type RecordState = (ItemId, u64, bool, Vec<Value>);
+
+    /// Snapshot of everything a failed destruction must leave
+    /// untouched: the whole resource table, and the event log.
+    fn snapshot(interpreter: &Interpreter<'_>) -> (Vec<RecordState>, Vec<String>) {
+        let table: Vec<RecordState> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+        (table, interpreter.event_log())
+    }
+
+    fn assert_refused_without_mutation(interpreter: &Interpreter<'_>, value: Value, what: &str) {
+        let before = snapshot(interpreter);
+        let result = interpreter.drop_value(value);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(interpreter),
+            "{what}: a refused destruction changed the resource table or the event log"
+        );
+    }
+
+    #[test]
+    fn a_resource_with_an_extra_runtime_field_is_refused_and_leaks_nothing() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let leaked = file(&interpreter, 1);
+        // `Session` declares one field; this record carries two, and the
+        // extra one holds a live resource. Skipping it would destroy the
+        // session while leaking the file.
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Int(0), Value::Resource(leaked)]);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(handle),
+            "resource with an extra runtime field",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(leaked).is_ok(),
+            "the resource in the extra field must still be alive and reachable"
+        );
+    }
+
+    #[test]
+    fn a_resource_with_a_missing_runtime_field_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, Vec::new());
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(handle),
+            "resource with a missing runtime field",
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_missing_generic_type_argument_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(live)],
+            },
+            "missing generic type argument",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_record_with_an_extra_generic_type_argument_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::I64, Ty::I64],
+                fields: vec![Value::Resource(live)],
+            },
+            "extra generic type argument",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_nested_malformed_record_is_refused_before_its_valid_sibling_is_destroyed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = file(&interpreter, 1);
+        let inner = file(&interpreter, 2);
+        // The outer record is well formed; its *second* field is an
+        // `Envelope` carrying one field too many. Validation has to
+        // reach it before the first field is destroyed.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: ENVELOPE,
+                type_args: Vec::new(),
+                fields: vec![Value::Record {
+                    item: ENVELOPE,
+                    type_args: Vec::new(),
+                    fields: vec![Value::Resource(inner), Value::Resource(good)],
+                }],
+            },
+            "nested malformed record",
+        );
+        for handle in [good, inner] {
+            assert!(interpreter.resources.borrow().observe(handle).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_nested_malformed_variant_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: ENVELOPE,
+                type_args: Vec::new(),
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(live), Value::Int(9)],
+                }],
+            },
+            "nested malformed variant",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_variant_naming_an_invalid_active_case_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 7,
+                payload: Vec::new(),
+            },
+            "invalid active case",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_resource_handle_in_two_fields_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = file(&interpreter, 1);
+        // One identity reached through two positions would be
+        // destroyed twice.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(shared), Value::Resource(shared)],
+            },
+            "duplicate identity in two fields",
+        );
+        assert!(interpreter.resources.borrow().observe(shared).is_ok());
+    }
+
+    #[test]
+    fn a_stale_child_after_a_valid_sibling_is_refused_without_destroying_the_sibling() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = file(&interpreter, 1);
+        let stale = file(&interpreter, 2);
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale handle");
+        // Reverse declaration order reaches the second field first, but
+        // either way nothing is destroyed until the whole graph
+        // validates.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(good), Value::Resource(stale)],
+            },
+            "stale child after a valid sibling",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(good).is_ok(),
+            "the valid sibling must not have been destroyed"
+        );
+    }
+
+    #[test]
+    fn an_already_dropped_nested_child_is_skipped_not_destroyed_twice() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Dropped]);
+        interpreter
+            .drop_value(Value::Resource(session))
+            .expect("a tombstoned child is skipped, not destroyed again");
+        assert!(interpreter.resources.borrow().observe(session).is_err());
+        assert!(
+            interpreter.resources.borrow().observe(live).is_ok(),
+            "an unrelated resource is untouched"
+        );
+    }
+
+    #[test]
+    fn a_deeply_nested_generic_graph_is_destroyed_in_exact_order() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = file(&interpreter, 1);
+        let second = file(&interpreter, 2);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(second)]);
+        // `Box[Maybe[Session]]` holding a `Some(Session)`, alongside a
+        // bare `File` in an envelope: reverse declaration order, each
+        // resource's own children before its outer identity.
+        let graph = Value::Record {
+            item: ENVELOPE,
+            type_args: Vec::new(),
+            fields: vec![Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(SESSION, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(SESSION, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(session)],
+                }],
+            }],
+        };
+        interpreter
+            .drop_value(graph)
+            .expect("a well-formed nested generic graph must be destroyed");
+        assert_eq!(
+            interpreter.event_log(),
+            vec![
+                format!("drop:{}", second.id.0),
+                format!("drop:{}", session.id.0)
+            ],
+            "the session's own child is destroyed before its outer identity"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(first).is_ok(),
+            "an unrelated resource is untouched"
+        );
+    }
+
+    #[test]
+    fn a_refused_destruction_reports_the_identical_error_every_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        let malformed = || Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(live)],
+        };
+        let first = interpreter.drop_value(malformed());
+        let second = interpreter.drop_value(malformed());
+        assert_eq!(first, second, "the refusal must be deterministic");
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
     }
 }

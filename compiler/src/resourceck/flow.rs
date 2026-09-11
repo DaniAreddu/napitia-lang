@@ -1192,13 +1192,30 @@ impl<'a> FlowChecker<'a> {
         // precise diagnostic (`double drop`, not the generic `use after
         // drop` a plain read would report for the same case).
         let HirExpr::Local { local, name, .. } = expr else {
-            // A non-local drop target (already rejected by typeck's own
-            // static-type check if it isn't even a resource) has no
-            // owned binding here to transition; still walked with
-            // `ConsumeKind::Other` for whatever nested reads/moves it
-            // does contain -- a compound `if`/`match`/`handle` origin
-            // here hits the same `nir::lower` limitation as any other
-            // non-`return` consuming position (Blocker 2).
+            // `drop session.input;` destroys exactly that one
+            // structural field (`rfcs/0012`) -- handled here, in its own
+            // right, rather than falling through to the ordinary
+            // field-move path: a field destroyed by `drop` becomes
+            // `Dropped`, not `Moved`, so a second `drop` of the same
+            // field reports a real double drop (and a later *use* of it
+            // a use-after-drop) instead of the generic use-after-move a
+            // plain transfer would.
+            if let HirExpr::Field { .. } = expr
+                && self.is_affine_expr(expr.id())
+                && let Some(place) = self.resolve_place(expr)
+                && !place.projections.is_empty()
+            {
+                self.check_field_drop(&place, expr, span);
+                return;
+            }
+            // Any other non-local drop target (already rejected by
+            // typeck's own static-type check if it isn't even a
+            // resource) has no owned place here to transition; still
+            // walked with `ConsumeKind::Other` for whatever nested
+            // reads/moves it does contain -- a compound `if`/`match`/
+            // `handle` origin here hits the same `nir::lower`
+            // limitation as any other non-`return` consuming position
+            // (Blocker 2).
             self.check_expr_ctx(expr, ConsumeKind::Other);
             return;
         };
@@ -1301,6 +1318,79 @@ impl<'a> FlowChecker<'a> {
                     "dropped before its defer ran",
                 );
                 self.set_place_state(&root, ResourceState::Error);
+            }
+        }
+    }
+
+    /// `drop <place>;` where `<place>` is an individual affine field
+    /// rather than a whole local (`rfcs/0012`) -- the structural
+    /// counterpart of [`Self::check_drop`]'s own whole-local handling,
+    /// sharing its exact shape: the still-live descendants this exact
+    /// field owns are recorded as this drop's own one-off cleanup plan
+    /// (keyed by this expression's own id, the same way a whole local's
+    /// already is, so `nir::lower` replays it rather than naively
+    /// destroying the field's own whole value and leaking whatever was
+    /// already moved out of it), and the field itself transitions to
+    /// `Dropped`.
+    fn check_field_drop(&mut self, place: &Place<LocalId>, expr: &HirExpr, span: Span) {
+        let (name, _) = Self::field_name_and_span(expr);
+        match self.place_state(place) {
+            ResourceState::Available => {
+                if self.has_defer_protected_descendant(place) {
+                    self.diagnose(
+                        MOVE_AFTER_DEFER_CAPTURED,
+                        span,
+                        format!(
+                            "`{}` has a field a pending `defer` still needs and cannot be dropped \
+                             yet",
+                            self.interner.resolve(name)
+                        ),
+                        "a field is still needed by a pending defer",
+                    );
+                    self.set_place_state(place, ResourceState::Error);
+                    return;
+                }
+                let targets = self.structural_drop_targets(place);
+                self.cleanup_edges.insert(
+                    expr.id(),
+                    targets.into_iter().map(CleanupAction::Drop).collect(),
+                );
+                self.record_consume(expr.id(), ConsumeInfo::Transfer);
+                self.set_place_state(place, ResourceState::Dropped);
+            }
+            ResourceState::Error => {}
+            ResourceState::Moved => {
+                self.diagnose(
+                    USE_AFTER_MOVE,
+                    span,
+                    format!(
+                        "`{}` was already moved and cannot be dropped",
+                        self.interner.resolve(name)
+                    ),
+                    "drop after move",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::Dropped => {
+                self.diagnose(
+                    DOUBLE_DROP,
+                    span,
+                    format!("`{}` was already dropped", self.interner.resolve(name)),
+                    "double drop",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::DropScheduled => {
+                self.diagnose(
+                    MOVE_AFTER_DEFER_CAPTURED,
+                    span,
+                    format!(
+                        "`{}` is still needed by a pending `defer` and cannot be dropped early",
+                        self.interner.resolve(name)
+                    ),
+                    "dropped before its defer ran",
+                );
+                self.set_place_state(place, ResourceState::Error);
             }
         }
     }

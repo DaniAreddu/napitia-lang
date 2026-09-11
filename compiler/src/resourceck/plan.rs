@@ -44,6 +44,19 @@ pub struct CheckedDeferPlan {
     pub callee: ItemId,
     pub arg_modes: Vec<ConsumeInfo>,
     pub arg_types: Vec<Ty>,
+    /// The exact structural place each argument names, in the same
+    /// declaration order (`rfcs/0012`) -- `Some(session.input)` for an
+    /// affine field access resolving to a stable place, `Some(session)`
+    /// for a bare affine local, and `None` for an argument that names
+    /// no place at all (a literal, a call's own result, a non-affine
+    /// value). This is the granularity at which the observing form of
+    /// this `defer` protects its capture, and at which its consuming
+    /// form transfers it: recording the *root* instead is what wrongly
+    /// rejected moving an unaffected sibling field while the defer was
+    /// still pending. `nir::lower` independently re-resolves each
+    /// argument's own place and cross-checks it against this, rather
+    /// than trusting a second parallel resolution unchecked.
+    pub arg_places: Vec<Option<Place<LocalId>>>,
     pub return_type: Ty,
     pub registration_order: u32,
 }

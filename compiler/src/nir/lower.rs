@@ -1674,6 +1674,13 @@ impl<'a> Lowering<'a> {
                 args.len()
             )));
         }
+        if plan.arg_places.len() != args.len() {
+            return Err(self.internal_error(&format!(
+                "a `defer` calling {item:?} has {} checked argument place(s) but {} argument(s)",
+                plan.arg_places.len(),
+                args.len()
+            )));
+        }
         if param_tys.len() != args.len() {
             return Err(self.internal_error(&format!(
                 "a `defer` calling {item:?} declares {} parameter(s) but is called with {} argument(s)",
@@ -1692,6 +1699,22 @@ impl<'a> Lowering<'a> {
             if plan.arg_types[i] != *hint {
                 return Err(self.internal_error(&format!(
                     "a `defer` calling {item:?} has a checked argument type for argument {i} that disagrees with its own resolved parameter type"
+                )));
+            }
+            // The exact place `resourceck` recorded for this argument
+            // (`rfcs/0012`) must be the same place this stage resolves
+            // on its own -- a plan naming `session` where this resolves
+            // `session.input` (or vice versa) means the two stages
+            // disagree about *what* this `defer` captures, which is
+            // never silently trusted just because a plan is present.
+            let resolved_place = if self.is_affine(hint) {
+                self.resolve_place_expr(arg)?
+            } else {
+                None
+            };
+            if plan.arg_places[i] != resolved_place {
+                return Err(self.internal_error(&format!(
+                    "a `defer` calling {item:?} has a checked place for argument {i} that disagrees with the place this stage resolves for it"
                 )));
             }
             let v = match self.lower_expr_hinted(fb, arg, hint)? {

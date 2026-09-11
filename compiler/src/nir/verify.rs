@@ -6374,6 +6374,69 @@ fn structural_cleanup_obligations(
     agg: &AggregateContext,
     origin: &impl Fn(ValueId) -> ValueId,
 ) -> Vec<(ValueId, Ty)> {
+    // Every value some instruction consumes *as a whole* anywhere in
+    // this function. A `VariantPayload` extraction copies its payload
+    // out without emptying the base, so when the base itself is still
+    // destroyed or transferred somewhere, that destruction covers the
+    // payload too and the extracted copy owns nothing of its own --
+    // demanding a separate destruction of it would be a double count.
+    let mut consumed_whole: HashSet<ValueId> = HashSet::new();
+    let consume = |v: ValueId, set: &mut HashSet<ValueId>| {
+        set.insert(origin(v));
+    };
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::Drop { value } => consume(*value, &mut consumed_whole),
+                Instruction::Store {
+                    value,
+                    mode: crate::nir::OwnershipMode::Transfer,
+                    ..
+                } => consume(*value, &mut consumed_whole),
+                Instruction::StorePlace { value, .. } => consume(*value, &mut consumed_whole),
+                Instruction::Value { kind, .. } => match kind {
+                    ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                        consume(*source, &mut consumed_whole)
+                    }
+                    ValueKind::RecordCreate(_, _, fields) => {
+                        for field in fields {
+                            consume(*field, &mut consumed_whole);
+                        }
+                    }
+                    ValueKind::VariantCreate { payload, .. } => {
+                        for field in payload {
+                            consume(*field, &mut consumed_whole);
+                        }
+                    }
+                    ValueKind::Call(_, _, args, _) => {
+                        for arg in args {
+                            consume(*arg, &mut consumed_whole);
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        match &block.terminator {
+            Terminator::Return(Some(v)) => consume(*v, &mut consumed_whole),
+            Terminator::Raise { value } => consume(*value, &mut consumed_whole),
+            Terminator::Invoke { args, .. } => {
+                for arg in args {
+                    consume(*arg, &mut consumed_whole);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A value a `match`'s own decision tree took apart: its ownership
+    // was handed to whichever payloads were extracted from it, each
+    // tracked in its own right from that point on -- so demanding a
+    // separate destruction of the scrutinee too would double-count the
+    // same obligation. Only when the base is *not* also consumed whole
+    // somewhere, which is the case in which the extracted payload
+    // really is the sole owner.
     let mut decomposed: HashSet<ValueId> = HashSet::new();
     for block in &function.blocks {
         for instruction in &block.instructions {
@@ -6381,12 +6444,32 @@ fn structural_cleanup_obligations(
                 kind: ValueKind::VariantPayload { base, .. },
                 ..
             } = instruction
+                && !consumed_whole.contains(&origin(*base))
             {
                 decomposed.insert(origin(*base));
             }
         }
-        if let Terminator::Switch { scrutinee, .. } = &block.terminator {
+        if let Terminator::Switch { scrutinee, .. } = &block.terminator
+            && !consumed_whole.contains(&origin(*scrutinee))
+        {
             decomposed.insert(origin(*scrutinee));
+        }
+    }
+    // Every payload extracted out of a base nothing else ever consumes:
+    // that extraction *is* the transfer of ownership, so the payload is
+    // this function's own obligation from there on.
+    let mut payload_owners: Vec<ValueId> = Vec::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::VariantPayload { base, .. },
+                ..
+            } = instruction
+                && decomposed.contains(&origin(*base))
+            {
+                payload_owners.push(*result);
+            }
         }
     }
 
@@ -6432,6 +6515,11 @@ fn structural_cleanup_obligations(
             if produces_owner && let Some(ty) = owns(*result) {
                 roots.push((*result, ty));
             }
+        }
+    }
+    for result in payload_owners {
+        if let Some(ty) = owns(result) {
+            roots.push((result, ty));
         }
     }
     roots.sort_by_key(|(v, _)| *v);
@@ -15731,6 +15819,146 @@ mod structural_ownership {
             left.get(&child),
             Some(&FieldState::Maybe),
             "a key present on only one side must join to the absorbing state"
+        );
+    }
+
+    // -- an extracted variant payload's own obligation ------------------
+
+    /// `f(take holder: Holder) { switch holder { Full -> extract the
+    /// `Envelope` payload and <do something with it>; Empty -> return } }`
+    /// -- the scrutinee itself is never consumed whole, so the extracted
+    /// payload is this function's own sole obligation.
+    fn payload_extraction(fx: &Fixture, destroy_payload: bool) -> Vec<BasicBlock> {
+        let mut full = vec![Instruction::Value {
+            result: ValueId(1),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::VariantPayload {
+                base: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                index: 0,
+            },
+        }];
+        if destroy_payload {
+            full.push(drop_of(1));
+        }
+        full.push(int(2, 1));
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Switch {
+                    scrutinee: ValueId(0),
+                    variant: HOLDER,
+                    cases: vec![BlockId(1), BlockId(2)],
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: full,
+                terminator: Terminator::Return(Some(ValueId(2))),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![int(3, 0)],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_left_undestroyed_is_reported() {
+        let mut fx = fixture();
+        let blocks = payload_extraction(&fx, false);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a payload extracted out of a scrutinee nothing else consumes is this function's own \
+             obligation"
+        );
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_that_is_destroyed_is_accepted() {
+        let mut fx = fixture();
+        let blocks = payload_extraction(&fx, true);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "destroying the extracted payload discharges the obligation"
+        );
+    }
+
+    /// The same extraction, but with the scrutinee *also* destroyed on
+    /// the other edge: that destruction already covers the payload, so
+    /// the extracted copy owns nothing of its own and demanding a
+    /// separate destruction would double-count the identical obligation.
+    #[test]
+    fn a_payload_extracted_from_a_scrutinee_that_is_itself_destroyed_owes_nothing() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
+                        variant: HOLDER,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.envelope.clone(),
+                            kind: ValueKind::VariantPayload {
+                                base: ValueId(0),
+                                variant: HOLDER,
+                                case: 0,
+                                index: 0,
+                            },
+                        },
+                        drop_of(0),
+                        int(2, 1),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![drop_of(0), int(3, 0)],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a scrutinee destroyed as a whole already covers its own extracted payload"
         );
     }
 }

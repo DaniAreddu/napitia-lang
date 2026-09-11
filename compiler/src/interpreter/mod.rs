@@ -497,7 +497,16 @@ impl<'a> Interpreter<'a> {
                 if !visiting.insert(*item) {
                     return false;
                 }
-                let subst = self.type_substitution(*item, args);
+                // Missing or arity-disagreeing generic metadata fails
+                // *closed*, to affine: an unsubstituted `Ty::Param`
+                // would answer `false` below and let a genuinely affine
+                // instantiation be treated as a freely-copyable value
+                // this stage never destroys -- the one direction that
+                // leaks rather than over-demands.
+                let Some(subst) = self.type_substitution(*item, args) else {
+                    visiting.remove(item);
+                    return true;
+                };
                 let result = self.item_field_types(*item).iter().any(|fty| {
                     self.is_affine_visiting(&crate::types::substitute(fty, &subst), visiting)
                 });
@@ -522,16 +531,16 @@ impl<'a> Interpreter<'a> {
 
     /// `item`'s own declared type parameters paired with `args`, for
     /// substituting a generic aggregate's own declared field types down
-    /// to this one instantiation's concrete shape (`rfcs/0008`). An
-    /// arity disagreement produces a *partial* map rather than a
-    /// fabricated one: an unmapped `Ty::Param` stays symbolic and is
-    /// answered `false` by [`Self::is_affine_visiting`], never silently
-    /// defaulted to some other type.
+    /// to this one instantiation's concrete shape (`rfcs/0008`).
+    /// `None` -- never a partial or empty map -- when `item` has no
+    /// recorded layout at all, or when its declared arity disagrees with
+    /// `args`: an unmapped `Ty::Param` would stay symbolic and answer
+    /// "not affine", which is the one direction that leaks.
     fn type_substitution(
         &self,
         item: ItemId,
         args: &[Ty],
-    ) -> std::collections::HashMap<crate::hir::TypeParamId, Ty> {
+    ) -> Option<std::collections::HashMap<crate::hir::TypeParamId, Ty>> {
         let params: Vec<crate::hir::TypeParamId> = self
             .module
             .records
@@ -544,9 +553,11 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .find(|(id, _)| *id == item)
                     .map(|(_, v)| v.type_params.iter().map(|(id, _)| *id).collect())
-            })
-            .unwrap_or_default();
-        params.into_iter().zip(args.iter().cloned()).collect()
+            })?;
+        if params.len() != args.len() {
+            return None;
+        }
+        Some(params.into_iter().zip(args.iter().cloned()).collect())
     }
 
     /// `true` iff this *runtime* value is transitively affine -- what
@@ -1990,7 +2001,7 @@ mod tests {
     /// this specific execution performed -- proving actual runtime
     /// cleanup order (deferred calls, resource drops) rather than only
     /// each test's own final return value.
-    fn run_with_log(text: &str) -> (Result<Value, InterpreterError>, Vec<String>) {
+    pub(super) fn run_with_log(text: &str) -> (Result<Value, InterpreterError>, Vec<String>) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -3646,5 +3657,559 @@ mod tests {
                          }; \
                      }";
         assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+}
+
+/// Missing-metadata fail-closed behavior at runtime (`rfcs/0008`,
+/// `rfcs/0012`), and the structural drop/traversal properties this
+/// stage answers entirely on its own -- from a module's own layouts,
+/// never trusted from an earlier stage's verdict.
+#[cfg(test)]
+mod structural_runtime {
+    use super::*;
+    use crate::nir::RecordLayout;
+    use crate::symbol::Symbol;
+
+    const BOXY: ItemId = ItemId(80);
+    const FILE: ItemId = ItemId(81);
+
+    fn module_with(type_params: Vec<(crate::hir::TypeParamId, Symbol)>) -> Module {
+        let param = crate::hir::TypeParamId(0);
+        let name = Symbol(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params,
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn nested_module() -> Module {
+        let name = Symbol(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_generic_instantiation_is_affine_only_for_an_affine_argument() {
+        let name = Symbol(0);
+        let module = module_with(vec![(crate::hir::TypeParamId(0), name)]);
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::Named(FILE, name)])),
+            "`Box[File]` must be affine at runtime"
+        );
+        assert!(
+            !interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            "`Box[i64]` must not be affine at runtime"
+        );
+    }
+
+    #[test]
+    fn a_missing_type_parameter_list_fails_closed_to_affine() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            "missing generic metadata must never be answered as an empty substitution"
+        );
+    }
+
+    #[test]
+    fn an_unknown_generic_item_fails_closed_to_affine() {
+        let module = module_with(vec![(crate::hir::TypeParamId(0), Symbol(0))]);
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(ItemId(9999), vec![Ty::I64])),
+            "an item with no recorded layout must never be answered as non-affine"
+        );
+    }
+
+    #[test]
+    fn an_affine_record_is_a_legal_structural_drop_target() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let record = Value::Record {
+            item: BOXY,
+            fields: vec![Value::Resource(handle)],
+        };
+        assert!(
+            interpreter.is_affine_value(&record),
+            "a record containing a resource must be a legal drop target"
+        );
+        interpreter
+            .drop_value(record)
+            .expect("dropping an affine record must destroy its own resource field");
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_err(),
+            "the nested resource must actually have been destroyed"
+        );
+    }
+
+    #[test]
+    fn dropping_an_already_destroyed_value_is_a_structured_error_not_a_panic() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        interpreter
+            .drop_value(Value::Resource(handle))
+            .expect("the first drop must succeed");
+        let second = interpreter.drop_value(Value::Resource(handle));
+        assert!(
+            matches!(second, Err(InterpreterError::InvalidOperation(_))),
+            "a second drop must be a structured error, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_tombstone_is_a_structured_error_not_a_silent_success() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            matches!(
+                interpreter.drop_value(Value::Moved),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "dropping a moved tombstone must be reported, not silently accepted"
+        );
+        assert!(
+            matches!(
+                interpreter.drop_value(Value::Dropped),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "dropping an already-destroyed tombstone must be reported"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_through_a_variant_field_is_a_structured_error() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        let projection = crate::place::Projection::VariantField {
+            variant: BOXY,
+            case: crate::place::CaseId(0),
+            field: crate::place::FieldId(0),
+        };
+        let result = interpreter.observe_projections(&Value::Unit, &[projection]);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a variant-field projection must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn observing_through_a_mixed_chain_mutates_nothing_at_any_depth() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(5)]);
+        let outer = Value::Record {
+            item: BOXY,
+            fields: vec![Value::Resource(handle)],
+        };
+        let path = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(0),
+            },
+        ];
+        let read = interpreter
+            .observe_projections(&outer, &path)
+            .expect("observing through record -> resource must succeed");
+        assert_eq!(read, Value::Int(5));
+        // Nothing above the leaf may have been disturbed: the inline
+        // record still holds its own handle, and the resource's own
+        // field storage is untouched.
+        let Value::Record { ref fields, .. } = outer else {
+            unreachable!("constructed as a record immediately above")
+        };
+        assert!(matches!(fields[0], Value::Resource(_)));
+        assert_eq!(
+            interpreter
+                .resources
+                .borrow()
+                .observe_field(handle, 0)
+                .expect("the resource must still hold its own field"),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn a_failed_traversal_leaves_every_container_on_the_path_untouched() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let outer = Value::Record {
+            item: BOXY,
+            fields: vec![Value::Resource(handle)],
+        };
+        // Projects one level too deep: the inner resource has no field
+        // index 9, so the walk fails -- and must leave the outer
+        // record's own live intermediate exactly where it was rather
+        // than tombstoned by a half-applied mutation.
+        let deep = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(9),
+            },
+        ];
+        assert!(interpreter.take_projections(outer.clone(), &deep).is_err());
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a failed traversal must not destroy or invalidate an intermediate"
+        );
+        let Value::Record { ref fields, .. } = outer else {
+            unreachable!("constructed as a record immediately above")
+        };
+        assert!(
+            matches!(fields[0], Value::Resource(_)),
+            "the intermediate container must still hold its own live value"
+        );
+    }
+
+    #[test]
+    fn transferring_through_a_mixed_chain_empties_only_the_final_field() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(3)]);
+        let outer = Value::Record {
+            item: BOXY,
+            fields: vec![Value::Resource(handle)],
+        };
+        let path = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(0),
+            },
+        ];
+        let result = interpreter
+            .take_projections(outer, &path)
+            .expect("transferring through record -> resource must succeed");
+        assert_eq!(result.extracted, Value::Int(3));
+        // The intermediate resource handle is still exactly where it
+        // belongs in the rebuilt container -- never tombstoned along
+        // with the leaf that actually moved.
+        let Value::Record { fields, .. } = result.container else {
+            unreachable!("the container is the same record it went in as")
+        };
+        assert!(matches!(fields[0], Value::Resource(_)));
+        assert_eq!(
+            interpreter
+                .resources
+                .borrow()
+                .observe_field(handle, 0)
+                .expect("the resource itself must still be alive"),
+            Value::Moved,
+            "only the final selected field may be tombstoned"
+        );
+    }
+}
+
+/// Observable destruction order (`rfcs/0012`). Every resource is
+/// constructed with a distinct table id in source order, and the event
+/// log records each destruction as `drop:<id>` at the moment it
+/// actually happens -- so these assertions pin the *exact* sequence,
+/// not merely that everything was eventually destroyed.
+#[cfg(test)]
+mod destruction_order {
+    use super::tests::run_with_log;
+
+    /// Only `drop:` events, in the order they actually happened.
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_records_own_affine_fields_are_destroyed_in_reverse_declaration_order() {
+        // `first` is table id 0 and `second` is id 1; reverse
+        // declaration order destroys 1 before 0.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair { first: File, second: File } \
+             func main() -> i64 { \
+                 value pair = Pair { \
+                     first: File { descriptor: 1 }, \
+                     second: File { descriptor: 2 }, \
+                 }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0"]);
+    }
+
+    #[test]
+    fn a_resources_own_children_are_destroyed_before_its_outer_identity() {
+        // `input` is id 0, `output` is id 1, and `Session` itself is id
+        // 2: reverse field order first, then the outer identity last.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0", "drop:2"]);
+    }
+
+    #[test]
+    fn a_variants_active_case_payload_is_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func main() -> i64 { \
+                 value pair = Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 ); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0"]);
+    }
+
+    #[test]
+    fn only_the_active_variant_case_is_destroyed() {
+        // The `Neither` case owns nothing at all: the `File` built for
+        // the *other* construction is destroyed on its own, and nothing
+        // fabricates a payload destruction for the inactive case.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             func main() -> i64 { \
+                 value empty = Held.Neither; \
+                 value full = Held.Carrying(File { descriptor: 1 }); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_record_nested_inside_a_variant_has_its_own_resources_destroyed() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Envelope { file: File } \
+             variant Held { Carrying(Envelope), Neither } \
+             func main() -> i64 { \
+                 value held = Held.Carrying(Envelope { file: File { descriptor: 1 } }); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_variant_nested_inside_a_resource_has_its_active_case_destroyed() {
+        // `File` is id 0 and `Holder` (a declared resource) is id 1:
+        // the variant field's own live payload first, the resource's
+        // own outer identity last.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             resource Holder { held: Held } \
+             func main() -> i64 { \
+                 value holder = Holder { held: Held.Carrying(File { descriptor: 1 }) }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1"]);
+    }
+
+    #[test]
+    fn a_partially_moved_parent_destroys_only_what_is_left() {
+        // `input` (id 0) is moved out and destroyed explicitly first;
+        // the structural drop of `session` then destroys `output` (id
+        // 1) and the session's own outer identity (id 2), and never
+        // touches `input` again.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value input = session.input; \
+                 drop input; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1", "drop:2"]);
+    }
+
+    #[test]
+    fn an_already_destroyed_child_is_never_destroyed_a_second_time() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 drop session.input; \
+                 drop session; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1", "drop:2"]);
+    }
+
+    #[test]
+    fn an_ignored_wildcard_payload_is_destroyed_exactly_once_before_the_arm_body() {
+        // `sentinel` (id 1) is constructed after the ignored payload
+        // (id 0) and destroyed by the arm body, so the ignored
+        // payload's own destruction must appear *first*: it happens
+        // before the body runs at all.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func discard(take held: Held) -> i64 { \
+                 return match held { \
+                     Carrying(_) => sink(File { descriptor: 9 }), \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return discard(Held.Carrying(File { descriptor: 1 })) \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1"]);
+    }
+
+    #[test]
+    fn two_payload_positions_are_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func discard(take pair: Pair) -> i64 { \
+                 return match pair { \
+                     Both(_, _) => 1, \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return discard(Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 )) \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "an ignored payload must be destroyed in reverse declaration order"
+        );
+    }
+
+    #[test]
+    fn the_destruction_order_is_identical_across_repeated_runs() {
+        let text = "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             record Pair { left: Session, right: File } \
+             func main() -> i64 { \
+                 value pair = Pair { \
+                     left: Session { \
+                         input: File { descriptor: 1 }, \
+                         output: File { descriptor: 2 }, \
+                     }, \
+                     right: File { descriptor: 3 }, \
+                 }; \
+                 return 0 \
+             }";
+        let first = drops(text);
+        let second = drops(text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed its resources in a different order twice"
+        );
+        // `input`=0, `output`=1, `Session`=2, `right`=3. Reverse
+        // declaration order visits `right` first, then `left`, whose
+        // own children precede its outer identity.
+        assert_eq!(first, vec!["drop:3", "drop:1", "drop:0", "drop:2"]);
     }
 }

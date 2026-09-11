@@ -365,6 +365,19 @@ pub enum Value {
     /// `nir::RecordLayout`.
     Record {
         item: ItemId,
+        /// This value's own *concrete* type arguments, in the
+        /// declaration's own parameter order (`rfcs/0008`) -- empty for
+        /// a non-generic record.
+        ///
+        /// Carried on the value itself, not re-derived, because
+        /// `item` alone cannot answer what this aggregate owns: `Box`'s
+        /// own declared field type is the symbolic `Ty::Param(T)`, and
+        /// asking whether *that* is affine answers "no" for every
+        /// instantiation, `Box[File]` included. Never inferred from the
+        /// payload values either -- a moved-out field is a tombstone
+        /// with no type left to read, so a value that has already given
+        /// up a field could no longer say what it is.
+        type_args: Vec<Ty>,
         fields: Vec<Value>,
     },
     /// A variant value: `case` is the declaration index of its active
@@ -372,6 +385,11 @@ pub enum Value {
     /// declaration order (empty for a unit case).
     Variant {
         item: ItemId,
+        /// See [`Value::Record::type_args`] -- identical role, and
+        /// identically load-bearing: a `Maybe[File]` whose payload is
+        /// declared `Ty::Param(T)` owns a resource, and a `Maybe[i64]`
+        /// does not.
+        type_args: Vec<Ty>,
         case: usize,
         payload: Vec<Value>,
     },
@@ -564,19 +582,29 @@ impl<'a> Interpreter<'a> {
     /// makes it a legal structural `Drop` target (`rfcs/0012`).
     /// Answered from the value's own dynamic item identity, never from
     /// a static type this stage would otherwise have to be handed.
-    fn is_affine_value(&self, value: &Value) -> bool {
-        match value {
-            Value::Resource(_) => true,
-            Value::Record { item, .. } | Value::Variant { item, .. } => {
-                let mut visiting = HashSet::new();
-                self.is_resource(*item)
-                    || self
-                        .item_field_types(*item)
-                        .iter()
-                        .any(|fty| self.is_affine_visiting(fty, &mut visiting))
+    fn is_affine_value(&self, value: &Value) -> Result<bool, InterpreterError> {
+        let (item, type_args) = match value {
+            Value::Resource(_) => return Ok(true),
+            Value::Record {
+                item, type_args, ..
             }
-            _ => false,
+            | Value::Variant {
+                item, type_args, ..
+            } => (*item, type_args),
+            _ => return Ok(false),
+        };
+        if self.is_resource(item) {
+            return Ok(true);
         }
+        // Answered from this value's own *concrete* instantiation, not
+        // from its declaration: `Box`'s declared field is `Ty::Param(T)`
+        // and is affine for no instantiation at all, while `Box[File]`
+        // plainly owns a resource.
+        let subst = self.checked_substitution(item, type_args)?;
+        let mut visiting = HashSet::new();
+        Ok(self.item_field_types(item).iter().any(|fty| {
+            self.is_affine_visiting(&crate::types::substitute(fty, &subst), &mut visiting)
+        }))
     }
 
     /// Reads or removes the value at `place`'s own final projection step
@@ -742,7 +770,11 @@ impl<'a> Interpreter<'a> {
                     })
                 }
             }
-            Value::Record { item, mut fields } => {
+            Value::Record {
+                item,
+                type_args,
+                mut fields,
+            } => {
                 if fields.len() <= index {
                     return Err(invalid(
                         "a place projects a field index out of range for this record",
@@ -757,14 +789,22 @@ impl<'a> Interpreter<'a> {
                     let extracted = std::mem::replace(&mut fields[index], Value::Moved);
                     Ok(AccessResult {
                         extracted,
-                        container: Value::Record { item, fields },
+                        container: Value::Record {
+                            item,
+                            type_args,
+                            fields,
+                        },
                     })
                 } else {
                     let inner = self.take_projections(fields[index].clone(), rest)?;
                     fields[index] = inner.container;
                     Ok(AccessResult {
                         extracted: inner.extracted,
-                        container: Value::Record { item, fields },
+                        container: Value::Record {
+                            item,
+                            type_args,
+                            fields,
+                        },
                     })
                 }
             }
@@ -829,7 +869,11 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Resource(handle))
             }
-            Value::Record { item, mut fields } => {
+            Value::Record {
+                item,
+                type_args,
+                mut fields,
+            } => {
                 if fields.len() <= index {
                     return Err(invalid(
                         "a place projects a field index out of range for this record",
@@ -850,7 +894,11 @@ impl<'a> Interpreter<'a> {
                     // intermediate used to be.
                     fields[index] = self.store_projections(fields[index].clone(), rest, value)?;
                 }
-                Ok(Value::Record { item, fields })
+                Ok(Value::Record {
+                    item,
+                    type_args,
+                    fields,
+                })
             }
             Value::Moved => Err(invalid(
                 "a place reinitializes through a field that was already moved",
@@ -899,7 +947,13 @@ impl<'a> Interpreter<'a> {
                     let record = table.observe(handle)?;
                     (record.item, record.fields.len())
                 };
-                let field_types = self.item_field_types(item);
+                // A declared `resource` is never generic in this
+                // milestone's grammar, so its own declared field types
+                // are already concrete -- but they are still resolved
+                // through the same checked path, so an unknown item or
+                // a malformed layout is an error rather than an empty
+                // list that would silently skip every field.
+                let field_types = self.record_field_types(item, &[])?;
                 for index in (0..arity).rev() {
                     let Some(ty) = field_types.get(index) else {
                         continue;
@@ -927,17 +981,23 @@ impl<'a> Interpreter<'a> {
                     .push(format!("drop:{}", handle.id.0));
                 Ok(())
             }
-            Value::Record { item, mut fields } => {
+            Value::Record {
+                item,
+                type_args,
+                mut fields,
+            } => {
                 // An ordinary `record` that merely *contains* affine
                 // fields has no separate runtime identity of its own to
                 // destroy -- only its own live affine fields, in
                 // reverse declaration order. Silently ignoring this
                 // shape is exactly what let a variant carrying an
                 // affine record leak that record's own resources.
-                if !self.module.records.iter().any(|(id, _)| *id == item) {
-                    return Err(invalid("drop of a value naming an unknown record"));
-                }
-                let field_types = self.item_field_types(item);
+                //
+                // The field types come from this value's *own*
+                // instantiation: a `Box[File]` destroyed through its
+                // declaration's symbolic `Ty::Param(T)` would find
+                // nothing affine and leak the `File` it holds.
+                let field_types = self.record_field_types(item, &type_args)?;
                 for index in (0..fields.len()).rev() {
                     let Some(ty) = field_types.get(index) else {
                         continue;
@@ -955,21 +1015,16 @@ impl<'a> Interpreter<'a> {
             }
             Value::Variant {
                 item,
+                type_args,
                 case,
                 mut payload,
             } => {
-                let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item)
-                else {
-                    return Err(invalid("drop of a value naming an unknown variant"));
-                };
-                let Some(case_layout) = variant.cases.get(case) else {
-                    return Err(invalid(
-                        "drop of a variant value naming an out-of-range case",
-                    ));
-                };
                 // Only the active case, and only its own live payload
-                // fields, in reverse declaration order (`rfcs/0012`).
-                let payload_types = case_layout.payload.clone();
+                // fields, in reverse declaration order (`rfcs/0012`) --
+                // substituted with this value's own type arguments, so
+                // a `Maybe[File]` destroys the `File` its declaration
+                // only ever calls `T`.
+                let payload_types = self.case_payload_types(item, &type_args, case)?;
                 for index in (0..payload.len()).rev() {
                     let Some(ty) = payload_types.get(index) else {
                         continue;
@@ -1012,6 +1067,79 @@ impl<'a> Interpreter<'a> {
         Vec::new()
     }
 
+    /// `item`'s own declared field types with `type_args` substituted
+    /// in, in declaration order (`rfcs/0008`, `rfcs/0012`) -- what a
+    /// runtime value's own fields *actually* are at this instantiation,
+    /// as opposed to the symbolic `Ty::Param` its declaration was
+    /// written with.
+    ///
+    /// Errors -- never an empty or partial list -- when `item` has no
+    /// recorded layout or when its declared arity disagrees with
+    /// `type_args`: destroying an aggregate from a substitution nobody
+    /// could build would skip exactly the fields whose types went
+    /// missing.
+    fn record_field_types(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+    ) -> Result<Vec<Ty>, InterpreterError> {
+        let Some((_, record)) = self.module.records.iter().find(|(id, _)| *id == item) else {
+            return Err(invalid(
+                "a runtime aggregate names a record this module never declared",
+            ));
+        };
+        let subst = self.checked_substitution(item, type_args)?;
+        Ok(record
+            .fields
+            .iter()
+            .map(|(_, t)| crate::types::substitute(t, &subst))
+            .collect())
+    }
+
+    /// `item`'s own declared payload types for `case`, with `type_args`
+    /// substituted in (`rfcs/0008`, `rfcs/0012`) -- only the *active*
+    /// case, never the flattened cross-case list: a case that was never
+    /// constructed owns nothing.
+    fn case_payload_types(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+        case: usize,
+    ) -> Result<Vec<Ty>, InterpreterError> {
+        let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item) else {
+            return Err(invalid(
+                "a runtime aggregate names a variant this module never declared",
+            ));
+        };
+        let Some(layout) = variant.cases.get(case) else {
+            return Err(invalid(
+                "a runtime variant value names a case out of range for its own declaration",
+            ));
+        };
+        let subst = self.checked_substitution(item, type_args)?;
+        Ok(layout
+            .payload
+            .iter()
+            .map(|t| crate::types::substitute(t, &subst))
+            .collect())
+    }
+
+    /// [`Self::type_substitution`] as a hard requirement: a structured,
+    /// deterministic error rather than an `Option` the caller might be
+    /// tempted to paper over with a default.
+    fn checked_substitution(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+    ) -> Result<std::collections::HashMap<crate::hir::TypeParamId, Ty>, InterpreterError> {
+        self.type_substitution(item, type_args).ok_or_else(|| {
+            invalid(
+                "a runtime aggregate carries type arguments that disagree with its own \
+                 declaration's parameter list",
+            )
+        })
+    }
+
     /// Transfers ownership of `value` if it is a resource (Blocker 8),
     /// recursing into a plain `Record`/`Variant`'s own fields/payload to
     /// transfer any resource nested inside *those* too (`rfcs/0012`) --
@@ -1032,8 +1160,17 @@ impl<'a> Interpreter<'a> {
             Value::Resource(handle) => Ok(Value::Resource(
                 self.resources.borrow_mut().transfer(handle)?,
             )),
-            Value::Record { item, fields } => Ok(Value::Record {
+            // A transfer rebuilds the aggregate around freshly-generated
+            // handles, so it must carry this value's own type arguments
+            // across unchanged: an ownership transfer is not the place
+            // a `Box[File]` quietly becomes a `Box[T]`.
+            Value::Record {
                 item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
                 fields: fields
                     .into_iter()
                     .map(|f| self.transfer_if_resource(f))
@@ -1041,10 +1178,12 @@ impl<'a> Interpreter<'a> {
             }),
             Value::Variant {
                 item,
+                type_args,
                 case,
                 payload,
             } => Ok(Value::Variant {
                 item,
+                type_args,
                 case,
                 payload: payload
                     .into_iter()
@@ -1327,7 +1466,7 @@ impl<'a> Interpreter<'a> {
                         match get(&values, value)? {
                             v @ Value::Resource(_) => self.drop_value(v)?,
                             v @ (Value::Record { .. } | Value::Variant { .. })
-                                if self.is_affine_value(&v) =>
+                                if self.is_affine_value(&v)? =>
                             {
                                 self.drop_value(v)?
                             }
@@ -1636,7 +1775,7 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
-            ValueKind::RecordCreate(item, _type_args, field_ids) => {
+            ValueKind::RecordCreate(item, type_args, field_ids) => {
                 let fields = field_ids
                     .iter()
                     .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
@@ -1654,6 +1793,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Ok(Value::Record {
                         item: *item,
+                        type_args: type_args.clone(),
                         fields,
                     })
                 }
@@ -1663,7 +1803,7 @@ impl<'a> Interpreter<'a> {
                 record,
                 field,
             } => match get(values, base)? {
-                Value::Record { item, fields } if item == *record => fields
+                Value::Record { item, fields, .. } if item == *record => fields
                     .get(*field)
                     .cloned()
                     .ok_or_else(|| invalid("record field index out of range")),
@@ -1688,7 +1828,7 @@ impl<'a> Interpreter<'a> {
             ValueKind::VariantCreate {
                 variant,
                 case,
-                type_args: _,
+                type_args,
                 payload,
             } => {
                 let payload = payload
@@ -1697,6 +1837,7 @@ impl<'a> Interpreter<'a> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *variant,
+                    type_args: type_args.clone(),
                     case: *case,
                     payload,
                 })
@@ -1711,6 +1852,7 @@ impl<'a> Interpreter<'a> {
                     item,
                     case: active_case,
                     payload,
+                    ..
                 } if item == *variant && active_case == *case => payload
                     .get(*index)
                     .cloned()
@@ -3779,10 +3921,13 @@ mod structural_runtime {
             .construct(FILE, vec![Value::Int(1)]);
         let record = Value::Record {
             item: BOXY,
+            type_args: Vec::new(),
             fields: vec![Value::Resource(handle)],
         };
         assert!(
-            interpreter.is_affine_value(&record),
+            interpreter
+                .is_affine_value(&record)
+                .expect("the fixture's own layout is well formed"),
             "a record containing a resource must be a legal drop target"
         );
         interpreter
@@ -3858,6 +4003,7 @@ mod structural_runtime {
             .construct(FILE, vec![Value::Int(5)]);
         let outer = Value::Record {
             item: BOXY,
+            type_args: Vec::new(),
             fields: vec![Value::Resource(handle)],
         };
         let path = [
@@ -3901,6 +4047,7 @@ mod structural_runtime {
             .construct(FILE, vec![Value::Int(1)]);
         let outer = Value::Record {
             item: BOXY,
+            type_args: Vec::new(),
             fields: vec![Value::Resource(handle)],
         };
         // Projects one level too deep: the inner resource has no field
@@ -3941,6 +4088,7 @@ mod structural_runtime {
             .construct(FILE, vec![Value::Int(3)]);
         let outer = Value::Record {
             item: BOXY,
+            type_args: Vec::new(),
             fields: vec![Value::Resource(handle)],
         };
         let path = [
@@ -4211,5 +4359,336 @@ mod destruction_order {
         // declaration order visits `right` first, then `left`, whose
         // own children precede its outer identity.
         assert_eq!(first, vec!["drop:3", "drop:1", "drop:0", "drop:2"]);
+    }
+}
+
+/// Whole-aggregate destruction of a *generic* instantiation
+/// (`rfcs/0008`, `rfcs/0012`). Every one of these drops the aggregate
+/// itself rather than moving its fields out first, which is the only
+/// shape that actually reaches the runtime's own structural drop for a
+/// generic value -- and the shape under which a discarded type argument
+/// leaks silently, because nothing else observes the loss.
+///
+/// The event log is the proof: each destruction appears as `drop:<table
+/// id>` at the moment it happens, so these pin the exact sequence
+/// rather than merely asserting the program finished.
+#[cfg(test)]
+mod generic_destruction {
+    use super::tests::run_with_log;
+    use super::*;
+    use crate::symbol::Symbol;
+
+    const DECLS: &str = "resource File { descriptor: i64 } \
+                         record Box[T] { item: T } \
+                         variant Maybe[T] { Some(T), None } ";
+
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn dropping_a_generic_record_destroys_its_substituted_field() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value boxed = Box[File] {{ item: File {{ descriptor: 1 }} }}; \
+               drop boxed; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[File]`'s own `File` must be destroyed exactly once"
+        );
+    }
+
+    #[test]
+    fn dropping_a_nested_generic_record_destroys_through_both_levels() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value nested = Box[Box[File]] {{ item: Box[File] {{ item: File {{ descriptor: 2 }} }} }}; \
+               drop nested; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[Box[File]]` must destroy the `File` two substitutions down"
+        );
+    }
+
+    #[test]
+    fn dropping_a_generic_variant_destroys_only_its_active_case() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value present = Maybe[File].Some(File {{ descriptor: 3 }}); \
+               drop present; \
+               value absent = Maybe[File].None; \
+               drop absent; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "the `Some` payload is destroyed once and `None` owns nothing"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_instantiation_destroys_nothing_at_runtime() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value plain = Box[i64] {{ item: 7 }}; \
+               value file = File {{ descriptor: 1 }}; \
+               drop file; \
+               return plain.item \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[i64]` owns nothing, so only the standalone `File` is destroyed"
+        );
+    }
+
+    #[test]
+    fn a_generic_record_inside_a_variant_payload_is_destroyed() {
+        let order = drops(&format!(
+            "{DECLS} variant Holder {{ Carry(Box[File]), Nothing }} \
+             func main() -> i64 {{ \
+               value held = Holder.Carry(Box[File] {{ item: File {{ descriptor: 4 }} }}); \
+               drop held; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "a variant payload's own generic record must not leak its resource"
+        );
+    }
+
+    #[test]
+    fn a_generic_variant_inside_an_ordinary_record_is_destroyed() {
+        let order = drops(&format!(
+            "{DECLS} record Wrap {{ m: Maybe[File] }} \
+             func main() -> i64 {{ \
+               value w = Wrap {{ m: Maybe[File].Some(File {{ descriptor: 5 }}) }}; \
+               drop w; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "an ordinary record's own generic variant field must not leak its resource"
+        );
+    }
+
+    #[test]
+    fn a_generic_aggregate_keeps_its_type_arguments_across_a_call_boundary() {
+        let order = drops(&format!(
+            "{DECLS} func relay(take boxed: Box[File]) -> Box[File] {{ return boxed }} \
+             func main() -> i64 {{ \
+               value first = Box[File] {{ item: File {{ descriptor: 6 }} }}; \
+               value second = relay(first); \
+               drop second; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "type arguments must survive a transfer into and back out of a call"
+        );
+    }
+
+    #[test]
+    fn a_partially_moved_generic_aggregate_destroys_only_what_is_left() {
+        // Two affine fields: the first is moved out and destroyed
+        // explicitly (table id 0), then the aggregate itself is dropped
+        // and destroys only the second (id 1).
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair[T] { left: T, right: T } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func main() -> i64 { \
+                 value pair = Pair[File] { \
+                     left: File { descriptor: 1 }, \
+                     right: File { descriptor: 2 }, \
+                 }; \
+                 value left = pair.left; \
+                 value taken = sink(left); \
+                 drop pair; \
+                 return taken \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:0", "drop:1"],
+            "a partially moved generic aggregate destroys only its remaining field"
+        );
+    }
+
+    #[test]
+    fn a_generic_aggregates_fields_are_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair[T] { left: T, right: T } \
+             func main() -> i64 { \
+                 value pair = Pair[File] { \
+                     left: File { descriptor: 1 }, \
+                     right: File { descriptor: 2 }, \
+                 }; \
+                 drop pair; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "reverse declaration order, exactly as for a concrete aggregate"
+        );
+    }
+
+    #[test]
+    fn the_generic_destruction_order_is_identical_across_repeated_runs() {
+        let text = "resource File { descriptor: i64 } \
+                    record Pair[T] { left: T, right: T } \
+                    func main() -> i64 { \
+                        value pair = Pair[Box[File]] { \
+                            left: Box[File] { item: File { descriptor: 1 } }, \
+                            right: Box[File] { item: File { descriptor: 2 } }, \
+                        }; \
+                        drop pair; \
+                        return 0 \
+                    } \
+                    record Box[T] { item: T }";
+        let first = drops(text);
+        let second = drops(text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed in a different order"
+        );
+        assert_eq!(first, vec!["drop:1", "drop:0"]);
+    }
+
+    // -- malformed runtime metadata ------------------------------------
+
+    fn generic_module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    ItemId(90),
+                    crate::nir::RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    ItemId(91),
+                    crate::nir::RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_runtime_arity_disagreement_is_a_structured_error_not_a_silent_skip() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        // `Box` declares one type parameter; this value carries two.
+        let malformed = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64, Ty::I64],
+            fields: vec![Value::Resource(handle)],
+        };
+        assert!(
+            matches!(
+                interpreter.is_affine_value(&malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "an arity disagreement must be reported, never answered from a partial substitution"
+        );
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "destroying from a substitution nobody could build must be refused"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a refused destruction must not have destroyed anything"
+        );
+    }
+
+    #[test]
+    fn an_unknown_runtime_item_is_a_structured_error() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let unknown = Value::Record {
+            item: ItemId(9999),
+            type_args: Vec::new(),
+            fields: Vec::new(),
+        };
+        assert!(matches!(
+            interpreter.is_affine_value(&unknown),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            interpreter.drop_value(unknown),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_generic_value_answers_from_its_own_arguments() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let name = Symbol(0);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        let affine = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::Named(ItemId(90), name)],
+            fields: vec![Value::Resource(handle)],
+        };
+        assert_eq!(interpreter.is_affine_value(&affine), Ok(true));
+        let plain = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            fields: vec![Value::Int(1)],
+        };
+        assert_eq!(interpreter.is_affine_value(&plain), Ok(false));
     }
 }

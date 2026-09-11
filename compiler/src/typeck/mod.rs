@@ -855,23 +855,58 @@ impl<'a> Checker<'a> {
                 result
             }
             Ty::Applied(item, args) => {
-                if !visiting.insert(*item) {
-                    return false;
+                if self.records.get(item).is_some_and(|r| r.affine) {
+                    return true;
                 }
-                let type_params = self.generic_params.get(item).cloned().unwrap_or_default();
-                let subst: HashMap<TypeParamId, Ty> =
-                    type_params.into_iter().zip(args.iter().cloned()).collect();
-                let declared_resource = self.records.get(item).is_some_and(|r| r.affine);
+                // Deliberately *not* guarded by `visiting`: that set is
+                // keyed by bare `ItemId`, so it cannot tell a genuine
+                // cycle apart from a legitimately nested instantiation
+                // of the same declaration -- `Box[Box[File]]` reaches
+                // `Box` twice with different arguments and must answer
+                // from the inner one, not be cut off as if it were
+                // self-referential. `depth` (checked at the top of this
+                // function) is the correct termination guard here: it
+                // bounds a genuinely cyclic generic, which
+                // `check_aggregate_cycles` independently rejects as an
+                // infinite-size layout before any body is checked.
+                let Some(subst) = self.checked_substitution(*item, args) else {
+                    // Missing or arity-disagreeing generic metadata
+                    // fails *closed*, to affine: a partial `zip` leaves
+                    // an unsubstituted `Ty::Param`, which answers "not
+                    // affine" and would silently drop every ownership
+                    // obligation this instantiation carries. An
+                    // over-demand is recoverable; a dropped obligation
+                    // is a leak.
+                    return true;
+                };
                 let field_types = self.item_field_types(*item);
-                let result = declared_resource
-                    || field_types.iter().any(|fty| {
-                        self.is_affine_visiting(&substitute(fty, &subst), visiting, depth + 1)
-                    });
-                visiting.remove(item);
-                result
+                field_types.iter().any(|fty| {
+                    self.is_affine_visiting(&substitute(fty, &subst), visiting, depth + 1)
+                })
             }
             _ => false,
         }
+    }
+
+    /// `item`'s own declared type parameters paired with `args`
+    /// (`rfcs/0008`) -- the one place a generic substitution is built in
+    /// this stage, so no caller can accidentally reintroduce a partial
+    /// one.
+    ///
+    /// `None`, never an empty or partial map, when `item` has no
+    /// recorded type-parameter list at all (an item this checker never
+    /// registered; `collect_generic_params` records one -- possibly
+    /// empty -- for every declared record, variant and function, so an
+    /// absent entry really does mean "unknown item") or when its
+    /// declared arity disagrees with `args`. A `zip` over mismatched
+    /// lengths silently truncates, leaving an unsubstituted `Ty::Param`
+    /// behind to decide ownership.
+    fn checked_substitution(&self, item: ItemId, args: &[Ty]) -> Option<HashMap<TypeParamId, Ty>> {
+        let params = self.generic_params.get(&item)?;
+        if params.len() != args.len() {
+            return None;
+        }
+        Some(params.iter().copied().zip(args.iter().cloned()).collect())
     }
 
     /// Rejects an infinitely-sized direct (or indirect) aggregate cycle
@@ -999,7 +1034,29 @@ impl<'a> Checker<'a> {
             } => {
                 let resolved_args: Vec<Ty> =
                     args.iter().map(|a| self.resolve_named_type(a)).collect();
-                let type_params = self.generic_params.get(item).cloned().unwrap_or_default();
+                // An item with no recorded parameter list at all is not
+                // the same thing as a non-generic one:
+                // `collect_generic_params` records an entry -- possibly
+                // empty -- for every declared record, variant and
+                // function, so an absent one means this name never
+                // resolved to a declaration this checker knows. Treated
+                // as its own `UNKNOWN_TYPE` rather than silently
+                // accepted as a non-generic `Ty::Named`, which would
+                // hand every later stage a type with no declaration
+                // behind it.
+                let Some(type_params) = self.generic_params.get(item).cloned() else {
+                    let text = self.registry.qualified_name(*item, self.interner);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::UNKNOWN_TYPE,
+                            self.source,
+                            ty.span(),
+                            format!("`{text}` does not name a declaration in scope"),
+                        )
+                        .with_primary_label("unknown type"),
+                    );
+                    return Ty::Error;
+                };
                 if type_params.is_empty() {
                     if !resolved_args.is_empty() {
                         let text = self.registry.qualified_name(*item, self.interner);
@@ -4303,7 +4360,7 @@ mod tests {
     use crate::parser::Parser;
     use crate::source::SourceMap;
 
-    fn check(text: &str) -> Vec<Diagnostic> {
+    pub(super) fn check(text: &str) -> Vec<Diagnostic> {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -8077,5 +8134,198 @@ mod tests {
             diags.is_empty(),
             "an inner loop's own break must not affect the outer loop's own divergence: {diags:?}"
         );
+    }
+}
+
+/// Generic affinity is decided by the *substituted* field types
+/// (`rfcs/0008`, `rfcs/0012`), and the substitution that decides it is
+/// never partial. `drop` accepts exactly the values that own a resource
+/// (`T0061` otherwise), so it is this stage's own observable answer to
+/// "is this instantiation affine" and is what these assert against.
+#[cfg(test)]
+mod generic_affinity {
+    use super::codes;
+    use super::tests::check;
+
+    const DECLS: &str = "resource File { descriptor: i64 } \
+                         record Box[T] { item: T } \
+                         variant Maybe[T] { Some(T), None } ";
+
+    fn codes(text: &str) -> Vec<&'static str> {
+        check(text).iter().map(|d| d.code).collect()
+    }
+
+    #[test]
+    fn an_affine_instantiation_owns_a_resource() {
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value b = Box[File] {{ item: File {{ descriptor: 1 }} }}; \
+                   drop b; \
+                   return 0 \
+                 }}"
+            ))
+            .is_empty(),
+            "`Box[File]` must be affine"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_instantiation_owns_nothing() {
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value b = Box[i64] {{ item: 1 }}; \
+                   drop b; \
+                   return 0 \
+                 }}"
+            ))
+            .contains(&codes::DROP_OF_NON_RESOURCE),
+            "`Box[i64]` must not be affine"
+        );
+    }
+
+    /// The cycle guard is keyed by bare `ItemId`, so reaching the same
+    /// *declaration* twice with different arguments used to be cut off
+    /// as if it were self-referential -- answering "not affine" for a
+    /// `Box[Box[File]]` that plainly owns a `File`.
+    #[test]
+    fn a_nested_instantiation_of_the_same_declaration_is_not_a_cycle() {
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value b = Box[Box[File]] {{ item: Box[File] {{ item: File {{ descriptor: 1 }} }} }}; \
+                   drop b; \
+                   return 0 \
+                 }}"
+            ))
+            .is_empty(),
+            "`Box[Box[File]]` must be affine through two levels of substitution"
+        );
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value b = Box[Box[i64]] {{ item: Box[i64] {{ item: 1 }} }}; \
+                   drop b; \
+                   return 0 \
+                 }}"
+            ))
+            .contains(&codes::DROP_OF_NON_RESOURCE),
+            "`Box[Box[i64]]` must still own nothing"
+        );
+    }
+
+    #[test]
+    fn a_generic_variants_affinity_follows_its_own_instantiation() {
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value m = Maybe[File].Some(File {{ descriptor: 1 }}); \
+                   drop m; \
+                   return 0 \
+                 }}"
+            ))
+            .is_empty(),
+            "`Maybe[File]` must be affine"
+        );
+        assert!(
+            codes(&format!(
+                "{DECLS} func main() -> i64 {{ \
+                   value m = Maybe[i64].Some(1); \
+                   drop m; \
+                   return 0 \
+                 }}"
+            ))
+            .contains(&codes::DROP_OF_NON_RESOURCE),
+            "`Maybe[i64]` must not be affine"
+        );
+    }
+
+    #[test]
+    fn a_generic_aggregate_nested_across_declarations_stays_affine() {
+        assert!(
+            codes(&format!(
+                "{DECLS} record Wrap {{ m: Maybe[File] }} \
+                 func main() -> i64 {{ \
+                   value w = Wrap {{ m: Maybe[File].Some(File {{ descriptor: 1 }}) }}; \
+                   drop w; \
+                   return 0 \
+                 }}"
+            ))
+            .is_empty(),
+            "an ordinary record holding an affine instantiation is affine"
+        );
+        assert!(
+            codes(&format!(
+                "{DECLS} variant Holder {{ Carry(Box[File]), Nothing }} \
+                 func main() -> i64 {{ \
+                   value h = Holder.Carry(Box[File] {{ item: File {{ descriptor: 1 }} }}); \
+                   drop h; \
+                   return 0 \
+                 }}"
+            ))
+            .is_empty(),
+            "a variant carrying an affine instantiation is affine"
+        );
+    }
+
+    #[test]
+    fn a_type_argument_arity_disagreement_is_its_own_diagnostic() {
+        let too_many = codes(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value b: Box[i64, i64] = Box[i64] {{ item: 1 }}; \
+               return 0 \
+             }}"
+        ));
+        assert!(
+            too_many.contains(&codes::GENERIC_ARITY_MISMATCH),
+            "too many type arguments must be reported, got {too_many:?}"
+        );
+        let too_few = codes(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value b: Box = Box[i64] {{ item: 1 }}; \
+               return 0 \
+             }}"
+        ));
+        assert!(
+            too_few.contains(&codes::MISSING_TYPE_ARGUMENTS),
+            "too few type arguments must be reported, got {too_few:?}"
+        );
+    }
+
+    #[test]
+    fn type_arguments_on_a_non_generic_declaration_are_rejected() {
+        let found = codes(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value f: File[i64] = File {{ descriptor: 1 }}; \
+               return 0 \
+             }}"
+        ));
+        assert!(
+            found.contains(&codes::TYPE_ARGUMENTS_TO_NON_GENERIC),
+            "type arguments on a non-generic declaration must be reported, got {found:?}"
+        );
+    }
+
+    /// Declaration order must not decide affinity: the same module with
+    /// its declarations reversed answers identically.
+    #[test]
+    fn reversing_the_declaration_order_changes_no_affinity_answer() {
+        let forward = "resource File { descriptor: i64 } \
+                       record Box[T] { item: T } \
+                       func main() -> i64 { \
+                         value b = Box[File] { item: File { descriptor: 1 } }; \
+                         drop b; \
+                         return 0 \
+                       }";
+        let reversed = "record Box[T] { item: T } \
+                        resource File { descriptor: i64 } \
+                        func main() -> i64 { \
+                          value b = Box[File] { item: File { descriptor: 1 } }; \
+                          drop b; \
+                          return 0 \
+                        }";
+        assert_eq!(codes(forward), codes(reversed));
+        assert!(codes(forward).is_empty());
     }
 }

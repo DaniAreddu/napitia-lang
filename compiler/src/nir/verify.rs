@@ -2194,18 +2194,30 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
             }
             let no_preds = Vec::new();
             let ps = preds.get(&id).unwrap_or(&no_preds);
+            // Every predecessor recorded above is reachable, and every
+            // reachable block was given a `dom` entry above, so none of
+            // these lookups can miss. They are written as lookups
+            // rather than indexing anyway: nothing a malformed CFG can
+            // express may reach a panic in this file.
             let mut new_dom = match ps.split_first() {
                 None => HashSet::from([id]),
                 Some((first, rest)) => {
-                    let mut acc = dom[first].clone();
+                    let Some(mut acc) = dom.get(first).cloned() else {
+                        continue;
+                    };
                     for p in rest {
-                        acc = acc.intersection(&dom[p]).copied().collect();
+                        let Some(other) = dom.get(p) else {
+                            continue;
+                        };
+                        acc = acc.intersection(other).copied().collect();
                     }
                     acc.insert(id);
                     acc
                 }
             };
-            let existing = dom.get_mut(&id).unwrap();
+            let Some(existing) = dom.get_mut(&id) else {
+                continue;
+            };
             if new_dom != *existing {
                 std::mem::swap(existing, &mut new_dom);
                 changed = true;

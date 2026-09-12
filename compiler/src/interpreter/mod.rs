@@ -220,11 +220,19 @@ impl ResourceTable {
         index: usize,
     ) -> Result<Value, InterpreterError> {
         let record = self.observe(handle)?;
-        record
-            .fields
-            .get(index)
-            .cloned()
-            .ok_or_else(|| invalid("a place projects a field index out of range for this resource"))
+        let field = record.fields.get(index).cloned().ok_or_else(|| {
+            invalid("a place projects a field index out of range for this resource")
+        })?;
+        // Reading *through* an observer may never hand back an owning
+        // handle: the field's stored handle is the owner's, and
+        // returning it as-is would let an observation promote itself by
+        // one projection.
+        match (handle.role, field) {
+            (RuntimeOwnershipRole::Observer, Value::Resource(inner)) => {
+                Ok(Value::Resource(self.to_observer(inner)?))
+            }
+            (_, field) => Ok(field),
+        }
     }
 
     /// Removes `handle`'s own field at `index`, leaving a
@@ -1934,10 +1942,57 @@ impl<'a> Interpreter<'a> {
     /// parameter binding, and every `store.observe`, goes through this
     /// rather than binding the caller's own handle as-is.
     fn to_observer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
+        self.to_observing_view(value, 0)
+    }
+
+    /// Rebuilds `value` as an observing *view* of itself: every resource
+    /// handle it carries, at any depth, becomes an `Observer`
+    /// (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Observation is transitive. Downgrading only a bare
+    /// `Value::Resource` left every handle inside a `Record` or a
+    /// `Variant` owning, so a `Box[File]` bound to an ordinary parameter
+    /// handed the callee full owning access to the `File` the caller
+    /// still owned.
+    ///
+    /// Nothing is mutated: a new value is built, and the caller's own
+    /// keeps its owning handles.
+    fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
         match value {
             Value::Resource(handle) => Ok(Value::Resource(
                 self.resources.borrow().to_observer(handle)?,
             )),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|field| self.to_observing_view(field, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|slot| self.to_observing_view(slot, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             other => Ok(other),
         }
     }
@@ -8065,6 +8120,265 @@ mod value_shape {
             before,
             snapshot(&interpreter),
             "a refused destruction changed state"
+        );
+    }
+}
+
+/// An ordinary (non-`take`) parameter observes, and so does everything
+/// reachable through it (`rfcs/0011`, `rfcs/0012`).
+///
+/// The runtime's own backstop for that: binding an observing parameter
+/// produces an observing *view* of the whole value, however deeply the
+/// owner handles are buried, and reading through an observer never hands
+/// back an owning handle. `nir::verify` already rejects the NIR that
+/// would need this; this is the independent second answer, not a
+/// substitute.
+#[cfg(test)]
+mod transitive_observation {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(140);
+    const SESSION: ItemId = ItemId(141);
+    const BOXY: ItemId = ItemId(142);
+    const MAYBE: ItemId = ItemId(143);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// Every resource handle `value` carries inline, in order.
+    fn handles(value: &Value, out: &mut Vec<ResourceHandle>) {
+        match value {
+            Value::Resource(handle) => out.push(*handle),
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    handles(field, out);
+                }
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    handles(slot, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_all_observers(value: &Value, what: &str) {
+        let mut found = Vec::new();
+        handles(value, &mut found);
+        assert!(!found.is_empty(), "{what}: the fixture carries no handles");
+        for handle in found {
+            assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "{what}: an owning handle survived into an observing view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_of_resources_becomes_an_observing_view_throughout() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let value = Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::Named(FILE, Symbol(0))],
+            fields: vec![Value::Resource(owned)],
+        };
+        let view = interpreter
+            .to_observer_if_resource(value.clone())
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Box[File]` bound to an observing parameter");
+        let mut original = Vec::new();
+        handles(&value, &mut original);
+        assert_eq!(
+            original,
+            vec![owned],
+            "the caller's own value is untouched: it still holds its owning handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owned).is_ok(),
+            "nothing about the resource itself changed"
+        );
+    }
+
+    #[test]
+    fn a_variant_payload_becomes_an_observing_view() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(owned)],
+            })
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Maybe[File]` bound to an observing parameter");
+    }
+
+    #[test]
+    fn a_deeply_nested_value_becomes_an_observing_view_at_every_level() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(owned)],
+                }],
+            })
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Box[Maybe[File]]`");
+    }
+
+    #[test]
+    fn reading_a_field_through_an_observer_yields_an_observer() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(inner)]);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(session)
+            .expect("downgrading an owner must succeed");
+        let field = interpreter
+            .resources
+            .borrow()
+            .observe_field(observer, 0)
+            .expect("reading a field of an observed resource must succeed");
+        let Value::Resource(handle) = field else {
+            panic!("the field holds a resource, got {field:?}");
+        };
+        assert_eq!(
+            handle.role,
+            RuntimeOwnershipRole::Observer,
+            "reading through an observer must never hand back an owning handle"
+        );
+    }
+
+    #[test]
+    fn reading_a_field_through_an_owner_still_yields_the_owner() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(inner)]);
+        let field = interpreter
+            .resources
+            .borrow()
+            .observe_field(session, 0)
+            .expect("reading a field of an owned resource must succeed");
+        assert_eq!(
+            field,
+            Value::Resource(inner),
+            "an owner reading its own field still reaches the owning handle"
+        );
+    }
+
+    #[test]
+    fn an_observing_view_cannot_be_transferred_or_destroyed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                fields: vec![Value::Resource(owned)],
+            })
+            .expect("observing a well-formed value must succeed");
+        let before = interpreter.resources.borrow().records[owned.id.0 as usize].generation;
+        assert!(
+            matches!(
+                interpreter.drop_value(view.clone()),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "destroying through an observing view must be refused"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[owned.id.0 as usize].generation,
+            before,
+            "a refused destruction changed a generation"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owned).is_ok(),
+            "the caller still owns its resource"
         );
     }
 }

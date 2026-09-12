@@ -1,0 +1,24 @@
+// Dropping the same *structural field* twice is rejected, exactly like
+// dropping the same whole local twice already was (`rfcs/0012`). The
+// field itself is the drop target here -- not a local extracted out of
+// it first -- so this exercises the field-level double-drop diagnostic
+// rather than the whole-local one it would otherwise fall back to.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    drop session.input;
+    drop session.input;
+    drop session;
+    return 0;
+}

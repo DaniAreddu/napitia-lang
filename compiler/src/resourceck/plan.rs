@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ExprId, ItemId, LocalId};
+use crate::place::Place;
 use crate::types::Ty;
 
 /// Whether one specific expression's own value, at the exact syntactic
@@ -43,6 +44,19 @@ pub struct CheckedDeferPlan {
     pub callee: ItemId,
     pub arg_modes: Vec<ConsumeInfo>,
     pub arg_types: Vec<Ty>,
+    /// The exact structural place each argument names, in the same
+    /// declaration order (`rfcs/0012`) -- `Some(session.input)` for an
+    /// affine field access resolving to a stable place, `Some(session)`
+    /// for a bare affine local, and `None` for an argument that names
+    /// no place at all (a literal, a call's own result, a non-affine
+    /// value). This is the granularity at which the observing form of
+    /// this `defer` protects its capture, and at which its consuming
+    /// form transfers it: recording the *root* instead is what wrongly
+    /// rejected moving an unaffected sibling field while the defer was
+    /// still pending. `nir::lower` independently re-resolves each
+    /// argument's own place and cross-checks it against this, rather
+    /// than trusting a second parallel resolution unchecked.
+    pub arg_places: Vec<Option<Place<LocalId>>>,
     pub return_type: Ty,
     pub registration_order: u32,
 }
@@ -56,11 +70,17 @@ pub struct CheckedDeferPlan {
 /// declaration-reversed order `rfcs/0011` specifies.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CleanupAction {
-    /// Destroys this still-owned local. Never emitted for a local this
-    /// exact exit has already proven `Moved`/`Dropped`/`Error` --
-    /// `nir::lower` does not re-derive that; it is baked into whether
-    /// this variant appears here at all.
-    Drop(LocalId),
+    /// Destroys this still-owned place -- a bare root (`Place::root`,
+    /// zero projections) is exactly what a whole local's own destruction
+    /// already was before Alpha 0.1.8; a projected place
+    /// (`rfcs/0012`) destroys exactly one structural field, in the
+    /// declaration-reversed order [`super::flow::FlowChecker::
+    /// structural_drop_targets`] already expanded a single registered
+    /// root obligation into. Never emitted for a place this exact exit
+    /// has already proven `Moved`/`Dropped`/`Error` -- `nir::lower` does
+    /// not re-derive that; it is baked into whether this variant appears
+    /// here at all.
+    Drop(Place<LocalId>),
     /// Runs a previously-registered `defer`'s own call, identified by
     /// its own callee expression's stable [`ExprId`] -- `nir::lower`
     /// looks up the concrete, already-lowered callee/arguments it

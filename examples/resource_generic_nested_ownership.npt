@@ -1,0 +1,48 @@
+// A generic aggregate reached through an ordinary one, and vice versa
+// (`rfcs/0012`): the type arguments a value carries survive being
+// stored into a variant payload, into a record field, and across a
+// function call and return.
+resource File {
+    descriptor: i64,
+}
+
+record Box[T] {
+    item: T,
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+variant Holder {
+    Carry(Box[File]),
+    Nothing,
+}
+
+record Wrap {
+    held: Maybe[File],
+}
+
+func relay(take boxed: Box[File]) -> Box[File] {
+    return boxed;
+}
+
+func main() -> i64 {
+    // A generic record inside a variant payload, destroyed through the
+    // variant's own active case.
+    value held = Holder.Carry(Box[File] { item: File { descriptor: 1 } });
+    drop held;
+
+    // A generic variant inside an ordinary record, destroyed through
+    // the record's own field.
+    value wrapped = Wrap { held: Maybe[File].Some(File { descriptor: 2 }) };
+    drop wrapped;
+
+    // Type arguments survive a transfer into and back out of a call.
+    value first = Box[File] { item: File { descriptor: 3 } };
+    value second = relay(first);
+    drop second;
+
+    return 0;
+}

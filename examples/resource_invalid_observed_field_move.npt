@@ -1,0 +1,32 @@
+// Observation is transitive (`rfcs/0011`, `rfcs/0012`).
+//
+// `holder` is an ordinary parameter: a call-scoped view of a value the
+// caller still owns. So is every field reached through it. Reading one
+// is exactly what observation is for; moving it out is not, and the
+// caller's own `File` would be destroyed under it.
+//
+// Rejected here, at the source layer, so `check`, `ir` and `run` all
+// refuse it for the same reason -- rather than `check` accepting it and
+// the verifier refusing the lowered form with nothing to point at.
+resource File {
+    descriptor: i64
+}
+
+record Box {
+    item: File
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func steal(holder: Box) -> i64 {
+    return sink(holder.item);
+}
+
+func main() -> i64 {
+    value boxed = Box { item: File { descriptor: 7 } };
+    return steal(boxed);
+}

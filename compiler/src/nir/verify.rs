@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry, TypeParamId};
 use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
+use crate::place::Place;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
@@ -388,6 +389,153 @@ mod codes {
     /// a lenient default that treats a location this pass recorded
     /// nothing for as already owned.
     pub const RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED: &str = "V0082";
+    /// A structural place (`rfcs/0012`) projects a field through a base
+    /// whose own resolved type is not the declared owner record at all
+    /// (a primitive, a different record, or the wrong generic
+    /// instantiation).
+    pub const PLACE_PROJECTION_THROUGH_NON_RECORD: &str = "V0083";
+    /// A structural place names a field owner `ItemId` this module never
+    /// registered as a record.
+    pub const INVALID_PLACE_FIELD_OWNER: &str = "V0084";
+    /// A structural place names a field index out of range for its own
+    /// declared owner record.
+    pub const UNKNOWN_PLACE_FIELD: &str = "V0085";
+    /// A `PlaceRead`/`StorePlace` names a place whose own resolved type
+    /// is not affine (`rfcs/0012`) -- there is no ownership state to
+    /// move or reinitialize for an ordinary, freely-copyable field.
+    pub const MOVE_OF_NON_AFFINE_PLACE: &str = "V0086";
+    /// A structural place (`rfcs/0012`) is read or moved (`PlaceRead`,
+    /// either mode) on a path where it is not *definitely* still holding
+    /// its own value -- already moved out on every reachable path
+    /// reaching this use, or moved on only some of several reachable
+    /// paths converging here. The same reachable-union "may" dataflow
+    /// shape `RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED` already
+    /// uses, applied to individual structural fields instead of whole
+    /// locations.
+    pub const PLACE_USE_AFTER_MOVE: &str = "V0087";
+    /// A `StorePlace` (`rfcs/0012`, structural reinitialization) targets
+    /// a place that is not *definitely* empty on every reachable path --
+    /// it is still holding a live value on at least one of them, which
+    /// this store would silently leak.
+    pub const PLACE_OVERWRITE_OF_LIVE_FIELD: &str = "V0088";
+    /// A structural place projects through a *generic* aggregate whose
+    /// own recorded type-parameter list disagrees with the number of
+    /// type arguments the place's own current type carries
+    /// (`rfcs/0008`, `rfcs/0012`) -- a `Box[i64, str]` reaching a
+    /// one-parameter `Box`, or a `Box[File]` reaching a declaration this
+    /// module recorded no parameters for at all. Never papered over
+    /// with an empty or partial substitution: an unsubstituted
+    /// `Ty::Param` leaking out of a projection would make a genuinely
+    /// affine field look freely copyable.
+    pub const PLACE_GENERIC_ARITY_MISMATCH: &str = "V0089";
+    /// A place is used as a *whole* value -- observed, transferred,
+    /// returned, raised, or consumed into an aggregate -- while one of
+    /// its own affine descendants has already been moved out or dropped
+    /// (`rfcs/0012`). Only accessing an unaffected sibling,
+    /// reinitializing an empty child, or structurally dropping what
+    /// remains is still permitted on a partially moved parent; this is
+    /// `nir::verify`'s own independent reconstruction of the same rule
+    /// `resourceck`'s `PARTIAL_PARENT_USED_AS_WHOLE` (U0014) applies at
+    /// the source level.
+    pub const PARTIAL_PLACE_USED_AS_WHOLE: &str = "V0090";
+    /// A transitively affine value this function owns still has
+    /// remaining owned affine descendants at a reachable
+    /// `Return`/`Raise` (`rfcs/0012`) -- a structural leak.
+    /// Complements `RESOURCE_LEAKED_ON_EXIT` (V0077), which covers the
+    /// same obligation for a *nominally* resource-typed root: this one
+    /// covers the gap that lattice cannot see, a record that merely
+    /// *contains* affine fields and is therefore never a key there.
+    pub const MISSING_STRUCTURAL_CLEANUP: &str = "V0091";
+    /// A place is destroyed or transferred whole after it was already
+    /// consumed on a path reaching it (`rfcs/0012`) -- duplicate
+    /// structural cleanup, including destroying a child whose own
+    /// parent was already dropped, or dropping the same structural
+    /// field twice.
+    pub const DUPLICATE_STRUCTURAL_CLEANUP: &str = "V0092";
+    /// A `StorePlace` whose own stored value is the very root its
+    /// destination place projects out of (`rfcs/0012`) -- an aggregate
+    /// stored into one of its own fields. Because the store *transfers*
+    /// ownership, the container would end up holding a handle its own
+    /// transfer had just made stale, so this is rejected outright
+    /// rather than left to fail unpredictably at run time.
+    pub const STORE_PLACE_SELF_ALIAS: &str = "V0093";
+    /// A `DecomposeVariant` whose own base is not *proven* to hold the
+    /// case it takes apart, on every path reaching it (`rfcs/0012`).
+    ///
+    /// Decomposition moves ownership of one specific case's payload
+    /// storage. Without a proof that the value actually holds that
+    /// case, the storage may not exist at all, and the payload of
+    /// whichever case really is live is abandoned with nothing owning
+    /// it. The proof is a real CFG fixed point over
+    /// `(canonical scrutinee, variant, case)` guarantees: it
+    /// originates on a `Switch` case edge, propagates through ordinary
+    /// edges, and is intersected at every join, so a block reachable
+    /// through two different cases has proven neither.
+    ///
+    /// Complements `PAYLOAD_OUTSIDE_REFINEMENT` (V0024), which asks the
+    /// same question of a payload *read*: this one covers the transfer
+    /// of ownership, which a read never performs.
+    pub const DECOMPOSITION_OUTSIDE_REFINEMENT: &str = "V0095";
+    /// A `DecomposeVariant` claims an owner that is not the value the
+    /// matching `ValueKind::VariantPayload` extraction produced
+    /// (`rfcs/0012`).
+    ///
+    /// Decomposition transfers *storage*, so the receiving value must
+    /// be the one that named that exact base, case and payload
+    /// position. A different value of the same declared type is a
+    /// different object: claiming it would leave the real payload owned
+    /// by nothing, and hand this frame an obligation for something it
+    /// never received.
+    pub const DECOMPOSITION_CLAIM_MISMATCH: &str = "V0096";
+    /// A payload extraction is destroyed or transferred without any
+    /// decomposition having transferred ownership of it (`rfcs/0012`).
+    ///
+    /// `ValueKind::VariantPayload` is a read. The shell still owns what
+    /// it read until a `DecomposeVariant` claims that exact extraction,
+    /// so consuming the read result destroys storage the shell will
+    /// destroy again.
+    pub const UNCLAIMED_PAYLOAD_OWNERSHIP: &str = "V0097";
+    /// A control-flow edge names `bb0`, the entry block (`rfcs/0011`).
+    ///
+    /// `bb0` is the unique entry and the one fixed boundary condition
+    /// every fixed point in this file starts from: its in-state is this
+    /// function's parameters and nothing else, and it is never
+    /// recomputed. An edge back into it would make that boundary a lie
+    /// -- a `take` parameter would be seeded live again on the second
+    /// pass, after the first had already destroyed it. Rather than let
+    /// the analyses quietly drop such an edge, it is rejected here, once
+    /// per edge, so verification and interpretation agree that the NIR
+    /// is malformed.
+    pub const EDGE_INTO_ENTRY_BLOCK: &str = "V0098";
+    /// Something reachable through an *observation* is transferred,
+    /// destroyed, decomposed or reinitialized (`rfcs/0011`,
+    /// `rfcs/0012`).
+    ///
+    /// An ordinary (non-`take`) parameter is a call-scoped observation
+    /// of a value the caller still owns, and so is everything reachable
+    /// through it. Availability alone cannot express that -- a field of
+    /// an observed aggregate is perfectly "there", and reading it is
+    /// exactly what observation is for -- so ownership is tracked as a
+    /// second axis, and no projection ever moves along it.
+    ///
+    /// Complements `RESOURCE_OBSERVER_CONSUMED` (V0079), which applies
+    /// the same rule to a *nominally* resource-typed value: this one
+    /// covers the gap that lattice cannot see, an ordinary record that
+    /// merely contains affine fields, and every place projected out of
+    /// one.
+    pub const OBSERVER_CANNOT_TRANSFER: &str = "V0099";
+    // `V0094` is deliberately not assigned. It claimed a structural
+    // ownership state invariant -- "a control-flow edge named a block
+    // this function does not declare" -- that no `.npt` source and no
+    // hand-built NIR can actually produce: a block's predecessors are
+    // derived by walking the declared blocks' own terminators, so a
+    // predecessor is always itself declared. The two malformed-CFG
+    // shapes that *are* reachable already have owners one layer up: a
+    // terminator naming an undeclared successor is `UNKNOWN_BRANCH_
+    // TARGET`, and a repeated block id is `DUPLICATE_BLOCK_ID`. Rather
+    // than keep a code whose coverage was a dead branch, the
+    // distinction it existed to protect is now carried by the
+    // `IncomingState` type itself.
 }
 
 /// Every function this module's `Call` instructions might reference,
@@ -1086,6 +1234,50 @@ fn verify_function(
         }
     }
 
+    // `bb0` is the unique entry, and the one fixed boundary condition
+    // every fixed point in this file starts from: its in-state is this
+    // function's parameters, and it is never recomputed. That is only
+    // sound if nothing branches back into it -- a second pass would
+    // seed a `take` parameter live again after the first had already
+    // destroyed it. Every edge naming it is reported here, once each,
+    // in declaration order, rather than being quietly dropped from the
+    // CFG by each analysis in turn. Unreachable edges are reported too:
+    // the NIR is malformed either way, and an analysis that never walks
+    // the edge is exactly what would miss it.
+    for block in &function.blocks {
+        let targets: Vec<BlockId> = match &block.terminator {
+            Terminator::Branch(target) => vec![*target],
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+            Terminator::Switch { cases, .. } => cases.clone(),
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => std::iter::once(*ok_target)
+                .chain(err_targets.iter().map(|t| t.target))
+                .collect(),
+            Terminator::Return(_) | Terminator::Raise { .. } => Vec::new(),
+        };
+        for target in targets {
+            if target == BlockId(0) {
+                diagnostics.push(Diagnostic::error(
+                    codes::EDGE_INTO_ENTRY_BLOCK,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{name}`: bb{} names bb0, the entry block, as a control-flow \
+                         target, which no block may do",
+                        block.id.0
+                    ),
+                ));
+            }
+        }
+    }
+
     // Every value this function ever defines (params, every
     // instruction's result), and its declared type -- built once so
     // every later check is a lookup, never a re-derivation. Tracked
@@ -1095,6 +1287,7 @@ fn verify_function(
     // first with no diagnostic) -- every SSA value must have exactly
     // one definition, across parameters *and* instruction results,
     // regardless of which block they're in.
+    let extractions = payload_extractions(function);
     let mut value_types: HashMap<ValueId, Ty> = HashMap::new();
     let mut alloc_slots: HashSet<ValueId> = HashSet::new();
     let mut seen_value_ids: HashSet<ValueId> = HashSet::new();
@@ -1212,11 +1405,159 @@ fn verify_function(
                         ));
                     }
                 }
+                // Declaration identity, case index, payload indexes and
+                // every claimed value's own type are revalidated here
+                // rather than trusted from lowering: this instruction
+                // names storage, so a malformed one would move ownership
+                // of something that does not exist.
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    taken,
+                } => {
+                    require_value(*value, diagnostics);
+                    for (_, owner) in taken {
+                        require_value(*owner, diagnostics);
+                    }
+                    let base_ok = value_types.get(value).is_some_and(|ty| {
+                        matches!(ty, Ty::Named(item, _) | Ty::Applied(item, _) if item == variant)
+                    });
+                    if !base_ok {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PLACE_PROJECTION_THROUGH_NON_RECORD,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart as variant {}, which is \
+                                 not its own declared type",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    }
+                    let Some(layout) = agg
+                        .variants
+                        .get(variant)
+                        .and_then(|v| v.cases.get(*case))
+                        .cloned()
+                    else {
+                        diagnostics.push(Diagnostic::error(
+                            codes::UNKNOWN_PLACE_FIELD,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart into case {case} of \
+                                 variant {}, which has no such case",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    };
+                    let args: Vec<Ty> = match value_types.get(value) {
+                        Some(Ty::Applied(_, args)) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let Ok(subst) = item_substitution(*variant, &args, agg) else {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PLACE_GENERIC_ARITY_MISMATCH,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is taken apart as variant {}, whose \
+                                 declared type parameters disagree with its own type arguments",
+                                value.0, variant.0
+                            ),
+                        ));
+                        continue;
+                    };
+                    let mut seen: HashSet<usize> = HashSet::new();
+                    let mut seen_owners: HashSet<ValueId> = HashSet::new();
+                    for (index, owner) in taken {
+                        // One value claiming two positions would be two
+                        // separate obligations collapsed into one, and
+                        // one of the two payloads would end up owned by
+                        // nothing.
+                        if !seen_owners.insert(*owner) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DECOMPOSITION_CLAIM_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is claimed by more than one payload \
+                                     position of a single decomposition",
+                                    owner.0
+                                ),
+                            ));
+                            continue;
+                        }
+                        // Decomposition transfers *storage*: the
+                        // receiving value must be the very extraction
+                        // that read this base, case and position. A
+                        // different value of the same declared type is
+                        // a different object, and claiming it would
+                        // leave the real payload owned by nothing.
+                        if !extractions.claim_matches(*owner, *value, *variant, *case, *index) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DECOMPOSITION_CLAIM_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is claimed as payload position \
+                                     {index} of %{}, but it is not the extraction that read it",
+                                    owner.0, value.0
+                                ),
+                            ));
+                            continue;
+                        }
+                        let Some(payload_ty) = layout.payload.get(*index) else {
+                            diagnostics.push(Diagnostic::error(
+                                codes::UNKNOWN_PLACE_FIELD,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} claims payload position {index} of a \
+                                     case that has no such position",
+                                    owner.0
+                                ),
+                            ));
+                            continue;
+                        };
+                        // One position claimed twice would hand the same
+                        // storage to two owners.
+                        if !seen.insert(*index) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DUPLICATE_STRUCTURAL_CLEANUP,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: payload position {index} of %{} is \
+                                     claimed more than once by one decomposition",
+                                    value.0
+                                ),
+                            ));
+                            continue;
+                        }
+                        let expected = substitute(payload_ty, &subst);
+                        if value_types.get(owner) != Some(&expected) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::STORE_TYPE_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is declared a different type from the \
+                                     payload position it claims",
+                                    owner.0
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Instruction::Drop { value } => {
                     require_value(*value, diagnostics);
                     let is_resource = value_types
                         .get(value)
-                        .is_some_and(|ty| matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)));
+                        .is_some_and(|ty| is_affine_in(ty, agg));
                     if !is_resource {
                         diagnostics.push(Diagnostic::error(
                             codes::DROP_OF_NON_RESOURCE_VALUE,
@@ -1227,6 +1568,62 @@ fn verify_function(
                                 value.0
                             ),
                         ));
+                    }
+                }
+                Instruction::StorePlace { place, value } => {
+                    require_value(place.root, diagnostics);
+                    require_value(*value, diagnostics);
+                    // A store whose source *is* the storage its own
+                    // destination is rooted in would have to place an
+                    // aggregate inside itself (`rfcs/0012`) -- and
+                    // because the store transfers, it would leave the
+                    // container holding a handle its own transfer just
+                    // made stale. Rejected statically, not only by the
+                    // interpreter's own runtime guard.
+                    if place.root == *value {
+                        diagnostics.push(Diagnostic::error(
+                            codes::STORE_PLACE_SELF_ALIAS,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{name}`: %{} is stored into a place rooted at itself",
+                                value.0
+                            ),
+                        ));
+                    }
+                    if let Some(root_ty) = value_types.get(&place.root).cloned() {
+                        match resolve_place_ty(&root_ty, &place.projections, agg) {
+                            Ok(resolved_ty) => {
+                                if !is_affine_in(&resolved_ty, agg) {
+                                    diagnostics.push(Diagnostic::error(
+                                        codes::MOVE_OF_NON_AFFINE_PLACE,
+                                        source,
+                                        Span::dummy(),
+                                        format!(
+                                            "function `{name}` reinitializes a place of non-affine type `{}`",
+                                            crate::types::display_ty(&resolved_ty, interner)
+                                        ),
+                                    ));
+                                } else if let Some(value_ty) = value_types.get(value)
+                                    && resolved_ty != *value_ty
+                                {
+                                    diagnostics.push(Diagnostic::error(
+                                        codes::STORE_TYPE_MISMATCH,
+                                        source,
+                                        Span::dummy(),
+                                        format!(
+                                            "function `{name}` stores a value of type `{}` into a place declared `{}`",
+                                            crate::types::display_ty(value_ty, interner),
+                                            crate::types::display_ty(&resolved_ty, interner)
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(place_error) => {
+                                diagnostics
+                                    .push(place_error.into_diagnostic(source, &name, place.root));
+                            }
+                        }
                     }
                 }
             }
@@ -1666,6 +2063,15 @@ fn verify_function(
         &name,
         diagnostics,
     );
+    verify_structural_places(
+        function,
+        &value_types,
+        known_functions,
+        agg,
+        source,
+        &name,
+        diagnostics,
+    );
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -1763,6 +2169,16 @@ fn verify_dominance(
                 Instruction::Drop { value } => {
                     check_use(*value, block.id, idx, diagnostics);
                 }
+                Instruction::DecomposeVariant { value, taken, .. } => {
+                    check_use(*value, block.id, idx, diagnostics);
+                    for (_, owner) in taken {
+                        check_use(*owner, block.id, idx, diagnostics);
+                    }
+                }
+                Instruction::StorePlace { place, value } => {
+                    check_use(place.root, block.id, idx, diagnostics);
+                    check_use(*value, block.id, idx, diagnostics);
+                }
             }
         }
         // Terminator operands are treated as occurring after every
@@ -1834,6 +2250,7 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         ValueKind::VariantPayload { base, .. } => vec![*base],
         ValueKind::ProtocolCall { args, .. } => args.clone(),
         ValueKind::Move { source } | ValueKind::DeferCapture { source } => vec![*source],
+        ValueKind::PlaceRead { place, .. } => vec![place.root],
     }
 }
 
@@ -1924,18 +2341,30 @@ fn compute_dominators(function: &Function) -> HashMap<BlockId, HashSet<BlockId>>
             }
             let no_preds = Vec::new();
             let ps = preds.get(&id).unwrap_or(&no_preds);
+            // Every predecessor recorded above is reachable, and every
+            // reachable block was given a `dom` entry above, so none of
+            // these lookups can miss. They are written as lookups
+            // rather than indexing anyway: nothing a malformed CFG can
+            // express may reach a panic in this file.
             let mut new_dom = match ps.split_first() {
                 None => HashSet::from([id]),
                 Some((first, rest)) => {
-                    let mut acc = dom[first].clone();
+                    let Some(mut acc) = dom.get(first).cloned() else {
+                        continue;
+                    };
                     for p in rest {
-                        acc = acc.intersection(&dom[p]).copied().collect();
+                        let Some(other) = dom.get(p) else {
+                            continue;
+                        };
+                        acc = acc.intersection(other).copied().collect();
                     }
                     acc.insert(id);
                     acc
                 }
             };
-            let existing = dom.get_mut(&id).unwrap();
+            let Some(existing) = dom.get_mut(&id) else {
+                continue;
+            };
             if new_dom != *existing {
                 std::mem::swap(existing, &mut new_dom);
                 changed = true;
@@ -3467,17 +3896,686 @@ fn verify_value_kind(
                 );
             }
         }
+        ValueKind::PlaceRead { place, .. } => {
+            require_value(place.root, diagnostics);
+            let Some(root_ty) = ty_of(place.root) else {
+                return;
+            };
+            match resolve_place_ty(&root_ty, &place.projections, agg) {
+                Ok(resolved_ty) => {
+                    if resolved_ty != *result_ty {
+                        operand_mismatch(
+                            diagnostics,
+                            format!(
+                                "reads a place of type `{}` but is declared `{}`",
+                                ty_name(&resolved_ty),
+                                ty_name(result_ty)
+                            ),
+                        );
+                    } else if !is_affine_in(&resolved_ty, agg) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::MOVE_OF_NON_AFFINE_PLACE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}`: %{} reads a place of non-affine type `{}`",
+                                result.0,
+                                ty_name(&resolved_ty)
+                            ),
+                        ));
+                    }
+                }
+                Err(place_error) => {
+                    diagnostics.push(place_error.into_diagnostic(source, function_name, result));
+                }
+            }
+        }
     }
 }
 
-/// A `variant.payload` instruction is only legal in a block reached
-/// through the matching case's own `Terminator::Switch` edge -- this
-/// re-derives that from the CFG itself, independent of how lowering
-/// happened to build it.
+/// One malformed structural place, independent of which instruction
+/// named it (`rfcs/0012`) -- `nir::verify`'s own reconstruction of the
+/// exact same place validity `resourceck`/`nir::lower` already checked,
+/// never trusted blindly for hand-built NIR that bypasses either.
+enum PlaceError {
+    UnknownFieldOwner(ItemId),
+    ProjectionThroughNonRecord(Ty),
+    UnknownField(ItemId, usize),
+    /// `(owner, declared parameter count, supplied argument count)`.
+    GenericArityMismatch(ItemId, usize, usize),
+}
+
+impl PlaceError {
+    fn into_diagnostic(self, source: SourceId, function_name: &str, result: ValueId) -> Diagnostic {
+        let (code, message) = match self {
+            PlaceError::UnknownFieldOwner(owner) => (
+                codes::INVALID_PLACE_FIELD_OWNER,
+                format!(
+                    "function `{function_name}`: %{} projects a field of unknown record id {}",
+                    result.0, owner.0
+                ),
+            ),
+            PlaceError::ProjectionThroughNonRecord(ty) => (
+                codes::PLACE_PROJECTION_THROUGH_NON_RECORD,
+                format!(
+                    "function `{function_name}`: %{} projects a field through a non-record place of type `{ty:?}`",
+                    result.0
+                ),
+            ),
+            PlaceError::UnknownField(owner, field) => (
+                codes::UNKNOWN_PLACE_FIELD,
+                format!(
+                    "function `{function_name}`: %{} projects field index {field} of record {}, which has no such field",
+                    result.0, owner.0
+                ),
+            ),
+            PlaceError::GenericArityMismatch(owner, declared, supplied) => (
+                codes::PLACE_GENERIC_ARITY_MISMATCH,
+                format!(
+                    "function `{function_name}`: %{} projects through record {}, which declares \
+                     {declared} type parameter(s) but is applied to {supplied} type argument(s)",
+                    result.0, owner.0
+                ),
+            ),
+        };
+        Diagnostic::error(code, source, Span::dummy(), message)
+    }
+}
+
+/// `true` iff `ty` is transitively affine (`rfcs/0012`) -- independently
+/// recomputed from `agg`'s own declared record/variant layouts,
+/// mirroring `resourceck`'s/`nir::lower`'s identical query, never
+/// trusted from either. Guarded against a genuinely cyclic declaration
+/// the same way every other stage's identical query is: a cycle
+/// back-edge contributes `false` to that one occurrence alone, never
+/// cached (this file's own resource checks are not called densely
+/// enough per module to need memoizing).
+fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
+    is_affine_in_visiting(ty, agg, &mut HashSet::new(), 0)
+}
+
+fn is_affine_in_visiting(
+    ty: &Ty,
+    agg: &AggregateContext,
+    visiting: &mut HashSet<ItemId>,
+    depth: usize,
+) -> bool {
+    // Bounds a genuinely cyclic declaration, which `typeck::cycles`
+    // independently rejects as an infinite layout long before anything
+    // reaches NIR -- and, for a `Ty::Applied`, is the *only* guard, see
+    // below.
+    if depth >= MAX_GENERIC_DEPTH {
+        return false;
+    }
+    // A generic instantiation's own affinity is decided by what it was
+    // instantiated *with* (`rfcs/0008`, `rfcs/0012`): `Box[File]` is
+    // affine, `Box[i64]` is not, and the same declaration answers both
+    // -- so its own arguments are substituted into the declaration's
+    // field types before recursing. Answering `false` for every
+    // `Ty::Applied` (as this once did) is what let a `Box[File]` reach
+    // `Drop`/`PlaceRead` looking like an ordinary, freely-copyable
+    // value.
+    let (item, args): (&ItemId, &[Ty]) = match ty {
+        Ty::Named(item, _) => (item, &[]),
+        Ty::Applied(item, args) => (item, args.as_slice()),
+        _ => return false,
+    };
+    if agg.records.get(item).is_some_and(|r| r.affine) {
+        return true;
+    }
+    // `visiting` guards a *non-generic* cycle only. It is keyed by bare
+    // `ItemId`, so it cannot tell a genuine cycle apart from a
+    // legitimately nested instantiation of the same declaration --
+    // `Box[Box[Box[File]]]` reaches `Box` three times with different
+    // arguments and must answer from the innermost one. For an
+    // instantiation, `depth` above is the termination guard, matching
+    // `typeck::Checker::is_affine`.
+    let generic = matches!(ty, Ty::Applied(..));
+    if !generic && !visiting.insert(*item) {
+        return false;
+    }
+    let subst = match item_substitution(*item, args, agg) {
+        Ok(subst) => subst,
+        // A malformed arity is reported as its own structured
+        // diagnostic wherever a *place* projects through it
+        // (`PLACE_GENERIC_ARITY_MISMATCH`). This pure query has no
+        // diagnostic channel of its own, so it fails *closed*, to
+        // affine -- matching every other stage. Answering `false` from
+        // a substitution nobody could build is the one direction that
+        // silently drops an ownership obligation.
+        Err(()) => {
+            if !generic {
+                visiting.remove(item);
+            }
+            return true;
+        }
+    };
+    let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
+        record.fields.iter().map(|(_, t)| t.clone()).collect()
+    } else if let Some(variant) = agg.variants.get(item) {
+        variant
+            .cases
+            .iter()
+            .flat_map(|c| c.payload.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let result = field_types.iter().any(|fty| {
+        is_affine_in_visiting(
+            &crate::types::substitute(fty, &subst),
+            agg,
+            visiting,
+            depth + 1,
+        )
+    });
+    if !generic {
+        visiting.remove(item);
+    }
+    result
+}
+
+/// `item`'s own declared type parameters paired with `args`
+/// (`rfcs/0008`), for substituting a generic aggregate's declared field
+/// types down to one concrete instantiation. `Err(())` on any arity
+/// disagreement -- including a non-generic declaration handed type
+/// arguments, or a generic one handed none -- never a partial or empty
+/// map: an unsubstituted `Ty::Param` escaping a projection would make a
+/// genuinely affine field look freely copyable.
+fn item_substitution(
+    item: ItemId,
+    args: &[Ty],
+    agg: &AggregateContext,
+) -> Result<HashMap<TypeParamId, Ty>, ()> {
+    let params: Vec<TypeParamId> = if let Some(record) = agg.records.get(&item) {
+        record.type_params.iter().map(|(id, _)| *id).collect()
+    } else if let Some(variant) = agg.variants.get(&item) {
+        variant.type_params.iter().map(|(id, _)| *id).collect()
+    } else if args.is_empty() {
+        // An item this module registered no layout for at all is
+        // already reported by whichever check actually needs the
+        // layout; with no arguments to substitute there is nothing to
+        // get wrong here.
+        return Ok(HashMap::new());
+    } else {
+        return Err(());
+    };
+    if params.len() != args.len() {
+        return Err(());
+    }
+    Ok(params.into_iter().zip(args.iter().cloned()).collect())
+}
+
+/// Resolves a structural place's own final type, starting from
+/// `root_ty` and walking each projection step against `agg`'s own
+/// declared record layouts -- independently re-validating owner/field
+/// identity exactly like `ValueKind::RecordField`'s own check does for
+/// a single-step, non-affine projection, generalized to a whole chain.
+/// Each step substitutes the owner's own type arguments into the
+/// selected field's declared type before continuing from it
+/// (`rfcs/0008`, `rfcs/0012`), in this exact order: validate the owner,
+/// retrieve its stable type parameters, require exact arity, build the
+/// substitution, substitute, continue. `Projection` itself carries no
+/// type-argument list -- the arguments come from the place's own
+/// *current* type at that step, which is precisely why the walk has to
+/// thread the substituted type forward rather than reading each field's
+/// declared type in isolation.
+fn resolve_place_ty(
+    root_ty: &Ty,
+    projections: &[crate::place::Projection],
+    agg: &AggregateContext,
+) -> Result<Ty, PlaceError> {
+    let mut ty = root_ty.clone();
+    for projection in projections {
+        let crate::place::Projection::Field { owner, field } = projection else {
+            return Err(PlaceError::UnknownFieldOwner(match projection {
+                crate::place::Projection::VariantField { variant, .. } => *variant,
+                crate::place::Projection::Field { owner, .. } => *owner,
+            }));
+        };
+        let args: Vec<Ty> = match &ty {
+            Ty::Named(item, _) if item == owner => Vec::new(),
+            Ty::Applied(item, args) if item == owner => args.clone(),
+            _ => return Err(PlaceError::ProjectionThroughNonRecord(ty)),
+        };
+        let Some(layout) = agg.records.get(owner) else {
+            return Err(PlaceError::UnknownFieldOwner(*owner));
+        };
+        let Some((_, field_ty)) = layout.fields.get(field.0 as usize) else {
+            return Err(PlaceError::UnknownField(*owner, field.0 as usize));
+        };
+        if layout.type_params.len() != args.len() {
+            return Err(PlaceError::GenericArityMismatch(
+                *owner,
+                layout.type_params.len(),
+                args.len(),
+            ));
+        }
+        let subst: HashMap<TypeParamId, Ty> = layout
+            .type_params
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(args)
+            .collect();
+        ty = crate::types::substitute(field_ty, &subst);
+    }
+    Ok(ty)
+}
+
+/// The exact storage one `ValueKind::VariantPayload` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PayloadExtraction {
+    /// Canonical, so an extraction naming one read of a slot and a
+    /// decomposition naming another read of that same slot agree about
+    /// which value they mean.
+    base: ValueId,
+    variant: ItemId,
+    case: usize,
+    index: usize,
+}
+
+/// Every payload extraction this function performs, and what each one
+/// read (`rfcs/0012`).
+///
+/// A `DecomposeVariant` hands ownership of one case's payload positions
+/// to the values in its own `taken` list. Checking only that each such
+/// value has the *declared type* of the position it claims proves
+/// nothing: any other value of that type would pass, while the real
+/// payload stayed owned by the shell and this frame acquired an
+/// obligation for something it never received. This table is what makes
+/// the claim provable.
+struct ExtractionTable {
+    extractions: HashMap<ValueId, PayloadExtraction>,
+    load_origin: HashMap<ValueId, ValueId>,
+}
+
+impl ExtractionTable {
+    /// Whether `owner` is exactly the extraction that read position
+    /// `index` of `case` out of `base`.
+    fn claim_matches(
+        &self,
+        owner: ValueId,
+        base: ValueId,
+        variant: ItemId,
+        case: usize,
+        index: usize,
+    ) -> bool {
+        let wanted = canonical_value(base, &self.load_origin);
+        self.extractions.get(&owner).is_some_and(|extraction| {
+            extraction.base == wanted
+                && extraction.variant == variant
+                && extraction.case == case
+                && extraction.index == index
+        })
+    }
+
+    /// Whether `value` is a payload extraction at all.
+    fn is_extraction(&self, value: ValueId) -> bool {
+        self.extractions.contains_key(&value)
+    }
+}
+
+fn payload_extractions(function: &Function) -> ExtractionTable {
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let mut extractions = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind:
+                    ValueKind::VariantPayload {
+                        base,
+                        variant,
+                        case,
+                        index,
+                    },
+                ..
+            } = instruction
+            {
+                extractions.insert(
+                    *result,
+                    PayloadExtraction {
+                        base: canonical_value(*base, &load_origin),
+                        variant: *variant,
+                        case: *case,
+                        index: *index,
+                    },
+                );
+            }
+        }
+    }
+    ExtractionTable {
+        extractions,
+        load_origin,
+    }
+}
+
 /// A single guaranteed fact: the value `.0` is known to be case `.2` of
 /// variant `.1`.
+///
+/// `.0` is always *canonical* -- a `Load` result is recorded as the slot
+/// it read, so a `switch` on one read of a slot and a `decompose` of
+/// another read of that same slot are recognised as one value.
 type RefinementFact = (ValueId, ItemId, usize);
 
+/// The canonical identity `value` stands for: the slot it was loaded
+/// from, or itself.
+fn canonical_value(value: ValueId, load_origin: &HashMap<ValueId, ValueId>) -> ValueId {
+    load_origin.get(&value).copied().unwrap_or(value)
+}
+
+/// The canonical value whose storage `instruction` writes, if any --
+/// every refinement naming it stops being proven from here on.
+///
+/// A `StorePlace` into a *field* is deliberately not a kill: no field
+/// write can change which case of a variant is live.
+fn refinement_kill(
+    instruction: &Instruction,
+    load_origin: &HashMap<ValueId, ValueId>,
+) -> Option<ValueId> {
+    match instruction {
+        Instruction::Store { slot, .. } => Some(canonical_value(*slot, load_origin)),
+        Instruction::StorePlace { place, .. } if place.projections.is_empty() => {
+            Some(canonical_value(place.root, load_origin))
+        }
+        _ => None,
+    }
+}
+
+/// Every case refinement each block is *guaranteed* on arrival
+/// (`rfcs/0010`, `rfcs/0012`), as a real worklist fixed point over the
+/// whole CFG rather than a look at the immediate predecessors.
+///
+/// A refinement originates on a `Switch` case edge, propagates through
+/// every ordinary edge, and is **intersected** at every join, never
+/// unioned. So:
+///
+/// * a block reached through two different cases of the same switch, or
+///   through a switch edge and a plain branch, is guaranteed nothing;
+/// * a refinement survives any number of ordinary hops, which a
+///   single-hop rule could not express;
+/// * one block's guarantee is never borrowed by a sibling, because a
+///   sibling is not a predecessor;
+/// * nested switches stay independent, because each fact names its own
+///   scrutinee;
+/// * `Branch`, `CondBranch` and `Invoke` edges generate nothing at all;
+/// * an unreachable predecessor is skipped entirely rather than
+///   intersected in, so a dead switch edge can never erase a guarantee
+///   every live path proved;
+/// * two edges from one terminator into the same block stay two edges,
+///   so a target shared by two cases has proven neither.
+///
+/// Writing a scrutinee's own storage ends what the switch proved about
+/// it -- see `refinement_kill`, and `Invoke`'s own result slots.
+struct RefinementTable {
+    /// Facts guaranteed on entry to each block. A block absent from the
+    /// map (unreachable, or never computed) guarantees nothing.
+    guaranteed: HashMap<BlockId, HashSet<RefinementFact>>,
+    /// `Load` result -> the slot it read.
+    load_origin: HashMap<ValueId, ValueId>,
+}
+
+impl RefinementTable {
+    fn canonical(&self, value: ValueId) -> ValueId {
+        canonical_value(value, &self.load_origin)
+    }
+
+    /// The facts guaranteed on entry to `block`.
+    ///
+    /// A block the fixed point never computed -- unreachable, or in a
+    /// function with no entry block at all -- guarantees *nothing*,
+    /// which is what the empty set means here. This is a must analysis:
+    /// the empty set is its most conservative answer, so a missing
+    /// entry can only ever reject more, never accept something
+    /// unproven.
+    fn on_entry(&self, block: BlockId) -> HashSet<RefinementFact> {
+        self.guaranteed.get(&block).cloned().unwrap_or_default()
+    }
+
+    /// Whether `value` is proven to hold `case` of `variant` at a point
+    /// whose currently-proven `facts` are given.
+    fn proves(
+        &self,
+        facts: &HashSet<RefinementFact>,
+        value: ValueId,
+        variant: ItemId,
+        case: usize,
+    ) -> bool {
+        facts.contains(&(self.canonical(value), variant, case))
+    }
+
+    /// Removes from `facts` everything `instruction` invalidates.
+    fn apply_kill(&self, instruction: &Instruction, facts: &mut HashSet<RefinementFact>) {
+        if let Some(root) = refinement_kill(instruction, &self.load_origin) {
+            facts.retain(|(value, _, _)| *value != root);
+        }
+    }
+
+    /// The facts still guaranteed once `block`'s own instructions have
+    /// run -- what a `Return`/`Raise` in it may rely on.
+    fn at_exit(&self, block: &BasicBlock) -> HashSet<RefinementFact> {
+        let mut facts = self.on_entry(block.id);
+        for instruction in &block.instructions {
+            self.apply_kill(instruction, &mut facts);
+        }
+        facts
+    }
+}
+
+fn case_refinements(function: &Function) -> RefinementTable {
+    let entry = BlockId(0);
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+
+    // Every CFG edge, as `(predecessor, the facts that edge itself
+    // proves)`. Two edges from one terminator into the same block stay
+    // two separate entries.
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut incoming: HashMap<BlockId, Vec<(BlockId, HashSet<RefinementFact>)>> = HashMap::new();
+    for block in &function.blocks {
+        let mut edges: Vec<(BlockId, HashSet<RefinementFact>)> = Vec::new();
+        match &block.terminator {
+            Terminator::Branch(target) => edges.push((*target, HashSet::new())),
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                edges.push((*then_block, HashSet::new()));
+                edges.push((*else_block, HashSet::new()));
+            }
+            Terminator::Switch {
+                scrutinee,
+                variant,
+                cases,
+            } => {
+                let root = canonical_value(*scrutinee, &load_origin);
+                for (case_index, target) in cases.iter().enumerate() {
+                    edges.push((*target, HashSet::from([(root, *variant, case_index)])));
+                }
+            }
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                edges.push((*ok_target, HashSet::new()));
+                for target in err_targets {
+                    edges.push((target.target, HashSet::new()));
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+        for (target, generated) in edges {
+            successors.entry(block.id).or_default().push(target);
+            incoming
+                .entry(target)
+                .or_default()
+                .push((block.id, generated));
+        }
+    }
+
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // An `Invoke`'s own result slots are written on its edges, so every
+    // refinement naming one stops at that terminator.
+    let terminator_kills = |terminator: &Terminator| -> Vec<ValueId> {
+        match terminator {
+            Terminator::Invoke {
+                ok_slot,
+                err_targets,
+                ..
+            } => {
+                let mut slots = vec![*ok_slot];
+                slots.extend(err_targets.iter().map(|t| t.slot));
+                slots
+            }
+            _ => Vec::new(),
+        }
+    };
+    let kill_through = |block: &BasicBlock, facts: &HashSet<RefinementFact>| {
+        let mut facts = facts.clone();
+        for instruction in &block.instructions {
+            if let Some(root) = refinement_kill(instruction, &load_origin) {
+                facts.retain(|(value, _, _)| *value != root);
+            }
+        }
+        for slot in terminator_kills(&block.terminator) {
+            let root = canonical_value(slot, &load_origin);
+            facts.retain(|(value, _, _)| *value != root);
+        }
+        facts
+    };
+
+    // `in_facts` answers `Pending` -- not an empty fact set -- until at
+    // least one reachable predecessor has produced an out-state, so a
+    // block popped before its own predecessors records nothing and is
+    // simply revisited. The lattice is the finite set of facts this
+    // function's switches can generate, ordered by inclusion, and both
+    // effects here only ever remove facts (a predecessor's out-state
+    // shrinking, or another predecessor joining the intersection), so
+    // the iteration is monotone and terminates with no pass limit.
+    let in_facts = |id: BlockId,
+                    out: &HashMap<BlockId, HashSet<RefinementFact>>|
+     -> IncomingState<HashSet<RefinementFact>> {
+        if id == entry {
+            return IncomingState::Entry(HashSet::new());
+        }
+        let mut acc: Option<HashSet<RefinementFact>> = None;
+        for (pred, generated) in incoming.get(&id).into_iter().flatten() {
+            if !reachable.contains(pred) {
+                continue;
+            }
+            let Some(pred_out) = out.get(pred) else {
+                continue;
+            };
+            let mut edge: HashSet<RefinementFact> = pred_out.clone();
+            edge.extend(generated.iter().copied());
+            acc = Some(match acc {
+                None => edge,
+                Some(previous) => previous.intersection(&edge).copied().collect(),
+            });
+        }
+        match acc {
+            Some(facts) => IncomingState::Ready(facts),
+            None => IncomingState::Pending,
+        }
+    };
+
+    let mut guaranteed: HashMap<BlockId, HashSet<RefinementFact>> = HashMap::new();
+    let Some(entry_block) = function.blocks.iter().find(|b| b.id == entry) else {
+        return RefinementTable {
+            guaranteed,
+            load_origin,
+        };
+    };
+    guaranteed.insert(entry, HashSet::new());
+    let mut out: HashMap<BlockId, HashSet<RefinementFact>> =
+        HashMap::from([(entry, kill_through(entry_block, &HashSet::new()))]);
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let facts = match in_facts(id, &out) {
+            IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+            IncomingState::Pending => continue,
+        };
+        guaranteed.insert(id, facts.clone());
+        let new_out = kill_through(block, &facts);
+        if out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    RefinementTable {
+        guaranteed,
+        load_origin,
+    }
+}
+
+/// Nothing may name one specific case of a variant without a proof
+/// that the value actually holds it (`rfcs/0010`, `rfcs/0012`).
+///
+/// Two instructions do: `ValueKind::VariantPayload` *reads* one payload
+/// position of a case, and `Instruction::DecomposeVariant` *transfers
+/// ownership* of every payload position of a case. Both are checked
+/// here, against the same `case_refinements` fixed point, so the two can
+/// never disagree about what a block proved.
+///
+/// The proof is re-derived from the CFG itself, independent of how
+/// lowering happened to build it, and is deliberately not limited to the
+/// immediately preceding block: a refinement survives any number of
+/// ordinary hops, and is lost the moment a join has one predecessor that
+/// did not prove it.
+///
+/// Within a block, the facts are walked instruction by instruction, so a
+/// write to a scrutinee's own storage stops proving anything about it
+/// from that point on -- including for a later instruction in the very
+/// same block.
 fn verify_payload_refinement(
     function: &Function,
     agg: &AggregateContext,
@@ -3486,116 +4584,53 @@ fn verify_payload_refinement(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let _ = agg;
-    // Every incoming edge into each block, tracked as its own
-    // independent fact-set: empty for a plain branch/condbr edge
-    // (which guarantees no case refinement at all), or a single
-    // `(scrutinee, variant, case)` fact for a switch-case edge. Two
-    // edges into the same block -- even two cases of the same switch,
-    // or two different switches -- are kept as separate list entries:
-    // a target block reachable through more than one case of the same
-    // switch is genuinely reachable via either case, so nothing about
-    // that specific case can be assumed from having reached the block
-    // at all. This check is deliberately single-hop (unlike
-    // `verify_invoke_slot_initialization`'s own full dataflow below):
-    // `nir::lower` only ever extracts a case's own payload immediately
-    // in that case's own direct switch-target block, never in some
-    // later, indirect one, so single-hop refinement is the exact
-    // invariant real lowering needs proven.
-    let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
+    let refinements = case_refinements(function);
     for block in &function.blocks {
-        match &block.terminator {
-            Terminator::Branch(target) => {
-                incoming.entry(*target).or_default().push(HashSet::new());
-            }
-            Terminator::CondBranch {
-                then_block,
-                else_block,
-                ..
-            } => {
-                incoming
-                    .entry(*then_block)
-                    .or_default()
-                    .push(HashSet::new());
-                incoming
-                    .entry(*else_block)
-                    .or_default()
-                    .push(HashSet::new());
-            }
-            Terminator::Switch {
-                scrutinee,
-                variant,
-                cases,
-            } => {
-                for (case_index, target) in cases.iter().enumerate() {
-                    let mut fact = HashSet::new();
-                    fact.insert((*scrutinee, *variant, case_index));
-                    incoming.entry(*target).or_default().push(fact);
-                }
-            }
-            Terminator::Invoke {
-                ok_target,
-                err_targets,
-                ..
-            } => {
-                incoming.entry(*ok_target).or_default().push(HashSet::new());
-                for target in err_targets {
-                    incoming
-                        .entry(target.target)
-                        .or_default()
-                        .push(HashSet::new());
-                }
-            }
-            Terminator::Return(_) | Terminator::Raise { .. } => {}
-        }
-    }
-
-    // A payload extraction is only sound when the SAME fact is
-    // guaranteed by EVERY incoming edge -- intersection, never union.
-    // A block with no recorded incoming edges at all (the entry block,
-    // or an otherwise-unreachable block) guarantees nothing, matching
-    // an empty intersection's identity (the universal set) only in the
-    // abstract; concretely there is no edge to ever have proven a case
-    // refinement on, so nothing is ever allowed there.
-    let guaranteed = |block_id: BlockId| -> HashSet<RefinementFact> {
-        let Some(edges) = incoming.get(&block_id) else {
-            return HashSet::new();
-        };
-        let mut edges = edges.iter();
-        let Some(first) = edges.next() else {
-            return HashSet::new();
-        };
-        let mut acc = first.clone();
-        for edge in edges {
-            acc.retain(|fact| edge.contains(fact));
-        }
-        acc
-    };
-
-    for block in &function.blocks {
-        let allowed = guaranteed(block.id);
+        let mut proven = refinements.on_entry(block.id);
         for instruction in &block.instructions {
-            if let Instruction::Value {
-                kind:
-                    ValueKind::VariantPayload {
-                        base,
-                        variant,
-                        case,
-                        ..
-                    },
-                ..
-            } = instruction
-                && !allowed.contains(&(*base, *variant, *case))
-            {
-                diagnostics.push(Diagnostic::error(
-                    codes::PAYLOAD_OUTSIDE_REFINEMENT,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
-                        block.id.0
-                    ),
-                ));
+            match instruction {
+                Instruction::Value {
+                    kind:
+                        ValueKind::VariantPayload {
+                            base,
+                            variant,
+                            case,
+                            ..
+                        },
+                    ..
+                } => {
+                    if !refinements.proves(&proven, *base, *variant, *case) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PAYLOAD_OUTSIDE_REFINEMENT,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
+                                block.id.0
+                            ),
+                        ));
+                    }
+                }
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    ..
+                } if !refinements.proves(&proven, *value, *variant, *case) => {
+                    diagnostics.push(Diagnostic::error(
+                        codes::DECOMPOSITION_OUTSIDE_REFINEMENT,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{function_name}` takes %{} apart into case {case} of \
+                             variant {} in bb{}, where nothing proves it holds that case",
+                            value.0, variant.0, block.id.0
+                        ),
+                    ));
+                }
+                _ => {}
             }
+            refinements.apply_kill(instruction, &mut proven);
         }
     }
 }
@@ -4158,11 +5193,34 @@ fn verify_resource_ownership(
     function_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Deliberately nominal, not transitively affine (`rfcs/0012`): this
+    // whole-value lattice (`live`/`facts`/`provenance`/`dropped_origins`)
+    // exists to make sure every value that is *itself* ever the direct
+    // target of a whole `Drop`/`Move`/`take` obligation actually
+    // discharges it -- a plain, non-resource record/variant that merely
+    // *contains* one is never such a target on its own: `resourceck`'s
+    // own structural cleanup planning already destroys its own affine
+    // fields individually (each becomes its own fresh, nominally-
+    // resource-or-opaque-variant `ValueId` the moment `PlaceRead` reads
+    // it out, tracked here in its own right from that point on), and
+    // the container's own whole value is never itself the operand of a
+    // `Drop`. Tracking it here too would double-count: it would demand
+    // an explicit destruction of the *container* that `resourceck`
+    // never plans (and `nir::lower` never emits) at all, alongside the
+    // real one already correctly demanded of each field individually.
+    // [`is_affine_whole`], below, is the transitive query for the
+    // handful of checks that *do* need it (`Drop`/`Move`/`DeferCapture`
+    // validity): those two *are* legitimately used on a transitively-
+    // affine value directly (an opaque variant read out as a whole via
+    // `PlaceRead`, or moved between locals) -- everywhere else in this
+    // pass, `is_resource` is exactly the right, narrower question.
     let is_resource = |v: ValueId| -> bool {
-        value_types.get(&v).is_some_and(|ty| {
-            matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine))
-        })
+        value_types
+            .get(&v)
+            .is_some_and(|ty| matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)))
     };
+    let is_affine_whole =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
 
     // Whether a `Call`/`Invoke` argument at index `i` transfers
     // ownership, given `take`'s own declared flags (`rfcs/0011`) --
@@ -4311,7 +5369,7 @@ fn verify_resource_ownership(
                     _ => None,
                 };
                 if let Some((source, label)) = source
-                    && !is_resource(source)
+                    && !is_affine_whole(source)
                 {
                     non_resource_moves.push((*result, label));
                 }
@@ -4534,6 +5592,47 @@ fn verify_resource_ownership(
                                 );
                             }
                         }
+                        // Every affine field argument is unconditionally
+                        // transferred into the fresh aggregate
+                        // (`rfcs/0012`): there is no "observing" record/
+                        // resource construction, exactly like `Move`/
+                        // `DeferCapture` have no non-consuming shape --
+                        // a non-affine field is simply never resource-
+                        // typed at all, so `check_use` below is already
+                        // a no-op for it (`is_resource` gates it).
+                        ValueKind::RecordCreate(_, _, fields) => {
+                            for field in fields {
+                                let legal = alias_safe!(*field, true, false);
+                                check_use(
+                                    *field,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    legal,
+                                );
+                            }
+                        }
+                        // Every affine payload value is unconditionally
+                        // transferred into the fresh variant (`rfcs/
+                        // 0012`), for the identical reason `RecordCreate`
+                        // just above is: there is no "observing" variant
+                        // construction either.
+                        ValueKind::VariantCreate { payload, .. } => {
+                            for value in payload {
+                                let legal = alias_safe!(*value, true, false);
+                                check_use(
+                                    *value,
+                                    &is_resource,
+                                    &origin,
+                                    &mut facts,
+                                    &mut live,
+                                    &mut violations,
+                                    legal,
+                                );
+                            }
+                        }
                         // Always an unconditional transfer (`rfcs/0011`)
                         // -- unlike a `Call` argument, whose own
                         // consumption depends on the callee's own
@@ -4573,6 +5672,39 @@ fn verify_resource_ownership(
                                         if legal { Role::Owned } else { Role::Observed },
                                     )),
                                 );
+                            }
+                        }
+                        // A structural place read never consumes its own
+                        // `place.root` at the whole-value level at all
+                        // (`rfcs/0012`) -- unlike `Move`, `root` is not
+                        // itself the value being transferred, only the
+                        // aggregate reached *through*; `check_alias_
+                        // safety`/`resourceck::flow`'s own separate
+                        // structural pass (`verify_structural_places`)
+                        // are what actually gate whether `place` itself
+                        // was live to read/move at all. `result` mints a
+                        // fresh identity (there is nothing at this
+                        // pass's own whole-value granularity to inherit
+                        // one from): `Owned`, and newly `live`, for a
+                        // `Transfer` (a genuine new obligation this
+                        // frame now owns); `Observed`, and never `live`,
+                        // for an `Observe` -- exactly like `Load`'s own
+                        // exclusion from the fresh-ownership rule below,
+                        // just explicit here since a place read is
+                        // neither `Load` nor `Alloc`.
+                        ValueKind::PlaceRead { mode, .. } => {
+                            if is_resource(*result) {
+                                let role = match mode {
+                                    crate::nir::OwnershipMode::Transfer => Role::Owned,
+                                    crate::nir::OwnershipMode::Observe => Role::Observed,
+                                };
+                                provenance.insert(
+                                    *result,
+                                    LocationState::Initialized((BTreeSet::from([*result]), role)),
+                                );
+                                if *mode == crate::nir::OwnershipMode::Transfer {
+                                    live.insert(*result);
+                                }
                             }
                         }
                         _ => {
@@ -4645,7 +5777,10 @@ fn verify_resource_ownership(
                     // target block cannot otherwise distinguish the two
                     // edges when they happen to share a target).
                     if is_resource(*result)
-                        && !matches!(kind, ValueKind::Load(_) | ValueKind::Alloc)
+                        && !matches!(
+                            kind,
+                            ValueKind::Load(_) | ValueKind::Alloc | ValueKind::PlaceRead { .. }
+                        )
                     {
                         live.insert(*result);
                         if !matches!(
@@ -4738,6 +5873,44 @@ fn verify_resource_ownership(
                         dropped_origins.extend(ids);
                     }
                 }
+                // `StorePlace` always transfers `value` into a
+                // structural field (`rfcs/0012`) -- consumed here
+                // exactly like an ordinary transferring `Store`'s own
+                // operand is, but with no slot of its own to relocate
+                // `value`'s own identity onto: a projected place is
+                // never a key in this pass's own whole-value
+                // `provenance` map at all (see [`verify_structural_
+                // places`], the dedicated pass that tracks each place's
+                // own move/reinit state instead).
+                Instruction::StorePlace { value, .. } => {
+                    let legal = alias_safe!(*value, true, false);
+                    check_use(
+                        *value,
+                        &is_resource,
+                        &origin,
+                        &mut facts,
+                        &mut live,
+                        &mut violations,
+                        legal,
+                    );
+                }
+                // Reads the shell without consuming it: the payload it
+                // hands over is tracked as its own value by this pass
+                // already, from its own `VariantPayload` definition.
+                // The structural place this moves is `verify_structural_
+                // places`' own concern, not this whole-value lattice's.
+                Instruction::DecomposeVariant { value, .. } => {
+                    let legal = alias_safe!(*value, false, false);
+                    check_use(
+                        *value,
+                        &is_resource,
+                        &origin,
+                        &mut facts,
+                        &mut live,
+                        &mut violations,
+                        legal,
+                    );
+                }
             }
         }
         match &block.terminator {
@@ -4781,10 +5954,25 @@ fn verify_resource_ownership(
                     );
                 }
             }
-            Terminator::Return(None)
-            | Terminator::Branch(_)
-            | Terminator::CondBranch { .. }
-            | Terminator::Switch { .. } => {}
+            // Matching an affine scrutinee decomposes it (`rfcs/0012`):
+            // `resourceck::flow` already treats this the same way,
+            // transferring the scrutinee's own place the moment a
+            // `match`/`handle` runs, rather than leaving it live for its
+            // own separate implicit cleanup to (wrongly) also try to
+            // destroy the very payload a pattern binding already took.
+            Terminator::Switch { scrutinee, .. } => {
+                let legal = alias_safe!(*scrutinee, true, false);
+                check_use(
+                    *scrutinee,
+                    &is_resource,
+                    &origin,
+                    &mut facts,
+                    &mut live,
+                    &mut violations,
+                    legal,
+                );
+            }
+            Terminator::Return(None) | Terminator::Branch(_) | Terminator::CondBranch { .. } => {}
         }
         // Every reachable `Return`/`Raise` is a real exit this function
         // takes: whatever is still `live` right here was created (or
@@ -4820,15 +6008,10 @@ fn verify_resource_ownership(
         entry: BlockId,
         entry_seed: (&HashSet<ValueId>, &HashMap<ValueId, LocationState>),
         incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
-        // `(reachable, computed)`: bundled into one tuple (matching
-        // `entry_seed`, above) purely to stay under clippy's
-        // `too_many_arguments` limit -- see each set's own doc comment
-        // below for what it actually means.
-        reachable_and_computed: (&HashSet<BlockId>, &HashSet<BlockId>),
+        reachable: &HashSet<BlockId>,
         out: &HashMap<BlockId, State>,
         is_resource: &impl Fn(ValueId) -> bool,
-    ) -> State {
-        let (reachable, computed) = reachable_and_computed;
+    ) -> IncomingState<State> {
         if block_id == entry {
             // Every `take`-flagged resource parameter is already live the
             // moment this function begins -- an entry block that itself
@@ -4838,15 +6021,15 @@ fn verify_resource_ownership(
             // successors, needs it folded in separately -- see
             // `entry_out`, below).
             let (entry_live, entry_provenance) = entry_seed;
-            return (
+            return IncomingState::Entry((
                 HashSet::new(),
                 entry_live.clone(),
                 HashSet::new(),
                 entry_provenance.clone(),
-            );
+            ));
         }
         let Some(edges) = incoming_edges.get(&block_id) else {
-            return State::default();
+            return IncomingState::Pending;
         };
         // A predecessor the worklist has never actually run `transfer`
         // on yet contributes nothing to this merge at all -- not the
@@ -4860,16 +6043,31 @@ fn verify_resource_ownership(
         // worklist has not reached it yet -- would permanently poison
         // every block downstream of it, regardless of what that
         // predecessor's own eventually-computed state actually turns
-        // out to be. Excluding an uncomputed predecessor here instead
-        // (and unconditionally re-queuing every successor the very
-        // first time any block *becomes* computed, see below) lets the
+        // out to be. Excluding an uncomputed predecessor here lets the
         // fixpoint converge on each edge's own real contribution once,
         // and only once, it is actually known.
-        let mut edges = edges
-            .iter()
-            .filter(|(pred, _)| reachable.contains(pred) && computed.contains(pred));
-        let Some((first_pred, first_extra)) = edges.next() else {
-            return State::default();
+        //
+        // "Computed" is the presence of an `out` entry, and nothing
+        // else: `out` holds a block only once `transfer` has actually
+        // produced its state, so the two can never drift apart.
+        // Yields each usable edge together with the out-state it
+        // carries, so there is no second lookup that could ever need a
+        // default standing in for a state.
+        let mut edges = edges.iter().filter_map(|(pred, extra)| {
+            if !reachable.contains(pred) {
+                return None;
+            }
+            out.get(pred).map(|state| (state, extra))
+        });
+        let Some((first_state, first_extra)) = edges.next() else {
+            // Nothing has been proven about this block yet. That is not
+            // an empty state: an empty `provenance` map disagrees with
+            // every real one, and `merge_provenance` reads disagreement
+            // as the absorbing `MaybeUninitialized` it never recovers
+            // from -- so recording a state here would poison an entire
+            // loop permanently, and did, depending on nothing but the
+            // order the block vector happened to list its blocks in.
+            return IncomingState::Pending;
         };
         // Union, not intersection, matching `verify_drop_state`: a
         // resource already consumed (or still live) on *any* reachable
@@ -4879,7 +6077,7 @@ fn verify_resource_ownership(
         // that block's own success edge alone, never folded into any
         // sibling failure edge that happens to reach this same block
         // (`rfcs/0011`).
-        let mut acc = out.get(first_pred).cloned().unwrap_or_default();
+        let mut acc = first_state.clone();
         if let Some(slot) = first_extra
             && is_resource(*slot)
         {
@@ -4889,9 +6087,8 @@ fn verify_resource_ownership(
                 LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
             );
         }
-        for (pred, extra) in edges {
-            let (other_facts, mut other_live, other_dropped, mut other_prov) =
-                out.get(pred).cloned().unwrap_or_default();
+        for (state, extra) in edges {
+            let (other_facts, mut other_live, other_dropped, mut other_prov) = state.clone();
             if let Some(slot) = extra
                 && is_resource(*slot)
             {
@@ -4906,7 +6103,7 @@ fn verify_resource_ownership(
             acc.2.extend(other_dropped);
             acc.3 = merge_provenance(&acc.3, &other_prov);
         }
-        acc
+        IncomingState::Ready(acc)
     }
 
     // Every `take`-flagged resource parameter is already owned the
@@ -4952,26 +6149,20 @@ fn verify_resource_ownership(
         ),
     );
 
-    let mut out: HashMap<BlockId, State> = function
-        .blocks
-        .iter()
-        .map(|b| {
-            let initial = if b.id == entry {
-                entry_out.clone()
-            } else {
-                State::default()
-            };
-            (b.id, initial)
-        })
-        .collect();
-
-    // Every block whose `out` entry has actually been produced by
-    // `transfer` at least once -- `entry` always starts in this set,
-    // since `entry_out` is already fully computed above; every other
-    // reachable block joins it the first time the worklist processes
-    // it. `in_state_for` only ever merges a predecessor edge once its
-    // own source block is in this set (see its own doc comment).
-    let mut computed: HashSet<BlockId> = HashSet::from([entry]);
+    // `out` holds a block *only once its own out-state has actually
+    // been computed*: "not computed yet" is the absence of a key, and
+    // is therefore impossible to confuse with a block genuinely
+    // computed to hold no facts. Pre-seeding every block with
+    // `State::default()` (as this once did) erases exactly that
+    // distinction, and an empty state is not this lattice's bottom --
+    // an empty `provenance` map disagrees with every real one, and
+    // `merge_provenance` reads disagreement as the absorbing
+    // `MaybeUninitialized` it never recovers from.
+    //
+    // The entry block is the one boundary condition: its in-state is
+    // the parameter seed by definition, so its out-state is fixed and
+    // never recomputed.
+    let mut out: HashMap<BlockId, State> = HashMap::from([(entry, entry_out)]);
 
     let mut worklist: VecDeque<BlockId> = function
         .blocks
@@ -4985,26 +6176,28 @@ fn verify_resource_ownership(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = in_state_for(
+        let in_state = match in_state_for(
             id,
             entry,
             (&entry_live, &entry_provenance),
             &incoming_edges,
-            (&reachable, &computed),
+            &reachable,
             &out,
             &is_resource,
-        );
+        ) {
+            IncomingState::Entry(state) | IncomingState::Ready(state) => state,
+            // Nothing has proven anything about this block yet, so it
+            // runs no transfer and records no out-state. A predecessor
+            // landing later re-enqueues it, and every reachable block
+            // is reached from the entry, whose out-state is fixed
+            // before this loop starts.
+            IncomingState::Pending => continue,
+        };
         let (new_out, ..) = transfer(block, &in_state);
-        // `computed.insert(id)` becoming newly true here means this is
-        // the very first time `id` has ever been computed -- its own
-        // successors must be re-queued regardless of whether `new_out`
-        // happens to coincide with the placeholder `State::default()`
-        // they were already seeded with, since what changed is *not*
-        // `id`'s own value but whether `in_state_for` may now finally
-        // merge `id`'s own real (if otherwise unremarkable) edge in at
-        // all, rather than skipping it as not-yet-computed.
-        let first_time = computed.insert(id);
-        if first_time || out.get(&id) != Some(&new_out) {
+        // An `out` entry appearing for the first time is itself a
+        // change: `out.get(&id)` is `None` until then, so successors
+        // are re-queued exactly when this block first becomes joinable.
+        if out.get(&id) != Some(&new_out) {
             out.insert(id, new_out);
             for &succ in successors.get(&id).into_iter().flatten() {
                 if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
@@ -5016,15 +6209,23 @@ fn verify_resource_ownership(
 
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            in_state_for(
+            match in_state_for(
                 block.id,
                 entry,
                 (&entry_live, &entry_provenance),
                 &incoming_edges,
-                (&reachable, &computed),
+                &reachable,
                 &out,
                 &is_resource,
-            )
+            ) {
+                IncomingState::Entry(state) | IncomingState::Ready(state) => state,
+                // The fixpoint above has converged, so every reachable
+                // block has a computed predecessor by now. Judging
+                // ownership from a state nothing proved would be
+                // guesswork, so the block is skipped rather than
+                // fabricated.
+                IncomingState::Pending => continue,
+            }
         } else {
             State::default()
         };
@@ -5101,6 +6302,1645 @@ fn verify_resource_ownership(
                 result.0
             ),
         ));
+    }
+}
+
+/// One structural place's own current "does it still hold its own
+/// value" status (`rfcs/0012`) -- see [`verify_structural_places`]'s own
+/// doc comment for the full three-state lattice this forms.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldState {
+    Full,
+    Empty,
+    Maybe,
+}
+
+/// The pairwise lattice meet two reachable predecessors' own
+/// [`FieldState`] for the identical structural place join to: agreement
+/// keeps that state, disagreement (including either side already being
+/// the absorbing [`FieldState::Maybe`]) always joins to `Maybe` -- never
+/// silently favors one side over the other, matching `LocationState`'s
+/// own identical three-state shape (this one just has no separate
+/// origin/role payload to carry along).
+fn merge_field(a: FieldState, b: FieldState) -> FieldState {
+    match (a, b) {
+        (FieldState::Full, FieldState::Full) => FieldState::Full,
+        (FieldState::Empty, FieldState::Empty) => FieldState::Empty,
+        _ => FieldState::Maybe,
+    }
+}
+
+/// Every structural place fact one program point holds, keyed by the
+/// exact [`Place`] (`rfcs/0012`). A key absent here is *not* a missing
+/// answer: it is the initial, untouched [`FieldState::Full`], which is
+/// exactly what a freshly constructed aggregate's own fields all start
+/// as. Facts are always read back through [`resolve_place_state`]/
+/// [`place_is_whole`], never a bare `get`, so an ancestor's own state
+/// always dominates its descendants' and a consumed descendant always
+/// makes its ancestors partial.
+type PlaceFacts = HashMap<Place<ValueId>, FieldState>;
+
+/// This place's own effective state within one structural ownership
+/// lattice (`rfcs/0012`): the *shortest* ancestor prefix (including
+/// itself) recorded as anything other than `Full`, or `Full` when no
+/// prefix was ever touched at all.
+///
+/// This is what makes moving or dropping a parent consume its entire
+/// descendant subtree, whether or not each descendant ever got a key of
+/// its own -- a child read after its parent was transferred or dropped
+/// is rejected by exactly the same check a child read after its *own*
+/// transfer is. Walks a bounded prefix chain in a fixed order, so no
+/// `HashMap` iteration order can affect the answer.
+fn resolve_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
+    for len in 0..=place.projections.len() {
+        let prefix = Place {
+            root: place.root,
+            projections: place.projections[..len].to_vec(),
+        };
+        match facts.get(&prefix) {
+            Some(FieldState::Full) | None => {}
+            Some(state) => return *state,
+        }
+    }
+    FieldState::Full
+}
+
+/// `true` iff `place` itself *and* every place reachable through it
+/// still hold their own values -- what a *whole-value* use requires
+/// (`rfcs/0012`): observed, transferred, returned, raised, or consumed
+/// into an aggregate. A parent with a moved-out child fails this while
+/// still passing [`resolve_place_state`], which is precisely the
+/// difference between "you may not use this as a value" and "you may
+/// still reach an unaffected sibling through it, reinitialize an empty
+/// child, or structurally drop what remains". A boolean `any`, so
+/// `facts`' own iteration order cannot affect the answer.
+fn place_is_whole(facts: &PlaceFacts, place: &Place<ValueId>) -> bool {
+    if resolve_place_state(facts, place) != FieldState::Full {
+        return false;
+    }
+    !facts
+        .iter()
+        .any(|(key, state)| key != place && place.is_ancestor_of(key) && *state != FieldState::Full)
+}
+
+/// Records `place`'s own new leaf state, first clearing every strictly
+/// deeper key it now supersedes -- consuming or restoring a place
+/// settles everything reachable through it, so a stale finer-grained
+/// fact recorded before this point must never be consulted again.
+/// Reinitializing an empty child through this is exactly what restores
+/// its ancestors' own completeness.
+fn set_place_state(facts: &mut PlaceFacts, place: &Place<ValueId>, state: FieldState) {
+    facts.retain(|key, _| key == place || !place.is_ancestor_of(key));
+    facts.insert(place.clone(), state);
+}
+
+/// One structural ownership violation, recorded during a block's own
+/// transfer and reported once afterwards, so the dataflow fixpoint
+/// never reports the same instruction twice (`rfcs/0012`).
+#[derive(Clone, Copy)]
+enum OwnershipViolation {
+    /// A place read or moved where it is not definitely still holding
+    /// its own value -- including a child reached through an ancestor
+    /// already transferred or dropped.
+    UseAfterMove(ValueId),
+    /// A `StorePlace` targeting a place that is not definitely empty.
+    OverwriteLive(ValueId),
+    /// A place used as a *whole* value while one of its own affine
+    /// descendants is already consumed.
+    PartialWhole(ValueId),
+    /// A whole-value destruction or transfer of something already
+    /// consumed on a path reaching it: structural double cleanup.
+    DoubleCleanup(ValueId),
+    /// A variant decomposition that leaves at least one affine payload
+    /// position of its own live case unclaimed -- a resource the shell
+    /// no longer owns and nothing else does either.
+    IncompleteDecomposition(ValueId),
+    /// Something reachable through an observation is transferred,
+    /// destroyed, decomposed or reinitialized.
+    ObserverTransfer(ValueId),
+}
+
+/// Path-sensitive structural ownership verification (`rfcs/0012`),
+/// independent of `resourceck` and reconstructed from NIR alone -- so
+/// hand-built NIR that never passed source checking is rejected on
+/// exactly the same terms as lowered NIR.
+///
+/// Complements [`verify_resource_ownership`], which tracks every *whole*
+/// nominally-resource value's own provenance, role and aliasing. This
+/// pass owns the two things that lattice deliberately does not model:
+/// the place *tree* (see [`resolve_place_state`]/[`place_is_whole`]),
+/// and the cleanup obligation of a *transitively* affine record, which
+/// is never itself a nominal resource and so is never a key there at
+/// all. The two never report the same value: the missing-cleanup check
+/// below deliberately skips every root the other pass already owns.
+///
+/// Uses the identical reachable-union worklist shape, with the identical
+/// `computed`-set fixpoint discipline `RESOURCE_LOCATION_NOT_DEFINITELY_
+/// INITIALIZED`'s own fix required: an as-yet-unprocessed loop back-edge
+/// predecessor contributes nothing to a join, and is never mistaken for
+/// a *computed* predecessor that has definitively proven a place
+/// consumed. A join takes the union of both sides' keys -- so a place
+/// touched on only one predecessor still joins to `Maybe` against the
+/// other's implicit `Full` -- which is what makes the result
+/// independent of predecessor discovery order, block vector order and
+/// `HashMap` order alike.
+#[allow(clippy::too_many_arguments)]
+fn verify_structural_places(
+    function: &Function,
+    value_types: &HashMap<ValueId, Ty>,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let entry = BlockId(0);
+    if !function.blocks.iter().any(|b| b.id == entry) {
+        return;
+    }
+
+    // Every CFG edge, carrying the slot that edge itself initializes.
+    // An `Invoke` writes ownership into `ok_slot` on its success edge
+    // and into each error target's own slot on that failure edge, and
+    // into nothing on any other edge. The fact therefore belongs to the
+    // *edge*: two logical edges may reach the same target block while
+    // initializing different slots, so recording it against the target
+    // would either demand cleanup on a path that never received the
+    // value or lose the leak on the path that did.
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut incoming_edges: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
+    for block in &function.blocks {
+        let mut edges: Vec<(BlockId, Option<ValueId>)> = Vec::new();
+        match &block.terminator {
+            Terminator::Branch(target) => edges.push((*target, None)),
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                edges.push((*then_block, None));
+                edges.push((*else_block, None));
+            }
+            Terminator::Switch { cases, .. } => {
+                edges.extend(cases.iter().map(|target| (*target, None)));
+            }
+            Terminator::Invoke {
+                ok_slot,
+                ok_target,
+                err_targets,
+                ..
+            } => {
+                edges.push((*ok_target, Some(*ok_slot)));
+                for target in err_targets {
+                    edges.push((target.target, Some(target.slot)));
+                }
+            }
+            Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+        for (target, slot) in edges {
+            successors.entry(block.id).or_default().push(target);
+            incoming_edges
+                .entry(target)
+                .or_default()
+                .push((block.id, slot));
+        }
+    }
+
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // Every `Load`'s own result shares its own place-tracking identity
+    // with the slot it loads from (`rfcs/0012`): a `mutable` local
+    // reloads its own current whole value fresh, as a *new* `ValueId`,
+    // every time a place projects into it (`session.input`, then later
+    // `session.output`, are two entirely separate `Load(%slot)`
+    // results) -- without canonicalizing back to the one shared slot
+    // they both actually reach into, two places that are structurally
+    // the very same field would never compare equal here at all,
+    // breaking every one of this pass's own checks for it.
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
+    let canonical = |place: &Place<ValueId>| -> Place<ValueId> {
+        Place {
+            root: origin(place.root),
+            projections: place.projections.clone(),
+        }
+    };
+
+    // Whether a `Call`/`Invoke` argument at index `i` transfers
+    // ownership -- structural malformation is handled conservatively
+    // (every argument treated as consumed), for the identical reason
+    // `verify_resource_ownership`'s own copy of this is: wrongly
+    // assuming a mere observation could let a value an unknown callee
+    // actually took ownership of keep looking live afterwards.
+    let consumes_arg = |take: Option<&[bool]>, args_len: usize, i: usize| -> bool {
+        match take {
+            Some(flags) if flags.len() == args_len => flags.get(i).copied().unwrap_or(true),
+            _ => true,
+        }
+    };
+
+    // Deliberately *transitive*, never nominal `is_resource`: an affine
+    // record or variant owns real resources, and is exactly what this
+    // pass exists to track. An ordinary, freely-copyable value never
+    // enters this lattice at all.
+    let is_affine =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
+
+    // Ownership is the second axis. A value this frame merely *observes*
+    // is available -- readable, passable to another observing parameter
+    // -- and is never this frame's to give away, destroy, take apart or
+    // overwrite. A slot and the loads of it are one place here, exactly
+    // as they are everywhere else in this pass.
+    let observed = observed_values(function, &is_affine);
+    let is_observed =
+        |v: ValueId| -> bool { observed.contains(&v) || observed.contains(&origin(v)) };
+
+    // Every value whose *only* use anywhere in this function is as a
+    // `Drop` operand (`rfcs/0012`). A structural destruction of one
+    // field is expressed as a `Transfer` read of it immediately
+    // followed by a `Drop` of the result -- the two primitives
+    // composed, since there is no separate `drop.place` instruction --
+    // so such a read is a *destruction*, not a transfer, and is
+    // therefore legal on a partially moved parent: it destroys exactly
+    // what is left, which is the whole point of a structural drop. A
+    // `Transfer` read feeding anything else really is moving a value
+    // out to be used, and does require a complete one.
+    let drop_only_reads: HashSet<ValueId> = {
+        let mut dropped: HashSet<ValueId> = HashSet::new();
+        let mut otherwise_used: HashSet<ValueId> = HashSet::new();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Drop { value } => {
+                        dropped.insert(*value);
+                    }
+                    Instruction::Value { kind, .. } => {
+                        otherwise_used.extend(operands_of(kind));
+                    }
+                    Instruction::Store { slot, value, .. } => {
+                        otherwise_used.insert(*slot);
+                        otherwise_used.insert(*value);
+                    }
+                    Instruction::StorePlace { place, value } => {
+                        otherwise_used.insert(place.root);
+                        otherwise_used.insert(*value);
+                    }
+                    // Reading the shell is an ordinary use; naming the
+                    // transferred value is the ownership event for it,
+                    // not an additional read -- but both are recorded,
+                    // since this set only ever gates `PlaceRead`
+                    // results, which neither of these can be.
+                    Instruction::DecomposeVariant { value, taken, .. } => {
+                        otherwise_used.insert(*value);
+                        otherwise_used.extend(taken.iter().map(|(_, owner)| *owner));
+                    }
+                }
+            }
+            match &block.terminator {
+                Terminator::Return(Some(v)) => {
+                    otherwise_used.insert(*v);
+                }
+                Terminator::Raise { value, .. } => {
+                    otherwise_used.insert(*value);
+                }
+                Terminator::CondBranch { condition, .. } => {
+                    otherwise_used.insert(*condition);
+                }
+                Terminator::Switch { scrutinee, .. } => {
+                    otherwise_used.insert(*scrutinee);
+                }
+                Terminator::Invoke { args, .. } => {
+                    otherwise_used.extend(args.iter().copied());
+                }
+                Terminator::Return(None) | Terminator::Branch(_) => {}
+            }
+        }
+        dropped.difference(&otherwise_used).copied().collect()
+    };
+
+    let transfer = |block: &BasicBlock,
+                    in_state: &PlaceFacts|
+     -> (PlaceFacts, Vec<OwnershipViolation>) {
+        let mut facts = in_state.clone();
+        let mut violations: Vec<OwnershipViolation> = Vec::new();
+
+        for instruction in &block.instructions {
+            // A value-producing instruction *defines* its own result
+            // afresh every time it executes, so any fact about that
+            // same id left over from a previous iteration -- carried
+            // back around a loop's own back edge -- is stale and must
+            // not survive into this definition (`rfcs/0012`). Without
+            // this, a resource constructed inside a loop body and
+            // destroyed at the end of that same iteration would look
+            // like a double cleanup on the second iteration. Skipped
+            // for a `Load`, whose canonical root is the slot it reads
+            // (defined by its own `Alloc`/`Store`), not this result.
+            if let Instruction::Value { result, kind, .. } = instruction
+                && is_affine(*result)
+                && origin(*result) == *result
+            {
+                // Two kinds own nothing at their own definition.
+                //
+                // A payload *read*: the shell still owns what it read
+                // until a `DecomposeVariant` claims that exact
+                // extraction.
+                //
+                // An `Alloc`: it produces uninitialized storage, not a
+                // value. The slot becomes owned when something writes
+                // it -- a `Store`, or the `Invoke` edge that fills it
+                // -- and treating the allocation itself as ownership
+                // made an `Invoke`'s result slot look owned on the
+                // failure edge that never wrote it.
+                let state = if matches!(kind, ValueKind::VariantPayload { .. } | ValueKind::Alloc) {
+                    FieldState::Empty
+                } else {
+                    FieldState::Full
+                };
+                set_place_state(&mut facts, &Place::root(*result), state);
+            }
+            match instruction {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::PlaceRead { place, mode },
+                    ..
+                } => {
+                    let place = canonical(place);
+                    // Moving a field out of an observation takes
+                    // ownership the caller never handed over. Reading
+                    // one is fine, and is the point.
+                    if *mode == crate::nir::OwnershipMode::Transfer && is_observed(place.root) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*result));
+                        continue;
+                    }
+                    if resolve_place_state(&facts, &place) != FieldState::Full {
+                        violations.push(OwnershipViolation::UseAfterMove(*result));
+                        continue;
+                    }
+                    // Reading or moving a place *as a whole* requires
+                    // every affine descendant of it to still be there
+                    // -- unless this read exists purely to destroy it
+                    // (see `drop_only_reads`), which is exactly the
+                    // shape a structural drop of a partially moved
+                    // parent takes.
+                    if !drop_only_reads.contains(result) && !place_is_whole(&facts, &place) {
+                        violations.push(OwnershipViolation::PartialWhole(*result));
+                        continue;
+                    }
+                    if *mode == crate::nir::OwnershipMode::Transfer {
+                        set_place_state(&mut facts, &place, FieldState::Empty);
+                    }
+                }
+                // Taking a variant apart into one specific case, on
+                // this path alone (`rfcs/0012`). The shell is consumed
+                // here and each claimed payload becomes its own owned
+                // value from here on -- so a whole-value `Drop` or
+                // transfer of the same variant on a *disjoint* path is
+                // completely independent: neither can suppress or
+                // discharge the other, which is exactly what a
+                // function-global "was this consumed anywhere" test got
+                // wrong.
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    taken,
+                } => {
+                    let shell = Place::root(origin(*value));
+                    // Taking an observed variant apart claims payload
+                    // positions the caller still owns.
+                    if is_observed(*value) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*value));
+                        continue;
+                    }
+                    if resolve_place_state(&facts, &shell) != FieldState::Full {
+                        violations.push(OwnershipViolation::DoubleCleanup(*value));
+                        continue;
+                    }
+                    if !place_is_whole(&facts, &shell) {
+                        violations.push(OwnershipViolation::PartialWhole(*value));
+                        continue;
+                    }
+                    // Every *affine* payload position of this case must
+                    // be claimed exactly once: one left out would be a
+                    // resource the shell no longer owns and nothing else
+                    // does either.
+                    let args: Vec<Ty> = match value_types.get(value) {
+                        Some(Ty::Applied(_, args)) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let payload_tys: Vec<Ty> =
+                        match agg.variants.get(variant).and_then(|v| v.cases.get(*case)) {
+                            Some(layout) => layout.payload.clone(),
+                            // There is no declaration to check claims
+                            // against. This pass's own validation arm
+                            // already rejects a `DecomposeVariant` naming
+                            // an unknown variant or a case out of range and
+                            // owns that diagnostic, so demanding claims
+                            // here would only report the same defect twice.
+                            // Nothing is silently discharged: the program
+                            // is rejected either way.
+                            None => Vec::new(),
+                        };
+                    let subst = item_substitution(*variant, &args, agg);
+                    let mut incomplete = false;
+                    if let Ok(subst) = &subst {
+                        for (index, payload_ty) in payload_tys.iter().enumerate() {
+                            if !is_affine_in(&substitute(payload_ty, subst), agg) {
+                                continue;
+                            }
+                            let claims = taken.iter().filter(|(i, _)| *i == index).count();
+                            if claims != 1 {
+                                incomplete = true;
+                            }
+                        }
+                    } else {
+                        incomplete = true;
+                    }
+                    if incomplete {
+                        violations.push(OwnershipViolation::IncompleteDecomposition(*value));
+                        continue;
+                    }
+                    set_place_state(&mut facts, &shell, FieldState::Empty);
+                    // Each claimed payload is this frame's own from
+                    // here: seeded `Full` so a later consumption of it
+                    // is checked against a real state, never a default.
+                    for (_, owner) in taken {
+                        if is_affine(*owner) && origin(*owner) == *owner {
+                            set_place_state(&mut facts, &Place::root(*owner), FieldState::Full);
+                        }
+                    }
+                }
+                Instruction::StorePlace { place, value } => {
+                    let place = canonical(place);
+                    // Writing through an observer overwrites storage
+                    // the caller still owns, leaking whatever was
+                    // there.
+                    if is_observed(place.root) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*value));
+                        continue;
+                    }
+                    if resolve_place_state(&facts, &place) != FieldState::Empty {
+                        violations.push(OwnershipViolation::OverwriteLive(*value));
+                        continue;
+                    }
+                    // Storing a nested affine value creates exactly the
+                    // descendant obligations that value itself carries:
+                    // the place becomes `Full` and every stale deeper
+                    // fact recorded before it was emptied is cleared, so
+                    // an ancestor emptied only by this child's own move
+                    // becomes complete again.
+                    set_place_state(&mut facts, &place, FieldState::Full);
+                    consume_root(
+                        &mut facts,
+                        &mut violations,
+                        &is_affine,
+                        &origin,
+                        &is_observed,
+                        *value,
+                        true,
+                        *value,
+                    );
+                }
+                Instruction::Drop { value } => {
+                    // A structural `Drop` destroys this value *and*
+                    // every remaining descendant under it (`rfcs/0012`'s
+                    // chosen coherent model), which is exactly what
+                    // clearing every deeper key expresses -- so a
+                    // parent dropped after one of its own children was
+                    // already moved out is valid, and destroys only
+                    // what is left.
+                    consume_root(
+                        &mut facts,
+                        &mut violations,
+                        &is_affine,
+                        &origin,
+                        &is_observed,
+                        *value,
+                        false,
+                        *value,
+                    );
+                }
+                Instruction::Store { slot, value, mode } => match mode {
+                    crate::nir::OwnershipMode::Transfer => {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            &is_observed,
+                            *value,
+                            true,
+                            *value,
+                        );
+                        if is_affine(*slot) {
+                            set_place_state(
+                                &mut facts,
+                                &Place::root(origin(*slot)),
+                                FieldState::Full,
+                            );
+                        }
+                    }
+                    crate::nir::OwnershipMode::Observe => {
+                        observe_root(&facts, &mut violations, &is_affine, &origin, *value, *value);
+                        // The slot now holds an observing alias. It owns
+                        // nothing -- the owner it aliases still owes the
+                        // cleanup -- but it is *there*, and reading it
+                        // back is legal. An `Alloc` alone leaves the slot
+                        // empty, so without this the very next `Load` of
+                        // it would look like a use after move.
+                        if is_affine(*slot) {
+                            set_place_state(
+                                &mut facts,
+                                &Place::root(origin(*slot)),
+                                FieldState::Full,
+                            );
+                        }
+                    }
+                },
+                Instruction::Value { result, kind, .. } => match kind {
+                    ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            &is_observed,
+                            *source,
+                            true,
+                            *result,
+                        );
+                    }
+                    ValueKind::RecordCreate(_, _, fields) => {
+                        for field in fields {
+                            consume_root(
+                                &mut facts,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                &is_observed,
+                                *field,
+                                true,
+                                *result,
+                            );
+                        }
+                    }
+                    ValueKind::VariantCreate { payload, .. } => {
+                        for field in payload {
+                            consume_root(
+                                &mut facts,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                &is_observed,
+                                *field,
+                                true,
+                                *result,
+                            );
+                        }
+                    }
+                    ValueKind::Call(callee, _, args, _) => {
+                        let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                        for (i, arg) in args.iter().enumerate() {
+                            if consumes_arg(take, args.len(), i) {
+                                consume_root(
+                                    &mut facts,
+                                    &mut violations,
+                                    &is_affine,
+                                    &origin,
+                                    &is_observed,
+                                    *arg,
+                                    true,
+                                    *result,
+                                );
+                            } else {
+                                observe_root(
+                                    &facts,
+                                    &mut violations,
+                                    &is_affine,
+                                    &origin,
+                                    *arg,
+                                    *result,
+                                );
+                            }
+                        }
+                    }
+                    ValueKind::RecordField {
+                        base,
+                        record,
+                        field,
+                    } if is_affine(*base) => {
+                        // Observes one *specific* field, so it requires
+                        // only that field to still hold its own value
+                        // -- never the whole aggregate. Reading an
+                        // unaffected (or non-affine) field of a
+                        // partially moved parent stays legal, which is
+                        // exactly what makes a partial move usable at
+                        // all; reading any field after the parent
+                        // itself was consumed is still rejected,
+                        // because the ancestor's own state dominates.
+                        let place = Place::root(origin(*base))
+                            .field(*record, crate::place::FieldId(*field as u32));
+                        if resolve_place_state(&facts, &place) != FieldState::Full {
+                            violations.push(OwnershipViolation::UseAfterMove(*result));
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        match &block.terminator {
+            Terminator::Return(Some(value)) => {
+                consume_root(
+                    &mut facts,
+                    &mut violations,
+                    &is_affine,
+                    &origin,
+                    &is_observed,
+                    *value,
+                    true,
+                    *value,
+                );
+            }
+            Terminator::Raise { value, .. } => {
+                consume_root(
+                    &mut facts,
+                    &mut violations,
+                    &is_affine,
+                    &origin,
+                    &is_observed,
+                    *value,
+                    true,
+                    *value,
+                );
+            }
+            Terminator::Invoke { callee, args, .. } => {
+                let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                for (i, arg) in args.iter().enumerate() {
+                    if consumes_arg(take, args.len(), i) {
+                        consume_root(
+                            &mut facts,
+                            &mut violations,
+                            &is_affine,
+                            &origin,
+                            &is_observed,
+                            *arg,
+                            true,
+                            *arg,
+                        );
+                    } else {
+                        observe_root(&facts, &mut violations, &is_affine, &origin, *arg, *arg);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        (facts, violations)
+    };
+
+    let entry_block = function
+        .blocks
+        .iter()
+        .find(|b| b.id == entry)
+        .expect("presence already checked above");
+    // Every root an instruction creates starts *absent*: nothing has
+    // created it yet on any path through the entry. Without this the
+    // absence of a key reads as `Full`, so a value built on one arm of
+    // a branch is indistinguishable at the join from one that was never
+    // created on the other arm at all -- and a bypass path silently
+    // excuses a real leak, or is itself blamed for a value it never
+    // received. Parameters are deliberately not seeded: a `take`
+    // parameter really is live from the entry.
+    let mut entry_facts = PlaceFacts::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value { result, .. } = instruction
+                && is_affine(*result)
+                && origin(*result) == *result
+            {
+                entry_facts.insert(Place::root(*result), FieldState::Empty);
+            }
+        }
+        // An `Invoke`'s own result slots are absent until the edge that
+        // writes them is taken, so a sibling edge never inherits one.
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            for slot in std::iter::once(*ok_slot).chain(err_targets.iter().map(|t| t.slot)) {
+                if is_affine(slot) && origin(slot) == slot {
+                    entry_facts.insert(Place::root(slot), FieldState::Empty);
+                }
+            }
+        }
+    }
+    let (entry_out, _) = transfer(entry_block, &entry_facts);
+
+    // `out` holds an entry for a block *only once that block's own
+    // out-state has actually been computed* -- "not computed yet" is the
+    // absence of a key, and is therefore impossible to confuse with a
+    // block genuinely computed to hold no facts at all. Pre-seeding
+    // every block with an empty map (as this once did) erases exactly
+    // that distinction, and lets an unprocessed loop back-edge
+    // predecessor contribute a fact set nothing ever proved.
+    //
+    // The entry block is the one boundary condition: its in-state is
+    // empty by definition, so its out-state is fixed and never
+    // recomputed.
+    let mut out: HashMap<BlockId, PlaceFacts> = HashMap::from([(entry, entry_out)]);
+
+    // Standard worklist ("chaotic iteration") over reachable non-entry
+    // blocks, seeded in declaration order so the exact same CFG is
+    // always explored in the same order. A block is re-enqueued only
+    // when one of its own predecessors' out-states actually changed.
+    //
+    // Termination, with no pass limit of any kind: every transfer
+    // either records a fixed state for a place or -- when its own guard
+    // fails on a worse in-state -- records nothing and leaves the joined
+    // state standing. So a worse in-state can only ever produce an
+    // equal-or-worse out-state, which makes the transfer monotone in
+    // the order `Full`/`Empty` below the absorbing `Maybe`. The set of
+    // tracked places is bounded by the places the instructions actually
+    // name, and each one's state can rise at most twice, so the
+    // iteration reaches a fixed point.
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let in_state =
+            match in_state_for_places(id, entry, &incoming_edges, &reachable, &out, &entry_facts) {
+                IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+                // Nothing has proven anything about this block yet, so it
+                // runs no transfer and records no out-state: the absence of
+                // a key is exactly what keeps "not computed" apart from
+                // "computed to nothing". Popping a block before its own
+                // predecessors is ordinary -- the worklist is seeded in
+                // declaration order, which says nothing about control flow
+                // -- and a predecessor's out-state landing later re-enqueues
+                // it. Every reachable block is reached from the entry,
+                // whose out-state is fixed before this loop starts, so no
+                // reachable block can stay `Pending` once this drains.
+                IncomingState::Pending => continue,
+            };
+        let (new_out, _) = transfer(block, &in_state);
+        let changed = out.get(&id) != Some(&new_out);
+        if changed {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    let owned_roots = structural_cleanup_obligations(function, value_types, agg);
+    let payloads = extracted_payloads(function);
+    let refinements = case_refinements(function);
+    let extractions = payload_extractions(function);
+    // Every extraction some decomposition claims *somewhere*. A value
+    // claimed on no path at all was never this frame's to consume; one
+    // claimed on some path and consumed twice is an ordinary double
+    // cleanup, and keeps that diagnostic.
+    let claimed_extractions: HashSet<ValueId> = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|instruction| match instruction {
+            Instruction::DecomposeVariant { taken, .. } => Some(taken),
+            _ => None,
+        })
+        .flat_map(|taken| taken.iter().map(|(_, owner)| *owner))
+        .collect();
+
+    for block in &function.blocks {
+        let in_state = if reachable.contains(&block.id) {
+            match in_state_for_places(
+                block.id,
+                entry,
+                &incoming_edges,
+                &reachable,
+                &out,
+                &entry_facts,
+            ) {
+                IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+                // The fixpoint above has converged, so every reachable
+                // block has a computed predecessor by now and this
+                // cannot be observed. Were it ever observed, judging
+                // ownership from a state nothing proved would be
+                // guesswork, so the block is skipped rather than
+                // fabricated -- which is the whole point of keeping
+                // `Pending` out of `PlaceFacts`.
+                IncomingState::Pending => continue,
+            }
+        } else {
+            // An unreachable block is walked purely so its own
+            // instructions are still shape-checked; it starts from
+            // nothing, and its facts never reach a reachable block.
+            PlaceFacts::new()
+        };
+        let (exit_facts, violations) = transfer(block, &in_state);
+        for violation in violations {
+            // A payload extraction no decomposition anywhere in this
+            // function claims was never this frame's to consume or
+            // transfer at all, so it gets the diagnostic that says so
+            // rather than one about a value having moved.
+            if let OwnershipViolation::UseAfterMove(v) | OwnershipViolation::DoubleCleanup(v) =
+                violation
+                && extractions.is_extraction(v)
+                && !claimed_extractions.contains(&v)
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNCLAIMED_PAYLOAD_OWNERSHIP,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} reads one payload position of a variant, \
+                         and is destroyed or transferred without any decomposition having \
+                         transferred ownership of it",
+                        v.0
+                    ),
+                ));
+                continue;
+            }
+            let (code, value, detail) = match violation {
+                OwnershipViolation::UseAfterMove(v) => (
+                    codes::PLACE_USE_AFTER_MOVE,
+                    v,
+                    "reads or moves a structural place that is not definitely still holding its \
+                     own value on every path reaching it",
+                ),
+                OwnershipViolation::OverwriteLive(v) => (
+                    codes::PLACE_OVERWRITE_OF_LIVE_FIELD,
+                    v,
+                    "reinitializes a structural place that is not definitely empty on every path \
+                     reaching it",
+                ),
+                OwnershipViolation::PartialWhole(v) => (
+                    codes::PARTIAL_PLACE_USED_AS_WHOLE,
+                    v,
+                    "uses a place as a whole value while one of its own affine descendants is \
+                     already moved or dropped",
+                ),
+                OwnershipViolation::DoubleCleanup(v) => (
+                    codes::DUPLICATE_STRUCTURAL_CLEANUP,
+                    v,
+                    "destroys or transfers a place that was already consumed on a path reaching it",
+                ),
+                OwnershipViolation::ObserverTransfer(v) => (
+                    codes::OBSERVER_CANNOT_TRANSFER,
+                    v,
+                    "transfers, destroys, takes apart or reinitializes something reachable only \
+                     through an observation, which the caller still owns",
+                ),
+                OwnershipViolation::IncompleteDecomposition(v) => (
+                    codes::MISSING_STRUCTURAL_CLEANUP,
+                    v,
+                    "is taken apart into a case whose own affine payload positions are not each \n                     claimed exactly once",
+                ),
+            };
+            diagnostics.push(Diagnostic::error(
+                code,
+                source,
+                Span::dummy(),
+                format!("function `{function_name}`: %{} {detail}", value.0),
+            ));
+        }
+        if !reachable.contains(&block.id) {
+            continue;
+        }
+        let returned = match &block.terminator {
+            Terminator::Return(Some(v)) => Some(origin(*v)),
+            Terminator::Raise { value, .. } => Some(origin(*value)),
+            Terminator::Return(None) => None,
+            _ => continue,
+        };
+        let block_refinements = refinements.at_exit(block);
+        let cases = VariantCaseContext {
+            refinements: &block_refinements,
+            payloads: &payloads,
+            claimed: &claimed_extractions,
+        };
+        for (root, ty) in &owned_roots {
+            let root_origin = origin(*root);
+            if returned == Some(root_origin) {
+                continue;
+            }
+            // Whether this exit owes cleanup is answered by the facts
+            // that actually reach it, not by dominance. Dominance asks
+            // "does *every* path here pass through the creation?"; the
+            // obligation asks "does *any* path here pass through it and
+            // still hold the value?". A branch-local aggregate reaching
+            // a shared exit answers no to the first and yes to the
+            // second, and used to be exempted -- a silent leak. The
+            // state below is `Empty` exactly when every path here either
+            // never created it or already consumed it.
+            let mut obligations = Vec::new();
+            remaining_obligations(
+                &exit_facts,
+                &Place::root(root_origin),
+                ty,
+                agg,
+                &cases,
+                0,
+                &mut obligations,
+            );
+            if !obligations.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    codes::MISSING_STRUCTURAL_CLEANUP,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} still owns {} affine descendant(s) that \
+                         were never destroyed or transferred out when this exit is reached (bb{})",
+                        root.0,
+                        obligations.len(),
+                        block.id.0
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Consumes `value`'s own whole root place -- a `Drop`, a
+/// `Move`/`DeferCapture` source, an aggregate construction operand, a
+/// `take` argument, or a returned/raised operand (`rfcs/0012`).
+///
+/// `require_whole` separates a *transfer* (which needs a complete
+/// value, and so rejects a partially moved parent) from a structural
+/// `Drop` (which is explicitly allowed on a partially moved parent, and
+/// destroys exactly what is left). A consumption of something already
+/// consumed on this path is duplicate structural cleanup, reported
+/// against `reporter` -- the instruction result, where there is one, so
+/// the diagnostic names the operation rather than its operand.
+#[allow(clippy::too_many_arguments)]
+fn consume_root(
+    facts: &mut PlaceFacts,
+    violations: &mut Vec<OwnershipViolation>,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+    is_observed: &impl Fn(ValueId) -> bool,
+    value: ValueId,
+    require_whole: bool,
+    reporter: ValueId,
+) {
+    if !is_affine(value) {
+        return;
+    }
+    // Consuming is giving away, and an observer has nothing to give:
+    // whatever this reaches, the caller still owns it.
+    if is_observed(value) {
+        violations.push(OwnershipViolation::ObserverTransfer(reporter));
+        return;
+    }
+    let place = Place::root(origin(value));
+    if resolve_place_state(facts, &place) != FieldState::Full {
+        violations.push(OwnershipViolation::DoubleCleanup(reporter));
+        return;
+    }
+    if require_whole && !place_is_whole(facts, &place) {
+        violations.push(OwnershipViolation::PartialWhole(reporter));
+        return;
+    }
+    set_place_state(facts, &place, FieldState::Empty);
+}
+
+/// Observes `value`'s own whole root place without consuming it -- still
+/// requires it to be intact, since a partially moved aggregate has no
+/// whole value left to observe (`rfcs/0012`).
+fn observe_root(
+    facts: &PlaceFacts,
+    violations: &mut Vec<OwnershipViolation>,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+    value: ValueId,
+    reporter: ValueId,
+) {
+    if !is_affine(value) {
+        return;
+    }
+    let place = Place::root(origin(value));
+    if resolve_place_state(facts, &place) != FieldState::Full {
+        violations.push(OwnershipViolation::UseAfterMove(reporter));
+    } else if !place_is_whole(facts, &place) {
+        violations.push(OwnershipViolation::PartialWhole(reporter));
+    }
+}
+
+/// Every value in this function that is an *observation* rather than an
+/// owner (`rfcs/0011`, `rfcs/0012`) -- a call-scoped view of something
+/// the caller still owns.
+///
+/// Ownership is a second axis alongside availability, and this is the
+/// half availability cannot express: a field of an observed aggregate is
+/// perfectly *there*, and reading it is exactly what observation is for,
+/// but nothing reached through it may be transferred, destroyed,
+/// decomposed or reinitialized.
+///
+/// It is a property of the value rather than of the path -- an ordinary
+/// (non-`take`) affine parameter is observed for its whole life -- so
+/// this is a least fixed point over definitions and uses, and a join
+/// can never lose it. Every projection out of an observation is an
+/// observation in turn: reading a field, extracting a payload, loading
+/// a slot an observing alias was stored into. No step ever moves the
+/// other way along this axis, which is exactly the laundering it
+/// closes.
+fn observed_values(function: &Function, is_affine: &impl Fn(ValueId) -> bool) -> HashSet<ValueId> {
+    let mut observed: HashSet<ValueId> = function
+        .params
+        .iter()
+        .filter(|param| !param.take && is_affine(param.value))
+        .map(|param| param.value)
+        .collect();
+    // Definitions may appear in any block order, so this runs to a
+    // fixed point rather than in one pass. The set only ever grows and
+    // is bounded by the values this function defines.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Value { result, kind, .. } => {
+                        let source = match kind {
+                            ValueKind::PlaceRead { place, .. } => Some(place.root),
+                            ValueKind::RecordField { base, .. } => Some(*base),
+                            ValueKind::VariantPayload { base, .. } => Some(*base),
+                            ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                                Some(*source)
+                            }
+                            ValueKind::Load(slot) => Some(*slot),
+                            _ => None,
+                        };
+                        if let Some(source) = source
+                            && observed.contains(&source)
+                            && observed.insert(*result)
+                        {
+                            changed = true;
+                        }
+                    }
+                    // Whatever a slot was last given, it can give back.
+                    Instruction::Store { slot, value, .. } => {
+                        if observed.contains(value) && observed.insert(*slot) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::StorePlace { place, value } => {
+                        if observed.contains(value) && observed.insert(place.root) {
+                            changed = true;
+                        }
+                    }
+                    // The decomposition itself is rejected below; the
+                    // fact still propagates so nothing downstream of it
+                    // looks like an owner either.
+                    Instruction::DecomposeVariant { value, taken, .. } => {
+                        if observed.contains(value) {
+                            for (_, owner) in taken {
+                                if observed.insert(*owner) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Drop { .. } => {}
+                }
+            }
+        }
+    }
+    observed
+}
+
+/// Every root this function itself owns and must therefore have fully
+/// cleaned up by any reachable exit (`rfcs/0012`), paired with its own
+/// type: a `take` parameter, and every instruction result that
+/// *produces* a new owned affine value.
+///
+/// Deliberately excludes a nominal `resource` root --
+/// [`verify_resource_ownership`] already owns that obligation end to
+/// end, and reporting it here too would double-report the identical
+/// leak under a second code. What is left is exactly the gap that
+/// lattice cannot see: a transitively affine *record*, which is never a
+/// key there at all.
+///
+/// Also excludes any root a `Terminator::Switch` or a
+/// `ValueKind::VariantPayload` reaches into: a `match`'s own decision
+/// tree takes ownership of the scrutinee and hands it to the extracted
+/// payloads, each of which is tracked in its own right from that point
+/// on, so demanding a separate destruction of the scrutinee too would
+/// double-count the very same obligation.
+/// Every root this function itself owns and must therefore have fully
+/// cleaned up by any reachable exit, paired with its own type and with
+/// the block ownership *begins* in (`rfcs/0012`).
+///
+/// Ownership is read straight off the instruction that establishes it,
+/// with no function-global reasoning whatsoever: a `take` parameter owns
+/// from entry, a construction/move/call/place-transfer owns from its own
+/// block, and a variant payload owns from the block its
+/// `TakeVariantPayload` appears in -- never from the shared extraction
+/// that merely read it. That last distinction is the whole point: the
+/// extraction is common to every arm reachable through a case, while the
+/// transfer is emitted only on the one path that actually claims the
+/// payload. An earlier design instead scanned the whole function for
+/// "is this value consumed anywhere", which let a whole-value drop in
+/// one branch silently cancel a sibling branch's payload obligations.
+///
+/// Deliberately excludes a nominal `resource` root --
+/// [`verify_resource_ownership`] already owns that obligation end to
+/// end, and reporting it here too would double-report the identical leak
+/// under a second code.
+fn structural_cleanup_obligations(
+    function: &Function,
+    value_types: &HashMap<ValueId, Ty>,
+    agg: &AggregateContext,
+) -> Vec<(ValueId, Ty)> {
+    let owns = |v: ValueId| -> Option<Ty> {
+        let ty = value_types.get(&v)?;
+        if !is_affine_in(ty, agg) {
+            return None;
+        }
+        if matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine)) {
+            return None;
+        }
+        Some(ty.clone())
+    };
+
+    let mut roots: Vec<(ValueId, Ty)> = Vec::new();
+    for param in &function.params {
+        if param.take
+            && let Some(ty) = owns(param.value)
+        {
+            roots.push((param.value, ty));
+        }
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::Value { result, kind, .. } => {
+                    let produces_owner = matches!(
+                        kind,
+                        ValueKind::RecordCreate(..)
+                            | ValueKind::VariantCreate { .. }
+                            | ValueKind::Move { .. }
+                            | ValueKind::DeferCapture { .. }
+                            // A callee that returns an affine value
+                            // transfers ownership of it out to this
+                            // frame, exactly like a construction does.
+                            | ValueKind::Call(..)
+                            | ValueKind::PlaceRead {
+                                mode: crate::nir::OwnershipMode::Transfer,
+                                ..
+                            }
+                    );
+                    if produces_owner && let Some(ty) = owns(*result) {
+                        roots.push((*result, ty));
+                    }
+                }
+                // Ownership of an extracted payload begins *here*, at
+                // the transfer, not at the extraction that read it.
+                Instruction::DecomposeVariant { taken, .. } => {
+                    for (_, owner) in taken {
+                        if let Some(ty) = owns(*owner) {
+                            roots.push((*owner, ty));
+                        }
+                    }
+                }
+                // A transferring `Store` moves ownership *into* a slot.
+                // The value it consumed stops being this frame's
+                // obligation at that point and the slot becomes one --
+                // otherwise the obligation simply vanished, and a slot
+                // left holding an affine value at an exit leaked in
+                // silence.
+                Instruction::Store {
+                    slot,
+                    mode: crate::nir::OwnershipMode::Transfer,
+                    ..
+                } => {
+                    if let Some(ty) = owns(*slot) {
+                        roots.push((*slot, ty));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A successful `Invoke` transfers its callee's returned value
+        // into `ok_slot`, and a failing one transfers the raised value
+        // into that error target's own slot -- each on its own edge.
+        // Both are ownership this frame receives and owes cleanup for,
+        // exactly like a construction.
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            if let Some(ty) = owns(*ok_slot) {
+                roots.push((*ok_slot, ty));
+            }
+            for target in err_targets {
+                if let Some(ty) = owns(target.slot) {
+                    roots.push((target.slot, ty));
+                }
+            }
+        }
+    }
+    roots.sort_by_key(|(v, _)| *v);
+    roots.dedup_by_key(|(v, _)| *v);
+    roots
+}
+
+/// Every payload position this function extracts, keyed by the
+/// `(base, case, index)` it was read out of and mapping to the value the
+/// extraction produced (`rfcs/0012`).
+///
+/// Read back when a variant's remaining obligations are computed: a
+/// payload the shell still owns is only "nothing owed" if the value
+/// standing for it owes nothing in turn, and answering that needs the
+/// payload's own value to consult its own case refinement from.
+fn extracted_payloads(function: &Function) -> HashMap<(ValueId, usize, usize), ValueId> {
+    let mut out = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind:
+                    ValueKind::VariantPayload {
+                        base, case, index, ..
+                    },
+                ..
+            } = instruction
+            {
+                out.entry((*base, *case, *index)).or_insert(*result);
+            }
+        }
+    }
+    out
+}
+
+/// Every remaining *owned* affine obligation reachable through `place`,
+/// given its own current type (`rfcs/0012`): a declared `resource` is
+/// one obligation in its own right, an ordinary affine record
+/// decomposes into its own affine fields (in reverse declaration order,
+/// matching the destruction order the rest of the pipeline uses), and a
+/// variant -- whose live case is a runtime fact -- or an item with
+/// malformed generic metadata stays one opaque obligation. Mirrors
+/// `resourceck::flow::structural_drop_targets`, recomputed here from
+/// NIR alone rather than trusted from it.
+/// The most precise state `facts` records for `place` (`rfcs/0012`).
+///
+/// An ancestor that is `Empty` is gone, and takes everything reachable
+/// through it, so nothing under it is ever owed. Otherwise the place's
+/// own recorded fact is the most precise answer there is: a join can
+/// leave a parent `Maybe` -- live on one predecessor, absent or consumed
+/// on another -- while a child is recorded `Empty` on every predecessor
+/// that had it at all, and reading the child through the parent would
+/// demand cleanup for something already cleaned everywhere.
+///
+/// This is deliberately *not* `resolve_place_state`, which answers the
+/// stricter question a *use* asks: there a non-`Full` ancestor makes
+/// every descendant unusable, which is exactly right for reading or
+/// moving, and too coarse for deciding what is still owed.
+fn precise_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
+    for len in 0..place.projections.len() {
+        let prefix = Place {
+            root: place.root,
+            projections: place.projections[..len].to_vec(),
+        };
+        if facts.get(&prefix) == Some(&FieldState::Empty) {
+            return FieldState::Empty;
+        }
+    }
+    match facts.get(place) {
+        Some(state) => *state,
+        None => resolve_place_state(facts, place),
+    }
+}
+
+fn remaining_obligations(
+    facts: &PlaceFacts,
+    place: &Place<ValueId>,
+    ty: &Ty,
+    agg: &AggregateContext,
+    cases: &VariantCaseContext,
+    depth: usize,
+    out: &mut Vec<Place<ValueId>>,
+) {
+    if depth >= MAX_GENERIC_DEPTH {
+        return;
+    }
+    // `Empty` is the only state that owes nothing: every path reaching
+    // here either never created this place or already consumed it.
+    // `Maybe` means at least one path still holds it, and that path
+    // leaks -- treating disagreement as "nothing owed" is exactly how a
+    // value live on one predecessor and consumed on another escaped.
+    if precise_place_state(facts, place) == FieldState::Empty {
+        return;
+    }
+    if !is_affine_in(ty, agg) {
+        return;
+    }
+    let (item, args): (ItemId, Vec<Ty>) = match ty {
+        Ty::Named(item, _) => (*item, Vec::new()),
+        Ty::Applied(item, args) => (*item, args.clone()),
+        _ => return,
+    };
+    if let Some(variant) = agg.variants.get(&item) {
+        // A variant only owns the payload of the case that is actually
+        // live. Which case that is, is a *path* fact: on a case-refined
+        // edge the switch already proved it, and this exit is on exactly
+        // one such path. Decomposing by it is what lets one branch hand
+        // its payload to an arm while a disjoint branch destroys the
+        // whole value, with neither affecting the other.
+        //
+        // Without a refinement there is nothing to decompose by, so the
+        // variant stays one opaque obligation -- never silently
+        // discharged.
+        let Some(case) = cases.refined_case(place) else {
+            out.push(place.clone());
+            return;
+        };
+        let Some(layout) = variant.cases.get(case) else {
+            out.push(place.clone());
+            return;
+        };
+        let Ok(subst) = item_substitution(item, &args, agg) else {
+            out.push(place.clone());
+            return;
+        };
+        for (index, payload_ty) in layout.payload.iter().enumerate().rev() {
+            let payload_ty = substitute(payload_ty, &subst);
+            if !is_affine_in(&payload_ty, agg) {
+                continue;
+            }
+            let payload_place = place.variant_field(
+                item,
+                crate::place::CaseId(case as u32),
+                crate::place::FieldId(index as u32),
+            );
+            if precise_place_state(facts, &payload_place) == FieldState::Empty {
+                // Already transferred out on this path: whoever took it
+                // owns it now, and owes its cleanup in its own right.
+                continue;
+            }
+            // Still held by the shell. What it owes in turn is answered
+            // through the value the extraction produced for it, which
+            // carries its own case refinement; with no such value there
+            // is nothing finer to say, so it is one opaque obligation.
+            match cases.extracted_value(place, case, index) {
+                Some(payload_value) => remaining_obligations(
+                    facts,
+                    &Place::root(payload_value),
+                    &payload_ty,
+                    agg,
+                    cases,
+                    depth + 1,
+                    out,
+                ),
+                None => out.push(payload_place),
+            }
+        }
+        return;
+    }
+    let Some(layout) = agg.records.get(&item) else {
+        // An item with no layout at all: one opaque obligation, never
+        // decomposed.
+        out.push(place.clone());
+        return;
+    };
+    let declared_resource = layout.affine;
+    let Ok(subst) = item_substitution(item, &args, agg) else {
+        out.push(place.clone());
+        return;
+    };
+    for (index, (_, field_ty)) in layout.fields.iter().enumerate().rev() {
+        let field_ty = substitute(field_ty, &subst);
+        if !is_affine_in(&field_ty, agg) {
+            continue;
+        }
+        remaining_obligations(
+            facts,
+            &place.field(item, crate::place::FieldId(index as u32)),
+            &field_ty,
+            agg,
+            cases,
+            depth + 1,
+            out,
+        );
+    }
+    if declared_resource {
+        out.push(place.clone());
+    }
+}
+
+/// Everything a variant obligation needs in order to decompose by the
+/// case that is actually live at one exit (`rfcs/0012`): the case
+/// refinements this exit's own block is on the receiving end of, and the
+/// values this function extracted for each payload position.
+///
+/// Both are path facts read back at a specific block, never
+/// function-global ownership conclusions: the refinement is whatever
+/// every incoming edge of that block independently guarantees, and the
+/// extraction map is mechanical instruction data.
+struct VariantCaseContext<'a> {
+    refinements: &'a HashSet<RefinementFact>,
+    payloads: &'a HashMap<(ValueId, usize, usize), ValueId>,
+    /// Extractions some decomposition actually claims. An unclaimed
+    /// extraction is only a read, so the shell still owns what it read
+    /// and the payload's obligation stays with the shell.
+    claimed: &'a HashSet<ValueId>,
+}
+
+impl VariantCaseContext<'_> {
+    /// The case this place's own root value is refined to at this exit,
+    /// when it is a bare root and exactly one refinement names it. A
+    /// projected place has no value to refine, and a value refined to
+    /// more than one case is not refined at all.
+    fn refined_case(&self, place: &Place<ValueId>) -> Option<usize> {
+        if !place.projections.is_empty() {
+            return None;
+        }
+        let mut found: Option<usize> = None;
+        for (value, _, case) in self.refinements {
+            if *value != place.root {
+                continue;
+            }
+            match found {
+                None => found = Some(*case),
+                Some(previous) if previous == *case => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// The value this function's own extraction produced for one payload
+    /// position of one case, if it extracted it at all.
+    fn extracted_value(
+        &self,
+        place: &Place<ValueId>,
+        case: usize,
+        index: usize,
+    ) -> Option<ValueId> {
+        if !place.projections.is_empty() {
+            return None;
+        }
+        self.payloads
+            .get(&(place.root, case, index))
+            .copied()
+            .filter(|owner| self.claimed.contains(owner))
+    }
+}
+
+/// The pairwise join of two reachable predecessors' own place facts --
+/// over the *union* of both sides' keys, so a place touched on only one
+/// of them still joins to `Maybe` against the other's implicit `Full`.
+/// Collected through a `BTreeSet`, so the result never depends on
+/// either map's own iteration order.
+fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
+    let keys: BTreeSet<Place<ValueId>> = a.keys().chain(b.keys()).cloned().collect();
+    keys.into_iter()
+        .map(|key| {
+            // Each side's most precise recorded state, never a bare
+            // `unwrap_or(Full)`: a side that never recorded this exact
+            // place may still have recorded its parent, and a child of
+            // a place that is absent or already consumed is absent or
+            // consumed too. Reading it as `Full` claimed the child was
+            // live there, which turned an agreed-clean join into a
+            // `Maybe` and reported a leak for a value one side never
+            // created at all. Resolving through ancestors is wrong here
+            // too: a join leaves a parent `Maybe` while its child stays
+            // recorded `Empty`, and the parent would mask it.
+            let left = precise_place_state(a, &key);
+            let right = precise_place_state(b, &key);
+            (key, merge_field(left, right))
+        })
+        .collect()
+}
+
+/// What a block's own incoming ownership state actually *is*
+/// (`rfcs/0012`).
+///
+/// Kept as its own type precisely because one of these answers is not a
+/// state at all, and every value that could stand in for it -- an empty
+/// map, `Default::default()`, `Option::unwrap_or_default()` -- is also
+/// a perfectly valid analysis state. Collapsing the two is what lets a
+/// fixed point be seeded with facts nothing ever proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncomingState<F> {
+    /// The entry block: no predecessors by definition, and a fact set
+    /// that is the analysis's one real boundary condition -- a *proven*
+    /// state, not a placeholder.
+    Entry(F),
+    /// At least one reachable predecessor has produced an out-state,
+    /// and this is the join of every such predecessor's.
+    Ready(F),
+    /// No reachable predecessor has produced an out-state yet. Not a
+    /// fact set: no transfer runs on it, and no out-state is recorded
+    /// from it, so nothing downstream can read facts nothing proved.
+    Pending,
+}
+
+/// This block's own in-state: the join of every *reachable, already
+/// computed* predecessor's out-state (`rfcs/0012`).
+///
+/// The three answers are deliberately kept apart, because collapsing
+/// any of them into a `PlaceFacts` is what lets a fixed point be seeded
+/// with facts nothing proved:
+///
+/// * the **entry** block has no predecessors by definition, and its
+///   empty in-state is the analysis's one real boundary condition;
+/// * a **reachable but not yet computed** predecessor (an unprocessed
+///   loop back edge) contributes *nothing* -- it is skipped, not
+///   treated as having proven an empty fact set;
+/// * an **unreachable** predecessor contributes nothing either, so a
+///   dead CFG fragment can never seed reachable ownership.
+///
+/// A block none of whose predecessors has landed yet is therefore
+/// `Pending`, never an empty state. It is always revisited: every
+/// reachable block is reached from the entry, whose own out-state is
+/// fixed before the worklist starts, and a predecessor's out-state
+/// appearing re-enqueues it.
+///
+/// There is deliberately no "malformed edge" answer. Every predecessor
+/// in `incoming_edges` is, by construction, the id of a block this
+/// function declares -- the map is built by walking exactly those
+/// blocks' own terminators -- so an undeclared *predecessor* is not a
+/// question this can be asked. A terminator naming an undeclared
+/// *successor* is real, and is reported once, at the terminator layer,
+/// as `UNKNOWN_BRANCH_TARGET`; this pass simply never reaches past it,
+/// and never invents ownership state for it.
+fn in_state_for_places(
+    block_id: BlockId,
+    entry: BlockId,
+    incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
+    reachable: &HashSet<BlockId>,
+    out: &HashMap<BlockId, PlaceFacts>,
+    entry_facts: &PlaceFacts,
+) -> IncomingState<PlaceFacts> {
+    if block_id == entry {
+        return IncomingState::Entry(entry_facts.clone());
+    }
+    let mut acc: Option<PlaceFacts> = None;
+    for (pred, generated) in incoming_edges.get(&block_id).into_iter().flatten() {
+        if !reachable.contains(pred) {
+            continue;
+        }
+        // Absence from `out` means "not computed yet", never "computed
+        // to nothing" -- the two are distinguishable precisely because
+        // `out` is populated only as blocks are actually processed.
+        let Some(facts) = out.get(pred) else {
+            continue;
+        };
+        // An `Invoke`'s own slot becomes owned on this edge alone --
+        // never folded into a sibling edge that happens to reach the
+        // same block, which is why the fact lives on the edge.
+        let facts = match generated {
+            Some(slot) => {
+                let mut initialized = facts.clone();
+                set_place_state(&mut initialized, &Place::root(*slot), FieldState::Full);
+                initialized
+            }
+            None => facts.clone(),
+        };
+        acc = Some(match acc {
+            None => facts,
+            Some(previous) => merge_place_facts(&previous, &facts),
+        });
+    }
+    match acc {
+        Some(facts) => IncomingState::Ready(facts),
+        None => IncomingState::Pending,
     }
 }
 
@@ -5390,6 +8230,64 @@ mod tests {
             merged.get(&ValueId(0)),
             Some(&LocationState::MaybeUninitialized),
             "unexpected merge result: {merged:?}"
+        );
+    }
+
+    // -- `merge_field` lattice laws (`rfcs/0012`) --------------------
+
+    #[test]
+    fn merge_field_is_commutative() {
+        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+            for b in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+                assert_eq!(
+                    merge_field(a, b),
+                    merge_field(b, a),
+                    "merge_field({a:?}, {b:?}) != merge_field({b:?}, {a:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_field_is_idempotent() {
+        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+            assert_eq!(
+                merge_field(a, a),
+                a,
+                "merging {a:?} with itself must not change it"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_field_is_associative() {
+        let states = [FieldState::Full, FieldState::Empty, FieldState::Maybe];
+        for a in states {
+            for b in states {
+                for c in states {
+                    assert_eq!(
+                        merge_field(merge_field(a, b), c),
+                        merge_field(a, merge_field(b, c)),
+                        "(a merge b) merge c != a merge (b merge c) for {a:?}, {b:?}, {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_field_disagreement_is_the_absorbing_maybe_state() {
+        assert_eq!(
+            merge_field(FieldState::Full, FieldState::Empty),
+            FieldState::Maybe
+        );
+        assert_eq!(
+            merge_field(FieldState::Maybe, FieldState::Full),
+            FieldState::Maybe
+        );
+        assert_eq!(
+            merge_field(FieldState::Empty, FieldState::Maybe),
+            FieldState::Maybe
         );
     }
 
@@ -6347,9 +9245,30 @@ mod tests {
     fn a_case_refined_target_with_an_additional_ordinary_predecessor_is_rejected() {
         // bb1 (the `Circle` case's own block, legally extracting its
         // own payload under the switch alone) also gets a plain branch
-        // predecessor from a third block -- that edge guarantees
-        // nothing, so the intersection across bb1's predecessors must
-        // now be empty and the extraction must be rejected.
+        // predecessor -- a *reachable* one, via bb2 -- and that edge
+        // guarantees nothing, so the intersection across bb1's
+        // predecessors is empty and the extraction must be rejected.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[2].terminator = Terminator::Branch(BlockId(3));
+        function.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+    }
+
+    #[test]
+    fn an_unreachable_ordinary_predecessor_does_not_erase_a_refinement() {
+        // The same third block, left unreachable. A dead edge proves
+        // nothing, but it also disproves nothing: intersecting its
+        // empty fact set in would wipe out a guarantee every genuinely
+        // live path into bb1 really did establish.
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let (variant, layout, ty_name) = variant_shape(&mut interner);
@@ -6361,7 +9280,10 @@ mod tests {
         });
         let diagnostics =
             verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
-        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT),
+            "an unreachable predecessor must contribute nothing: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -6439,17 +9361,17 @@ mod tests {
             blocks: vec![
                 BasicBlock {
                     id: BlockId(1),
-                    instructions: Vec::new(),
-                    terminator: Terminator::Branch(BlockId(0)),
-                },
-                BasicBlock {
-                    id: BlockId(0),
                     instructions: vec![Instruction::Value {
                         result: ValueId(0),
                         ty: Ty::I64,
                         kind: ValueKind::Const(Const::Int(1)),
                     }],
                     terminator: Terminator::Return(Some(ValueId(0))),
+                },
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
                 },
             ],
         };
@@ -12912,6 +15834,5683 @@ mod tests {
             assert_eq!(
                 leaked_value_ids(name, resource, resource_name, &interner),
                 first
+            );
+        }
+    }
+}
+
+/// Adversarial hand-built NIR for the structural ownership lattice
+/// (`rfcs/0012`), written against `verify_module` directly rather than
+/// through `nir::lower`: every one of these modules is malformed in a
+/// way no source program can express, which is exactly the point --
+/// `nir::verify` must reject malformed ownership independently, even
+/// when NIR bypasses source checking entirely.
+///
+/// Every assertion is made against the *set of structural codes*
+/// (`V0083`-`V0092`) rather than the complete diagnostic list, so an
+/// unrelated pre-existing check firing on the same fixture never makes
+/// one of these tests pass or fail for the wrong reason.
+#[cfg(test)]
+mod structural_ownership {
+    use super::*;
+    use crate::hir::TypeParamId;
+    use crate::nir::{BasicBlock, CaseLayout, OwnershipMode, Param};
+    use crate::place::FieldId;
+    use crate::source::SourceMap;
+
+    const FILE: ItemId = ItemId(200);
+    const SESSION: ItemId = ItemId(201);
+    const ENVELOPE: ItemId = ItemId(202);
+    const BOXY: ItemId = ItemId(203);
+    const HOLDER: ItemId = ItemId(204);
+    const PLAIN: ItemId = ItemId(205);
+    const SELF: ItemId = ItemId(300);
+    const SINK: ItemId = ItemId(301);
+    const OBSERVE: ItemId = ItemId(302);
+    const BUILD: ItemId = ItemId(303);
+    const RAISER: ItemId = ItemId(304);
+    const T: TypeParamId = TypeParamId(0);
+
+    struct Fixture {
+        interner: Interner,
+        records: Vec<(ItemId, RecordLayout)>,
+        variants: Vec<(ItemId, VariantLayout)>,
+        file: Ty,
+        session: Ty,
+        envelope: Ty,
+        holder: Ty,
+        box_file: Ty,
+        plain: Ty,
+    }
+
+    /// `File` (a declared `resource`), `Session` (a `resource` with two
+    /// `File` fields), `Envelope` (an ordinary `record` with one `File`
+    /// field, so transitively affine but never nominally a resource),
+    /// `Box[T]` (generic), `Holder` (a variant carrying an `Envelope`),
+    /// and `Plain` (an ordinary non-affine record).
+    fn fixture() -> Fixture {
+        let mut interner = Interner::new();
+        let file = interner.intern("File");
+        let session = interner.intern("Session");
+        let envelope = interner.intern("Envelope");
+        let boxy = interner.intern("Box");
+        let holder = interner.intern("Holder");
+        let plain = interner.intern("Plain");
+        let descriptor = interner.intern("descriptor");
+        let input = interner.intern("input");
+        let output = interner.intern("output");
+        let item = interner.intern("item");
+        let full = interner.intern("Full");
+        let empty = interner.intern("Empty");
+
+        let file_ty = Ty::Named(FILE, file);
+        let envelope_ty = Ty::Named(ENVELOPE, envelope);
+        let records = vec![
+            (
+                FILE,
+                RecordLayout {
+                    name: file,
+                    type_params: Vec::new(),
+                    fields: vec![(descriptor, Ty::I64)],
+                    affine: true,
+                },
+            ),
+            (
+                SESSION,
+                RecordLayout {
+                    name: session,
+                    type_params: Vec::new(),
+                    fields: vec![(input, file_ty.clone()), (output, file_ty.clone())],
+                    affine: true,
+                },
+            ),
+            (
+                ENVELOPE,
+                RecordLayout {
+                    name: envelope,
+                    type_params: Vec::new(),
+                    fields: vec![(item, file_ty.clone())],
+                    affine: false,
+                },
+            ),
+            (
+                BOXY,
+                RecordLayout {
+                    name: boxy,
+                    type_params: vec![(T, item)],
+                    fields: vec![(item, Ty::Param(T, item))],
+                    affine: false,
+                },
+            ),
+            (
+                PLAIN,
+                RecordLayout {
+                    name: plain,
+                    type_params: Vec::new(),
+                    fields: vec![(descriptor, Ty::I64)],
+                    affine: false,
+                },
+            ),
+        ];
+        let variants = vec![(
+            HOLDER,
+            VariantLayout {
+                name: holder,
+                type_params: Vec::new(),
+                cases: vec![
+                    CaseLayout {
+                        name: full,
+                        payload: vec![envelope_ty.clone()],
+                    },
+                    CaseLayout {
+                        name: empty,
+                        payload: Vec::new(),
+                    },
+                ],
+            },
+        )];
+
+        Fixture {
+            interner,
+            records,
+            variants,
+            file: file_ty.clone(),
+            session: Ty::Named(SESSION, session),
+            envelope: envelope_ty,
+            holder: Ty::Named(HOLDER, holder),
+            box_file: Ty::Applied(BOXY, vec![file_ty]),
+            plain: Ty::Named(PLAIN, plain),
+        }
+    }
+
+    /// `sink(take File) -> unit`, for a genuinely consuming call
+    /// argument, and `observe(File) -> i64`, for a merely-observing one.
+    fn helpers(fx: &mut Fixture) -> Vec<Function> {
+        let sink = fx.interner.intern("sink");
+        let observe = fx.interner.intern("observe");
+        vec![
+            Function {
+                id: SINK,
+                name: sink,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: true,
+                }],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Return(None),
+                }],
+            },
+            Function {
+                id: OBSERVE,
+                name: observe,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: false,
+                }],
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(0)),
+                    }],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                }],
+            },
+        ]
+    }
+
+    fn under_test(params: Vec<Param>, return_type: Ty, blocks: Vec<BasicBlock>) -> Function {
+        Function {
+            id: SELF,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    /// Only the structural ownership family, sorted -- a deterministic
+    /// multiset two permutations of the same module can be compared
+    /// against directly.
+    fn structural_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+        structural_codes_with(fx, function, false)
+    }
+
+    /// `with_builder` additionally links in `build`, a callee that
+    /// transfers an affine record out to its caller.
+    fn structural_codes_with(
+        fx: &mut Fixture,
+        function: Function,
+        with_builder: bool,
+    ) -> Vec<&'static str> {
+        let helpers = helpers(fx);
+        let builder = with_builder.then(|| builder(fx));
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        functions.extend(builder);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        let mut codes: Vec<&'static str> =
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| d.code)
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        codes::PLACE_PROJECTION_THROUGH_NON_RECORD
+                            | codes::INVALID_PLACE_FIELD_OWNER
+                            | codes::UNKNOWN_PLACE_FIELD
+                            | codes::MOVE_OF_NON_AFFINE_PLACE
+                            | codes::PLACE_USE_AFTER_MOVE
+                            | codes::PLACE_OVERWRITE_OF_LIVE_FIELD
+                            | codes::PLACE_GENERIC_ARITY_MISMATCH
+                            | codes::PARTIAL_PLACE_USED_AS_WHOLE
+                            | codes::MISSING_STRUCTURAL_CLEANUP
+                            | codes::DUPLICATE_STRUCTURAL_CLEANUP
+                            | codes::DECOMPOSITION_OUTSIDE_REFINEMENT
+                            | codes::DECOMPOSITION_CLAIM_MISMATCH
+                            | codes::UNCLAIMED_PAYLOAD_OWNERSHIP
+                            | codes::OBSERVER_CANNOT_TRANSFER
+                    )
+                })
+                .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    /// Every diagnostic the whole verifier reports, rendered as
+    /// `code: message` in the exact order it was emitted -- so two runs
+    /// can be compared byte for byte, not merely as a set of codes.
+    fn rendered(fx: &mut Fixture, function: Function) -> Vec<String> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+            .into_iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
+    /// Every diagnostic the whole verifier reports, unfiltered and
+    /// sorted -- for asserting which *layer* owns a malformed CFG, and
+    /// that no second layer reports the same defect again.
+    fn all_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        let mut codes: Vec<&'static str> =
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| d.code)
+                .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    fn take_session(fx: &Fixture) -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: fx.session.clone(),
+            take: true,
+        }]
+    }
+
+    fn session_field(index: u32) -> Place<ValueId> {
+        Place::root(ValueId(0)).field(SESSION, FieldId(index))
+    }
+
+    fn read(result: u32, ty: Ty, place: Place<ValueId>, mode: OwnershipMode) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::PlaceRead { place, mode },
+        }
+    }
+
+    fn drop_of(value: u32) -> Instruction {
+        Instruction::Drop {
+            value: ValueId(value),
+        }
+    }
+
+    fn int(result: u32, value: u128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value)),
+        }
+    }
+
+    // -- the place tree: ancestors, descendants, siblings ---------------
+
+    #[test]
+    fn a_child_moved_then_the_parent_moved_as_a_whole_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    // Moving the parent *as a value* after one of its
+                    // own children left: nothing may transfer an
+                    // incomplete aggregate.
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(2),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "moving a partially moved parent as a whole must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_moved_then_the_parent_observed_as_a_whole_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.session.clone(),
+                        Place::root(ValueId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "observing a partially moved parent as a whole must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_read_after_its_parent_was_transferred_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(1),
+                    // `session` is gone: every place reachable through
+                    // it went with it, whether or not this exact field
+                    // was ever individually tracked.
+                    read(2, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "reading a child after its parent was transferred must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_child_read_after_its_parent_was_dropped_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    drop_of(0),
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "reading a child after its parent was dropped must be rejected"
+        );
+    }
+
+    #[test]
+    fn moving_one_child_leaves_its_sibling_freely_readable() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unaffected sibling must stay available after its sibling moved"
+        );
+    }
+
+    #[test]
+    fn a_partially_moved_parent_may_still_be_structurally_dropped() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    // Only `output` and the outer identity are left --
+                    // a structural drop destroys exactly those.
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a structural drop after a partial move must be accepted"
+        );
+    }
+
+    #[test]
+    fn reinitializing_an_empty_child_restores_the_parents_completeness() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 7),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: fx.file.clone(),
+                        kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(2)]),
+                    },
+                    Instruction::StorePlace {
+                        place: session_field(0),
+                        value: ValueId(3),
+                    },
+                    // Complete again: a whole-value transfer is legal
+                    // once more.
+                    Instruction::Value {
+                        result: ValueId(4),
+                        ty: fx.session.clone(),
+                        kind: ValueKind::Move { source: ValueId(0) },
+                    },
+                    drop_of(4),
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a reinitialized child must restore its parent's completeness"
+        );
+    }
+
+    #[test]
+    fn dropping_the_same_structural_field_twice_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    drop_of(0),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "destroying the same structural field twice must be rejected"
+        );
+    }
+
+    #[test]
+    fn dropping_the_same_whole_value_twice_is_duplicate_structural_cleanup() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![drop_of(0), drop_of(0), int(1, 0)],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "a second whole-value destruction must be rejected"
+        );
+    }
+
+    // -- missing cleanup for a transitively affine aggregate -----------
+
+    #[test]
+    fn a_taken_affine_record_parameter_left_undestroyed_is_reported_as_leaked() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(1, 0)],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a taken affine record left undestroyed must be reported"
+        );
+    }
+
+    #[test]
+    fn a_taken_affine_record_parameter_destroyed_field_by_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(ENVELOPE, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an affine record whose own affine field was destroyed owes nothing further"
+        );
+    }
+
+    #[test]
+    fn a_record_construction_consuming_an_affine_record_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                    },
+                    read(
+                        2,
+                        fx.file.clone(),
+                        Place::root(ValueId(1)).field(ENVELOPE, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "constructing an affine record from an owned field, then destroying it, is complete"
+        );
+    }
+
+    #[test]
+    fn a_record_construction_from_an_already_consumed_field_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    drop_of(0),
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                    },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "an aggregate built from an already-destroyed field must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_variant_construction_consuming_an_affine_record_payload_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.envelope.clone(),
+                take: true,
+            }],
+            fx.holder.clone(),
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.holder.clone(),
+                    kind: ValueKind::VariantCreate {
+                        variant: HOLDER,
+                        case: 0,
+                        type_args: Vec::new(),
+                        payload: vec![ValueId(0)],
+                    },
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a variant taking ownership of an affine payload and returning it owes nothing"
+        );
+    }
+
+    #[test]
+    fn a_take_argument_consuming_an_affine_record_discharges_its_obligation() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::Unit,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(0)], Vec::new()),
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a take argument must discharge its own structural obligation"
+        );
+    }
+
+    #[test]
+    fn an_observing_argument_of_a_partially_moved_parent_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::Call(OBSERVE, Vec::new(), vec![ValueId(0)], Vec::new()),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE),
+            "passing a partially moved parent to an observing parameter must be rejected"
+        );
+    }
+
+    // -- malformed projection metadata ---------------------------------
+
+    #[test]
+    fn a_place_projecting_an_unknown_field_owner_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(ItemId(9999), FieldId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        let codes = structural_codes(&mut fx, f);
+        assert!(
+            codes.contains(&codes::PLACE_PROJECTION_THROUGH_NON_RECORD)
+                || codes.contains(&codes::INVALID_PLACE_FIELD_OWNER),
+            "an unknown field owner must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_a_field_index_out_of_range_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(SESSION, FieldId(9)),
+                        OwnershipMode::Observe,
+                    ),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNKNOWN_PLACE_FIELD),
+            "a field index out of range must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_a_non_affine_field_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.plain.clone(),
+                take: false,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        Ty::I64,
+                        Place::root(ValueId(0)).field(PLAIN, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MOVE_OF_NON_AFFINE_PLACE),
+            "moving an ordinary, freely copyable field must be rejected"
+        );
+    }
+
+    // -- generics -------------------------------------------------------
+
+    #[test]
+    fn a_substituted_generic_field_place_resolves_to_its_concrete_affine_type() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "`Box[File].item` must resolve to the affine `File`, not a bare type parameter"
+        );
+    }
+
+    #[test]
+    fn a_generic_place_with_the_wrong_type_argument_arity_is_rejected() {
+        let mut fx = fixture();
+        let wrong = Ty::Applied(BOXY, vec![fx.file.clone(), fx.file.clone()]);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: wrong,
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_GENERIC_ARITY_MISMATCH),
+            "a generic place whose arity disagrees with its own declaration must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_generic_place_with_no_recorded_type_parameters_is_rejected_not_defaulted() {
+        let mut fx = fixture();
+        // Strip `Box`'s own type-parameter list, leaving the place's
+        // own single type argument with nothing to bind to. The
+        // substitution must fail loudly rather than silently become
+        // empty and leave `item` typed as a never-affine `Ty::Param`.
+        for (id, layout) in fx.records.iter_mut() {
+            if *id == BOXY {
+                layout.type_params.clear();
+            }
+        }
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(
+                        1,
+                        fx.file.clone(),
+                        Place::root(ValueId(0)).field(BOXY, FieldId(0)),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_GENERIC_ARITY_MISMATCH),
+            "missing generic metadata must be rejected, never treated as an empty substitution"
+        );
+    }
+
+    // -- joins, orderings, and permutation invariance -------------------
+
+    /// `f(cond) { if cond { move session.input; drop it } ; read
+    /// session.input }` -- empty on exactly one predecessor, so the
+    /// join is the absorbing `Maybe` and the later read is rejected.
+    fn field_empty_on_one_predecessor(fx: &Fixture) -> Vec<BasicBlock> {
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: vec![
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                ],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![
+                    read(
+                        3,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(3),
+                    drop_of(0),
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            },
+        ]
+    }
+
+    fn cond_params(fx: &Fixture) -> Vec<Param> {
+        vec![
+            Param {
+                value: ValueId(0),
+                ty: fx.session.clone(),
+                take: true,
+            },
+            Param {
+                value: ValueId(1),
+                ty: Ty::Bool,
+                take: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_field_empty_on_only_one_predecessor_is_rejected_at_the_join() {
+        let mut fx = fixture();
+        let blocks = field_empty_on_one_predecessor(&fx);
+        let f = under_test(cond_params(&fx), Ty::I64, blocks);
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a field emptied on only one path must not be usable after the join"
+        );
+    }
+
+    #[test]
+    fn a_reversed_block_vector_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(
+            a, b,
+            "block vector order must not change which structural diagnostics fire"
+        );
+        assert!(
+            !a.is_empty(),
+            "the fixture must actually diagnose something"
+        );
+    }
+
+    #[test]
+    fn a_reversed_predecessor_order_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        // The join block's two predecessors are discovered in the order
+        // the block vector lists them; swapping the two `CondBranch`
+        // targets (and the bodies with them) reverses that discovery
+        // order without changing the program's meaning.
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut swapped = forward.clone();
+        swapped[0].terminator = Terminator::CondBranch {
+            condition: ValueId(1),
+            then_block: BlockId(2),
+            else_block: BlockId(1),
+        };
+        swapped[1].terminator = Terminator::Branch(BlockId(2));
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, swapped));
+        assert_eq!(
+            a, b,
+            "predecessor discovery order must not change which structural diagnostics fire"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_predecessor_contributes_no_structural_facts() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        drop_of(0),
+                        int(3, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+                // Never reached from the entry block at all: its own
+                // (nonsense) facts must not leak into anything.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        read(
+                            4,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(4),
+                    ],
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unreachable block (including an unreachable cycle) must contribute nothing"
+        );
+    }
+
+    #[test]
+    fn a_loop_that_moves_and_reinitializes_the_same_field_is_accepted() {
+        let mut fx = fixture();
+        let f = under_test(
+            cond_params(&fx),
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        int(3, 1),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                        },
+                        Instruction::StorePlace {
+                            place: session_field(0),
+                            value: ValueId(4),
+                        },
+                    ],
+                    // Back edge: the field is `Full` again, so a second
+                    // iteration may move it again.
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![drop_of(0), int(5, 0)],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a loop that restores what it moved must be accepted on every iteration"
+        );
+    }
+
+    #[test]
+    fn a_deep_alternating_projection_chain_is_tracked_without_panicking() {
+        let mut fx = fixture();
+        // `Session.input.descriptor` is not affine, so the deepest
+        // *affine* place is two levels down; the chain below goes
+        // deliberately deeper than any declaration allows, which must
+        // be diagnosed rather than panic or hang.
+        let deep = Place::root(ValueId(0))
+            .field(SESSION, FieldId(0))
+            .field(FILE, FieldId(0))
+            .field(FILE, FieldId(0));
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(1, fx.file.clone(), deep, OwnershipMode::Transfer),
+                    drop_of(1),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        let codes = structural_codes(&mut fx, f);
+        assert!(
+            !codes.is_empty(),
+            "an over-deep projection chain must be diagnosed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn the_entry_block_listed_last_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let forward = field_empty_on_one_predecessor(&fx);
+        let mut rotated = forward.clone();
+        let head = rotated.remove(0);
+        rotated.push(head);
+        let params = cond_params(&fx);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, rotated));
+        assert_eq!(
+            a, b,
+            "the entry block's position in the vector must not change the result"
+        );
+    }
+
+    // -- lattice laws ---------------------------------------------------
+
+    #[test]
+    fn an_ancestors_state_dominates_every_descendant() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let grandchild = child.field(FILE, FieldId(0));
+        set_place_state(&mut facts, &parent, FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &child), FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &grandchild), FieldState::Empty);
+    }
+
+    #[test]
+    fn a_consumed_descendant_makes_every_ancestor_partial_but_not_consumed() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let sibling = parent.field(SESSION, FieldId(1));
+        set_place_state(&mut facts, &child, FieldState::Empty);
+        assert_eq!(resolve_place_state(&facts, &parent), FieldState::Full);
+        assert!(!place_is_whole(&facts, &parent));
+        assert!(place_is_whole(&facts, &sibling));
+    }
+
+    #[test]
+    fn setting_an_ancestor_clears_every_stale_descendant_fact() {
+        let mut facts = PlaceFacts::new();
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        set_place_state(&mut facts, &child, FieldState::Empty);
+        set_place_state(&mut facts, &parent, FieldState::Full);
+        assert!(
+            place_is_whole(&facts, &parent),
+            "restoring a parent must retire every stale descendant fact"
+        );
+    }
+
+    #[test]
+    fn a_join_over_the_union_of_keys_is_commutative_and_absorbing() {
+        let parent = Place::root(ValueId(0));
+        let child = parent.field(SESSION, FieldId(0));
+        let mut a = PlaceFacts::new();
+        a.insert(child.clone(), FieldState::Empty);
+        let b = PlaceFacts::new();
+        let left = merge_place_facts(&a, &b);
+        let right = merge_place_facts(&b, &a);
+        assert_eq!(left, right, "the join must be commutative");
+        assert_eq!(
+            left.get(&child),
+            Some(&FieldState::Maybe),
+            "a key present on only one side must join to the absorbing state"
+        );
+    }
+
+    // -- an extracted variant payload's own obligation ------------------
+
+    /// `f(take holder: Holder) { switch holder { Full -> extract the
+    /// `Envelope` payload and <do something with it>; Empty -> return } }`
+    /// -- the scrutinee itself is never consumed whole, so the extracted
+    /// payload is this function's own sole obligation.
+    fn payload_extraction(fx: &Fixture, destroy_payload: bool) -> Vec<BasicBlock> {
+        payload_extraction_with(fx, true, destroy_payload)
+    }
+
+    /// `claim_payload` decides whether a `DecomposeVariant` actually
+    /// transfers the extraction to this frame. Without it the read owns
+    /// nothing, and the shell still owns what it read.
+    fn payload_extraction_with(
+        fx: &Fixture,
+        claim_payload: bool,
+        destroy_payload: bool,
+    ) -> Vec<BasicBlock> {
+        let mut full = vec![Instruction::Value {
+            result: ValueId(1),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::VariantPayload {
+                base: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                index: 0,
+            },
+        }];
+        if claim_payload {
+            full.push(Instruction::DecomposeVariant {
+                value: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                taken: vec![(0, ValueId(1))],
+            });
+        }
+        if destroy_payload {
+            full.push(drop_of(1));
+        }
+        full.push(int(2, 1));
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Switch {
+                    scrutinee: ValueId(0),
+                    variant: HOLDER,
+                    cases: vec![BlockId(1), BlockId(2)],
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: full,
+                terminator: Terminator::Return(Some(ValueId(2))),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![int(3, 0)],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_left_undestroyed_is_reported() {
+        let mut fx = fixture();
+        let blocks = payload_extraction(&fx, false);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a payload extracted out of a scrutinee nothing else consumes is this function's own \
+             obligation"
+        );
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_that_is_destroyed_is_accepted() {
+        let mut fx = fixture();
+        let blocks = payload_extraction(&fx, true);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "destroying the extracted payload discharges the obligation"
+        );
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_destroyed_without_a_claim_is_rejected() {
+        let mut fx = fixture();
+        // The read alone transfers nothing: the shell still owns this
+        // payload, and will destroy it again.
+        let blocks = payload_extraction_with(&fx, false, true);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP),
+            "destroying an unclaimed extraction destroys storage the shell still owns"
+        );
+    }
+
+    /// The same extraction, but with the scrutinee *also* destroyed on
+    /// the other edge: that destruction already covers the payload, so
+    /// the extracted copy owns nothing of its own and demanding a
+    /// separate destruction would double-count the identical obligation.
+    #[test]
+    fn a_payload_extracted_from_a_scrutinee_that_is_itself_destroyed_owes_nothing() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
+                        variant: HOLDER,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.envelope.clone(),
+                            kind: ValueKind::VariantPayload {
+                                base: ValueId(0),
+                                variant: HOLDER,
+                                case: 0,
+                                index: 0,
+                            },
+                        },
+                        drop_of(0),
+                        int(2, 1),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![drop_of(0), int(3, 0)],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "a scrutinee destroyed as a whole already covers its own extracted payload"
+        );
+    }
+
+    // -- a call's own returned affine value -----------------------------
+
+    /// `build() -> Envelope`, for a callee that transfers an affine
+    /// record out to its caller.
+    fn builder(fx: &mut Fixture) -> Function {
+        let build = fx.interner.intern("build");
+        Function {
+            id: BUILD,
+            name: build,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            return_type: fx.envelope.clone(),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.envelope.clone(),
+                    kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(0)]),
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        }
+    }
+
+    fn calls_builder(fx: &Fixture, destroy: bool) -> Function {
+        let mut instructions = vec![Instruction::Value {
+            result: ValueId(1),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::Call(BUILD, Vec::new(), vec![ValueId(0)], Vec::new()),
+        }];
+        if destroy {
+            instructions.push(read(
+                2,
+                fx.file.clone(),
+                Place::root(ValueId(1)).field(ENVELOPE, FieldId(0)),
+                OwnershipMode::Transfer,
+            ));
+            instructions.push(drop_of(2));
+        }
+        instructions.push(int(3, 0));
+        under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.file.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        )
+    }
+
+    #[test]
+    fn an_affine_record_returned_by_a_call_and_left_undestroyed_is_reported() {
+        let mut fx = fixture();
+        let f = calls_builder(&fx, false);
+        assert!(
+            structural_codes_with(&mut fx, f, true).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a callee transfers its affine result out to this frame, which then owns it"
+        );
+    }
+
+    #[test]
+    fn an_affine_record_returned_by_a_call_and_destroyed_is_accepted() {
+        let mut fx = fixture();
+        let f = calls_builder(&fx, true);
+        assert_eq!(
+            structural_codes_with(&mut fx, f, true),
+            Vec::<&str>::new(),
+            "destroying the returned record's own affine field discharges the obligation"
+        );
+    }
+
+    // -- adversarial control-flow shapes for the structural fixed point -
+
+    /// A diamond whose two arms may disagree about whether they
+    /// moved `session.input`. The merge block then moves it, which is
+    /// legal exactly when it is definitely still there on every path
+    /// reaching the join.
+    fn diamond(fx: &Fixture, arms_that_move: usize) -> Vec<BasicBlock> {
+        let arm = |index: usize, result: u32| {
+            if index < arms_that_move {
+                vec![
+                    read(
+                        result,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(result),
+                ]
+            } else {
+                Vec::new()
+            }
+        };
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: arm(0, 2),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: arm(1, 3),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![
+                    read(
+                        4,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(4),
+                    read(
+                        6,
+                        fx.file.clone(),
+                        session_field(1),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(6),
+                    drop_of(0),
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_diamond_whose_arms_agree_joins_cleanly() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = diamond(&fx, 0);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "neither arm touched the field, so the join leaves it definitely present"
+        );
+    }
+
+    #[test]
+    fn a_diamond_whose_arms_disagree_is_reported_once_at_the_join() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = diamond(&fx, 1);
+        let codes = structural_codes(&mut fx, under_test(params, Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::PARTIAL_PLACE_USED_AS_WHOLE)
+                || codes.contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a one-sided move before a join must not be silently accepted, got {codes:?}"
+        );
+    }
+
+    /// A loop whose back edge reaches the header before the header has
+    /// ever been processed: the unprocessed predecessor must contribute
+    /// nothing, never a fact set nothing proved.
+    fn loop_with_back_edge(fx: &Fixture, restore: bool) -> Vec<BasicBlock> {
+        let mut body = vec![
+            read(
+                2,
+                fx.file.clone(),
+                session_field(0),
+                OwnershipMode::Transfer,
+            ),
+            drop_of(2),
+        ];
+        if restore {
+            body.push(int(3, 1));
+            body.push(Instruction::Value {
+                result: ValueId(4),
+                ty: fx.file.clone(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+            });
+            body.push(Instruction::StorePlace {
+                place: session_field(0),
+                value: ValueId(4),
+            });
+        }
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(2),
+                    else_block: BlockId(3),
+                },
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: body,
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![drop_of(0), int(5, 0)],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_loop_that_moves_without_restoring_is_reported() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = loop_with_back_edge(&fx, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::PLACE_USE_AFTER_MOVE),
+            "a second iteration would move an already-empty field"
+        );
+    }
+
+    #[test]
+    fn a_loop_that_restores_what_it_moved_reaches_a_clean_fixed_point() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let blocks = loop_with_back_edge(&fx, true);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "the back edge restores the field, so every iteration starts complete"
+        );
+    }
+
+    /// Every permutation of the same CFG must produce the identical
+    /// sorted diagnostic multiset -- block-vector order, entry position
+    /// and predecessor discovery order are all storage details.
+    fn assert_permutation_invariant(fx: &mut Fixture, blocks: Vec<BasicBlock>, label: &str) {
+        let params = cond_params(fx);
+        let baseline = structural_codes(fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+
+        let mut reversed = blocks.clone();
+        reversed.reverse();
+        assert_eq!(
+            structural_codes(fx, under_test(params.clone(), Ty::I64, reversed)),
+            baseline,
+            "{label}: reversing the block vector changed the result"
+        );
+
+        let mut rotated = blocks.clone();
+        let head = rotated.remove(0);
+        rotated.push(head);
+        assert_eq!(
+            structural_codes(fx, under_test(params.clone(), Ty::I64, rotated)),
+            baseline,
+            "{label}: moving the entry block last changed the result"
+        );
+
+        // Reverse each block's own predecessor discovery order by
+        // reversing the order successors are listed in.
+        let swapped: Vec<BasicBlock> = blocks
+            .iter()
+            .map(|b| {
+                let terminator = match &b.terminator {
+                    Terminator::CondBranch {
+                        condition,
+                        then_block,
+                        else_block,
+                    } => Terminator::CondBranch {
+                        condition: *condition,
+                        then_block: *else_block,
+                        else_block: *then_block,
+                    },
+                    other => other.clone(),
+                };
+                BasicBlock {
+                    id: b.id,
+                    instructions: b.instructions.clone(),
+                    terminator,
+                }
+            })
+            .collect();
+        let swapped_codes = structural_codes(fx, under_test(params, Ty::I64, swapped));
+        assert_eq!(
+            swapped_codes.len(),
+            baseline.len(),
+            "{label}: swapping branch targets changed how many diagnostics fire"
+        );
+    }
+
+    #[test]
+    fn a_diamonds_diagnostics_are_invariant_under_every_ordering() {
+        let mut fx = fixture();
+        let blocks = diamond(&fx, 1);
+        assert_permutation_invariant(&mut fx, blocks, "diamond");
+    }
+
+    #[test]
+    fn a_loops_diagnostics_are_invariant_under_every_ordering() {
+        let mut fx = fixture();
+        let blocks = loop_with_back_edge(&fx, false);
+        assert_permutation_invariant(&mut fx, blocks, "loop");
+    }
+
+    #[test]
+    fn a_deep_chain_reaches_its_fixed_point() {
+        let mut fx = fixture();
+        // Twenty blocks in a row, the last of which cleans up: a long
+        // chain must not need more passes than the worklist gives it.
+        let depth = 20u32;
+        let mut blocks: Vec<BasicBlock> = (0..depth)
+            .map(|i| BasicBlock {
+                id: BlockId(i),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(i + 1)),
+            })
+            .collect();
+        blocks.push(BasicBlock {
+            id: BlockId(depth),
+            instructions: vec![
+                read(
+                    2,
+                    fx.file.clone(),
+                    session_field(0),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(2),
+                read(
+                    3,
+                    fx.file.clone(),
+                    session_field(1),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(3),
+                drop_of(0),
+                int(4, 0),
+            ],
+            terminator: Terminator::Return(Some(ValueId(4))),
+        });
+        let params = cond_params(&fx);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "a twenty-deep chain must converge and stay clean"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_cycle_seeds_no_reachable_ownership() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let f = under_test(
+            params,
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+                // Two blocks reachable only from each other. Their
+                // (nonsense) facts must never reach bb0.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![read(
+                        5,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    )],
+                    terminator: Terminator::Branch(BlockId(2)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "an unreachable cycle must contribute nothing at all"
+        );
+    }
+
+    /// An `Invoke`'s success and failure edges reaching the same block:
+    /// both are real predecessors and both must be joined.
+    #[test]
+    fn invoke_success_and_failure_edges_reaching_one_block_are_both_joined() {
+        let mut fx = fixture();
+        let raiser = fx.interner.intern("raiser");
+        let shared = BlockId(1);
+        let f = Function {
+            id: SELF,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: take_session(&fx),
+            return_type: Ty::I64,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(2),
+                        ok_target: shared,
+                        err_targets: vec![crate::nir::InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(3),
+                            target: shared,
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: shared,
+                    instructions: vec![
+                        // `input` is empty on *both* edges, so this
+                        // second move of it must be rejected.
+                        read(
+                            4,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(4),
+                        int(5, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ],
+        };
+        let _ = raiser;
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+            "both invoke edges carry the same emptied field into the shared block"
+        );
+    }
+
+    #[test]
+    fn an_edge_naming_an_undeclared_block_is_owned_by_the_terminator_layer() {
+        let mut fx = fixture();
+        let params = cond_params(&fx);
+        let f = under_test(
+            params,
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                // bb1 branches from a block that does not exist in this
+                // function at all -- reached here by declaring bb2 with
+                // an edge out of an undeclared bb7 into bb1 is not
+                // expressible, so instead bb2 itself is undeclared and
+                // bb1 joins an edge from it.
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        read(
+                            2,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(2),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ],
+        );
+        // bb2 is never declared. That is a genuine malformed CFG, and
+        // exactly one layer owns it: the terminator check, as
+        // `UNKNOWN_BRANCH_TARGET`. The structural pass never reaches
+        // past that edge and must invent no ownership state for it --
+        // bb1 cleans `session` up completely, so there is nothing for
+        // it to report and no second diagnostic for the same defect.
+        let structural = structural_codes(&mut fx, f.clone());
+        assert!(
+            structural.is_empty(),
+            "an undeclared successor must not make this pass invent ownership state, \
+             got {structural:?}"
+        );
+        let all = all_codes(&mut fx, f);
+        assert_eq!(
+            all.iter()
+                .filter(|code| **code == codes::UNKNOWN_BRANCH_TARGET)
+                .count(),
+            1,
+            "the undeclared target is reported once, by the layer that owns it, got {all:?}"
+        );
+    }
+
+    // -- path-sensitive variant decomposition, hand-built --------------
+
+    /// `f(take holder: Holder, cond: bool)`: one branch drops the shell
+    /// whole, the other takes it apart into case `Full` and claims its
+    /// `Envelope` payload. Neither may affect the other.
+    fn branch_local_variant(
+        fx: &Fixture,
+        drop_first: bool,
+        claim_payload: bool,
+        destroy_claim: bool,
+    ) -> Vec<BasicBlock> {
+        let mut decompose_block = vec![Instruction::Value {
+            result: ValueId(2),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::VariantPayload {
+                base: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                index: 0,
+            },
+        }];
+        decompose_block.push(Instruction::DecomposeVariant {
+            value: ValueId(0),
+            variant: HOLDER,
+            case: 0,
+            taken: if claim_payload {
+                vec![(0, ValueId(2))]
+            } else {
+                Vec::new()
+            },
+        });
+        if destroy_claim {
+            decompose_block.push(drop_of(2));
+        }
+        decompose_block.push(int(3, 2));
+
+        let drop_block = vec![drop_of(0), int(4, 1)];
+        // Taking a value apart into one case is only meaningful where
+        // the case is proven, so the decomposing branch tests it first
+        // -- exactly the shape `nir::lower` emits for a `match`.
+        let (switch_arm, drop_arm) = if drop_first {
+            (BlockId(2), BlockId(1))
+        } else {
+            (BlockId(1), BlockId(2))
+        };
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(1),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: drop_arm,
+                instructions: drop_block,
+                terminator: Terminator::Return(Some(ValueId(4))),
+            },
+            BasicBlock {
+                id: switch_arm,
+                instructions: Vec::new(),
+                terminator: Terminator::Switch {
+                    scrutinee: ValueId(0),
+                    variant: HOLDER,
+                    cases: vec![BlockId(3), BlockId(4)],
+                },
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: decompose_block,
+                terminator: Terminator::Return(Some(ValueId(3))),
+            },
+            BasicBlock {
+                id: BlockId(4),
+                instructions: vec![
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 1,
+                        taken: Vec::new(),
+                    },
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ]
+    }
+
+    fn holder_params(fx: &Fixture) -> Vec<Param> {
+        vec![
+            Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            },
+            Param {
+                value: ValueId(1),
+                ty: Ty::Bool,
+                take: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_whole_drop_in_one_branch_does_not_discharge_a_sibling_decomposition() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        // The decomposing branch claims the payload but never destroys
+        // it: that branch alone must be reported, and the sibling
+        // branch's whole drop must not excuse it.
+        let blocks = branch_local_variant(&fx, true, true, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "a claimed payload left undestroyed on its own path must be reported"
+        );
+    }
+
+    #[test]
+    fn a_whole_drop_in_one_branch_and_a_complete_match_in_the_other_is_accepted() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let blocks = branch_local_variant(&fx, true, true, true);
+        assert_eq!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks)),
+            Vec::<&str>::new(),
+            "disjoint branches each account for the shell exactly once"
+        );
+    }
+
+    #[test]
+    fn reversing_the_branch_order_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let forward = branch_local_variant(&fx, true, true, true);
+        let reversed = branch_local_variant(&fx, false, true, true);
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(a, b, "which branch comes first must not matter");
+        assert_eq!(a, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn reversing_the_block_vector_produces_the_identical_diagnostic_multiset() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        let forward = branch_local_variant(&fx, true, true, true);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+        let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+        assert_eq!(a, b, "block vector order must not matter");
+    }
+
+    #[test]
+    fn a_decomposition_leaving_an_affine_payload_unclaimed_is_reported() {
+        let mut fx = fixture();
+        let params = holder_params(&fx);
+        // `Full`'s own `Envelope` payload is affine and is claimed by
+        // nobody: the shell no longer owns it and nothing else does.
+        let blocks = branch_local_variant(&fx, true, false, false);
+        assert!(
+            structural_codes(&mut fx, under_test(params, Ty::I64, blocks))
+                .contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "every affine payload position must be claimed exactly once"
+        );
+    }
+
+    #[test]
+    fn decomposing_a_shell_twice_on_one_path_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: Vec::new(),
+                    },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "a shell already taken apart cannot be taken apart again"
+        );
+    }
+
+    #[test]
+    fn dropping_a_shell_already_decomposed_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    drop_of(0),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "the shell is spent once its payloads have been taken"
+        );
+    }
+
+    #[test]
+    fn an_inactive_case_owning_nothing_discharges_the_shell() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
+                        variant: HOLDER,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![drop_of(0), int(1, 0)],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        // Case 1 (`Empty`) carries no payload at all.
+                        Instruction::DecomposeVariant {
+                            value: ValueId(0),
+                            variant: HOLDER,
+                            case: 1,
+                            taken: Vec::new(),
+                        },
+                        int(2, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                },
+            ],
+        );
+        assert_eq!(
+            structural_codes(&mut fx, f),
+            Vec::<&str>::new(),
+            "taking a payload-less case apart leaves nothing owed"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_naming_a_case_out_of_range_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 9,
+                        taken: Vec::new(),
+                    },
+                    int(1, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNKNOWN_PLACE_FIELD),
+            "a case index out of range must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_claiming_one_position_twice_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.envelope.clone(),
+                        kind: ValueKind::VariantPayload {
+                            base: ValueId(0),
+                            variant: HOLDER,
+                            case: 0,
+                            index: 0,
+                        },
+                    },
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 0,
+                        taken: vec![(0, ValueId(1)), (0, ValueId(1))],
+                    },
+                    drop_of(1),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+            "one payload position cannot be handed to two owners"
+        );
+    }
+
+    #[test]
+    fn a_decomposition_of_a_value_that_is_not_that_variant_is_rejected() {
+        let mut fx = fixture();
+        let f = under_test(
+            take_session(&fx),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    // `%0` is a `Session`, not a `Holder`.
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 1,
+                        taken: Vec::new(),
+                    },
+                    int(1, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::PLACE_PROJECTION_THROUGH_NON_RECORD),
+            "the decomposed value must actually be the named variant"
+        );
+    }
+
+    /// Adversarial control-flow shapes for the structural ownership fixed
+    /// point (`rfcs/0012`).
+    ///
+    /// The defect these exist for: the join used to end in
+    /// `Ok(acc.unwrap_or_default())`, so a block none of whose reachable
+    /// predecessors had landed yet was handed a real, empty `PlaceFacts` --
+    /// a perfectly valid state meaning "every place is still whole" -- ran
+    /// its transfer on it, and recorded an out-state its successors then
+    /// joined. `IncomingState::Pending` is a distinct answer that runs no
+    /// transfer and records no out-state, and the shapes below pin down
+    /// both that distinction and the convergence it has to preserve.
+    #[cfg(test)]
+    mod structural_fixpoint {
+        use super::*;
+
+        // -- the Pending answer itself -------------------------------------
+
+        #[test]
+        fn the_entry_block_is_its_own_proven_boundary_condition() {
+            let incoming = HashMap::new();
+            let reachable = HashSet::from([BlockId(0)]);
+            let out = HashMap::new();
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(0),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &out,
+                    &PlaceFacts::new()
+                ),
+                IncomingState::Entry(PlaceFacts::new()),
+                "the entry block's empty in-state is proven, not a placeholder"
+            );
+        }
+
+        #[test]
+        fn a_block_waiting_for_every_predecessor_is_pending_not_an_empty_state() {
+            // bb2 joins bb0 and bb1. Neither has produced an out-state.
+            let incoming =
+                HashMap::from([(BlockId(2), vec![(BlockId(0), None), (BlockId(1), None)])]);
+            let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::new(),
+                    &PlaceFacts::new()
+                ),
+                IncomingState::Pending,
+                "nothing has been computed, which is not the same as having computed nothing"
+            );
+            // The same block, once a predecessor has genuinely computed an
+            // empty out-state, is a different answer entirely -- which is
+            // exactly what `unwrap_or_default` used to erase.
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(1), PlaceFacts::new())]),
+                    &PlaceFacts::new()
+                ),
+                IncomingState::Ready(PlaceFacts::new()),
+                "a computed empty out-state is a real state, and must not compare equal to Pending"
+            );
+        }
+
+        #[test]
+        fn a_block_waiting_for_one_predecessor_joins_only_the_ones_that_landed() {
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            // bb2's back edge from bb1 has not been processed yet; bb0 has.
+            let incoming =
+                HashMap::from([(BlockId(2), vec![(BlockId(0), None), (BlockId(1), None)])]);
+            let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(0), consumed.clone())]),
+                    &PlaceFacts::new()
+                ),
+                IncomingState::Ready(consumed),
+                "an unprocessed back edge contributes nothing, and never dilutes what did land"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_predecessors_computed_out_state_is_never_joined() {
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            let incoming = HashMap::from([(BlockId(2), vec![(BlockId(1), None)])]);
+            // bb1 has an out-state, but nothing reaches it from the entry.
+            let reachable = HashSet::from([BlockId(0), BlockId(2)]);
+            assert_eq!(
+                in_state_for_places(
+                    BlockId(2),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &HashMap::from([(BlockId(1), consumed)]),
+                    &PlaceFacts::new()
+                ),
+                IncomingState::Pending,
+                "a dead CFG fragment may not seed reachable ownership, even having computed facts"
+            );
+        }
+
+        // -- convergence under adversarial control flow --------------------
+
+        #[test]
+        fn a_self_looping_block_reaches_a_fixed_point() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    // bb1 is its own predecessor: on the very first visit
+                    // its only landed predecessor is bb0, and the back edge
+                    // contributes nothing until it has been computed.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                            read(
+                                3,
+                                fx.file.clone(),
+                                session_field(1),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(3),
+                            drop_of(0),
+                            int(4, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a self-loop that owns nothing must converge and stay clean"
+            );
+        }
+
+        #[test]
+        fn a_self_looping_block_that_consumes_a_field_is_still_reported() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    // The second iteration reaches this same move with the
+                    // field already emptied by the first.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                        ],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![drop_of(0), int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the self-loop's own back edge must carry its consumption back to its head"
+            );
+        }
+
+        /// bb1 loops through bb2 and back, so bb1 is its own indirect
+        /// predecessor and neither block can be computed before the other.
+        fn mutually_recursive_loop(fx: &Fixture, consume_in_the_loop: bool) -> Vec<BasicBlock> {
+            let body = if consume_in_the_loop {
+                vec![
+                    read(
+                        2,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(2),
+                ]
+            } else {
+                Vec::new()
+            };
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: body,
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        drop_of(0),
+                        int(4, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ]
+        }
+
+        #[test]
+        fn mutually_recursive_loop_blocks_reach_a_fixed_point() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, false);
+            let f = under_test(cond_params(&fx), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a loop that consumes nothing must converge and stay clean"
+            );
+        }
+
+        #[test]
+        fn a_consumption_inside_a_mutually_recursive_loop_reaches_its_own_head() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, true);
+            let f = under_test(cond_params(&fx), Ty::I64, blocks);
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the move must be seen again on the iteration that re-enters through bb2"
+            );
+        }
+
+        #[test]
+        fn a_deep_reverse_ordered_chain_reaches_the_same_fixed_point() {
+            let mut fx = fixture();
+            let depth = 20u32;
+            let mut forward: Vec<BasicBlock> = (0..depth)
+                .map(|i| BasicBlock {
+                    id: BlockId(i),
+                    // The entry empties `input`; that fact then has to
+                    // travel the whole chain to the exit below.
+                    instructions: if i == 0 {
+                        vec![
+                            read(
+                                2,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(2),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    terminator: Terminator::Branch(BlockId(i + 1)),
+                })
+                .collect();
+            forward.push(BasicBlock {
+                id: BlockId(depth),
+                // Twenty blocks later, `input` is moved a second time. Only
+                // a fact that actually travelled the chain can catch it.
+                instructions: vec![
+                    read(
+                        3,
+                        fx.file.clone(),
+                        session_field(0),
+                        OwnershipMode::Transfer,
+                    ),
+                    drop_of(3),
+                    drop_of(0),
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            });
+            // Declared last-to-first, so every block in the chain is popped
+            // before the predecessor it depends on.
+            let mut reversed = forward.clone();
+            reversed.reverse();
+            let params = cond_params(&fx);
+            let a = structural_codes(&mut fx, under_test(params.clone(), Ty::I64, forward));
+            let b = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+            assert_eq!(
+                a, b,
+                "a chain explored entirely backwards must reach the same fixed point"
+            );
+            assert!(
+                a.contains(&codes::PLACE_USE_AFTER_MOVE),
+                "the move in the entry block must still be visible twenty blocks later, got {a:?}"
+            );
+        }
+
+        #[test]
+        fn a_diverging_arm_owes_nothing_at_the_other_arms_exit() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    // This arm diverges: it is reachable, it is part of the
+                    // fixed point, and it never reaches any exit at all, so
+                    // it owes nothing and must impose nothing.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![
+                            read(
+                                5,
+                                fx.file.clone(),
+                                session_field(0),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(5),
+                            read(
+                                6,
+                                fx.file.clone(),
+                                session_field(1),
+                                OwnershipMode::Transfer,
+                            ),
+                            drop_of(6),
+                            drop_of(0),
+                            int(7, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(7))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a diverging arm must not disturb the arm that actually reaches the exit"
+            );
+        }
+
+        // -- determinism ---------------------------------------------------
+
+        #[test]
+        fn verifying_one_adversarial_module_twice_reports_byte_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = mutually_recursive_loop(&fx, true);
+            let params = cond_params(&fx);
+            let first = rendered(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            let second = rendered(&mut fx, under_test(params, Ty::I64, blocks));
+            assert_eq!(
+                first, second,
+                "the same module must produce byte-identical diagnostics on every run"
+            );
+            assert!(
+                !first.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+
+        /// Every rotation of `blocks`, plus the full reversal: the entry
+        /// block ends up first, last and everywhere between, and each block
+        /// is popped both before and after the predecessors it depends on.
+        ///
+        /// Compares *every* diagnostic the verifier reports, rendered in
+        /// emission order -- not just the structural family -- because the
+        /// fixed points in this file share one discipline and a regression
+        /// in any of them is a regression in all of them.
+        fn assert_order_independent(fx: &mut Fixture, blocks: Vec<BasicBlock>, label: &str) {
+            let params = cond_params(fx);
+            assert_order_independent_with(fx, params, blocks, label);
+        }
+
+        /// Compared as a sorted multiset rather than a sequence.
+        ///
+        /// *Which* diagnostics fire, and how many of each, is a property
+        /// of the program, and may not depend on storage order at all --
+        /// that is what this asserts. The sequence they arrive in
+        /// follows `function.blocks`, which *is* part of the input; for
+        /// one fixed input it is byte-identical every time, which the
+        /// determinism tests assert directly.
+        fn assert_order_independent_with(
+            fx: &mut Fixture,
+            params: Vec<Param>,
+            blocks: Vec<BasicBlock>,
+            label: &str,
+        ) {
+            let multiset = |mut found: Vec<String>| -> Vec<String> {
+                found.sort();
+                found
+            };
+            let expected = multiset(rendered(
+                fx,
+                under_test(params.clone(), Ty::I64, blocks.clone()),
+            ));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    multiset(rendered(fx, under_test(params.clone(), Ty::I64, rotated))),
+                    expected,
+                    "{label}: rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                multiset(rendered(fx, under_test(params, Ty::I64, reversed))),
+                expected,
+                "{label}: reversing the block vector changed the diagnostics"
+            );
+        }
+
+        #[test]
+        fn every_block_vector_permutation_reports_byte_identical_diagnostics() {
+            let mut fx = fixture();
+            // A loop whose body consumes a field used to poison itself
+            // permanently when the block vector happened to list the loop
+            // before the entry: the loop's own uncomputed head was read as
+            // a *computed* empty state, and `merge_provenance`'s absorbing
+            // `MaybeUninitialized` never recovers from that.
+            let loops = mutually_recursive_loop(&fx, true);
+            assert_order_independent(&mut fx, loops, "a mutually recursive loop that consumes");
+            let clean_loop = mutually_recursive_loop(&fx, false);
+            assert_order_independent(
+                &mut fx,
+                clean_loop,
+                "a mutually recursive loop that does not",
+            );
+            let joined = field_empty_on_one_predecessor(&fx);
+            assert_order_independent(&mut fx, joined, "a join whose predecessors disagree");
+            for arms in 0..=2 {
+                let shape = diamond(&fx, arms);
+                assert_order_independent(&mut fx, shape, "a diamond");
+            }
+            for restore in [false, true] {
+                let shape = loop_with_back_edge(&fx, restore);
+                assert_order_independent(&mut fx, shape, "a loop with a back edge");
+            }
+        }
+
+        /// The analyses added for case refinement and for `Invoke`'s own
+        /// per-edge result slots are fixed points of their own, and the
+        /// same guarantee has to hold for them: no permutation of the
+        /// block vector may change a single diagnostic.
+        #[test]
+        fn the_newer_fixed_points_are_order_independent_too() {
+            let mut fx = fixture();
+            // A switch whose two case blocks meet again -- refinement
+            // generated on an edge, propagated, and intersected away.
+            for claim in [false, true] {
+                for destroy in [false, true] {
+                    let shape = branch_local_variant(&fx, true, claim, destroy);
+                    let params = holder_params(&fx);
+                    assert_order_independent_with(
+                        &mut fx,
+                        params,
+                        shape,
+                        "a branch-local decomposition",
+                    );
+                }
+            }
+            // One `Invoke`, two edges, two slots, one of them leaked.
+            let invoked = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: fx.holder.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(2),
+                        ok_target: BlockId(1),
+                        err_targets: vec![crate::nir::InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(3),
+                            target: BlockId(2),
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![drop_of(0), int(4, 0)],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ];
+            let params = take_session(&fx);
+            assert_order_independent_with(
+                &mut fx,
+                params,
+                invoked,
+                "an invoke with two result slots",
+            );
+        }
+    }
+
+    /// A `DecomposeVariant` is only meaningful where the active case is
+    /// *proven*: taking a value apart into a case it might not hold
+    /// moves ownership of storage that may not exist (`rfcs/0012`).
+    ///
+    /// The proof is a real CFG fixed point, so these cover it
+    /// end-to-end through `verify_module`, never a private helper.
+    #[cfg(test)]
+    mod decomposition_refinement {
+        use super::*;
+
+        /// `f(take holder: Holder, cond: bool, take other: Holder)`.
+        fn params(fx: &Fixture) -> Vec<Param> {
+            vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: fx.holder.clone(),
+                    take: true,
+                },
+            ]
+        }
+
+        fn switch_on(value: u32, targets: Vec<BlockId>) -> Terminator {
+            Terminator::Switch {
+                scrutinee: ValueId(value),
+                variant: HOLDER,
+                cases: targets,
+            }
+        }
+
+        fn payload(result: u32, base: u32, case: usize, fx: &Fixture) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty: fx.envelope.clone(),
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(base),
+                    variant: HOLDER,
+                    case,
+                    index: 0,
+                },
+            }
+        }
+
+        fn decompose(value: u32, case: usize, taken: Vec<(usize, u32)>) -> Instruction {
+            Instruction::DecomposeVariant {
+                value: ValueId(value),
+                variant: HOLDER,
+                case,
+                taken: taken
+                    .into_iter()
+                    .map(|(index, owner)| (index, ValueId(owner)))
+                    .collect(),
+            }
+        }
+
+        /// `Full`: extract, claim and destroy the payload, then return.
+        fn take_full(first: u32, result: u32, base: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                payload(first, base, 0, fx),
+                decompose(base, 0, vec![(0, first)]),
+                drop_of(first),
+                int(result, 0),
+            ]
+        }
+
+        /// The second `take` parameter is destroyed wherever it is not
+        /// the value under test, so no test is ever judged on a leak it
+        /// did not mean to create.
+        fn dispose_other() -> Instruction {
+            drop_of(2)
+        }
+
+        #[test]
+        fn a_decomposition_at_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            // Nothing whatsoever proved `%0` holds `Empty`. It might be
+            // `Full`, whose payload this silently abandons.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(3, 0)],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                }],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a decomposition with no proof of its own case must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_in_its_own_case_block_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each arm decomposes exactly the case its own switch edge proved"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_after_several_ordinary_branches_is_accepted() {
+            let mut fx = fixture();
+            // The refinement has to survive two plain hops to reach the
+            // block that uses it -- a single-hop rule cannot see it.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(4)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a refinement must propagate through ordinary branches"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_naming_the_sibling_case_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    // Reached only through the `Empty` edge, but takes
+                    // the value apart as `Full`.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 0, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a sibling case's edge proves nothing about this case"
+            );
+        }
+
+        #[test]
+        fn a_join_of_two_different_cases_loses_the_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    // Reachable through either case: neither is proven.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a block reachable through two different cases has proven neither"
+            );
+        }
+
+        #[test]
+        fn a_join_where_only_one_path_refines_loses_the_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(3), BlockId(4)]),
+                    },
+                    // Reaches the same block having tested nothing.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "one unrefined predecessor is enough to lose the guarantee"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_switch_edge_contributes_no_refinement() {
+            let mut fx = fixture();
+            // bb9 is unreachable and names bb3 on its `Empty` edge.
+            // Intersecting that in would wipe the guarantee bb1 really
+            // proved; skipping it entirely is the only sound answer.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(9),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(9), BlockId(3)]),
+                    },
+                ],
+            );
+            assert!(
+                !all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a dead switch edge may not erase a guarantee every live path proved"
+            );
+        }
+
+        #[test]
+        fn nested_switches_refine_their_own_scrutinees_independently() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    // Inside `%0 == Full`, test `%2` as well.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(2, vec![BlockId(3), BlockId(4)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    // Both refinements hold here, and each applies only
+                    // to its own scrutinee.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: {
+                            let mut v = take_full(4, 5, 0, &fx);
+                            v.pop();
+                            v.extend(take_full(7, 8, 2, &fx));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(8))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: {
+                            let mut v = take_full(10, 11, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(12, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(12))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "two independent scrutinees each keep their own refinement"
+            );
+        }
+
+        #[test]
+        fn a_nested_switch_may_not_borrow_its_parents_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(2, vec![BlockId(3), BlockId(4)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    // `%2` was proven `Full` here; `%0` was too. Taking
+                    // `%2` apart as `Empty` is still unproven.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: {
+                            let mut v = take_full(4, 5, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(9, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(9))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: {
+                            let mut v = take_full(10, 11, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(12, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(12))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "the inner scrutinee's own `Full` edge proves nothing about `Empty`"
+            );
+        }
+
+        #[test]
+        fn a_refinement_does_not_survive_a_store_to_its_own_scrutinee() {
+            let mut fx = fixture();
+            // `%4` is a fresh `Holder` written into the slot the
+            // scrutinee was loaded from, so the switch's guarantee no
+            // longer describes what a later load of it holds.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(0),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(3),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::VariantCreate {
+                                    variant: HOLDER,
+                                    case: 1,
+                                    type_args: Vec::new(),
+                                    payload: Vec::new(),
+                                },
+                            },
+                            Instruction::Store {
+                                slot: ValueId(0),
+                                value: ValueId(3),
+                                mode: OwnershipMode::Transfer,
+                            },
+                            Instruction::Value {
+                                result: ValueId(5),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Load(ValueId(0)),
+                            },
+                        ],
+                        terminator: switch_on(5, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(6),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::VariantCreate {
+                                    variant: HOLDER,
+                                    case: 1,
+                                    type_args: Vec::new(),
+                                    payload: Vec::new(),
+                                },
+                            },
+                            Instruction::Store {
+                                slot: ValueId(0),
+                                value: ValueId(6),
+                                mode: OwnershipMode::Transfer,
+                            },
+                            Instruction::Value {
+                                result: ValueId(7),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Load(ValueId(0)),
+                            },
+                            decompose(7, 1, Vec::new()),
+                            int(8, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(8))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "writing the scrutinee's own storage invalidates what the switch proved"
+            );
+        }
+
+        #[test]
+        fn an_invoke_edge_fabricates_no_refinement() {
+            let mut fx = fixture();
+            let builder = builder(&mut fx);
+            let _ = builder;
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![decompose(0, 0, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "an ordinary edge proves no case at all"
+            );
+        }
+
+        #[test]
+        fn reversing_the_block_vector_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![dispose_other()],
+                    terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: take_full(4, 5, 0, &fx),
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ];
+            let ps = params(&fx);
+            let forward = all_codes(&mut fx, under_test(ps.clone(), Ty::I64, blocks.clone()));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    all_codes(&mut fx, under_test(ps.clone(), Ty::I64, rotated)),
+                    forward,
+                    "rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                all_codes(&mut fx, under_test(ps, Ty::I64, reversed)),
+                forward,
+                "reversing the block vector changed the diagnostics"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+    }
+
+    /// A decomposition transfers ownership of *specific storage*, so
+    /// each claimed owner must be the very value that extraction
+    /// produced -- having the right declared type proves nothing
+    /// (`rfcs/0012`).
+    ///
+    /// And a `ValueKind::VariantPayload` is only a read: ownership of a
+    /// payload begins when a decomposition claims that exact extraction,
+    /// never merely because it was read.
+    #[cfg(test)]
+    mod payload_binding {
+        use super::*;
+
+        fn params(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }]
+        }
+
+        fn payload(result: u32, base: u32, case: usize, index: usize, fx: &Fixture) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty: fx.envelope.clone(),
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(base),
+                    variant: HOLDER,
+                    case,
+                    index,
+                },
+            }
+        }
+
+        fn decompose(value: u32, case: usize, taken: Vec<(usize, u32)>) -> Instruction {
+            Instruction::DecomposeVariant {
+                value: ValueId(value),
+                variant: HOLDER,
+                case,
+                taken: taken
+                    .into_iter()
+                    .map(|(index, owner)| (index, ValueId(owner)))
+                    .collect(),
+            }
+        }
+
+        /// `switch %0 { bb1 => full, bb2 => empty }`, where `full` is
+        /// whatever the test wants to try in the `Full` case block.
+        fn under_switch(full: Vec<Instruction>, result: u32) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
+                        variant: HOLDER,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: full,
+                    terminator: Terminator::Return(Some(ValueId(result))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![decompose(0, 1, Vec::new()), int(20, 0)],
+                    terminator: Terminator::Return(Some(ValueId(20))),
+                },
+            ]
+        }
+
+        #[test]
+        fn an_unrelated_value_of_the_right_type_may_not_be_claimed() {
+            let mut fx = fixture();
+            // `%3` is a brand new `Envelope`, not the shell's payload.
+            // Claiming it would leave the real payload owned by nothing
+            // and hand this frame a second obligation it never received.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(9)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: fx.envelope.clone(),
+                            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(4)]),
+                        },
+                        decompose(0, 0, vec![(0, 3)]),
+                        drop_of(3),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            let mut blocks = f.blocks.clone();
+            blocks[0].instructions.push(int(9, 0));
+            let f = under_test(params(&fx), Ty::I64, blocks);
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "a same-typed value that is not the extraction must be rejected"
+            );
+        }
+
+        #[test]
+        fn the_exact_extraction_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "claiming the extraction this decomposition's own base produced is the whole point"
+            );
+        }
+
+        #[test]
+        fn an_extraction_from_another_base_may_not_be_claimed() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(
+                vec![
+                    payload(2, 6, 0, 0, &fx),
+                    decompose(0, 0, vec![(0, 2)]),
+                    drop_of(2),
+                    int(5, 0),
+                ],
+                5,
+            );
+            // A second, independent `Holder`, extracted from in the same
+            // block but belonging to nothing this decomposition names.
+            blocks[0].instructions.push(Instruction::Value {
+                result: ValueId(6),
+                ty: fx.holder.clone(),
+                kind: ValueKind::VariantCreate {
+                    variant: HOLDER,
+                    case: 1,
+                    type_args: Vec::new(),
+                    payload: Vec::new(),
+                },
+            });
+            let f = under_test(params(&fx), Ty::I64, blocks);
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "an extraction out of a different value is not this shell's payload"
+            );
+        }
+
+        #[test]
+        fn an_extraction_of_another_position_may_not_be_claimed() {
+            let mut fx = fixture();
+            // `Full` declares one payload position, so index 1 does not
+            // exist -- but the claim names position 0 with a value read
+            // from position 1.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 1, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "the claimed position must be the position the extraction read"
+            );
+        }
+
+        #[test]
+        fn an_extraction_of_another_case_may_not_be_claimed() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 1, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "the claimed case must be the case the extraction read"
+            );
+        }
+
+        #[test]
+        fn one_extraction_may_not_be_claimed_by_two_decompositions_on_one_path() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+                "the shell is already emptied, so a second decomposition of it has nothing to take"
+            );
+        }
+
+        #[test]
+        fn an_extraction_destroyed_without_any_decomposition_is_rejected() {
+            let mut fx = fixture();
+            // Reading a payload position is a read. Destroying what it
+            // read, then destroying the shell that still owns it, is a
+            // double destruction of the same storage.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![payload(2, 0, 0, 0, &fx), drop_of(2), drop_of(0), int(5, 0)],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP),
+                "a payload read confers no ownership at all"
+            );
+        }
+
+        #[test]
+        fn an_extraction_transferred_without_any_decomposition_is_rejected() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(vec![payload(2, 0, 0, 0, &fx), drop_of(0)], 2);
+            blocks[1].terminator = Terminator::Return(Some(ValueId(2)));
+            let f = under_test(params(&fx), fx.envelope.clone(), blocks);
+            let codes = all_codes(&mut fx, f);
+            assert!(
+                codes.contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP)
+                    || codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "returning an unclaimed extraction transfers storage this frame never owned, \
+                 got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn a_claimed_payload_may_be_returned_instead_of_destroyed() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(
+                vec![payload(2, 0, 0, 0, &fx), decompose(0, 0, vec![(0, 2)])],
+                2,
+            );
+            blocks[1].terminator = Terminator::Return(Some(ValueId(2)));
+            blocks[2].instructions = vec![
+                decompose(0, 1, Vec::new()),
+                Instruction::Value {
+                    result: ValueId(7),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(8)]),
+                },
+                Instruction::Value {
+                    result: ValueId(20),
+                    ty: fx.envelope.clone(),
+                    kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(7)]),
+                },
+            ];
+            blocks[0].instructions.push(int(8, 0));
+            let f = under_test(params(&fx), fx.envelope.clone(), blocks);
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "an arm that returns its claimed payload transfers it instead of destroying it"
+            );
+        }
+
+        #[test]
+        fn a_wildcard_payload_is_claimed_and_destroyed_in_the_same_block() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a discarded payload is claimed and destroyed the instant the arm commits"
+            );
+        }
+
+        #[test]
+        fn the_shell_may_not_be_dropped_after_it_was_decomposed() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        drop_of(0),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+                "the shell was emptied by the decomposition and owns nothing to destroy"
+            );
+        }
+
+        #[test]
+        fn two_arms_of_one_case_may_each_claim_the_shared_extraction() {
+            let mut fx = fixture();
+            // One extraction is genuinely shared by every arm reachable
+            // through a case; each arm commits on its own disjoint path,
+            // so both claims are correct and neither may be rejected.
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.holder.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(1),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![payload(2, 0, 0, 0, &fx)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(3),
+                            else_block: BlockId(4),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(20, 0)],
+                        terminator: Terminator::Return(Some(ValueId(20))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![decompose(0, 0, vec![(0, 2)]), drop_of(2), int(5, 1)],
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: vec![decompose(0, 0, vec![(0, 2)]), drop_of(2), int(6, 2)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "two disjoint arms under one case each legitimately claim the shared extraction"
+            );
+        }
+    }
+
+    /// Whether an exit owes cleanup for a value is a question about the
+    /// *paths reaching it*, not about dominance (`rfcs/0012`).
+    ///
+    /// Dominance asks "does every path to this exit pass through the
+    /// creation?". The obligation asks "does *any* path to this exit
+    /// pass through it and still hold the value?". A branch-local
+    /// aggregate reaching a shared exit answers no to the first and yes
+    /// to the second, and was silently exempted.
+    #[cfg(test)]
+    mod ownership_presence {
+        use super::*;
+
+        fn cond_param() -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: Ty::Bool,
+                take: false,
+            }]
+        }
+
+        /// `%file = File { n }` then `%box = Box[File](%file)`.
+        fn build_box(file: u32, boxed: u32, n: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                int(n, 1),
+                Instruction::Value {
+                    result: ValueId(file),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(n)]),
+                },
+                Instruction::Value {
+                    result: ValueId(boxed),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone()], vec![ValueId(file)]),
+                },
+            ]
+        }
+
+        /// bb0 branches to bb1 (which builds a `Box[File]`) and bb2
+        /// (which does not); both meet at bb3, which returns.
+        fn diamond_creating_on_one_arm(fx: &Fixture, destroy: bool) -> Vec<BasicBlock> {
+            let mut arm = build_box(1, 2, 3, fx);
+            if destroy {
+                arm.push(drop_of(2));
+            }
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(0),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: arm,
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![int(4, 0)],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ]
+        }
+
+        #[test]
+        fn a_branch_local_aggregate_leaked_at_a_shared_exit_is_reported() {
+            let mut fx = fixture();
+            // bb1 does not dominate bb3, but the path bb1 -> bb3 leaks
+            // the `Box[File]` it built.
+            let blocks = diamond_creating_on_one_arm(&fx, false);
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "a value created on one arm and still live at the shared exit is leaked"
+            );
+        }
+
+        #[test]
+        fn a_branch_local_aggregate_cleaned_before_the_merge_is_accepted() {
+            let mut fx = fixture();
+            let blocks = diamond_creating_on_one_arm(&fx, true);
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "destroying it on the only arm that created it discharges the obligation"
+            );
+        }
+
+        #[test]
+        fn the_bypassing_arm_alone_is_never_diagnosed() {
+            let mut fx = fixture();
+            // bb2 creates nothing, and returns on its own. Nothing may
+            // be demanded of it for a value it never received.
+            let mut blocks = diamond_creating_on_one_arm(&fx, true);
+            blocks[2].instructions = vec![int(5, 0)];
+            blocks[2].terminator = Terminator::Return(Some(ValueId(5)));
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "an exit on a path that never created the value owes nothing"
+            );
+        }
+
+        #[test]
+        fn both_arms_creating_their_own_value_must_each_clean_it() {
+            let mut fx = fixture();
+            let mut first = build_box(1, 2, 3, &fx);
+            first.push(drop_of(2));
+            // The second arm builds its own and abandons it.
+            let second = build_box(5, 6, 7, &fx);
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: first,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: second,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            let codes = structural_codes(&mut fx, f);
+            assert!(
+                codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the arm that abandoned its own value must be reported, got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn both_arms_cleaning_their_own_value_are_accepted() {
+            let mut fx = fixture();
+            let mut first = build_box(1, 2, 3, &fx);
+            first.push(drop_of(2));
+            let mut second = build_box(5, 6, 7, &fx);
+            second.push(drop_of(6));
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: first,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: second,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each arm discharges its own obligation on its own path"
+            );
+        }
+
+        #[test]
+        fn an_arm_that_diverges_imposes_nothing_on_the_other() {
+            let mut fx = fixture();
+            let mut blocks = diamond_creating_on_one_arm(&fx, true);
+            // The creating arm never reaches the exit at all.
+            blocks[1].instructions = build_box(1, 2, 3, &fx);
+            blocks[1].terminator = Terminator::Branch(BlockId(1));
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            let codes = structural_codes(&mut fx, f);
+            assert_eq!(
+                codes,
+                Vec::<&str>::new(),
+                "a diverging arm reaches no exit, so it owes nothing there, got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn a_loop_creating_and_cleaning_each_iteration_is_accepted() {
+            let mut fx = fixture();
+            let mut body = build_box(1, 2, 3, &fx);
+            body.push(drop_of(2));
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: body,
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a loop that destroys what it built each iteration owes nothing at the exit"
+            );
+        }
+
+        #[test]
+        fn a_loop_leaking_on_its_exit_path_is_reported() {
+            let mut fx = fixture();
+            let body = build_box(1, 2, 3, &fx);
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: body,
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "a loop body that never destroys what it built leaks on the way out"
+            );
+        }
+
+        #[test]
+        fn a_nested_branch_creating_deep_inside_still_owes_at_the_outer_exit() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(4),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(2),
+                            else_block: BlockId(3),
+                        },
+                    },
+                    // Two levels in, and still reaching the one exit.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: build_box(1, 2, 3, &fx),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(5),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "depth of nesting changes nothing about which paths reach the exit"
+            );
+        }
+
+        #[test]
+        fn every_block_and_predecessor_order_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = diamond_creating_on_one_arm(&fx, false);
+            let expected = rendered(&mut fx, under_test(cond_param(), Ty::I64, blocks.clone()));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    rendered(&mut fx, under_test(cond_param(), Ty::I64, rotated)),
+                    expected,
+                    "rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks.clone();
+            reversed.reverse();
+            assert_eq!(
+                rendered(&mut fx, under_test(cond_param(), Ty::I64, reversed)),
+                expected,
+                "reversing the block vector changed the diagnostics"
+            );
+            // The same diamond with its two arms swapped: the join's
+            // predecessors are discovered in the other order.
+            let mut swapped = blocks;
+            swapped[0].terminator = Terminator::CondBranch {
+                condition: ValueId(0),
+                then_block: BlockId(2),
+                else_block: BlockId(1),
+            };
+            assert_eq!(
+                rendered(&mut fx, under_test(cond_param(), Ty::I64, swapped)),
+                expected,
+                "reversing predecessor discovery order changed the diagnostics"
+            );
+            assert!(
+                !expected.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+    }
+
+    /// An `Invoke` writes ownership into a slot *on one edge only*
+    /// (`rfcs/0011`, `rfcs/0012`): the success edge initializes
+    /// `ok_slot`, and each failure edge initializes its own error slot.
+    /// The other edges initialize nothing.
+    ///
+    /// The fact therefore belongs to the edge, never to the target
+    /// block -- two logical edges may reach the same block carrying
+    /// different slots.
+    #[cfg(test)]
+    mod invoke_slots {
+        use super::*;
+        use crate::nir::InvokeErrTarget;
+
+        /// `func raiser() -> Box[File] raises Holder`.
+        fn raiser(fx: &mut Fixture) -> Function {
+            let name = fx.interner.intern("raiser");
+            Function {
+                id: RAISER,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: fx.box_file.clone(),
+                raises: vec![HOLDER],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        int(0, 1),
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::RecordCreate(
+                                BOXY,
+                                vec![fx.file.clone()],
+                                vec![ValueId(1)],
+                            ),
+                        },
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            }
+        }
+
+        /// Only the structural family, sorted, with `raiser` linked in.
+        fn codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+            let helpers = helpers(fx);
+            let raiser = raiser(fx);
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let mut functions = vec![function, raiser];
+            functions.extend(helpers);
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions,
+                records: fx.records.clone(),
+                variants: fx.variants.clone(),
+            };
+            let mut codes: Vec<&'static str> =
+                verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                    .into_iter()
+                    .map(|d| d.code)
+                    .filter(|code| {
+                        matches!(
+                            *code,
+                            codes::MISSING_STRUCTURAL_CLEANUP
+                                | codes::DUPLICATE_STRUCTURAL_CLEANUP
+                                | codes::PLACE_USE_AFTER_MOVE
+                                | codes::PARTIAL_PLACE_USED_AS_WHOLE
+                        )
+                    })
+                    .collect();
+            codes.sort_unstable();
+            codes
+        }
+
+        /// Destroys a `Box[File]` held in `slot` by moving its own field
+        /// out and dropping it.
+        fn clean_box(slot: u32, field: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                read(
+                    field,
+                    fx.file.clone(),
+                    Place::root(ValueId(slot)).field(BOXY, FieldId(0)),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(field),
+            ]
+        }
+
+        /// Destroys a `Holder` held in `slot` by testing its case.
+        fn clean_holder(slot: u32, first: u32, exit: BlockId) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(first),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(slot),
+                        variant: HOLDER,
+                        cases: vec![BlockId(first + 1), BlockId(first + 2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(first + 1),
+                    instructions: vec![drop_of(slot)],
+                    terminator: Terminator::Branch(exit),
+                },
+                BasicBlock {
+                    id: BlockId(first + 2),
+                    instructions: vec![drop_of(slot)],
+                    terminator: Terminator::Branch(exit),
+                },
+            ]
+        }
+
+        /// bb0 invokes `raiser`; the success edge lands in bb1 and the
+        /// failure edge in bb2, both eventually returning through bb9.
+        fn invoking(
+            fx: &Fixture,
+            ok_body: Vec<Instruction>,
+            err_body: Vec<Instruction>,
+        ) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.holder.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(1),
+                        ok_target: BlockId(1),
+                        err_targets: vec![InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(2),
+                            target: BlockId(2),
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: ok_body,
+                    terminator: Terminator::Branch(BlockId(9)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: err_body,
+                    terminator: Terminator::Branch(BlockId(9)),
+                },
+                BasicBlock {
+                    id: BlockId(9),
+                    instructions: vec![int(20, 0)],
+                    terminator: Terminator::Return(Some(ValueId(20))),
+                },
+            ]
+        }
+
+        fn no_params() -> Vec<Param> {
+            Vec::new()
+        }
+
+        #[test]
+        fn an_affine_success_slot_that_is_cleaned_is_accepted() {
+            let mut fx = fixture();
+            let ok = clean_box(1, 3, &fx);
+            let mut blocks = invoking(&fx, ok, Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert_eq!(
+                codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each edge's own slot is destroyed on the edge that created it"
+            );
+        }
+
+        #[test]
+        fn an_affine_success_slot_left_undestroyed_is_reported() {
+            let mut fx = fixture();
+            let mut blocks = invoking(&fx, Vec::new(), Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert!(
+                codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the success edge created an owned `Box[File]` that nothing destroys"
+            );
+        }
+
+        #[test]
+        fn the_failure_edge_owes_nothing_for_the_success_slot() {
+            let mut fx = fixture();
+            // The success edge cleans its own slot; the failure edge
+            // never received it and must not be blamed for it.
+            let ok = clean_box(1, 3, &fx);
+            let mut blocks = invoking(&fx, ok, Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert_eq!(
+                codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a slot initialized on one edge is owed nothing on a sibling edge"
+            );
+        }
+
+        #[test]
+        fn an_affine_error_slot_left_undestroyed_is_reported() {
+            let mut fx = fixture();
+            let ok = clean_box(1, 3, &fx);
+            let blocks = invoking(&fx, ok, Vec::new());
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert!(
+                codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the failure edge created an owned `Holder` that nothing destroys"
+            );
+        }
+
+        #[test]
+        fn success_and_failure_edges_reaching_one_block_keep_their_own_slots() {
+            let mut fx = fixture();
+            // Both edges land in bb1. Only one of the two slots is
+            // initialized on each, so demanding either unconditionally
+            // would be wrong -- and demanding neither would lose both
+            // leaks.
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.box_file.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: RAISER,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(1),
+                            ok_target: BlockId(1),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(2),
+                                target: BlockId(1),
+                            }],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![int(20, 0)],
+                        terminator: Terminator::Return(Some(ValueId(20))),
+                    },
+                ],
+            );
+            let found = codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "both slots reach this block still owned on their own edge, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn reversing_the_error_target_order_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let straight = under_test(no_params(), Ty::I64, invoking(&fx, Vec::new(), Vec::new()));
+            let mut blocks = invoking(&fx, Vec::new(), Vec::new());
+            blocks.swap(1, 2);
+            let swapped = under_test(no_params(), Ty::I64, blocks);
+            let forward = codes(&mut fx, straight);
+            let reversed = codes(&mut fx, swapped);
+            assert_eq!(
+                forward, reversed,
+                "the order the error targets are listed in must not change the result"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+
+        #[test]
+        fn the_same_invoke_reports_byte_identical_diagnostics_twice() {
+            let mut fx = fixture();
+            let blocks = invoking(&fx, Vec::new(), Vec::new());
+            let first = codes(&mut fx, under_test(no_params(), Ty::I64, blocks.clone()));
+            let second = codes(&mut fx, under_test(no_params(), Ty::I64, blocks));
+            assert_eq!(first, second, "the refusal must be deterministic");
+        }
+    }
+
+    /// `bb0` is the unique entry, and the one fixed boundary condition
+    /// every fixed point in this file starts from: its in-state is the
+    /// function's parameters and nothing else. That is only sound if
+    /// nothing can branch back into it, so an edge naming `bb0` is
+    /// rejected outright rather than quietly dropped from the dataflow
+    /// (`rfcs/0011`, `rfcs/0012`).
+    #[cfg(test)]
+    mod entry_edges {
+        use super::*;
+        use crate::nir::InvokeErrTarget;
+
+        fn take_file(fx: &Fixture) -> Vec<Param> {
+            vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                },
+            ]
+        }
+
+        #[test]
+        fn a_branch_back_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            // Reaching bb0 twice would run its own entry seeding twice
+            // and destroy `%0` on the second pass.
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0)],
+                        terminator: Terminator::Branch(BlockId(0)),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a back edge into the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_conditional_edge_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(0),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a conditional edge into the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_switch_case_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: true,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(0), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a switch case naming the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn invoke_edges_into_the_entry_block_are_each_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            drop_of(0),
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: Ty::Unit,
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(3),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: SINK,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(2),
+                            ok_target: BlockId(0),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(3),
+                                target: BlockId(0),
+                            }],
+                        },
+                    },
+                ],
+            );
+            let found = all_codes(&mut fx, f);
+            assert_eq!(
+                found
+                    .iter()
+                    .filter(|code| **code == codes::EDGE_INTO_ENTRY_BLOCK)
+                    .count(),
+                2,
+                "both the success and the failure edge name the entry block, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_edge_into_the_entry_block_is_still_rejected() {
+            let mut fx = fixture();
+            // Unreachable, so no dataflow ever walks it -- and exactly
+            // the shape a "drop it from the CFG" rule would miss.
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(9),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(0)),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "an unreachable edge into the entry block is still malformed NIR"
+            );
+        }
+
+        #[test]
+        fn the_entry_block_with_no_incoming_edge_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(2),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                !all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "an ordinary CFG that never names bb0 as a target is fine"
+            );
+        }
+
+        #[test]
+        fn every_block_vector_order_reports_the_identical_entry_edge_diagnostics() {
+            let mut fx = fixture();
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![drop_of(0)],
+                    terminator: Terminator::Branch(BlockId(0)),
+                },
+            ];
+            let params = take_file(&fx);
+            let forward = rendered(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                rendered(&mut fx, under_test(params, Ty::I64, reversed)),
+                forward,
+                "block vector order must not change the entry-edge diagnostics"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+    }
+
+    /// An ordinary (non-`take`) parameter is an *observation*, and so is
+    /// everything reachable through it (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Availability alone cannot express that: a field of an observed
+    /// aggregate is perfectly "there", and reading it is legal, but
+    /// nothing reached through an observer may be transferred,
+    /// destroyed, decomposed or reinitialized. Ownership is a second
+    /// axis, and projecting a field never moves along it.
+    #[cfg(test)]
+    mod observation {
+        use super::*;
+
+        fn observed_box(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: false,
+            }]
+        }
+
+        fn owned_box(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }]
+        }
+
+        fn box_field() -> Place<ValueId> {
+            Place::root(ValueId(0)).field(BOXY, FieldId(0))
+        }
+
+        fn single_block(instructions: Vec<Instruction>, result: u32) -> Vec<BasicBlock> {
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(result))),
+            }]
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_have_its_field_read() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Observe),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "observing a field of an observed aggregate is exactly what observation is for"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_have_its_field_moved_out() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Transfer),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "moving a field out of an observed aggregate takes ownership it never had"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_be_dropped() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(vec![drop_of(0), int(2, 0)], 2),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "destroying an observed aggregate destroys the caller's own value"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_be_reinitialized() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        int(3, 1),
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                        },
+                        Instruction::StorePlace {
+                            place: box_field(),
+                            value: ValueId(1),
+                        },
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "writing through an observer overwrites storage the caller still owns"
+            );
+        }
+
+        #[test]
+        fn an_observed_variant_may_not_be_decomposed() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.envelope.clone(),
+                                kind: ValueKind::VariantPayload {
+                                    base: ValueId(0),
+                                    variant: HOLDER,
+                                    case: 0,
+                                    index: 0,
+                                },
+                            },
+                            Instruction::DecomposeVariant {
+                                value: ValueId(0),
+                                variant: HOLDER,
+                                case: 0,
+                                taken: vec![(0, ValueId(1))],
+                            },
+                            drop_of(1),
+                            int(2, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(3, 0)],
+                        terminator: Terminator::Return(Some(ValueId(3))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "taking an observed variant apart claims payload the caller still owns"
+            );
+        }
+
+        #[test]
+        fn a_taken_aggregate_may_have_its_field_moved_out() {
+            let mut fx = fixture();
+            let f = under_test(
+                owned_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Transfer),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a `take` parameter really is this frame's to take apart"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_a_record_field_projection() {
+            let mut fx = fixture();
+            // `RecordField` reads the same storage a place read would;
+            // it may not launder an observation into an owner.
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordField {
+                                base: ValueId(0),
+                                record: BOXY,
+                                field: 0,
+                            },
+                        },
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a field projection of an observer is still an observer"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_a_variant_payload_projection() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.envelope.clone(),
+                                kind: ValueKind::VariantPayload {
+                                    base: ValueId(0),
+                                    variant: HOLDER,
+                                    case: 0,
+                                    index: 0,
+                                },
+                            },
+                            drop_of(1),
+                            int(2, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(3, 0)],
+                        terminator: Terminator::Return(Some(ValueId(3))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a payload read of an observed variant is still an observer"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_an_observing_place_read() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Observe),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "reading an observed field observes it; it does not hand it over"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_being_moved_into_a_new_value() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Move { source: ValueId(0) },
+                        },
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "moving an observed value out of this frame is the escape observation forbids"
+            );
+        }
+
+        #[test]
+        fn a_nested_observed_resource_field_may_not_be_moved_out() {
+            let mut fx = fixture();
+            // `Session` is a declared resource with two `File` fields.
+            // An ordinary parameter of it observes every one of them.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a nested field of an observed resource is observed too"
+            );
+        }
+
+        #[test]
+        fn an_observed_value_may_be_passed_on_as_an_observation() {
+            let mut fx = fixture();
+            // `observe(File) -> i64` takes an ordinary parameter, so
+            // handing it an observed field passes the observation on
+            // rather than giving anything away.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Call(
+                                OBSERVE,
+                                Vec::new(),
+                                vec![ValueId(1)],
+                                Vec::new(),
+                            ),
+                        },
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "passing an observation to an observing parameter gives nothing away"
+            );
+        }
+
+        #[test]
+        fn an_observed_value_may_not_be_handed_to_a_take_parameter() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                        },
+                        int(3, 0),
+                    ],
+                    3,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a `take` parameter consumes its argument, which an observer may not give"
+            );
+        }
+    }
+
+    /// A slot is storage, and storing an affine value into one moves the
+    /// obligation with it (`rfcs/0012`). The value is consumed by the
+    /// store; the slot now owes the cleanup, and an exit that reaches it
+    /// still holding one is a leak like any other.
+    #[cfg(test)]
+    mod slot_ownership {
+        use super::*;
+
+        fn no_params() -> Vec<Param> {
+            Vec::new()
+        }
+
+        /// `%1 = alloc Box[File]`, then a `Box[File]` built and stored
+        /// into it.
+        fn build_into_slot(fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::Alloc,
+                },
+                int(2, 1),
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(2)]),
+                },
+                Instruction::Value {
+                    result: ValueId(4),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone()], vec![ValueId(3)]),
+                },
+                Instruction::Store {
+                    slot: ValueId(1),
+                    value: ValueId(4),
+                    mode: OwnershipMode::Transfer,
+                },
+            ]
+        }
+
+        #[test]
+        fn a_slot_left_holding_an_affine_value_is_reported() {
+            let mut fx = fixture();
+            let mut instructions = build_into_slot(&fx);
+            instructions.push(int(5, 0));
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                }],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the store moved the obligation into the slot, and nothing discharged it"
+            );
+        }
+
+        #[test]
+        fn a_slot_whose_value_is_read_back_and_destroyed_is_accepted() {
+            let mut fx = fixture();
+            let mut instructions = build_into_slot(&fx);
+            instructions.extend([
+                Instruction::Value {
+                    result: ValueId(6),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::Load(ValueId(1)),
+                },
+                read(
+                    7,
+                    fx.file.clone(),
+                    Place::root(ValueId(6)).field(BOXY, FieldId(0)),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(7),
+                int(5, 0),
+            ]);
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                }],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "reading the slot back and destroying what it held discharges the obligation"
+            );
+        }
+
+        #[test]
+        fn a_slot_filled_on_one_arm_only_is_reported_at_the_shared_exit() {
+            let mut fx = fixture();
+            // The bypassing arm never filled the slot, so only the arm
+            // that did can leak -- and it does.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: Ty::Bool,
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        }],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: build_into_slot(&fx)[1..].to_vec(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(5, 0)],
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the arm that filled the slot leaks it at the shared exit"
             );
         }
     }

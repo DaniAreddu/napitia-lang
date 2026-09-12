@@ -891,6 +891,31 @@ fn resource_handle_cleanup_example_runs_end_to_end() {
     assert_resource_example_runs("resource_handle_cleanup.npt", "4");
 }
 
+#[test]
+fn resource_nested_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_nested.npt", "3");
+}
+
+#[test]
+fn resource_field_move_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_move.npt", "20");
+}
+
+#[test]
+fn resource_partial_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_drop.npt", "0");
+}
+
+#[test]
+fn resource_field_reinitialize_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_reinitialize.npt", "5");
+}
+
+#[test]
+fn resource_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_payload.npt", "8");
+}
+
 /// Each invalid resource example is rejected at `check` with its own
 /// exact code, and every stage that runs it agrees, with no leaked
 /// internal (`Ixxxx`/`Vxxxx`) diagnostic and no panic.
@@ -916,6 +941,15 @@ fn assert_resource_example_rejected(name: &str, code: &str) {
             !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
             "`{cmd}` panicked instead of reporting a diagnostic for {name}: {err}"
         );
+        // The same invalid program must produce byte-identical output
+        // across two independent runs: no `HashMap` iteration order may
+        // reach a user-visible diagnostic (`rfcs/0012`).
+        let again = napitia(&[cmd, &path]);
+        assert_eq!(
+            err,
+            stderr(&again),
+            "`{cmd}`'s own diagnostics for {name} are not deterministic across repeated runs"
+        );
     }
 }
 
@@ -937,4 +971,263 @@ fn resource_invalid_escape_example_is_u0005_at_every_stage() {
 #[test]
 fn resource_invalid_generic_take_example_is_t0065_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_generic_take.npt", "T0065");
+}
+
+#[test]
+fn resource_invalid_parent_after_partial_move_example_is_u0014_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_parent_after_partial_move.npt", "U0014");
+}
+
+#[test]
+fn resource_invalid_live_field_overwrite_example_is_u0010_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_live_field_overwrite.npt", "U0010");
+}
+
+#[test]
+fn resource_invalid_field_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_field_double_drop.npt", "U0003");
+}
+
+// -- Alpha 0.1.8 structural ownership repairs (`rfcs/0012`) -------------
+//
+// Every example below is one of the blockers the first Alpha 0.1.8
+// review rejected the milestone for, exercised end to end through the
+// real binary: `check` accepts it, `ir` produces deterministic NIR with
+// no leaked verifier code, and `run` produces the value that proves each
+// affine identity was transferred or destroyed exactly once.
+
+#[test]
+fn resource_wildcard_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_payload.npt", "1");
+}
+
+#[test]
+fn resource_wildcard_partial_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_partial_payload.npt", "11");
+}
+
+#[test]
+fn resource_mixed_nesting_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_mixed_nesting.npt", "82");
+}
+
+#[test]
+fn resource_generic_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_aggregate.npt", "69");
+}
+
+#[test]
+fn resource_generic_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_variant_payload.npt", "5");
+}
+
+#[test]
+fn resource_defer_field_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_defer_field.npt", "2");
+}
+
+#[test]
+fn resource_field_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_drop.npt", "2");
+}
+
+#[test]
+fn resource_structural_exits_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_exits.npt", "5");
+}
+
+#[test]
+fn resource_invalid_local_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_local_double_drop.npt", "U0003");
+}
+
+#[test]
+fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_defer_parent_drop.npt", "U0004");
+}
+
+/// The field-level double drop reports the *field* as double-dropped,
+/// not merely the generic whole-local diagnostic a local extracted out
+/// of that field first would produce -- the two examples exist side by
+/// side precisely so a regression collapsing one into the other is
+/// visible.
+#[test]
+fn the_field_and_local_double_drop_examples_name_their_own_target() {
+    let field = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_field_double_drop.npt"),
+    ]));
+    assert!(
+        field.contains("drop session.input;"),
+        "the field double drop must be reported against the field itself: {field}"
+    );
+    let local = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_local_double_drop.npt"),
+    ]));
+    assert!(
+        local.contains("drop input;"),
+        "the local double drop must be reported against the local: {local}"
+    );
+}
+
+#[test]
+fn resource_structural_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_drop.npt", "0");
+}
+
+/// `drop` still refuses a value that owns nothing at all -- extending it
+/// to every transitively affine value must not quietly turn it into a
+/// no-op accepted on any expression.
+#[test]
+fn dropping_a_value_that_owns_no_resource_is_still_t0061() {
+    let output = napitia(&["check", &fixture("drop_non_affine_invalid.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("error[T0061]"),
+        "expected T0061: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn resource_partial_sibling_access_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_sibling_access.npt", "13");
+}
+
+/// The advice `U0014` gives must actually work: a partially moved
+/// aggregate stays usable for an unaffected field (affine or not), and
+/// only using it as a *whole* value is rejected. A regression that
+/// widened the whole-value rule back over ordinary field reads would
+/// make the diagnostic's own suggestion impossible to follow.
+#[test]
+fn a_partially_moved_parent_still_permits_what_u0014_suggests() {
+    let ok = napitia(&["check", &example("resource_partial_sibling_access.npt")]);
+    assert!(
+        ok.status.success(),
+        "reading an unaffected field of a partially moved parent must stay legal: {}",
+        stderr(&ok)
+    );
+    let rejected = napitia(&[
+        "check",
+        &example("resource_invalid_parent_after_partial_move.npt"),
+    ]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stderr(&rejected).contains("error[U0014]"));
+}
+
+// -- Alpha 0.1.8 generic runtime ownership (`rfcs/0008`, `rfcs/0012`) ---
+//
+// A runtime aggregate carries its own concrete type arguments, so
+// destroying one asks what *this instantiation* owns rather than what
+// its declaration's symbolic parameter owns. Both examples destroy
+// generic aggregates as a whole, which is the shape that reaches the
+// runtime's own structural drop -- and the shape under which a
+// discarded type argument leaks silently.
+
+#[test]
+fn resource_generic_whole_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_whole_drop.npt", "14");
+}
+
+#[test]
+fn resource_generic_nested_ownership_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_nested_ownership.npt", "0");
+}
+
+/// Textual NIR carries each construction's own concrete type arguments,
+/// which is what the interpreter reads them back from -- a regression
+/// dropping them from the printed form would mean they were dropped
+/// from the instruction too.
+#[test]
+fn textual_nir_shows_a_generic_constructions_type_arguments() {
+    let output = napitia(&["ir", &example("resource_generic_whole_drop.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("record.create @Box") && text.contains("[File"),
+        "expected a generic record construction to print its type arguments: {text}"
+    );
+    assert!(
+        text.contains("variant.create @Maybe") && text.contains("[File"),
+        "expected a generic variant construction to print its type arguments: {text}"
+    );
+}
+
+/// A malformed program whose parser recovery produces a self-referential
+/// layout must terminate. `typeck::cycles` rejects it as an infinite
+/// layout, but checking never stops at the first error, so `resourceck`
+/// still walks the same HIR -- and its own place decomposition has to
+/// bound the infinite place tree that layout describes rather than
+/// descending it forever.
+#[test]
+fn a_recovered_self_referential_layout_terminates_instead_of_hanging() {
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &fixture("cyclic_recovery_hang_invalid.npt")]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should reject the recovered cyclic layout"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error["),
+            "`{cmd}` should report a diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked: {err}"
+        );
+    }
+}
+
+// -- Alpha 0.1.8 path-sensitive variant ownership (`rfcs/0012`) ---------
+//
+// Variant ownership is per *path*: one branch may destroy the whole
+// value while a disjoint branch takes it apart and owns the payload, and
+// neither may suppress or discharge the other's obligations.
+
+#[test]
+fn resource_branch_local_variant_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_branch_local_variant.npt", "36");
+}
+
+#[test]
+fn resource_variant_decomposition_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_decomposition.npt", "134");
+}
+
+// Observation is transitive: an ordinary parameter is a call-scoped view
+// of a value the caller still owns, and so is every field reached
+// through it.
+
+#[test]
+fn resource_observed_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observed_aggregate.npt", "31");
+}
+
+/// Moving a field out of an observed aggregate is refused by `check`
+/// itself -- not by the verifier after `check` already accepted it.
+#[test]
+fn resource_invalid_observed_field_move_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observed_field_move.npt", "U0005");
+}
+
+/// Textual NIR shows the decomposition explicitly, on the arm's own
+/// path -- the ownership event a function-global consumption scan used
+/// to stand in for.
+#[test]
+fn textual_nir_shows_variant_decomposition_on_the_claiming_path() {
+    let output = napitia(&["ir", &example("resource_branch_local_variant.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("decompose "),
+        "expected an explicit decomposition in textual NIR: {text}"
+    );
+    // The branch that drops the whole value must not decompose it.
+    assert!(
+        text.contains("drop "),
+        "expected the sibling branch's whole-value drop: {text}"
+    );
 }

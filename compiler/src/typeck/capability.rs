@@ -226,15 +226,16 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            // Protocols over resource types are out of scope this
-            // milestone (`rfcs/0011`): a resource used as one of this
-            // extend's own protocol type arguments is rejected with a
-            // dedicated diagnostic here, rather than silently letting an
-            // affine value flow through capability resolution as though
-            // it were an ordinary observable value.
+            // Protocols over affine (resource-containing) types are out
+            // of scope this milestone (`rfcs/0011`, `rfcs/0012`): an
+            // affine type used as one of this extend's own protocol type
+            // arguments is rejected with a dedicated diagnostic here,
+            // rather than silently letting an affine value flow through
+            // capability resolution as though it were an ordinary
+            // observable value.
             let mut has_resource_argument = false;
             for arg in &protocol_arguments {
-                if self.is_affine_resource(arg) {
+                if self.is_affine(arg) {
                     has_resource_argument = true;
                     self.diagnostics.push(
                         Diagnostic::error(

@@ -1,0 +1,22 @@
+// A partially-moved aggregate may not be observed, returned,
+// transferred, or passed as a whole (`rfcs/0012`).
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func inspect_session(session: Session) -> unit {}
+
+func main() -> i64 {
+    mutable session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    value input = session.input;
+    inspect_session(session);
+    return 0;
+}

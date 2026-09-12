@@ -15,14 +15,15 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::hir::ItemId;
-use crate::nir::{Const, Function, Module, Terminator, ValueId, ValueKind};
+use crate::nir::{Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind};
+use crate::place::{Place, Projection};
 use crate::symbol::Interner;
-use crate::types::Evidence;
+use crate::types::{Evidence, Ty};
 
 /// A resource record's own identity within one [`Interpreter`]'s own
 /// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
 /// lives at, stable for that resource's entire runtime lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ResourceId(u32);
 
 /// A capability to observe or consume one resource record, as of a
@@ -208,6 +209,180 @@ impl ResourceTable {
         self.records[id.0 as usize].status = ResourceStatus::Dropped;
         Ok(())
     }
+
+    /// Reads `handle`'s own field at `index` without disturbing it
+    /// (`rfcs/0012`) -- legal through both an `Owner` and an `Observer`
+    /// handle, exactly like reading the resource's own top-level
+    /// identity already is ([`Self::observe`]).
+    fn observe_field(
+        &self,
+        handle: ResourceHandle,
+        index: usize,
+    ) -> Result<Value, InterpreterError> {
+        let record = self.observe(handle)?;
+        let field = record.fields.get(index).cloned().ok_or_else(|| {
+            invalid("a place projects a field index out of range for this resource")
+        })?;
+        // Reading *through* an observer may never hand back an owning
+        // handle: the field's stored handle is the owner's, and
+        // returning it as-is would let an observation promote itself by
+        // one projection.
+        match (handle.role, field) {
+            (RuntimeOwnershipRole::Observer, Value::Resource(inner)) => {
+                Ok(Value::Resource(self.to_observer(inner)?))
+            }
+            (_, field) => Ok(field),
+        }
+    }
+
+    /// Removes `handle`'s own field at `index`, leaving a
+    /// [`Value::Moved`] tombstone behind, and returns the removed value
+    /// (`rfcs/0012`) -- only ever legal through an `Owner` handle:
+    /// transferring a field out through a merely-observing handle would
+    /// let an observer silently grant itself ownership of something it
+    /// was only ever supposed to read.
+    fn take_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+    ) -> Result<Value, InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot transfer a field through a merely-observing resource handle",
+            ));
+        }
+        let record = self.observe(handle)?;
+        let _ = record;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        Ok(std::mem::replace(slot, Value::Moved))
+    }
+
+    /// Overwrites `handle`'s own field at `index` with `value`
+    /// (`rfcs/0012`, structural reinitialization) -- only ever legal
+    /// through an `Owner` handle, for the same reason
+    /// [`Self::take_field`] is. Defensively rejects overwriting a field
+    /// that is not currently a tombstone (`Moved`/`Dropped`): `nir::
+    /// verify` already statically guarantees `StorePlace` only ever
+    /// targets a provably-empty place, but this stage never trusts that
+    /// blindly either.
+    fn set_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+        value: Value,
+    ) -> Result<(), InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot reinitialize a field through a merely-observing resource handle",
+            ));
+        }
+        let record = self.observe(handle)?;
+        let _ = record;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        if !matches!(slot, Value::Moved | Value::Dropped) {
+            return Err(invalid(
+                "cannot overwrite a resource field that still owns a live value",
+            ));
+        }
+        *slot = value;
+        Ok(())
+    }
+
+    /// Writes `container` back into `handle`'s own field at `index`
+    /// after a place traversal passed *through* it (`rfcs/0012`) --
+    /// deliberately **not** [`Self::set_field`]: that one is the
+    /// user-facing structural reinitialization primitive `StorePlace`
+    /// lowers to, and correctly refuses to overwrite a field that still
+    /// owns a live value. This one is the internal, transactional
+    /// counterpart: the field genuinely *is* still live here (the
+    /// traversal only ever reached deeper *through* it), and what is
+    /// being written back is that very same container with at most one
+    /// of its own descendants tombstoned. Conflating the two is exactly
+    /// what made a mixed `resource` -> `record` chain report a bogus
+    /// live-overwrite error.
+    ///
+    /// Still `Owner`-gated, exactly like [`Self::take_field`]/
+    /// [`Self::set_field`]: a merely-observing handle must never be able
+    /// to write through an intermediate container either, or a
+    /// `record` -> `resource` -> `field` transfer reached through an
+    /// observer would silently grant itself ownership. Only ever called
+    /// *after* the recursion it accompanies already succeeded, so a
+    /// failure deeper in the chain leaves this field exactly as it was
+    /// rather than half-mutated.
+    fn restore_field(
+        &mut self,
+        handle: ResourceHandle,
+        index: usize,
+        container: Value,
+    ) -> Result<(), InterpreterError> {
+        if handle.role != RuntimeOwnershipRole::Owner {
+            return Err(invalid(
+                "cannot write through a merely-observing resource handle",
+            ));
+        }
+        self.observe(handle)?;
+        let slot = self.records[handle.id.0 as usize]
+            .fields
+            .get_mut(index)
+            .ok_or_else(|| {
+                invalid("a place projects a field index out of range for this resource")
+            })?;
+        *slot = container;
+        Ok(())
+    }
+}
+
+/// One recursive place-traversal step's own complete result
+/// (`rfcs/0012`): the value actually read or removed at the place's own
+/// final projection, *and* the container this step was handed, in
+/// exactly the state it must now be written back into whatever slot it
+/// came from.
+///
+/// `container` is always present, and always meaningful -- never an
+/// `Option` doing double duty for both "the caller must write this
+/// back" and "this container's own ownership disappeared." For a
+/// `resource` intermediate the mutation already happened directly in
+/// the resource table, and `container` is that same
+/// [`Value::Resource`] handle, unchanged, so the caller reinserting it
+/// into its own parent slot keeps the handle exactly where it belongs
+/// instead of tombstoning a live resource out of its owner.
+struct AccessResult {
+    extracted: Value,
+    container: Value,
+}
+
+/// A complete, not-yet-applied plan for one structural store
+/// (`rfcs/0012`), collected before anything is mutated.
+///
+/// The two sets answer different questions and must not be confused.
+///
+/// `reachable` is the *whole* ownership graph the source carries,
+/// including everything a resource holds in its own `ResourceRecord`
+/// rather than inline in the value. Stopping at a resource's outer
+/// handle -- as this once did -- hides exactly the cases that matter: a
+/// child duplicated between a resource and its own container, an
+/// identity the destination is reached through, and an ownership cycle
+/// no destruction order could ever satisfy.
+///
+/// `transitions` is only the identities whose ownership *handle* really
+/// crosses this boundary, with the generation each one moves to. A
+/// child that stays nested inside a moved parent never crosses: its
+/// owner is the same resource it always was, so its generation must not
+/// change and handles to it stay current.
+#[derive(Default)]
+struct StorePlan {
+    reachable: HashSet<ResourceId>,
+    transitions: Vec<(ResourceId, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +397,19 @@ pub enum Value {
     /// `nir::RecordLayout`.
     Record {
         item: ItemId,
+        /// This value's own *concrete* type arguments, in the
+        /// declaration's own parameter order (`rfcs/0008`) -- empty for
+        /// a non-generic record.
+        ///
+        /// Carried on the value itself, not re-derived, because
+        /// `item` alone cannot answer what this aggregate owns: `Box`'s
+        /// own declared field type is the symbolic `Ty::Param(T)`, and
+        /// asking whether *that* is affine answers "no" for every
+        /// instantiation, `Box[File]` included. Never inferred from the
+        /// payload values either -- a moved-out field is a tombstone
+        /// with no type left to read, so a value that has already given
+        /// up a field could no longer say what it is.
+        type_args: Vec<Ty>,
         fields: Vec<Value>,
     },
     /// A variant value: `case` is the declaration index of its active
@@ -229,6 +417,11 @@ pub enum Value {
     /// declaration order (empty for a unit case).
     Variant {
         item: ItemId,
+        /// See [`Value::Record::type_args`] -- identical role, and
+        /// identically load-bearing: a `Maybe[File]` whose payload is
+        /// declared `Ty::Param(T)` owns a resource, and a `Maybe[i64]`
+        /// does not.
+        type_args: Vec<Ty>,
         case: usize,
         payload: Vec<Value>,
     },
@@ -239,6 +432,24 @@ pub enum Value {
     /// clones) duplicates only the cheap handle, never the resource's
     /// own runtime identity or data.
     Resource(ResourceHandle),
+    /// A structural tombstone (`rfcs/0012`, Alpha 0.1.8) left behind in
+    /// exactly the field slot a `PlaceRead { mode: Transfer }` just took
+    /// ownership out of, inside a plain `Record`/`Variant` value (a
+    /// `resource`'s own fields are tombstoned directly in its
+    /// `ResourceTable` record instead -- see [`ResourceRecord::fields`]
+    /// -- since they are never held inline the way an ordinary
+    /// aggregate's are). Reading a `Moved` field is a structured runtime
+    /// error, never a silent `Unit`/default value -- `nir::verify`
+    /// already statically guarantees this can never happen for verified
+    /// NIR; this is this stage's own independent backstop, not a
+    /// substitute for it.
+    Moved,
+    /// Like [`Value::Moved`], but left by the recursive structural
+    /// destruction a `Drop` of an enclosing aggregate applies to each of
+    /// its own still-live affine fields (`rfcs/0012`) -- distinguished
+    /// from `Moved` only for a clearer error message on a later
+    /// (already-impossible, for verified NIR) use.
+    Dropped,
 }
 
 /// A condition the interpreter detects and reports instead of crashing:
@@ -305,16 +516,1428 @@ impl<'a> Interpreter<'a> {
             .any(|(id, layout)| *id == item && layout.affine)
     }
 
-    /// Transfers ownership of `value` if it is a resource (Blocker 8);
-    /// passes any other value through unchanged. Shared by both
-    /// directions ownership crosses a call boundary: a `take`
-    /// argument's own transfer *into* a call, and a returned value's
-    /// own transfer back *out* of one.
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`) -- mirrors
+    /// `nir::lower`'s/`resourceck`'s identical query, independently
+    /// recomputed from this module's own `records`/`variants` layouts
+    /// (never a generic-instantiation-aware substitution here: this is
+    /// only ever consulted while destroying an *already-constructed*
+    /// runtime `Variant` value's own active-case payload, whose payload
+    /// types come from that one concrete case's own declared shape).
+    /// Guarded against a genuinely cyclic declaration the same way every
+    /// other stage's identical query is: a cycle back-edge contributes
+    /// `false` to that one occurrence alone, never cached (this is not
+    /// called densely enough to need memoizing).
+    fn is_affine(&self, ty: &Ty) -> bool {
+        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
+    }
+
+    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>, depth: usize) -> bool {
+        // For a `Ty::Applied` this is the *only* termination guard:
+        // `visiting` is keyed by bare `ItemId` and so cannot tell a
+        // genuine cycle apart from a legitimately nested instantiation
+        // of the same declaration -- `Box[Box[Box[File]]]` reaches
+        // `Box` three times with different arguments and must answer
+        // from the innermost one.
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
+        let item = match ty {
+            Ty::Named(item, _) => *item,
+            // A generic instantiation's own affinity depends on what it
+            // was instantiated *with* (`Box[File]` is affine, `Box[i64]`
+            // is not), so its own arguments are substituted into the
+            // declaration's field types before recursing -- never
+            // silently answered `false`, which would leave a
+            // `Box[File]` looking freely copyable at runtime.
+            Ty::Applied(item, args) => {
+                if self.is_resource(*item) {
+                    return true;
+                }
+                // Missing or arity-disagreeing generic metadata fails
+                // *closed*, to affine: an unsubstituted `Ty::Param`
+                // would answer `false` below and let a genuinely affine
+                // instantiation be treated as a freely-copyable value
+                // this stage never destroys -- the one direction that
+                // leaks rather than over-demands.
+                let Some(subst) = self.type_substitution(*item, args) else {
+                    return true;
+                };
+                return self.item_field_types(*item).iter().any(|fty| {
+                    self.is_affine_visiting(
+                        &crate::types::substitute(fty, &subst),
+                        visiting,
+                        depth + 1,
+                    )
+                });
+            }
+            _ => return false,
+        };
+        if self.is_resource(item) {
+            return true;
+        }
+        if !visiting.insert(item) {
+            return false;
+        }
+        let result = self
+            .item_field_types(item)
+            .iter()
+            .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
+        visiting.remove(&item);
+        result
+    }
+
+    /// `item`'s own declared type parameters paired with `args`, for
+    /// substituting a generic aggregate's own declared field types down
+    /// to this one instantiation's concrete shape (`rfcs/0008`).
+    /// `None` -- never a partial or empty map -- when `item` has no
+    /// recorded layout at all, or when its declared arity disagrees with
+    /// `args`: an unmapped `Ty::Param` would stay symbolic and answer
+    /// "not affine", which is the one direction that leaks.
+    fn type_substitution(
+        &self,
+        item: ItemId,
+        args: &[Ty],
+    ) -> Option<std::collections::HashMap<crate::hir::TypeParamId, Ty>> {
+        let params: Vec<crate::hir::TypeParamId> = self
+            .module
+            .records
+            .iter()
+            .find(|(id, _)| *id == item)
+            .map(|(_, r)| r.type_params.iter().map(|(id, _)| *id).collect())
+            .or_else(|| {
+                self.module
+                    .variants
+                    .iter()
+                    .find(|(id, _)| *id == item)
+                    .map(|(_, v)| v.type_params.iter().map(|(id, _)| *id).collect())
+            })?;
+        if params.len() != args.len() {
+            return None;
+        }
+        Some(params.into_iter().zip(args.iter().cloned()).collect())
+    }
+
+    /// `true` iff this *runtime* value is transitively affine -- what
+    /// makes it a legal structural `Drop` target (`rfcs/0012`).
+    /// Answered from the value's own dynamic item identity, never from
+    /// a static type this stage would otherwise have to be handed.
+    fn is_affine_value(&self, value: &Value) -> Result<bool, InterpreterError> {
+        let (item, type_args) = match value {
+            Value::Resource(_) => return Ok(true),
+            Value::Record {
+                item, type_args, ..
+            }
+            | Value::Variant {
+                item, type_args, ..
+            } => (*item, type_args),
+            _ => return Ok(false),
+        };
+        if self.is_resource(item) {
+            return Ok(true);
+        }
+        // Answered from this value's own *concrete* instantiation, not
+        // from its declaration: `Box`'s declared field is `Ty::Param(T)`
+        // and is affine for no instantiation at all, while `Box[File]`
+        // plainly owns a resource.
+        let subst = self.checked_substitution(item, type_args)?;
+        let mut visiting = HashSet::new();
+        Ok(self.item_field_types(item).iter().any(|fty| {
+            self.is_affine_visiting(&crate::types::substitute(fty, &subst), &mut visiting, 0)
+        }))
+    }
+
+    /// Reads or removes the value at `place`'s own final projection step
+    /// (`rfcs/0012`), recursing through zero or more `Value::Record`
+    /// ancestors it passes through on the way there and rebuilding each
+    /// one, then writing the rebuilt root back into `values[place.root]`
+    /// -- a plain record's own fields are held directly, by value, with
+    /// no separate addressable identity of their own -- but mutating a
+    /// `resource`'s own field storage in place, directly through the
+    /// resource table, the moment the walk passes through one, since a
+    /// resource's own fields are never held inline (`rfcs/0011`, Blocker
+    /// 8). `mode: Observe` never mutates anything at all (only ever
+    /// clones); `mode: Transfer` leaves a [`Value::Moved`] tombstone
+    /// behind at the exact field it removed.
+    fn access_place(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        place: &Place<ValueId>,
+        mode: OwnershipMode,
+    ) -> Result<Value, InterpreterError> {
+        let root_id = canonical_root(load_origin, place.root);
+        let place = &Place {
+            root: root_id,
+            projections: place.projections.clone(),
+        };
+        let root = get(values, &place.root)?;
+        match mode {
+            // Observing never writes anything back -- not the root, not
+            // any intermediate inline record, and not any intermediate
+            // resource's own field storage (`rfcs/0012`). Reading
+            // `outer.inner.file` must leave `outer` byte-for-byte as it
+            // was, however many `record`/`resource` layers alternate on
+            // the way there.
+            OwnershipMode::Observe => self.observe_projections(&root, &place.projections),
+            OwnershipMode::Transfer => {
+                let result = self.take_projections(root, &place.projections)?;
+                values.insert(place.root, result.container);
+                Ok(result.extracted)
+            }
+        }
+    }
+
+    /// Writes `value` into `place`'s own final projection step
+    /// (`rfcs/0012`, structural reinitialization) -- the write-only
+    /// counterpart of [`Self::access_place`]'s `Transfer` mode, sharing
+    /// its identical container-navigation logic.
+    /// Reinitializes `place` with the value `source` names, as a genuine
+    /// **ownership transfer** (`rfcs/0011`, `rfcs/0012`) -- what
+    /// `Instruction::StorePlace` actually means, as opposed to merely
+    /// copying a value into a field and leaving the original looking
+    /// like a current owner too.
+    ///
+    /// Runs in three strictly ordered phases so the whole operation is
+    /// transactional:
+    ///
+    /// 1. **Validate**, mutating nothing: the destination chain must be
+    ///    reachable and its final field provably empty, and every
+    ///    resource reachable through `source` must be a live, current,
+    ///    owning handle. A failure here leaves the source valid, the
+    ///    destination untouched, and no generation bumped.
+    /// 2. **Transfer**: every resource identity nested in `source` is
+    ///    transferred, which bumps its generation and makes every handle
+    ///    minted from the previous one stale. Phase 1 already proved
+    ///    each one transferable, so this cannot fail partway and leave
+    ///    some children transferred and others not.
+    /// 3. **Commit**: the transferred value is written into the place,
+    ///    and `source`'s own entry is tombstoned so a later read is a
+    ///    structured error rather than a stale handle that happens to
+    ///    look plausible. Both the exact id and the storage it
+    ///    canonicalizes to are tombstoned -- a `Load` result and the
+    ///    slot it read share one identity, exactly as `nir::verify`
+    ///    treats them.
+    ///
+    /// Self-aliasing is rejected up front: a store whose source is the
+    /// very storage its destination is rooted in would have to place an
+    /// aggregate inside itself.
+    fn store_place_transfer(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        place: &Place<ValueId>,
+        source: ValueId,
+    ) -> Result<(), InterpreterError> {
+        let root_id = canonical_root(load_origin, place.root);
+        let source_id = canonical_root(load_origin, source);
+        if source_id == root_id {
+            return Err(invalid(
+                "a structural store's own source and destination name the same storage",
+            ));
+        }
+        let root = get(values, &root_id)?;
+        let incoming = get(values, &source)?;
+
+        // Phase A -- validation and planning. Nothing below this point
+        // mutates anything, and the plan is complete before it does:
+        // every identity the source carries, the generation each one
+        // moves to, and the fully rebuilt value to install.
+        //
+        // The shape comes first: the planner reasons about declared
+        // types, so a value that disagrees with its own declaration --
+        // a resource standing where a primitive is declared, an
+        // instantiation that is not the one its position names -- must
+        // be refused before any of that reasoning is trusted.
+        self.validate_owned_graph(&incoming)?;
+        let mut plan = StorePlan::default();
+        let rebuilt = self.plan_transfer(&incoming, &mut plan)?;
+        self.validate_store_target(&root, &place.projections)?;
+        // The two ownership graphs must be disjoint, and both halves of
+        // that matter.
+        //
+        // An identity the destination is *traversed through* would be
+        // invalidated by the very transfer whose install has to reach
+        // through it -- and, since the source would then own it,
+        // becomes a cycle no destruction order can satisfy.
+        //
+        // An identity the destination merely *owns* somewhere else,
+        // off the traversal path, is equally fatal: installing the
+        // source would give one identity two owners inside one value.
+        // Neither is visible from the outer handles alone, which is why
+        // `plan.reachable` and this walk both go all the way down.
+        let mut destination = Vec::new();
+        self.destination_identities(&root, &place.projections, &mut destination)?;
+        let mut destination_owned = HashSet::new();
+        self.collect_owned_identities(&root, &mut destination_owned, 0)?;
+        destination_owned.extend(destination);
+        for id in destination_owned {
+            if plan.reachable.contains(&id) {
+                return Err(invalid(
+                    "a structural store's own source and destination share a resource identity",
+                ));
+            }
+        }
+
+        // Phase B -- commit. Every fallible question was already
+        // answered above, and the one remaining step that *returns* a
+        // `Result` runs first, deliberately: the install walks the exact
+        // chain `validate_store_target` just proved reachable and empty,
+        // and it touches only destination identities, which Phase A
+        // proved disjoint from everything moving. Running it before the
+        // generation transitions means no fallible step remains after a
+        // generation has changed -- so even a failure this cannot
+        // actually reach would leave every generation as it found it.
+        let updated_root = self.store_projections(root, &place.projections, rebuilt)?;
+        {
+            let mut table = self.resources.borrow_mut();
+            for (id, generation) in &plan.transitions {
+                table.records[id.0 as usize].generation = *generation;
+            }
+        }
+        values.insert(root_id, updated_root);
+        values.insert(source, Value::Moved);
+        values.insert(source_id, Value::Moved);
+        Ok(())
+    }
+
+    /// Proves `projections` reaches a field that may legally be
+    /// reinitialized, without mutating anything (`rfcs/0012`) -- the
+    /// read-only half of [`Self::store_place_transfer`]'s own phase 1.
+    /// Every intermediate must be a live container, and the final field
+    /// must already be a `Moved`/`Dropped` tombstone: reinitializing
+    /// over a live value would silently leak it.
+    fn validate_store_target(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+    ) -> Result<(), InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Err(invalid("a structural store names no field to reinitialize"));
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot reinitialize a field through a merely-observing resource handle",
+                    ));
+                }
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                if rest.is_empty() {
+                    if !matches!(inner, Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a resource field that still owns a live value",
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    self.validate_store_target(&inner, rest)
+                }
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                if rest.is_empty() {
+                    if !matches!(slot, Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a record field that still owns a live value",
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    self.validate_store_target(slot, rest)
+                }
+            }
+            Value::Moved => Err(invalid(
+                "a place reinitializes through a field that was already moved",
+            )),
+            Value::Dropped => Err(invalid(
+                "a place reinitializes through a field that was already dropped",
+            )),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// Takes a variant apart into one specific case, moving each claimed
+    /// payload position out of the shell that still holds it
+    /// (`rfcs/0012`).
+    ///
+    /// Validated completely before anything is written: the shell must
+    /// be a live variant value of the named declaration, currently in
+    /// the named case, every claimed position must exist, none may
+    /// already have moved, no position may be claimed twice, and every
+    /// value receiving a payload must be one this frame actually
+    /// computed. A failure therefore leaves the shell exactly as it was.
+    ///
+    /// The values receiving the payloads are *not* re-materialized here:
+    /// the preceding `VariantPayload` reads produced them, and the read
+    /// plus this transfer together are one move -- the read hands the
+    /// value over, this tombstones the storage so the shell can no
+    /// longer be said to own it too. Without it, a later structural
+    /// destruction of the shell would destroy what the arm now owns.
+    fn decompose_variant(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        value: ValueId,
+        variant: ItemId,
+        case: usize,
+        taken: &[(usize, ValueId)],
+    ) -> Result<(), InterpreterError> {
+        let shell_id = canonical_root(load_origin, value);
+        let shell = get(values, &shell_id)?;
+        let Value::Variant {
+            item,
+            type_args,
+            case: active_case,
+            mut payload,
+        } = shell
+        else {
+            return Err(invalid(
+                "a variant decomposition names a value that is not a variant",
+            ));
+        };
+        if item != variant {
+            return Err(invalid(
+                "a variant decomposition names a different variant than its own value holds",
+            ));
+        }
+        if active_case != case {
+            return Err(invalid(
+                "a variant decomposition names a case other than the one actually live",
+            ));
+        }
+        // The shell's own shape first: every claim below is checked
+        // against its declared payload types, so a shell that disagrees
+        // with its declaration must be refused before any of that is
+        // trusted.
+        self.validate_owned_graph(&Value::Variant {
+            item,
+            type_args: type_args.clone(),
+            case: active_case,
+            payload: payload.clone(),
+        })?;
+        // Phase 1 -- validate every claim before writing any of them, so
+        // a bad claim partway through cannot leave the shell with some
+        // positions moved and others not.
+        let mut seen: HashSet<usize> = HashSet::new();
+        for (index, owner) in taken {
+            if !values.contains_key(owner) {
+                return Err(invalid(
+                    "a variant decomposition hands a payload to a value this frame never computed",
+                ));
+            }
+            if !seen.insert(*index) {
+                return Err(invalid(
+                    "a variant decomposition claims the same payload position more than once",
+                ));
+            }
+            let Some(slot) = payload.get(*index) else {
+                return Err(invalid(
+                    "a variant decomposition claims a payload position out of range for its case",
+                ));
+            };
+            if matches!(slot, Value::Moved | Value::Dropped) {
+                return Err(invalid(
+                    "a variant decomposition claims a position whose ownership already moved",
+                ));
+            }
+            // The receiving value must be the value this position
+            // actually holds. A different value of the same shape would
+            // leave the real payload owned by nothing while this frame
+            // acquired an obligation for something it never received --
+            // and the shell would be tombstoned for a transfer that
+            // never happened.
+            let Some(receiver) = values.get(owner) else {
+                return Err(invalid(
+                    "a variant decomposition hands a payload to a value this frame never computed",
+                ));
+            };
+            if receiver != slot {
+                return Err(invalid(
+                    "a variant decomposition hands a payload position to a value that is not what \
+                     that position holds",
+                ));
+            }
+        }
+        // Phase 2 -- commit.
+        for (index, _) in taken {
+            payload[*index] = Value::Moved;
+        }
+        values.insert(
+            shell_id,
+            Value::Variant {
+                item,
+                type_args,
+                case: active_case,
+                payload,
+            },
+        );
+        Ok(())
+    }
+
+    /// Builds the complete transfer plan for `value` and returns the
+    /// value rebuilt around the handles it will own *after* the commit
+    /// (`rfcs/0011`, `rfcs/0012`) -- validating the whole graph without
+    /// mutating any of it.
+    ///
+    /// Validates, in one traversal: the declaration exists and its kind
+    /// matches the runtime value, generic type-argument arity resolves,
+    /// the runtime field/payload count equals the declared one, the
+    /// active variant case exists, every handle is a live current owner,
+    /// and no resource identity appears twice anywhere in the graph.
+    ///
+    /// That last check is why this exists at all. Validating values
+    /// recursively is not enough: a malformed graph carrying the *same*
+    /// identity in two positions passes a per-value check twice, because
+    /// each occurrence independently sees the one live handle. The
+    /// transfer then moves the first, and the second -- now stale --
+    /// fails partway through, leaving the runtime half-mutated with the
+    /// new owner unreachable. Collecting identities makes the duplicate
+    /// visible before anything moves.
+    ///
+    /// The post-transfer generation is *computed*, never applied, so
+    /// the rebuilt value can be constructed in full while the resource
+    /// table still holds its pre-transfer state.
+    fn plan_transfer(
+        &self,
+        value: &Value,
+        plan: &mut StorePlan,
+    ) -> Result<Value, InterpreterError> {
+        match value {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot transfer ownership through a merely-observing resource handle",
+                    ));
+                }
+                let table = self.resources.borrow();
+                let record = table.record(*handle)?;
+                if record.status == ResourceStatus::Dropped {
+                    return Err(invalid(
+                        "cannot transfer ownership of a resource that was already dropped",
+                    ));
+                }
+                if !plan.reachable.insert(handle.id) {
+                    return Err(invalid(
+                        "a structural store's own source carries the same resource identity more \
+                         than once",
+                    ));
+                }
+                let generation = record.generation + 1;
+                let nested = record.fields.clone();
+                drop(table);
+                plan.transitions.push((handle.id, generation));
+                // Everything this resource owns stays nested inside it:
+                // its generation does not change, but its identity is
+                // still part of the graph being moved, and must be
+                // visible to the duplicate, cycle and overlap checks.
+                for field in &nested {
+                    self.collect_owned_identities(field, &mut plan.reachable, 1)?;
+                }
+                Ok(Value::Resource(ResourceHandle {
+                    id: handle.id,
+                    generation,
+                    role: RuntimeOwnershipRole::Owner,
+                }))
+            }
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => {
+                let declared = self.record_field_types(*item, type_args)?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a structural store's own source record carries a field count its \
+                         declaration does not declare",
+                    ));
+                }
+                let rebuilt = fields
+                    .iter()
+                    .map(|field| self.plan_transfer(field, plan))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Record {
+                    item: *item,
+                    type_args: type_args.clone(),
+                    fields: rebuilt,
+                })
+            }
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => {
+                let declared = self.case_payload_types(*item, type_args, *case)?;
+                if declared.len() != payload.len() {
+                    return Err(invalid(
+                        "a structural store's own source variant carries a payload count its \
+                         active case does not declare",
+                    ));
+                }
+                let rebuilt = payload
+                    .iter()
+                    .map(|field| self.plan_transfer(field, plan))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Variant {
+                    item: *item,
+                    type_args: type_args.clone(),
+                    case: *case,
+                    payload: rebuilt,
+                })
+            }
+            Value::Moved => Err(invalid("transfer of a value that was already moved")),
+            Value::Dropped => Err(invalid("transfer of a value that was already destroyed")),
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Every resource identity `value` owns, however deeply, including
+    /// the ones held inside a resource's own `ResourceRecord` rather
+    /// than inline (`rfcs/0012`).
+    ///
+    /// This is the half a value-only walk cannot see. A `Session` value
+    /// is one handle; the `File` it owns lives in the resource table,
+    /// so stopping at the handle hides a child duplicated between the
+    /// session and its own container, a child the destination is
+    /// reached through, and any ownership cycle.
+    ///
+    /// An identity reached twice is refused outright: within one graph
+    /// that is either a duplicate -- one identity with two owners -- or
+    /// a cycle, and it is also what makes this walk terminate.
+    fn collect_owned_identities(
+        &self,
+        value: &Value,
+        out: &mut HashSet<ResourceId>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime ownership graph is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => {
+                if !out.insert(handle.id) {
+                    return Err(invalid(
+                        "a runtime ownership graph reaches the same resource identity twice, \
+                         either duplicated or through a cycle",
+                    ));
+                }
+                let nested = {
+                    let table = self.resources.borrow();
+                    table.record(*handle)?.fields.clone()
+                };
+                for field in &nested {
+                    self.collect_owned_identities(field, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.collect_owned_identities(field, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.collect_owned_identities(slot, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Every resource identity the *destination* traversal has to reach
+    /// through, in deterministic order (`rfcs/0012`) -- the root itself
+    /// when it is resource-backed, and every intermediate the
+    /// projections pass through. Never the final field being written,
+    /// which holds a tombstone by the time this runs.
+    ///
+    /// Compared against the source's own identities so a store can never
+    /// invalidate the very handle the install has to reach through.
+    fn destination_identities(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+        out: &mut Vec<ResourceId>,
+    ) -> Result<(), InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(());
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                out.push(handle.id);
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                self.destination_identities(&inner, rest, out)
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                self.destination_identities(slot, rest, out)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Reads the value at `projections`' own final step out of
+    /// `container` without mutating anything at all, at any depth
+    /// (`rfcs/0012`): no ancestor is tombstoned, no inline record is
+    /// rebuilt, and no resource's own field storage is written -- an
+    /// observation is a pure read, whatever mixture of inline `Record`
+    /// and resource-table-backed `Resource` containers it passes
+    /// through on the way. Cloning an intermediate is always safe here:
+    /// a `Value::Resource` carries only a cheap `(id, generation, role)`
+    /// handle, never the resource's own identity or data, and observing
+    /// never bumps a generation.
+    fn observe_projections(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+    ) -> Result<Value, InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(container.clone());
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                let inner = self.resources.borrow().observe_field(*handle, index)?;
+                self.observe_projections(&inner, rest)
+            }
+            Value::Record { fields, .. } => {
+                let slot = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                self.observe_projections(slot, rest)
+            }
+            Value::Moved => Err(invalid("use of a field after it was already moved")),
+            Value::Dropped => Err(invalid("use of a field after it was already dropped")),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// Removes the value at `projections`' own final step out of
+    /// `container`, tombstoning **only** that one final field and
+    /// returning the container itself for its own caller to reinsert
+    /// (`rfcs/0012`).
+    ///
+    /// Every intermediate is preserved, whichever kind it is: an inline
+    /// `Record` is handed back rebuilt (with its own descendant's
+    /// updated state in place), and a `Resource` is handed back as the
+    /// very same handle, with the update already applied directly to
+    /// its own field storage through [`ResourceTable::restore_field`]
+    /// -- never through the user-facing `set_field`, which would
+    /// (correctly, for its own purpose) reject the still-live
+    /// intermediate as an overwrite.
+    ///
+    /// Transactional: the recursion runs to completion on a *clone* of
+    /// the intermediate before anything is written back, so a failure
+    /// deeper in the chain leaves every container on the path exactly
+    /// as it was rather than half-mutated.
+    fn take_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+    ) -> Result<AccessResult, InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            // A zero-projection place is the whole root value itself:
+            // there is no container above it to tombstone a field in,
+            // and `nir::verify` tracks a bare root through its own
+            // whole-value ownership lattice rather than this one.
+            return Ok(AccessResult {
+                extracted: container.clone(),
+                container,
+            });
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                if rest.is_empty() {
+                    let extracted = self.resources.borrow_mut().take_field(handle, index)?;
+                    if matches!(extracted, Value::Moved | Value::Dropped) {
+                        // Put the tombstone back exactly as it was:
+                        // this took nothing, and must not look like it
+                        // did.
+                        self.resources
+                            .borrow_mut()
+                            .restore_field(handle, index, extracted)?;
+                        return Err(invalid(
+                            "transfer of a resource field that was already moved or dropped",
+                        ));
+                    }
+                    Ok(AccessResult {
+                        extracted,
+                        container: Value::Resource(handle),
+                    })
+                } else {
+                    let inner = self.resources.borrow().observe_field(handle, index)?;
+                    let inner = self.take_projections(inner, rest)?;
+                    self.resources
+                        .borrow_mut()
+                        .restore_field(handle, index, inner.container)?;
+                    Ok(AccessResult {
+                        extracted: inner.extracted,
+                        container: Value::Resource(handle),
+                    })
+                }
+            }
+            Value::Record {
+                item,
+                type_args,
+                mut fields,
+            } => {
+                if fields.len() <= index {
+                    return Err(invalid(
+                        "a place projects a field index out of range for this record",
+                    ));
+                }
+                if rest.is_empty() {
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "transfer of a record field that was already moved or dropped",
+                        ));
+                    }
+                    let extracted = std::mem::replace(&mut fields[index], Value::Moved);
+                    Ok(AccessResult {
+                        extracted,
+                        container: Value::Record {
+                            item,
+                            type_args,
+                            fields,
+                        },
+                    })
+                } else {
+                    let inner = self.take_projections(fields[index].clone(), rest)?;
+                    fields[index] = inner.container;
+                    Ok(AccessResult {
+                        extracted: inner.extracted,
+                        container: Value::Record {
+                            item,
+                            type_args,
+                            fields,
+                        },
+                    })
+                }
+            }
+            Value::Moved => Err(invalid("use of a field after it was already moved")),
+            Value::Dropped => Err(invalid("use of a field after it was already dropped")),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    /// One projection step's own field index, rejecting the
+    /// `VariantField` shape this milestone's runtime never produces
+    /// (a variant payload is only ever reached through a
+    /// `ValueKind::VariantPayload` extraction on its own case-refined
+    /// edge, never through a `Place`).
+    fn projection_index(projection: &Projection) -> Result<usize, InterpreterError> {
+        match projection {
+            Projection::Field { field, .. } => Ok(field.0 as usize),
+            Projection::VariantField { .. } => Err(invalid(
+                "a place projects through a variant field, which this milestone's runtime never \
+                 produces",
+            )),
+        }
+    }
+
+    /// The write-only counterpart of [`Self::access_projections`]:
+    /// navigates the same way, but only ever replaces the final field's
+    /// own tombstone with `value` (`rfcs/0012`), rather than reading or
+    /// removing anything.
+    fn store_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+        value: Value,
+    ) -> Result<Value, InterpreterError> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(value);
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                if rest.is_empty() {
+                    // The one genuine reinitialization in this whole
+                    // walk: the *final* step, which really must find a
+                    // provably-empty slot (`rfcs/0012`).
+                    self.resources
+                        .borrow_mut()
+                        .set_field(handle, index, value)?;
+                } else {
+                    // An *intermediate* resource field is still live by
+                    // construction -- this walk only reached deeper
+                    // through it -- so it goes back through the
+                    // internal `restore_field`, never `set_field`,
+                    // which would reject it as a live overwrite.
+                    let inner = self.resources.borrow().observe_field(handle, index)?;
+                    let updated_inner = self.store_projections(inner, rest, value)?;
+                    self.resources
+                        .borrow_mut()
+                        .restore_field(handle, index, updated_inner)?;
+                }
+                Ok(Value::Resource(handle))
+            }
+            Value::Record {
+                item,
+                type_args,
+                mut fields,
+            } => {
+                if fields.len() <= index {
+                    return Err(invalid(
+                        "a place projects a field index out of range for this record",
+                    ));
+                }
+                if rest.is_empty() {
+                    if !matches!(fields[index], Value::Moved | Value::Dropped) {
+                        return Err(invalid(
+                            "cannot overwrite a record field that still owns a live value",
+                        ));
+                    }
+                    fields[index] = value;
+                } else {
+                    // Recurse on a clone and only write back once it
+                    // succeeded, exactly like `take_projections`: a
+                    // failure deeper in the chain must never leave this
+                    // record holding a `Moved` tombstone where a live
+                    // intermediate used to be.
+                    fields[index] = self.store_projections(fields[index].clone(), rest, value)?;
+                }
+                Ok(Value::Record {
+                    item,
+                    type_args,
+                    fields,
+                })
+            }
+            Value::Moved => Err(invalid(
+                "a place reinitializes through a field that was already moved",
+            )),
+            Value::Dropped => Err(invalid(
+                "a place reinitializes through a field that was already dropped",
+            )),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    /// Checks that `value` really is an inhabitant of the type its
+    /// position declares, all the way down (`rfcs/0008`, `rfcs/0011`,
+    /// `rfcs/0012`) -- mutating nothing.
+    ///
+    /// Counting fields and type arguments is not enough, and neither is
+    /// looking only at positions whose *declared* type is affine. A
+    /// `Wrapper` whose one declared field is `i64` but whose runtime
+    /// slot holds a live `Resource` passed every count-based check, and
+    /// destroying it left that resource alive and unreachable, because
+    /// the non-affine position was never looked at.
+    ///
+    /// `expected` is `None` only for the root of a graph: the root
+    /// declares its own identity and has no enclosing position to
+    /// disagree with. Every position below it is checked against the
+    /// declaration, never against the value's own claim.
+    ///
+    /// `seen` carries every resource identity already reached, so one
+    /// identity occurring twice -- including a resource reachable from
+    /// itself -- is refused rather than destroyed twice or walked
+    /// forever.
+    fn validate_value_against_ty(
+        &self,
+        value: &Value,
+        expected: Option<&Ty>,
+        seen: &mut HashSet<ResourceId>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
+        // A tombstone stands where ownership *was*. A position that
+        // never owned anything has nothing that could have moved out of
+        // it, so a tombstone there is a malformed value, not an empty
+        // one.
+        if matches!(value, Value::Moved | Value::Dropped) {
+            return match expected {
+                Some(ty) if self.is_affine(ty) => Ok(()),
+                Some(_) => Err(invalid(
+                    "a runtime tombstone stands in a position whose declared type owns nothing",
+                )),
+                None => Ok(()),
+            };
+        }
+        let primitive_ok = |matches: bool| -> Result<(), InterpreterError> {
+            if matches {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "a runtime value is of a different kind than its position declares",
+                ))
+            }
+        };
+        match value {
+            Value::Int(_) => primitive_ok(matches!(
+                expected,
+                None | Some(
+                    Ty::I8
+                        | Ty::I16
+                        | Ty::I32
+                        | Ty::I64
+                        | Ty::Isize
+                        | Ty::U8
+                        | Ty::U16
+                        | Ty::U32
+                        | Ty::U64
+                        | Ty::Usize
+                )
+            )),
+            Value::Float(_) => primitive_ok(matches!(expected, None | Some(Ty::F32 | Ty::F64))),
+            Value::Bool(_) => primitive_ok(matches!(expected, None | Some(Ty::Bool))),
+            Value::Char(_) => primitive_ok(matches!(expected, None | Some(Ty::Char))),
+            Value::Str(_) => primitive_ok(matches!(expected, None | Some(Ty::Str))),
+            Value::Unit => primitive_ok(matches!(expected, None | Some(Ty::Unit))),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => {
+                if let Some((declared_item, declared_args)) = required_declaration(expected)?
+                    && (declared_item != *item || declared_args != *type_args)
+                {
+                    return Err(invalid(
+                        "a runtime record names a different declaration or instantiation than its \
+                         position declares",
+                    ));
+                }
+                // A declared `resource` never lives inline: it is
+                // constructed into the resource table and stands as a
+                // handle, so an inline record claiming to be one is
+                // malformed.
+                if self.is_resource(*item) {
+                    return Err(invalid(
+                        "a runtime record value claims a declaration that is a `resource`, which \
+                         is only ever represented by a handle",
+                    ));
+                }
+                let declared = self.record_field_types(*item, type_args)?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime record value's own field count disagrees with its declaration",
+                    ));
+                }
+                for (field, field_ty) in fields.iter().zip(declared.iter()) {
+                    self.validate_value_against_ty(field, Some(field_ty), seen, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => {
+                if let Some((declared_item, declared_args)) = required_declaration(expected)?
+                    && (declared_item != *item || declared_args != *type_args)
+                {
+                    return Err(invalid(
+                        "a runtime variant names a different declaration or instantiation than \
+                         its position declares",
+                    ));
+                }
+                let declared = self.case_payload_types(*item, type_args, *case)?;
+                if declared.len() != payload.len() {
+                    return Err(invalid(
+                        "a runtime variant value's own payload count disagrees with its active \
+                         case's declaration",
+                    ));
+                }
+                for (slot, slot_ty) in payload.iter().zip(declared.iter()) {
+                    self.validate_value_against_ty(slot, Some(slot_ty), seen, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Resource(handle) => {
+                let (item, fields) = {
+                    let table = self.resources.borrow();
+                    let record = table.record(*handle)?;
+                    (record.item, record.fields.clone())
+                };
+                if let Some((declared_item, declared_args)) = required_declaration(expected)?
+                    && (declared_item != item || !declared_args.is_empty())
+                {
+                    return Err(invalid(
+                        "a runtime resource handle names a different declaration than its \
+                         position declares",
+                    ));
+                }
+                // One identity reached twice is either a duplicate --
+                // which would be destroyed or transferred twice -- or a
+                // cycle, which no destruction order can satisfy.
+                if !seen.insert(handle.id) {
+                    return Err(invalid(
+                        "a runtime value graph reaches the same resource identity twice, either \
+                         duplicated or through a cycle",
+                    ));
+                }
+                let declared = self.record_field_types(item, &[])?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime resource's own field count disagrees with its declaration",
+                    ));
+                }
+                for (field, field_ty) in fields.iter().zip(declared.iter()) {
+                    self.validate_value_against_ty(field, Some(field_ty), seen, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Moved | Value::Dropped => Ok(()),
+        }
+    }
+
+    /// Validates a whole owned graph from its root, which declares its
+    /// own identity (`rfcs/0012`). Every ownership operation runs this
+    /// before it plans anything, so no operation ever trusts the shape
+    /// of the Rust enum it was handed.
+    fn validate_owned_graph(&self, value: &Value) -> Result<(), InterpreterError> {
+        let mut seen = HashSet::new();
+        self.validate_value_against_ty(value, None, &mut seen, 0)
+    }
+
+    /// Recursively destroys `value` (`rfcs/0012`): a `resource` handle
+    /// goes through the ordinary resource table drop; a plain, still-
+    /// affine `Variant`'s own *active* case is walked to destroy every
+    /// one of its own live affine payload fields, exactly the "only the
+    /// active case is destroyed" rule `rfcs/0012` specifies -- the one
+    /// case `resourceck`'s own compile-time cleanup planning cannot
+    /// expand into individual per-field `Drop` actions itself, since
+    /// which case is live is not known until runtime (see
+    /// `resourceck::flow::FlowChecker::structural_drop_targets`'s own
+    /// doc comment on `variant_items`). A plain, non-affine value (or
+    /// one already `Moved`/`Dropped`) is left untouched -- the caller is
+    /// responsible for only ever calling this on something it already
+    /// knows is still live.
+    /// Destroys `value` and everything it still owns (`rfcs/0012`), as a
+    /// transaction: the complete destruction graph is validated and
+    /// ordered *before* any resource status changes or any event is
+    /// emitted, so a malformed graph changes nothing at all.
+    ///
+    /// The earlier implementation looked each field's declared type up
+    /// with `get(index)` and skipped past a miss, which let a value
+    /// carrying an extra runtime field have its outer resource destroyed
+    /// while a live resource in that extra field leaked -- reported as
+    /// success. Nothing is ever skipped now: a shape that disagrees with
+    /// its declaration is an error.
+    fn drop_value(&self, value: Value) -> Result<(), InterpreterError> {
+        // Phase A0 -- the shape itself, before anything is planned. The
+        // planner below looks only at positions whose *declared* type
+        // is affine; this looks at every position, so a live resource
+        // sitting where an `i64` is declared is refused rather than
+        // walked past and left unreachable.
+        self.validate_owned_graph(&value)?;
+        let mut plan = Vec::new();
+        let mut seen = HashSet::new();
+        self.plan_drop(&value, &mut seen, &mut plan, 0)?;
+        // Phase B: every question was answered above, so this cannot
+        // fail partway and leave the graph half-destroyed.
+        for handle in plan {
+            self.resources.borrow_mut().drop_resource(handle)?;
+            #[cfg(test)]
+            self.event_log
+                .borrow_mut()
+                .push(format!("drop:{}", handle.id.0));
+        }
+        Ok(())
+    }
+
+    /// Validates the complete destruction graph reachable through
+    /// `value` and appends every resource identity to `plan` in the
+    /// exact order it must be destroyed (`rfcs/0012`) -- mutating
+    /// nothing.
+    ///
+    /// Validates at every level: the declaration exists and its kind
+    /// matches the runtime value, generic type-argument arity resolves,
+    /// the runtime field count equals the declared field count, the
+    /// active variant case exists with the exact declared payload count,
+    /// every handle is a live current owner, and no resource identity
+    /// appears twice anywhere in the graph -- which alone would make one
+    /// identity destroyed twice.
+    ///
+    /// Order is deterministic and is the destruction order itself: a
+    /// value's own live affine fields in *reverse* declaration order,
+    /// each fully expanded first, and a declared `resource`'s own outer
+    /// identity after all of its remaining children. Only the active
+    /// case of a variant is ever visited.
+    fn plan_drop(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        plan: &mut Vec<ResourceHandle>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a destruction graph is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return Err(invalid(
+                        "cannot drop a resource through a merely-observing resource handle",
+                    ));
+                }
+                if !seen.insert(handle.id) {
+                    return Err(invalid(
+                        "a destruction graph reaches the same resource identity twice",
+                    ));
+                }
+                let (item, fields) = {
+                    let table = self.resources.borrow();
+                    // Rejects a stale handle and an already-dropped
+                    // record alike, before anything is planned.
+                    let record = table.observe(*handle)?;
+                    (record.item, record.fields.clone())
+                };
+                let declared = self.record_field_types(item, &[])?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime resource's own field count disagrees with its declaration",
+                    ));
+                }
+                for index in (0..fields.len()).rev() {
+                    if !self.is_affine(&declared[index]) {
+                        continue;
+                    }
+                    // A child this frame's own NIR already destroyed or
+                    // moved out is not this graph's to destroy.
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    self.plan_drop(&fields[index], seen, plan, depth + 1)?;
+                }
+                // The outer identity goes last: after every child it
+                // delegates to has been accounted for.
+                plan.push(*handle);
+                Ok(())
+            }
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => {
+                let declared = self.record_field_types(*item, type_args)?;
+                if declared.len() != fields.len() {
+                    return Err(invalid(
+                        "a runtime record value's own field count disagrees with its declaration",
+                    ));
+                }
+                for index in (0..fields.len()).rev() {
+                    if !self.is_affine(&declared[index]) {
+                        continue;
+                    }
+                    if matches!(fields[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    self.plan_drop(&fields[index], seen, plan, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => {
+                // Only the active case: a case that was never
+                // constructed owns nothing.
+                let declared = self.case_payload_types(*item, type_args, *case)?;
+                if declared.len() != payload.len() {
+                    return Err(invalid(
+                        "a runtime variant value's own payload count disagrees with its active \
+                         case's declaration",
+                    ));
+                }
+                for index in (0..payload.len()).rev() {
+                    if !self.is_affine(&declared[index]) {
+                        continue;
+                    }
+                    if matches!(payload[index], Value::Moved | Value::Dropped) {
+                        continue;
+                    }
+                    self.plan_drop(&payload[index], seen, plan, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Moved => Err(invalid("drop of a field that was already moved")),
+            Value::Dropped => Err(invalid("double drop: this value was already destroyed")),
+            other => Err(invalid(format!(
+                "drop of a non-affine value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// Every field type of the declared record/`resource` `item`, or
+    /// every payload type of the variant `item` flattened across its own
+    /// cases, in declaration order -- empty for an unknown item. Read
+    /// straight off this module's own layouts rather than re-derived.
+    fn item_field_types(&self, item: ItemId) -> Vec<Ty> {
+        if let Some((_, record)) = self.module.records.iter().find(|(id, _)| *id == item) {
+            return record.fields.iter().map(|(_, t)| t.clone()).collect();
+        }
+        if let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item) {
+            return variant
+                .cases
+                .iter()
+                .flat_map(|c| c.payload.clone())
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// `item`'s own declared field types with `type_args` substituted
+    /// in, in declaration order (`rfcs/0008`, `rfcs/0012`) -- what a
+    /// runtime value's own fields *actually* are at this instantiation,
+    /// as opposed to the symbolic `Ty::Param` its declaration was
+    /// written with.
+    ///
+    /// Errors -- never an empty or partial list -- when `item` has no
+    /// recorded layout or when its declared arity disagrees with
+    /// `type_args`: destroying an aggregate from a substitution nobody
+    /// could build would skip exactly the fields whose types went
+    /// missing.
+    fn record_field_types(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+    ) -> Result<Vec<Ty>, InterpreterError> {
+        let Some((_, record)) = self.module.records.iter().find(|(id, _)| *id == item) else {
+            return Err(invalid(
+                "a runtime aggregate names a record this module never declared",
+            ));
+        };
+        let subst = self.checked_substitution(item, type_args)?;
+        Ok(record
+            .fields
+            .iter()
+            .map(|(_, t)| crate::types::substitute(t, &subst))
+            .collect())
+    }
+
+    /// `item`'s own declared payload types for `case`, with `type_args`
+    /// substituted in (`rfcs/0008`, `rfcs/0012`) -- only the *active*
+    /// case, never the flattened cross-case list: a case that was never
+    /// constructed owns nothing.
+    fn case_payload_types(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+        case: usize,
+    ) -> Result<Vec<Ty>, InterpreterError> {
+        let Some((_, variant)) = self.module.variants.iter().find(|(id, _)| *id == item) else {
+            return Err(invalid(
+                "a runtime aggregate names a variant this module never declared",
+            ));
+        };
+        let Some(layout) = variant.cases.get(case) else {
+            return Err(invalid(
+                "a runtime variant value names a case out of range for its own declaration",
+            ));
+        };
+        let subst = self.checked_substitution(item, type_args)?;
+        Ok(layout
+            .payload
+            .iter()
+            .map(|t| crate::types::substitute(t, &subst))
+            .collect())
+    }
+
+    /// [`Self::type_substitution`] as a hard requirement: a structured,
+    /// deterministic error rather than an `Option` the caller might be
+    /// tempted to paper over with a default.
+    fn checked_substitution(
+        &self,
+        item: ItemId,
+        type_args: &[Ty],
+    ) -> Result<std::collections::HashMap<crate::hir::TypeParamId, Ty>, InterpreterError> {
+        self.type_substitution(item, type_args).ok_or_else(|| {
+            invalid(
+                "a runtime aggregate carries type arguments that disagree with its own \
+                 declaration's parameter list",
+            )
+        })
+    }
+
+    /// Transfers ownership of `value` if it is a resource (Blocker 8),
+    /// recursing into a plain `Record`/`Variant`'s own fields/payload to
+    /// transfer any resource nested inside *those* too (`rfcs/0012`) --
+    /// without this, constructing a new aggregate from an existing
+    /// resource value would leave the *source* `ValueId`'s own cached
+    /// copy holding a handle whose generation was never bumped, so it
+    /// would still look like a live, undestroyed obligation of this
+    /// frame's own to `leaked_resource`, even once the resource is only
+    /// really reachable through the new aggregate now. A no-op for a
+    /// non-affine leaf. Shared by every place ownership genuinely
+    /// crosses a boundary: a `take` argument's own transfer *into* a
+    /// call, a returned value's own transfer back *out* of one, and a
+    /// `record.create`/`variant.create`'s own field/payload arguments
+    /// (`resourceck`/`nir::verify` already require every one of those to
+    /// be an unconditional transfer, mirrored here).
     fn transfer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
         match value {
             Value::Resource(handle) => Ok(Value::Resource(
                 self.resources.borrow_mut().transfer(handle)?,
             )),
+            // A transfer rebuilds the aggregate around freshly-generated
+            // handles, so it must carry this value's own type arguments
+            // across unchanged: an ownership transfer is not the place
+            // a `Box[File]` quietly becomes a `Box[T]`.
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|f| self.transfer_if_resource(f))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|f| self.transfer_if_resource(f))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             other => Ok(other),
         }
     }
@@ -324,10 +1947,57 @@ impl<'a> Interpreter<'a> {
     /// parameter binding, and every `store.observe`, goes through this
     /// rather than binding the caller's own handle as-is.
     fn to_observer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
+        self.to_observing_view(value, 0)
+    }
+
+    /// Rebuilds `value` as an observing *view* of itself: every resource
+    /// handle it carries, at any depth, becomes an `Observer`
+    /// (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Observation is transitive. Downgrading only a bare
+    /// `Value::Resource` left every handle inside a `Record` or a
+    /// `Variant` owning, so a `Box[File]` bound to an ordinary parameter
+    /// handed the callee full owning access to the `File` the caller
+    /// still owned.
+    ///
+    /// Nothing is mutated: a new value is built, and the caller's own
+    /// keeps its owning handles.
+    fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
         match value {
             Value::Resource(handle) => Ok(Value::Resource(
                 self.resources.borrow().to_observer(handle)?,
             )),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|field| self.to_observing_view(field, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|slot| self.to_observing_view(slot, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             other => Ok(other),
         }
     }
@@ -356,26 +2026,79 @@ impl<'a> Interpreter<'a> {
         values: &HashMap<ValueId, Value>,
         observing_params: &HashSet<ValueId>,
     ) -> Option<ValueId> {
-        let resources = self.resources.borrow();
-        let mut leaked: Vec<ValueId> = values
+        // Sorted first, so the *lowest* `ValueId` still owning anything
+        // is the one reported no matter what order the map iterates in.
+        let mut candidates: Vec<(&ValueId, &Value)> = values
             .iter()
             .filter(|(id, _)| !observing_params.contains(id))
-            .filter_map(|(id, value)| match value {
-                // A merely-observing handle never counts as owned here
-                // regardless of `observing_params` -- which only ever
-                // lists this frame's own *parameters* -- since a value
-                // downgraded mid-function (`store.observe`) is exactly
-                // as much a non-owner as an ordinary parameter is.
-                Value::Resource(handle) if handle.role == RuntimeOwnershipRole::Owner => resources
-                    .record(*handle)
-                    .ok()
-                    .filter(|record| record.status == ResourceStatus::Alive)
-                    .map(|_| *id),
-                _ => None,
-            })
             .collect();
-        leaked.sort();
-        leaked.into_iter().next()
+        candidates.sort_by_key(|(id, _)| **id);
+        for (id, value) in candidates {
+            let mut seen = HashSet::new();
+            if self.owns_a_live_resource(value, &mut seen, 0) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// Whether `value` still owns any live resource, however deeply
+    /// (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Looking only at a bare `Value::Resource` missed every nested one:
+    /// a `Box[File]` built inside a branch and abandoned there carries
+    /// its owner handle one level down, and the frame exited reporting
+    /// nothing. Records, variants, generic instantiations and a
+    /// resource's own `ResourceRecord` fields are all walked.
+    ///
+    /// A merely-observing handle never counts: this frame never owned
+    /// what it points at. `seen` bounds the walk, so a duplicated
+    /// identity is visited once and a cycle terminates; `depth` bounds
+    /// it again for inline nesting, which carries no identity to record.
+    ///
+    /// This is a backstop for malformed NIR, not a replacement for
+    /// `nir::verify`'s own static answer.
+    fn owns_a_live_resource(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        depth: usize,
+    ) -> bool {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return false;
+                }
+                if !seen.insert(handle.id) {
+                    return false;
+                }
+                let nested = {
+                    let resources = self.resources.borrow();
+                    match resources.record(*handle) {
+                        Ok(record) if record.status == ResourceStatus::Alive => {
+                            return true;
+                        }
+                        // Stale or already destroyed: this handle owns
+                        // nothing, but a record it still names may.
+                        Ok(record) => record.fields.clone(),
+                        Err(_) => return false,
+                    }
+                };
+                nested
+                    .iter()
+                    .any(|field| self.owns_a_live_resource(field, seen, depth + 1))
+            }
+            Value::Record { fields, .. } => fields
+                .iter()
+                .any(|field| self.owns_a_live_resource(field, seen, depth + 1)),
+            Value::Variant { payload, .. } => payload
+                .iter()
+                .any(|slot| self.owns_a_live_resource(slot, seen, depth + 1)),
+            _ => false,
+        }
     }
 
     /// Calls the function named `name` with no arguments — the shape of
@@ -485,6 +2208,22 @@ impl<'a> Interpreter<'a> {
             .filter(|p| !p.take)
             .map(|p| p.value)
             .collect();
+        // Every `Load`'s own result paired with the slot it reads --
+        // see `canonical_root`. Built once per frame from the whole
+        // function, exactly like `nir::verify` builds its own.
+        let load_origin: HashMap<ValueId, ValueId> = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                crate::nir::Instruction::Value {
+                    result,
+                    kind: ValueKind::Load(slot),
+                    ..
+                } => Some((*result, *slot)),
+                _ => None,
+            })
+            .collect();
         let mut values: HashMap<ValueId, Value> = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
             // A `take` parameter transfers ownership into this call
@@ -525,8 +2264,35 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, kind, .. } => {
-                        let value = self.eval(kind, &values, &evidence)?;
+                        let value = if let ValueKind::PlaceRead { place, mode } = kind {
+                            self.access_place(&mut values, &load_origin, place, *mode)?
+                        } else {
+                            self.eval(kind, &values, &evidence)?
+                        };
                         values.insert(*result, value);
+                    }
+                    // Ownership of one active case's payload position
+                    // genuinely moves out of the shell here
+                    // (`rfcs/0012`): the slot it came from is
+                    // tombstoned, so a later structural destruction of
+                    // the shell skips it instead of destroying what the
+                    // arm now owns, and a second transfer of the same
+                    // position is a structured error rather than a
+                    // silent duplicate owner.
+                    crate::nir::Instruction::DecomposeVariant {
+                        value,
+                        variant,
+                        case,
+                        taken,
+                    } => {
+                        self.decompose_variant(
+                            &mut values,
+                            &load_origin,
+                            *value,
+                            *variant,
+                            *case,
+                            taken,
+                        )?;
                     }
                     crate::nir::Instruction::Store { slot, value, mode } => {
                         let v = get(&values, value)?;
@@ -562,22 +2328,34 @@ impl<'a> Interpreter<'a> {
                         // the same underlying record (not just the same
                         // `ValueId`) is independently caught here too,
                         // never silently treated as a fresh drop.
+                        // Every *transitively affine* value is a legal
+                        // structural drop target (`rfcs/0012`), not
+                        // just a declared `resource` or a variant: an
+                        // ordinary `record` carrying an affine field
+                        // owns real resources too, and silently
+                        // accepting it as a no-op leaked them.
                         match get(&values, value)? {
-                            Value::Resource(handle) => {
-                                self.resources.borrow_mut().drop_resource(handle)?;
-                                #[cfg(test)]
-                                self.event_log
-                                    .borrow_mut()
-                                    .push(format!("drop:{}", handle.id.0));
+                            v @ Value::Resource(_) => self.drop_value(v)?,
+                            v @ (Value::Record { .. } | Value::Variant { .. })
+                                if self.is_affine_value(&v)? =>
+                            {
+                                self.drop_value(v)?
                             }
                             other => {
                                 return Err(invalid(format!(
-                                    "drop of a non-resource value ({})",
+                                    "drop of a non-affine value ({})",
                                     kind_name(&other)
                                 )));
                             }
                         }
                         values.remove(value);
+                    }
+                    crate::nir::Instruction::StorePlace { place, value } => {
+                        // A structural reinitialization *transfers*
+                        // ownership into the place (`rfcs/0012`): the
+                        // source is consumed here, not copied, so it
+                        // must not go on looking like a current owner.
+                        self.store_place_transfer(&mut values, &load_origin, place, *value)?;
                     }
                 }
             }
@@ -721,6 +2499,15 @@ impl<'a> Interpreter<'a> {
             // place -- defended here too, rather than trusted blindly.
             ValueKind::Move { source } => self.transfer_if_resource(get(values, source)?),
             ValueKind::DeferCapture { source } => self.transfer_if_resource(get(values, source)?),
+            // Always intercepted by `call_function`'s own instruction
+            // loop before `eval` is ever reached (`rfcs/0012`): unlike
+            // every other `ValueKind`, a place read may need to *mutate*
+            // `values` itself (writing back a rebuilt container after a
+            // `Transfer`), which this method's own `&HashMap` (not
+            // `&mut`) signature cannot do.
+            ValueKind::PlaceRead { .. } => Err(invalid(
+                "ValueKind::PlaceRead must be evaluated by call_function directly, never through eval",
+            )),
             ValueKind::Add(a, b) => arith(
                 get(values, a)?,
                 get(values, b)?,
@@ -862,10 +2649,10 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
-            ValueKind::RecordCreate(item, _type_args, field_ids) => {
+            ValueKind::RecordCreate(item, type_args, field_ids) => {
                 let fields = field_ids
                     .iter()
-                    .map(|id| get(values, id))
+                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
                     .collect::<Result<Vec<_>, _>>()?;
                 // A `resource` gets its own unique runtime identity
                 // (Blocker 8) rather than being represented inline the
@@ -880,6 +2667,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Ok(Value::Record {
                         item: *item,
+                        type_args: type_args.clone(),
                         fields,
                     })
                 }
@@ -889,7 +2677,7 @@ impl<'a> Interpreter<'a> {
                 record,
                 field,
             } => match get(values, base)? {
-                Value::Record { item, fields } if item == *record => fields
+                Value::Record { item, fields, .. } if item == *record => fields
                     .get(*field)
                     .cloned()
                     .ok_or_else(|| invalid("record field index out of range")),
@@ -914,15 +2702,16 @@ impl<'a> Interpreter<'a> {
             ValueKind::VariantCreate {
                 variant,
                 case,
-                type_args: _,
+                type_args,
                 payload,
             } => {
                 let payload = payload
                     .iter()
-                    .map(|id| get(values, id))
+                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *variant,
+                    type_args: type_args.clone(),
                     case: *case,
                     payload,
                 })
@@ -937,6 +2726,7 @@ impl<'a> Interpreter<'a> {
                     item,
                     case: active_case,
                     payload,
+                    ..
                 } if item == *variant && active_case == *case => payload
                     .get(*index)
                     .cloned()
@@ -948,6 +2738,30 @@ impl<'a> Interpreter<'a> {
             },
         }
     }
+}
+
+/// The storage location a place's own root actually names: a `Load`'s
+/// own result shares its identity with the slot it loaded from
+/// (`rfcs/0012`), exactly as `nir::verify::verify_structural_places`
+/// already canonicalizes it. A `mutable` binding reloads its whole
+/// current value as a *fresh* `ValueId` every time a place projects
+/// into it, so tombstoning a field in the load's own cached copy --
+/// rather than in the slot every later load reads back from -- would
+/// lose the mutation entirely, and a later reinitialization would find
+/// the field still live.
+///
+/// Follows a chain of loads to its fixed point, bounded by the number
+/// of entries so a hand-built cyclic `load` chain terminates instead of
+/// spinning.
+fn canonical_root(load_origin: &HashMap<ValueId, ValueId>, root: ValueId) -> ValueId {
+    let mut current = root;
+    for _ in 0..=load_origin.len() {
+        match load_origin.get(&current) {
+            Some(next) if *next != current => current = *next,
+            _ => return current,
+        }
+    }
+    current
 }
 
 fn get(values: &HashMap<ValueId, Value>, id: &ValueId) -> Result<Value, InterpreterError> {
@@ -1017,6 +2831,8 @@ fn kind_name(value: &Value) -> &'static str {
         Value::Record { .. } => "a record",
         Value::Variant { .. } => "a variant",
         Value::Resource(_) => "a resource",
+        Value::Moved => "a moved field",
+        Value::Dropped => "a dropped field",
     }
 }
 
@@ -1167,6 +2983,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -1195,7 +3017,7 @@ mod tests {
     /// this specific execution performed -- proving actual runtime
     /// cleanup order (deferred calls, resource drops) rather than only
     /// each test's own final return value.
-    fn run_with_log(text: &str) -> (Result<Value, InterpreterError>, Vec<String>) {
+    pub(super) fn run_with_log(text: &str) -> (Result<Value, InterpreterError>, Vec<String>) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -1219,6 +3041,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),
@@ -1520,6 +3348,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         let nir = lower_nir(
             &hir,
@@ -1566,6 +3400,12 @@ mod tests {
             &result.local_types,
             &result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &result.aggregate_field_types,
+                declared_resources: &result.declared_resources,
+                item_type_params: &result.item_type_params,
+                field_projections: &result.field_projections,
+            },
         );
         let nir = lower_nir(
             &hir,
@@ -2833,5 +4673,4024 @@ mod tests {
                          }; \
                      }";
         assert_eq!(run(text), Ok(Value::Int(7)));
+    }
+}
+
+/// Missing-metadata fail-closed behavior at runtime (`rfcs/0008`,
+/// `rfcs/0012`), and the structural drop/traversal properties this
+/// stage answers entirely on its own -- from a module's own layouts,
+/// never trusted from an earlier stage's verdict.
+#[cfg(test)]
+mod structural_runtime {
+    use super::*;
+    use crate::nir::RecordLayout;
+    use crate::symbol::Symbol;
+
+    const BOXY: ItemId = ItemId(80);
+    const FILE: ItemId = ItemId(81);
+
+    fn module_with(type_params: Vec<(crate::hir::TypeParamId, Symbol)>) -> Module {
+        let param = crate::hir::TypeParamId(0);
+        let name = Symbol(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params,
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn nested_module() -> Module {
+        let name = Symbol(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_generic_instantiation_is_affine_only_for_an_affine_argument() {
+        let name = Symbol(0);
+        let module = module_with(vec![(crate::hir::TypeParamId(0), name)]);
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::Named(FILE, name)])),
+            "`Box[File]` must be affine at runtime"
+        );
+        assert!(
+            !interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            "`Box[i64]` must not be affine at runtime"
+        );
+    }
+
+    #[test]
+    fn a_missing_type_parameter_list_fails_closed_to_affine() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            "missing generic metadata must never be answered as an empty substitution"
+        );
+    }
+
+    #[test]
+    fn an_unknown_generic_item_fails_closed_to_affine() {
+        let module = module_with(vec![(crate::hir::TypeParamId(0), Symbol(0))]);
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            interpreter.is_affine(&Ty::Applied(ItemId(9999), vec![Ty::I64])),
+            "an item with no recorded layout must never be answered as non-affine"
+        );
+    }
+
+    #[test]
+    fn an_affine_record_is_a_legal_structural_drop_target() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let record = Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        assert!(
+            interpreter
+                .is_affine_value(&record)
+                .expect("the fixture's own layout is well formed"),
+            "a record containing a resource must be a legal drop target"
+        );
+        interpreter
+            .drop_value(record)
+            .expect("dropping an affine record must destroy its own resource field");
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_err(),
+            "the nested resource must actually have been destroyed"
+        );
+    }
+
+    #[test]
+    fn dropping_an_already_destroyed_value_is_a_structured_error_not_a_panic() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        interpreter
+            .drop_value(Value::Resource(handle))
+            .expect("the first drop must succeed");
+        let second = interpreter.drop_value(Value::Resource(handle));
+        assert!(
+            matches!(second, Err(InterpreterError::InvalidOperation(_))),
+            "a second drop must be a structured error, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_tombstone_is_a_structured_error_not_a_silent_success() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        assert!(
+            matches!(
+                interpreter.drop_value(Value::Moved),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "dropping a moved tombstone must be reported, not silently accepted"
+        );
+        assert!(
+            matches!(
+                interpreter.drop_value(Value::Dropped),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "dropping an already-destroyed tombstone must be reported"
+        );
+    }
+
+    #[test]
+    fn a_place_projecting_through_a_variant_field_is_a_structured_error() {
+        let module = module_with(Vec::new());
+        let interpreter = Interpreter::new(&module);
+        let projection = crate::place::Projection::VariantField {
+            variant: BOXY,
+            case: crate::place::CaseId(0),
+            field: crate::place::FieldId(0),
+        };
+        let result = interpreter.observe_projections(&Value::Unit, &[projection]);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a variant-field projection must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn observing_through_a_mixed_chain_mutates_nothing_at_any_depth() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(5)]);
+        let outer = Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        let path = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(0),
+            },
+        ];
+        let read = interpreter
+            .observe_projections(&outer, &path)
+            .expect("observing through record -> resource must succeed");
+        assert_eq!(read, Value::Int(5));
+        // Nothing above the leaf may have been disturbed: the inline
+        // record still holds its own handle, and the resource's own
+        // field storage is untouched.
+        let Value::Record { ref fields, .. } = outer else {
+            unreachable!("constructed as a record immediately above")
+        };
+        assert!(matches!(fields[0], Value::Resource(_)));
+        assert_eq!(
+            interpreter
+                .resources
+                .borrow()
+                .observe_field(handle, 0)
+                .expect("the resource must still hold its own field"),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn a_failed_traversal_leaves_every_container_on_the_path_untouched() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let outer = Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        // Projects one level too deep: the inner resource has no field
+        // index 9, so the walk fails -- and must leave the outer
+        // record's own live intermediate exactly where it was rather
+        // than tombstoned by a half-applied mutation.
+        let deep = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(9),
+            },
+        ];
+        assert!(interpreter.take_projections(outer.clone(), &deep).is_err());
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a failed traversal must not destroy or invalidate an intermediate"
+        );
+        let Value::Record { ref fields, .. } = outer else {
+            unreachable!("constructed as a record immediately above")
+        };
+        assert!(
+            matches!(fields[0], Value::Resource(_)),
+            "the intermediate container must still hold its own live value"
+        );
+    }
+
+    #[test]
+    fn transferring_through_a_mixed_chain_empties_only_the_final_field() {
+        let module = nested_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(3)]);
+        let outer = Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        let path = [
+            crate::place::Projection::Field {
+                owner: BOXY,
+                field: crate::place::FieldId(0),
+            },
+            crate::place::Projection::Field {
+                owner: FILE,
+                field: crate::place::FieldId(0),
+            },
+        ];
+        let result = interpreter
+            .take_projections(outer, &path)
+            .expect("transferring through record -> resource must succeed");
+        assert_eq!(result.extracted, Value::Int(3));
+        // The intermediate resource handle is still exactly where it
+        // belongs in the rebuilt container -- never tombstoned along
+        // with the leaf that actually moved.
+        let Value::Record { fields, .. } = result.container else {
+            unreachable!("the container is the same record it went in as")
+        };
+        assert!(matches!(fields[0], Value::Resource(_)));
+        assert_eq!(
+            interpreter
+                .resources
+                .borrow()
+                .observe_field(handle, 0)
+                .expect("the resource itself must still be alive"),
+            Value::Moved,
+            "only the final selected field may be tombstoned"
+        );
+    }
+}
+
+/// Observable destruction order (`rfcs/0012`). Every resource is
+/// constructed with a distinct table id in source order, and the event
+/// log records each destruction as `drop:<id>` at the moment it
+/// actually happens -- so these assertions pin the *exact* sequence,
+/// not merely that everything was eventually destroyed.
+#[cfg(test)]
+mod destruction_order {
+    use super::tests::run_with_log;
+
+    /// Only `drop:` events, in the order they actually happened.
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_records_own_affine_fields_are_destroyed_in_reverse_declaration_order() {
+        // `first` is table id 0 and `second` is id 1; reverse
+        // declaration order destroys 1 before 0.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair { first: File, second: File } \
+             func main() -> i64 { \
+                 value pair = Pair { \
+                     first: File { descriptor: 1 }, \
+                     second: File { descriptor: 2 }, \
+                 }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0"]);
+    }
+
+    #[test]
+    fn a_resources_own_children_are_destroyed_before_its_outer_identity() {
+        // `input` is id 0, `output` is id 1, and `Session` itself is id
+        // 2: reverse field order first, then the outer identity last.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0", "drop:2"]);
+    }
+
+    #[test]
+    fn a_variants_active_case_payload_is_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func main() -> i64 { \
+                 value pair = Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 ); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:1", "drop:0"]);
+    }
+
+    #[test]
+    fn only_the_active_variant_case_is_destroyed() {
+        // The `Neither` case owns nothing at all: the `File` built for
+        // the *other* construction is destroyed on its own, and nothing
+        // fabricates a payload destruction for the inactive case.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             func main() -> i64 { \
+                 value empty = Held.Neither; \
+                 value full = Held.Carrying(File { descriptor: 1 }); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_record_nested_inside_a_variant_has_its_own_resources_destroyed() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Envelope { file: File } \
+             variant Held { Carrying(Envelope), Neither } \
+             func main() -> i64 { \
+                 value held = Held.Carrying(Envelope { file: File { descriptor: 1 } }); \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_variant_nested_inside_a_resource_has_its_active_case_destroyed() {
+        // `File` is id 0 and `Holder` (a declared resource) is id 1:
+        // the variant field's own live payload first, the resource's
+        // own outer identity last.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             resource Holder { held: Held } \
+             func main() -> i64 { \
+                 value holder = Holder { held: Held.Carrying(File { descriptor: 1 }) }; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1"]);
+    }
+
+    #[test]
+    fn a_partially_moved_parent_destroys_only_what_is_left() {
+        // `input` (id 0) is moved out and destroyed explicitly first;
+        // the structural drop of `session` then destroys `output` (id
+        // 1) and the session's own outer identity (id 2), and never
+        // touches `input` again.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value input = session.input; \
+                 drop input; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1", "drop:2"]);
+    }
+
+    #[test]
+    fn an_already_destroyed_child_is_never_destroyed_a_second_time() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func main() -> i64 { \
+                 value session = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 drop session.input; \
+                 drop session; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1", "drop:2"]);
+    }
+
+    #[test]
+    fn an_ignored_wildcard_payload_is_destroyed_exactly_once_before_the_arm_body() {
+        // `sentinel` (id 1) is constructed after the ignored payload
+        // (id 0) and destroyed by the arm body, so the ignored
+        // payload's own destruction must appear *first*: it happens
+        // before the body runs at all.
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Held { Carrying(File), Neither } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func discard(take held: Held) -> i64 { \
+                 return match held { \
+                     Carrying(_) => sink(File { descriptor: 9 }), \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return discard(Held.Carrying(File { descriptor: 1 })) \
+             }",
+        );
+        assert_eq!(order, vec!["drop:0", "drop:1"]);
+    }
+
+    #[test]
+    fn two_payload_positions_are_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func discard(take pair: Pair) -> i64 { \
+                 return match pair { \
+                     Both(_, _) => 1, \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return discard(Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 )) \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "an ignored payload must be destroyed in reverse declaration order"
+        );
+    }
+
+    #[test]
+    fn the_destruction_order_is_identical_across_repeated_runs() {
+        let text = "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             record Pair { left: Session, right: File } \
+             func main() -> i64 { \
+                 value pair = Pair { \
+                     left: Session { \
+                         input: File { descriptor: 1 }, \
+                         output: File { descriptor: 2 }, \
+                     }, \
+                     right: File { descriptor: 3 }, \
+                 }; \
+                 return 0 \
+             }";
+        let first = drops(text);
+        let second = drops(text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed its resources in a different order twice"
+        );
+        // `input`=0, `output`=1, `Session`=2, `right`=3. Reverse
+        // declaration order visits `right` first, then `left`, whose
+        // own children precede its outer identity.
+        assert_eq!(first, vec!["drop:3", "drop:1", "drop:0", "drop:2"]);
+    }
+}
+
+/// Whole-aggregate destruction of a *generic* instantiation
+/// (`rfcs/0008`, `rfcs/0012`). Every one of these drops the aggregate
+/// itself rather than moving its fields out first, which is the only
+/// shape that actually reaches the runtime's own structural drop for a
+/// generic value -- and the shape under which a discarded type argument
+/// leaks silently, because nothing else observes the loss.
+///
+/// The event log is the proof: each destruction appears as `drop:<table
+/// id>` at the moment it happens, so these pin the exact sequence
+/// rather than merely asserting the program finished.
+#[cfg(test)]
+mod generic_destruction {
+    use super::tests::run_with_log;
+    use super::*;
+    use crate::symbol::Symbol;
+
+    const DECLS: &str = "resource File { descriptor: i64 } \
+                         record Box[T] { item: T } \
+                         variant Maybe[T] { Some(T), None } ";
+
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn dropping_a_generic_record_destroys_its_substituted_field() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value boxed = Box[File] {{ item: File {{ descriptor: 1 }} }}; \
+               drop boxed; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[File]`'s own `File` must be destroyed exactly once"
+        );
+    }
+
+    #[test]
+    fn dropping_a_nested_generic_record_destroys_through_both_levels() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value nested = Box[Box[File]] {{ item: Box[File] {{ item: File {{ descriptor: 2 }} }} }}; \
+               drop nested; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[Box[File]]` must destroy the `File` two substitutions down"
+        );
+    }
+
+    #[test]
+    fn dropping_a_generic_variant_destroys_only_its_active_case() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value present = Maybe[File].Some(File {{ descriptor: 3 }}); \
+               drop present; \
+               value absent = Maybe[File].None; \
+               drop absent; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "the `Some` payload is destroyed once and `None` owns nothing"
+        );
+    }
+
+    #[test]
+    fn a_non_affine_instantiation_destroys_nothing_at_runtime() {
+        let order = drops(&format!(
+            "{DECLS} func main() -> i64 {{ \
+               value plain = Box[i64] {{ item: 7 }}; \
+               value file = File {{ descriptor: 1 }}; \
+               drop file; \
+               return plain.item \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "`Box[i64]` owns nothing, so only the standalone `File` is destroyed"
+        );
+    }
+
+    #[test]
+    fn a_generic_record_inside_a_variant_payload_is_destroyed() {
+        let order = drops(&format!(
+            "{DECLS} variant Holder {{ Carry(Box[File]), Nothing }} \
+             func main() -> i64 {{ \
+               value held = Holder.Carry(Box[File] {{ item: File {{ descriptor: 4 }} }}); \
+               drop held; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "a variant payload's own generic record must not leak its resource"
+        );
+    }
+
+    #[test]
+    fn a_generic_variant_inside_an_ordinary_record_is_destroyed() {
+        let order = drops(&format!(
+            "{DECLS} record Wrap {{ m: Maybe[File] }} \
+             func main() -> i64 {{ \
+               value w = Wrap {{ m: Maybe[File].Some(File {{ descriptor: 5 }}) }}; \
+               drop w; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "an ordinary record's own generic variant field must not leak its resource"
+        );
+    }
+
+    #[test]
+    fn a_generic_aggregate_keeps_its_type_arguments_across_a_call_boundary() {
+        let order = drops(&format!(
+            "{DECLS} func relay(take boxed: Box[File]) -> Box[File] {{ return boxed }} \
+             func main() -> i64 {{ \
+               value first = Box[File] {{ item: File {{ descriptor: 6 }} }}; \
+               value second = relay(first); \
+               drop second; \
+               return 0 \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "type arguments must survive a transfer into and back out of a call"
+        );
+    }
+
+    #[test]
+    fn a_partially_moved_generic_aggregate_destroys_only_what_is_left() {
+        // Two affine fields: the first is moved out and destroyed
+        // explicitly (table id 0), then the aggregate itself is dropped
+        // and destroys only the second (id 1).
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair[T] { left: T, right: T } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func main() -> i64 { \
+                 value pair = Pair[File] { \
+                     left: File { descriptor: 1 }, \
+                     right: File { descriptor: 2 }, \
+                 }; \
+                 value left = pair.left; \
+                 value taken = sink(left); \
+                 drop pair; \
+                 return taken \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:0", "drop:1"],
+            "a partially moved generic aggregate destroys only its remaining field"
+        );
+    }
+
+    #[test]
+    fn a_generic_aggregates_fields_are_destroyed_in_reverse_declaration_order() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             record Pair[T] { left: T, right: T } \
+             func main() -> i64 { \
+                 value pair = Pair[File] { \
+                     left: File { descriptor: 1 }, \
+                     right: File { descriptor: 2 }, \
+                 }; \
+                 drop pair; \
+                 return 0 \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "reverse declaration order, exactly as for a concrete aggregate"
+        );
+    }
+
+    #[test]
+    fn the_generic_destruction_order_is_identical_across_repeated_runs() {
+        let text = "resource File { descriptor: i64 } \
+                    record Pair[T] { left: T, right: T } \
+                    func main() -> i64 { \
+                        value pair = Pair[Box[File]] { \
+                            left: Box[File] { item: File { descriptor: 1 } }, \
+                            right: Box[File] { item: File { descriptor: 2 } }, \
+                        }; \
+                        drop pair; \
+                        return 0 \
+                    } \
+                    record Box[T] { item: T }";
+        let first = drops(text);
+        let second = drops(text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed in a different order"
+        );
+        assert_eq!(first, vec!["drop:1", "drop:0"]);
+    }
+
+    // -- malformed runtime metadata ------------------------------------
+
+    fn generic_module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    ItemId(90),
+                    crate::nir::RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    ItemId(91),
+                    crate::nir::RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_runtime_arity_disagreement_is_a_structured_error_not_a_silent_skip() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        // `Box` declares one type parameter; this value carries two.
+        let malformed = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64, Ty::I64],
+            fields: vec![Value::Resource(handle)],
+        };
+        assert!(
+            matches!(
+                interpreter.is_affine_value(&malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "an arity disagreement must be reported, never answered from a partial substitution"
+        );
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "destroying from a substitution nobody could build must be refused"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a refused destruction must not have destroyed anything"
+        );
+    }
+
+    #[test]
+    fn an_unknown_runtime_item_is_a_structured_error() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let unknown = Value::Record {
+            item: ItemId(9999),
+            type_args: Vec::new(),
+            fields: Vec::new(),
+        };
+        assert!(matches!(
+            interpreter.is_affine_value(&unknown),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            interpreter.drop_value(unknown),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_generic_value_answers_from_its_own_arguments() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let name = Symbol(0);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        let affine = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::Named(ItemId(90), name)],
+            fields: vec![Value::Resource(handle)],
+        };
+        assert_eq!(interpreter.is_affine_value(&affine), Ok(true));
+        let plain = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            fields: vec![Value::Int(1)],
+        };
+        assert_eq!(interpreter.is_affine_value(&plain), Ok(false));
+    }
+
+    // -- malformed runtime *shape*, as opposed to malformed type args --
+
+    #[test]
+    fn a_record_value_with_more_fields_than_its_declaration_is_refused() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        // `Box` declares exactly one field; this value carries two, so
+        // the second has no declared type to answer affinity from.
+        // Skipping it would skip exactly the field nothing can classify.
+        let malformed = Value::Record {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            fields: vec![Value::Int(1), Value::Resource(handle)],
+        };
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "a field count disagreeing with the declaration must be refused"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(handle).is_ok(),
+            "a refused destruction must not have destroyed anything"
+        );
+    }
+
+    #[test]
+    fn a_variant_value_with_the_wrong_payload_count_is_refused() {
+        let name = Symbol(0);
+        let module = Module {
+            functions: Vec::new(),
+            records: vec![(
+                ItemId(90),
+                crate::nir::RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(name, Ty::I64)],
+                    affine: true,
+                },
+            )],
+            variants: vec![(
+                ItemId(95),
+                crate::nir::VariantLayout {
+                    name,
+                    type_params: Vec::new(),
+                    cases: vec![crate::nir::CaseLayout {
+                        name,
+                        payload: vec![Ty::Named(ItemId(90), name)],
+                    }],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(ItemId(90), vec![Value::Int(1)]);
+        let malformed = Value::Variant {
+            item: ItemId(95),
+            type_args: Vec::new(),
+            case: 0,
+            payload: vec![Value::Resource(handle), Value::Int(2)],
+        };
+        assert!(
+            matches!(
+                interpreter.drop_value(malformed),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "a payload count disagreeing with the active case must be refused"
+        );
+        assert!(interpreter.resources.borrow().observe(handle).is_ok());
+    }
+
+    #[test]
+    fn a_variant_value_naming_an_out_of_range_case_is_refused() {
+        let module = generic_module();
+        let interpreter = Interpreter::new(&module);
+        let malformed = Value::Variant {
+            item: ItemId(91),
+            type_args: vec![Ty::I64],
+            case: 7,
+            payload: Vec::new(),
+        };
+        assert!(matches!(
+            interpreter.drop_value(malformed),
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+}
+
+/// `StorePlace` as a genuine ownership transfer (`rfcs/0011`,
+/// `rfcs/0012`), driven through the interpreter's own primitives rather
+/// than through lowered source, so each phase can be observed
+/// separately: the destination must be provably empty *before* anything
+/// is transferred, the transfer must be all-or-nothing, and the source
+/// must stop being a current owner the moment it succeeds.
+#[cfg(test)]
+mod store_place_transfer {
+    use super::*;
+    use crate::nir::RecordLayout;
+    use crate::place::{FieldId, Projection};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(60);
+    const HOLDER: ItemId = ItemId(61);
+    const BOXY: ItemId = ItemId(62);
+    const PAIR: ItemId = ItemId(63);
+    const HOLDERS: ItemId = ItemId(64);
+    const MIXED: ItemId = ItemId(65);
+    const SESSION: ItemId = ItemId(66);
+    const MAYBE: ItemId = ItemId(67);
+    const NEST: ItemId = ItemId(68);
+    const LINKED: ItemId = ItemId(69);
+
+    /// `File` (a declared `resource`), `Holder` (an ordinary record with
+    /// one `File` field), `Box[T]` (generic, one field), `Pair` (two
+    /// `File` fields), `Holders` (two `Holder` fields), `Mixed` (a
+    /// `File` and a `Maybe[File]`), `Session` (a `resource` with one
+    /// `File` field, used as a destination spine) and the generic
+    /// variant `Maybe[T]`.
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name)), (name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    HOLDERS,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(HOLDER, name)),
+                            (name, Ty::Named(HOLDER, name)),
+                        ],
+                        affine: false,
+                    },
+                ),
+                (
+                    MIXED,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(FILE, name)),
+                            (name, Ty::Applied(MAYBE, vec![Ty::Named(FILE, name)])),
+                        ],
+                        affine: false,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    NEST,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(SESSION, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    LINKED,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(SESSION, name)),
+                            (name, Ty::Named(FILE, name)),
+                        ],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                crate::nir::VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn field(owner: ItemId, index: u32) -> Vec<Projection> {
+        vec![Projection::Field {
+            owner,
+            field: FieldId(index),
+        }]
+    }
+
+    fn place(root: u32, projections: Vec<Projection>) -> Place<ValueId> {
+        Place {
+            root: ValueId(root),
+            projections,
+        }
+    }
+
+    /// A `Holder` whose own field is already a tombstone (as it would be
+    /// after the field was moved out), plus a fresh `File` to store back
+    /// into it.
+    fn emptied_holder(
+        interpreter: &Interpreter<'_>,
+        holder_id: u32,
+        source_id: u32,
+    ) -> (HashMap<ValueId, Value>, ResourceHandle) {
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(holder_id),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(source_id), Value::Resource(replacement));
+        (values, replacement)
+    }
+
+    #[test]
+    fn a_successful_store_transfers_ownership_into_the_place() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(HOLDER, 0)),
+                ValueId(1),
+            )
+            .expect("storing into a provably empty field must succeed");
+
+        let Some(Value::Record { fields, .. }) = values.get(&ValueId(0)) else {
+            unreachable!("the destination is still a record")
+        };
+        let Value::Resource(stored) = fields[0] else {
+            unreachable!("the field now holds the transferred resource")
+        };
+        assert_eq!(stored.id, replacement.id, "the same resource identity");
+        assert!(
+            stored.generation > replacement.generation,
+            "a transfer must bump the generation, so the caller's own handle goes stale"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(stored).is_ok(),
+            "the new owner's handle is current"
+        );
+    }
+
+    #[test]
+    fn the_old_source_is_no_longer_a_current_owner_after_a_store() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(HOLDER, 0)),
+                ValueId(1),
+            )
+            .expect("the store must succeed");
+
+        assert_eq!(
+            values.get(&ValueId(1)),
+            Some(&Value::Moved),
+            "the source is tombstoned, not left holding a plausible-looking handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_err(),
+            "the handle the source held must be stale"
+        );
+        assert!(
+            interpreter
+                .drop_value(Value::Resource(replacement))
+                .is_err(),
+            "a double drop attempted through the stale source must be refused"
+        );
+    }
+
+    #[test]
+    fn a_store_into_a_live_field_leaves_the_source_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        // The destination field is *not* empty: the store must be
+        // refused before anything is transferred.
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(live)],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(replacement));
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "overwriting a live field must be a structured error, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused store must mutate nothing");
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_ok(),
+            "the source must still be a current owner: no generation may have been bumped"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(live).is_ok(),
+            "the destination's own live value must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_store_of_an_already_dropped_source_leaves_the_destination_empty() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+        interpreter
+            .drop_value(Value::Resource(replacement))
+            .expect("destroying the source first");
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "storing a destroyed value must be refused, got {result:?}"
+        );
+        assert_eq!(
+            values, before,
+            "the destination field must still be the tombstone it was"
+        );
+    }
+
+    #[test]
+    fn a_store_whose_source_and_destination_are_the_same_storage_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 0)),
+            ValueId(0),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "an aggregate may not be stored into its own field, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused self-store must mutate nothing");
+    }
+
+    /// A `Load` result and the slot it read share one storage identity,
+    /// so aliasing them is the same self-store.
+    #[test]
+    fn a_store_aliasing_its_destination_through_a_load_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), Value::Unit);
+        // `%1` is a `Load` of slot `%0`.
+        let load_origin = HashMap::from([(ValueId(1), ValueId(0))]);
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &load_origin,
+            &place(0, field(HOLDER, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a load of the destination's own slot is still the destination, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_affine_record_is_transferred_whole() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(3)]);
+        let mut values = HashMap::new();
+        // Destination: a `Box[Holder]` whose field is empty.
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(HOLDER, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        // Source: a whole `Holder` carrying a live resource.
+        values.insert(
+            ValueId(1),
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(inner)],
+            },
+        );
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(BOXY, 0)),
+                ValueId(1),
+            )
+            .expect("storing a whole affine record must succeed");
+
+        assert!(
+            interpreter.resources.borrow().observe(inner).is_err(),
+            "the nested resource's own identity must have been transferred too"
+        );
+        assert_eq!(values.get(&ValueId(1)), Some(&Value::Moved));
+        // The transferred value is destroyed exactly once through its
+        // new owner, and its type arguments survived the store.
+        let stored = values.remove(&ValueId(0)).expect("the destination");
+        assert!(
+            interpreter
+                .is_affine_value(&stored)
+                .expect("well-formed metadata"),
+            "`Box[Holder]` owns a resource through its stored field"
+        );
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
+    }
+
+    #[test]
+    fn a_store_into_a_generic_aggregate_preserves_its_type_arguments() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(4)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(replacement));
+
+        interpreter
+            .store_place_transfer(
+                &mut values,
+                &HashMap::new(),
+                &place(0, field(BOXY, 0)),
+                ValueId(1),
+            )
+            .expect("the store must succeed");
+
+        let Some(Value::Record { type_args, .. }) = values.get(&ValueId(0)) else {
+            unreachable!("the destination is still a record")
+        };
+        assert_eq!(
+            type_args,
+            &vec![Ty::Named(FILE, Symbol(0))],
+            "a store must not quietly turn a `Box[File]` into a `Box[T]`"
+        );
+    }
+
+    #[test]
+    fn a_store_through_a_missing_field_index_is_a_structured_error() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
+        let before = values.clone();
+
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "an out-of-range field must be reported, got {result:?}"
+        );
+        assert_eq!(values, before);
+        assert!(
+            interpreter.resources.borrow().observe(replacement).is_ok(),
+            "a refused store must not have bumped the source's generation"
+        );
+    }
+
+    /// A malformed source graph carrying the *same* resource identity
+    /// twice validated twice -- each check looked at the one live
+    /// handle independently -- and only failed partway through the
+    /// transfer, after the first occurrence had already been moved.
+    #[test]
+    fn a_duplicate_identity_in_the_source_is_refused_without_mutation() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(HOLDER, Symbol(0))],
+                fields: vec![Value::Moved],
+            },
+        );
+        // The same resource identity in both of `Pair`'s own fields.
+        values.insert(
+            ValueId(1),
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(shared), Value::Resource(shared)],
+            },
+        );
+        let before = values.clone();
+        let result = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(BOXY, 0)),
+            ValueId(1),
+        );
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "a duplicated resource identity must be refused, got {result:?}"
+        );
+        assert_eq!(values, before, "a refused store must mutate nothing");
+        assert!(
+            interpreter.resources.borrow().observe(shared).is_ok(),
+            "no generation may have been bumped"
+        );
+    }
+
+    #[test]
+    fn a_refused_store_reports_the_identical_error_every_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _) = emptied_holder(&interpreter, 0, 1);
+        let first = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        let second = interpreter.store_place_transfer(
+            &mut values,
+            &HashMap::new(),
+            &place(0, field(HOLDER, 9)),
+            ValueId(1),
+        );
+        assert_eq!(first, second, "the same refusal must be deterministic");
+    }
+
+    // -- transactional rejection: nothing may change on any failure ----
+
+    /// Every refused store must leave the frame value map, the resource
+    /// table, every generation and every Alive/Moved/Dropped status
+    /// exactly as it found them. Asserted by comparing the whole
+    /// observable state before and after.
+    fn assert_refused_without_mutation(
+        interpreter: &Interpreter<'_>,
+        values: &mut HashMap<ValueId, Value>,
+        place: &Place<ValueId>,
+        source: ValueId,
+        watched: &[ResourceHandle],
+        what: &str,
+    ) {
+        let before_values = values.clone();
+        let before_table: Vec<(ItemId, u64, bool, Vec<Value>)> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+
+        let result = interpreter.store_place_transfer(values, &HashMap::new(), place, source);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            *values, before_values,
+            "{what}: the frame value map changed"
+        );
+        let after_table: Vec<(ItemId, u64, bool, Vec<Value>)> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            before_table, after_table,
+            "{what}: the resource table changed"
+        );
+        for handle in watched {
+            assert!(
+                interpreter.resources.borrow().observe(*handle).is_ok(),
+                "{what}: a watched handle went stale"
+            );
+        }
+
+        // The identical error, with the state still unchanged, on a
+        // second attempt.
+        let again = interpreter.store_place_transfer(values, &HashMap::new(), place, source);
+        assert_eq!(result, again, "{what}: the refusal is not deterministic");
+        assert_eq!(*values, before_values, "{what}: the retry mutated state");
+    }
+
+    /// An empty `Box` destination plus whatever source the caller wants
+    /// to try storing into it.
+    fn destination_and(source: Value) -> (HashMap<ValueId, Value>, Place<ValueId>) {
+        destination_typed(Ty::Named(HOLDER, Symbol(0)), source)
+    }
+
+    /// The same empty `Box` destination, instantiated for whatever the
+    /// source actually is -- so a *successful* store leaves a value
+    /// whose every position really does hold what it declares.
+    fn destination_typed(held: Ty, source: Value) -> (HashMap<ValueId, Value>, Place<ValueId>) {
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: BOXY,
+                type_args: vec![held],
+                fields: vec![Value::Moved],
+            },
+        );
+        values.insert(ValueId(1), source);
+        (values, place(0, field(BOXY, 0)))
+    }
+
+    #[test]
+    fn a_duplicate_handle_nested_inside_records_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // The same identity reached through two separate `Holder`
+        // records nested in one `Box`.
+        let holder = |handle| Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(handle)],
+        };
+        let (mut values, destination) = destination_and(Value::Record {
+            item: HOLDERS,
+            type_args: Vec::new(),
+            fields: vec![holder(shared), holder(shared)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "duplicate identity nested in records",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_handle_across_record_and_variant_nesting_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let (mut values, destination) = destination_typed(
+            Ty::Named(MIXED, Symbol(0)),
+            Value::Record {
+                item: MIXED,
+                type_args: Vec::new(),
+                fields: vec![
+                    Value::Resource(shared),
+                    Value::Variant {
+                        item: MAYBE,
+                        type_args: vec![Ty::Named(FILE, Symbol(0))],
+                        case: 0,
+                        payload: vec![Value::Resource(shared)],
+                    },
+                ],
+            },
+        );
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "duplicate identity across record and variant",
+        );
+    }
+
+    #[test]
+    fn a_source_sharing_an_identity_with_the_destination_path_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // The destination is reached *through* this resource, and the
+        // source carries the same identity: transferring it would
+        // invalidate the handle the install has to walk through.
+        let spine = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(spine));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine],
+            "source and destination path share an identity",
+        );
+    }
+
+    #[test]
+    fn a_stale_child_after_a_valid_sibling_is_refused_without_moving_the_sibling() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let stale = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        // Make the second child's handle stale by transferring it away.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale handle");
+        let (mut values, destination) = destination_and(Value::Record {
+            item: PAIR,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(good), Value::Resource(stale)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[good],
+            "stale child after a valid sibling",
+        );
+    }
+
+    #[test]
+    fn a_source_whose_field_count_disagrees_with_its_declaration_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // `Holder` declares one field; this value carries three.
+        let (mut values, destination) = destination_and(Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(live), Value::Int(1), Value::Int(2)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "field count disagreeing with the declaration",
+        );
+    }
+
+    #[test]
+    fn a_source_with_mismatched_generic_type_arguments_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        // `Box` declares one type parameter; this value carries two.
+        let (mut values, destination) = destination_and(Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::I64, Ty::I64],
+            fields: vec![Value::Resource(live)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "mismatched generic type arguments",
+        );
+    }
+
+    #[test]
+    fn a_source_variant_with_the_wrong_payload_count_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let (mut values, destination) = destination_and(Value::Variant {
+            item: MAYBE,
+            type_args: vec![Ty::Named(FILE, Symbol(0))],
+            case: 0,
+            payload: vec![Value::Resource(live), Value::Int(2)],
+        });
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[live],
+            "variant payload count disagreeing with its active case",
+        );
+    }
+
+    #[test]
+    fn a_destination_traversed_through_a_stale_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(spine)
+            .expect("transferring to make the spine handle stale");
+        let replacement = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(1), Value::Resource(replacement));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[replacement],
+            "destination traversed through a stale resource",
+        );
+    }
+
+    #[test]
+    fn a_successful_nested_generic_store_transfers_every_resource_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let second = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let (mut values, destination) = destination_typed(
+            Ty::Named(MIXED, Symbol(0)),
+            Value::Record {
+                item: MIXED,
+                type_args: Vec::new(),
+                fields: vec![
+                    Value::Resource(first),
+                    Value::Variant {
+                        item: MAYBE,
+                        type_args: vec![Ty::Named(FILE, Symbol(0))],
+                        case: 0,
+                        payload: vec![Value::Resource(second)],
+                    },
+                ],
+            },
+        );
+
+        interpreter
+            .store_place_transfer(&mut values, &HashMap::new(), &destination, ValueId(1))
+            .expect("a well-formed nested store must succeed");
+
+        // Every identity moved exactly once: the caller's own handles
+        // are stale, and the installed graph's are current.
+        for stale in [first, second] {
+            assert!(
+                interpreter.resources.borrow().observe(stale).is_err(),
+                "each transferred identity must have moved exactly once"
+            );
+        }
+        assert_eq!(values.get(&ValueId(1)), Some(&Value::Moved));
+        let stored = values.remove(&ValueId(0)).expect("the destination");
+        assert!(
+            interpreter
+                .is_affine_value(&stored)
+                .expect("well-formed metadata"),
+            "the destination owns the transferred graph"
+        );
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
+    }
+
+    // -- the complete owned graph, not just the outer handles ----------
+    //
+    // A resource's own children live in the resource table, not in the
+    // value, so planning a transfer by walking only the value stops at
+    // the outer handle. Duplicates, ownership cycles and
+    // source/destination overlap all hide below that line
+    // (`rfcs/0012`).
+
+    /// Replaces `owner`'s single field with `child`, directly in the
+    /// resource table -- what the runtime itself does when a resource
+    /// is constructed around another.
+    fn own(interpreter: &Interpreter<'_>, owner: ResourceHandle, child: Value) {
+        interpreter.resources.borrow_mut().records[owner.id.0 as usize].fields = vec![child];
+    }
+
+    /// A `Session` whose one `File` field is empty.
+    fn session(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved])
+    }
+
+    /// A `Nest` owning `inner`.
+    fn nest(interpreter: &Interpreter<'_>, inner: ResourceHandle) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(NEST, vec![Value::Resource(inner)])
+    }
+
+    fn a_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    #[test]
+    fn a_duplicate_reached_through_a_resource_and_directly_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        let owner = session(&interpreter);
+        own(&interpreter, owner, Value::Resource(shared));
+        // `Linked` carries the `Session` that owns `shared`, and
+        // `shared` itself. One identity, two owners -- invisible to
+        // anything that stops at the `Session`'s outer handle.
+        let (mut values, destination) = destination_typed(
+            Ty::Named(LINKED, Symbol(0)),
+            Value::Record {
+                item: LINKED,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(owner), Value::Resource(shared)],
+            },
+        );
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared, owner],
+            "one identity owned both directly and through a resource",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_nested_several_levels_down_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        let inner = session(&interpreter);
+        own(&interpreter, inner, Value::Resource(shared));
+        let outer = nest(&interpreter, inner);
+        // `outer -> inner -> shared`, with `shared` alongside it again.
+        let (mut values, destination) = destination_typed(
+            Ty::Named(LINKED, Symbol(0)),
+            Value::Record {
+                item: LINKED,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(inner), Value::Resource(shared)],
+            },
+        );
+        values.insert(ValueId(4), Value::Resource(outer));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared, inner, outer],
+            "the same identity twice, two levels apart",
+        );
+    }
+
+    #[test]
+    fn a_source_descendant_that_is_the_destination_spine_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // The destination is written *through* `spine`, and the source
+        // owns `spine` below its own outer handle. Transferring it
+        // would invalidate the very handle the install walks through,
+        // and leave `spine` owning the thing it lives inside.
+        let spine = session(&interpreter);
+        let carrier = nest(&interpreter, spine);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(carrier));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine, carrier],
+            "a source descendant that is the destination's own spine",
+        );
+    }
+
+    #[test]
+    fn a_destination_descendant_that_is_in_the_source_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        // The destination container already owns `shared` in a sibling
+        // of the slot being written, and the source carries it too.
+        // Neither is on the traversal path, so only a full walk of the
+        // destination's own graph can see it.
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDERS,
+                type_args: Vec::new(),
+                fields: vec![
+                    Value::Record {
+                        item: HOLDER,
+                        type_args: Vec::new(),
+                        fields: vec![Value::Moved],
+                    },
+                    Value::Record {
+                        item: HOLDER,
+                        type_args: Vec::new(),
+                        fields: vec![Value::Resource(shared)],
+                    },
+                ],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(shared));
+        let destination = Place {
+            root: ValueId(0),
+            projections: vec![
+                Projection::Field {
+                    owner: HOLDERS,
+                    field: FieldId(0),
+                },
+                Projection::Field {
+                    owner: HOLDER,
+                    field: FieldId(0),
+                },
+            ],
+        };
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "a destination descendant that is also in the source",
+        );
+    }
+
+    #[test]
+    fn a_direct_ownership_cycle_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = session(&interpreter);
+        // `spine` would end up owning itself.
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(spine));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine],
+            "a resource stored into itself",
+        );
+    }
+
+    #[test]
+    fn an_indirect_ownership_cycle_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = session(&interpreter);
+        let middle = nest(&interpreter, spine);
+        // Writing `middle` into `spine`'s own empty field closes the
+        // loop `spine -> middle -> spine`, two links long.
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(middle));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine, middle],
+            "an ownership cycle two links long",
+        );
+    }
+
+    #[test]
+    fn a_stale_child_inside_a_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let stale = a_file(&interpreter, 1);
+        let carrier = session(&interpreter);
+        own(&interpreter, carrier, Value::Resource(stale));
+        // The nested handle goes stale without the carrier knowing.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale nested handle");
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[],
+            "a stale handle nested inside the resource being transferred",
+        );
+    }
+
+    #[test]
+    fn a_malformed_value_nested_inside_a_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let carrier = session(&interpreter);
+        // `Session` declares one `File` field; this one holds an `i64`.
+        own(&interpreter, carrier, Value::Int(7));
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[],
+            "a nested value disagreeing with the resource's own declaration",
+        );
+    }
+
+    #[test]
+    fn a_nested_child_keeps_its_own_generation_when_its_parent_moves() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let child = a_file(&interpreter, 1);
+        let carrier = session(&interpreter);
+        own(&interpreter, carrier, Value::Resource(child));
+        let before = interpreter.resources.borrow().records[child.id.0 as usize].generation;
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+
+        interpreter
+            .store_place_transfer(&mut values, &HashMap::new(), &destination, ValueId(1))
+            .expect("a well-formed nested transfer must succeed");
+
+        assert_eq!(
+            interpreter.resources.borrow().records[child.id.0 as usize].generation,
+            before,
+            "ownership of the child never crossed the boundary, so its handle stays current"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(child).is_ok(),
+            "the child is still reachable through its unchanged handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(carrier).is_err(),
+            "the carrier's own handle moved, so the caller's copy is stale"
+        );
+        let stored = values.remove(&ValueId(0)).expect("the destination");
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
+    }
+}
+
+/// Variant ownership is per *path* (`rfcs/0012`): one branch may destroy
+/// the whole value while a disjoint branch takes it apart and owns the
+/// payload instead. The event log is the proof that each resource is
+/// destroyed exactly once on whichever path actually ran -- a leak and a
+/// double drop both show up here, and neither shows up in a return
+/// value.
+#[cfg(test)]
+mod branch_local_variants {
+    use super::tests::run_with_log;
+
+    const DECLS: &str = "resource File { descriptor: i64 } \
+                         variant Maybe[T] { Some(T), None } \
+                         func sink(take file: File) -> i64 { \
+                             value descriptor = file.descriptor; \
+                             drop file; \
+                             return descriptor \
+                         } ";
+
+    fn drops(text: &str) -> Vec<String> {
+        let (result, log) = run_with_log(text);
+        assert!(result.is_ok(), "program failed at runtime: {result:?}");
+        log.into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    const DISPOSE: &str = "func dispose(cond: bool, take maybe: Maybe[File]) -> i64 { \
+                               if cond { \
+                                   drop maybe; \
+                                   return 1; \
+                               } \
+                               return match maybe { \
+                                   Some(file) => { drop file; 2 }, \
+                                   None => 0, \
+                               } \
+                           } ";
+
+    #[test]
+    fn the_whole_value_branch_destroys_its_payload_exactly_once() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "dropping the shell destroys the payload it still owns, once"
+        );
+    }
+
+    #[test]
+    fn the_matching_branch_destroys_its_payload_exactly_once() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:0"],
+            "the arm owns the payload and destroys it, once -- the shell no longer owns it"
+        );
+    }
+
+    #[test]
+    fn the_inactive_case_destroys_nothing() {
+        let order = drops(&format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].None) \
+             }}"
+        ));
+        assert_eq!(order, Vec::<String>::new(), "`None` owns nothing at all");
+    }
+
+    /// The same program with the branches written the other way round
+    /// must behave identically: nothing about this may depend on which
+    /// branch happens to come first.
+    #[test]
+    fn reversing_the_branch_order_changes_nothing() {
+        let reversed = "func dispose(cond: bool, take maybe: Maybe[File]) -> i64 { \
+                            if cond { \
+                                return match maybe { \
+                                    Some(file) => { drop file; 2 }, \
+                                    None => 0, \
+                                }; \
+                            } \
+                            drop maybe; \
+                            return 1 \
+                        } ";
+        let matched = drops(&format!(
+            "{DECLS}{reversed} func main() -> i64 {{ \
+               return dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        let dropped = drops(&format!(
+            "{DECLS}{reversed} func main() -> i64 {{ \
+               return dispose(false, Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(matched, vec!["drop:0"]);
+        assert_eq!(dropped, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn an_arm_returning_its_payload_transfers_it_instead_of_destroying_it() {
+        // The returned payload is destroyed by its new owner, after the
+        // fallback the other arm would have returned: exactly one
+        // destruction each, in caller order.
+        let order = drops(&format!(
+            "{DECLS} func unwrap(take maybe: Maybe[File], take fallback: File) -> File {{ \
+               return match maybe {{ \
+                 Some(file) => {{ drop fallback; file }}, \
+                 None => fallback, \
+               }} \
+             }} \
+             func main() -> i64 {{ \
+               value taken = unwrap( \
+                 Maybe[File].Some(File {{ descriptor: 1 }}), \
+                 File {{ descriptor: 2 }}, \
+               ); \
+               return sink(taken) \
+             }}"
+        ));
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "the unused fallback is destroyed inside the arm, the returned payload by its caller"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_arm_destroys_the_payload_it_ignores() {
+        let order = drops(&format!(
+            "{DECLS} func discard(take maybe: Maybe[File]) -> i64 {{ \
+               return match maybe {{ Some(_) => 7, None => 0 }} \
+             }} \
+             func main() -> i64 {{ \
+               return discard(Maybe[File].Some(File {{ descriptor: 1 }})) \
+             }}"
+        ));
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_nested_generic_variant_is_taken_apart_at_each_level() {
+        let decls = "resource File { descriptor: i64 } \
+                     variant Maybe[T] { Some(T), None } \
+                     variant Outer { Wrap(Maybe[File]), Empty } \
+                     func nested(take outer: Outer) -> i64 { \
+                         return match outer { \
+                             Wrap(Some(file)) => { drop file; 1 }, \
+                             Wrap(None) => 2, \
+                             Empty => 3, \
+                         } \
+                     } ";
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return nested(Outer.Wrap(Maybe[File].Some(File {{ descriptor: 1 }}))) \
+                 }}"
+            )),
+            vec!["drop:0"],
+            "the innermost payload is destroyed exactly once"
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return nested(Outer.Wrap(Maybe[File].None)) \
+                 }}"
+            )),
+            Vec::<String>::new(),
+            "an inactive inner case owns nothing"
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ return nested(Outer.Empty) }}"
+            )),
+            Vec::<String>::new(),
+            "an inactive outer case owns nothing"
+        );
+    }
+
+    #[test]
+    fn a_diverging_arm_still_destroys_what_it_owns() {
+        let order = drops(&format!(
+            "variant Fail {{ Bad }} {DECLS} \
+             func diverging(take maybe: Maybe[File]) -> i64 raises Fail {{ \
+               return match maybe {{ \
+                 Some(file) => {{ drop file; raise Fail.Bad; }}, \
+                 None => 5, \
+               }} \
+             }} \
+             func main() -> i64 {{ \
+               return handle diverging(Maybe[File].Some(File {{ descriptor: 1 }})) {{ \
+                 success v => v, \
+                 failure Fail.Bad => 100, \
+               }} \
+             }}"
+        ));
+        assert_eq!(order, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn a_match_whose_arms_all_diverge_accounts_for_each_path() {
+        let decls = format!(
+            "{DECLS} func all_diverging(take maybe: Maybe[File]) -> i64 {{ \
+               match maybe {{ \
+                 Some(file) => {{ return sink(file); }}, \
+                 None => {{ return 0; }}, \
+               }} \
+             }} "
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ \
+                   return all_diverging(Maybe[File].Some(File {{ descriptor: 1 }})) \
+                 }}"
+            )),
+            vec!["drop:0"]
+        );
+        assert_eq!(
+            drops(&format!(
+                "{decls} func main() -> i64 {{ return all_diverging(Maybe[File].None) }}"
+            )),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Two payload positions, one bound and one ignored: both are
+    /// claimed by the same decomposition, and destroyed in reverse
+    /// payload declaration order.
+    #[test]
+    fn two_payload_positions_are_each_claimed_exactly_once() {
+        let order = drops(
+            "resource File { descriptor: i64 } \
+             variant Pair { Both(File, File), Neither } \
+             func sink(take file: File) -> i64 { \
+                 value descriptor = file.descriptor; \
+                 drop file; \
+                 return descriptor \
+             } \
+             func first(take pair: Pair) -> i64 { \
+                 return match pair { \
+                     Both(left, _) => sink(left), \
+                     Neither => 0, \
+                 } \
+             } \
+             func main() -> i64 { \
+                 return first(Pair.Both( \
+                     File { descriptor: 1 }, \
+                     File { descriptor: 2 }, \
+                 )) \
+             }",
+        );
+        assert_eq!(
+            order,
+            vec!["drop:1", "drop:0"],
+            "the ignored position is destroyed first, then the bound one by its consumer"
+        );
+    }
+
+    #[test]
+    fn the_destruction_order_is_identical_across_repeated_runs() {
+        let text = format!(
+            "{DECLS}{DISPOSE} func main() -> i64 {{ \
+               value a = dispose(true, Maybe[File].Some(File {{ descriptor: 1 }})); \
+               value b = dispose(false, Maybe[File].Some(File {{ descriptor: 2 }})); \
+               return a + b \
+             }}"
+        );
+        let first = drops(&text);
+        let second = drops(&text);
+        assert_eq!(
+            first, second,
+            "the same program destroyed in a different order"
+        );
+        assert_eq!(first, vec!["drop:0", "drop:1"]);
+    }
+}
+
+/// Destruction is a transaction (`rfcs/0012`): the complete graph is
+/// validated and ordered before any resource status changes or any event
+/// is emitted, so a malformed graph changes nothing at all.
+///
+/// An earlier implementation looked each field's declared type up with
+/// `get(index)` and skipped past a miss, which let a value carrying an
+/// extra runtime field have its outer resource destroyed while a live
+/// resource in that extra field leaked -- reported as success.
+#[cfg(test)]
+mod drop_transaction {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(70);
+    const SESSION: ItemId = ItemId(71);
+    const ENVELOPE: ItemId = ItemId(72);
+    const BOXY: ItemId = ItemId(73);
+    const MAYBE: ItemId = ItemId(74);
+    const PAIR: ItemId = ItemId(75);
+
+    /// `File` (a `resource` with one `i64`), `Session` (a `resource`
+    /// with one `File`), `Envelope` (a record with one `File`), `Box[T]`
+    /// (generic) and `Maybe[T]` (a generic variant).
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    ENVELOPE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name)), (name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// One resource record, reduced to everything a failed
+    /// destruction must leave untouched.
+    type RecordState = (ItemId, u64, bool, Vec<Value>);
+
+    /// Snapshot of everything a failed destruction must leave
+    /// untouched: the whole resource table, and the event log.
+    fn snapshot(interpreter: &Interpreter<'_>) -> (Vec<RecordState>, Vec<String>) {
+        let table: Vec<RecordState> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+        (table, interpreter.event_log())
+    }
+
+    fn assert_refused_without_mutation(interpreter: &Interpreter<'_>, value: Value, what: &str) {
+        let before = snapshot(interpreter);
+        let result = interpreter.drop_value(value);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(interpreter),
+            "{what}: a refused destruction changed the resource table or the event log"
+        );
+    }
+
+    #[test]
+    fn a_resource_with_an_extra_runtime_field_is_refused_and_leaks_nothing() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let leaked = file(&interpreter, 1);
+        // `Session` declares one field; this record carries two, and the
+        // extra one holds a live resource. Skipping it would destroy the
+        // session while leaking the file.
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Int(0), Value::Resource(leaked)]);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(handle),
+            "resource with an extra runtime field",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(leaked).is_ok(),
+            "the resource in the extra field must still be alive and reachable"
+        );
+    }
+
+    #[test]
+    fn a_resource_with_a_missing_runtime_field_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, Vec::new());
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(handle),
+            "resource with a missing runtime field",
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_missing_generic_type_argument_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(live)],
+            },
+            "missing generic type argument",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_record_with_an_extra_generic_type_argument_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::I64, Ty::I64],
+                fields: vec![Value::Resource(live)],
+            },
+            "extra generic type argument",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_nested_malformed_record_is_refused_before_its_valid_sibling_is_destroyed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = file(&interpreter, 1);
+        let inner = file(&interpreter, 2);
+        // The outer record is well formed; its *second* field is an
+        // `Envelope` carrying one field too many. Validation has to
+        // reach it before the first field is destroyed.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: ENVELOPE,
+                type_args: Vec::new(),
+                fields: vec![Value::Record {
+                    item: ENVELOPE,
+                    type_args: Vec::new(),
+                    fields: vec![Value::Resource(inner), Value::Resource(good)],
+                }],
+            },
+            "nested malformed record",
+        );
+        for handle in [good, inner] {
+            assert!(interpreter.resources.borrow().observe(handle).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_nested_malformed_variant_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: ENVELOPE,
+                type_args: Vec::new(),
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(live), Value::Int(9)],
+                }],
+            },
+            "nested malformed variant",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_variant_naming_an_invalid_active_case_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 7,
+                payload: Vec::new(),
+            },
+            "invalid active case",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_resource_handle_in_two_fields_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = file(&interpreter, 1);
+        // One identity reached through two positions would be
+        // destroyed twice.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(shared), Value::Resource(shared)],
+            },
+            "duplicate identity in two fields",
+        );
+        assert!(interpreter.resources.borrow().observe(shared).is_ok());
+    }
+
+    #[test]
+    fn a_stale_child_after_a_valid_sibling_is_refused_without_destroying_the_sibling() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = file(&interpreter, 1);
+        let stale = file(&interpreter, 2);
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale handle");
+        // Reverse declaration order reaches the second field first, but
+        // either way nothing is destroyed until the whole graph
+        // validates.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: PAIR,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(good), Value::Resource(stale)],
+            },
+            "stale child after a valid sibling",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(good).is_ok(),
+            "the valid sibling must not have been destroyed"
+        );
+    }
+
+    #[test]
+    fn an_already_dropped_nested_child_is_skipped_not_destroyed_twice() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Dropped]);
+        interpreter
+            .drop_value(Value::Resource(session))
+            .expect("a tombstoned child is skipped, not destroyed again");
+        assert!(interpreter.resources.borrow().observe(session).is_err());
+        assert!(
+            interpreter.resources.borrow().observe(live).is_ok(),
+            "an unrelated resource is untouched"
+        );
+    }
+
+    #[test]
+    fn a_deeply_nested_generic_graph_is_destroyed_in_exact_order() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = file(&interpreter, 1);
+        let second = file(&interpreter, 2);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(second)]);
+        // `Box[Maybe[Session]]` holding a `Some(Session)`: reverse
+        // declaration order, each resource's own children before its
+        // outer identity. Every position holds exactly what its own
+        // declaration says it holds.
+        let graph = Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(SESSION, Symbol(0))])],
+            fields: vec![Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(SESSION, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(session)],
+            }],
+        };
+        interpreter
+            .drop_value(graph)
+            .expect("a well-formed nested generic graph must be destroyed");
+        assert_eq!(
+            interpreter.event_log(),
+            vec![
+                format!("drop:{}", second.id.0),
+                format!("drop:{}", session.id.0)
+            ],
+            "the session's own child is destroyed before its outer identity"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(first).is_ok(),
+            "an unrelated resource is untouched"
+        );
+    }
+
+    #[test]
+    fn a_refused_destruction_reports_the_identical_error_every_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        let malformed = || Value::Record {
+            item: BOXY,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(live)],
+        };
+        let first = interpreter.drop_value(malformed());
+        let second = interpreter.drop_value(malformed());
+        assert_eq!(first, second, "the refusal must be deterministic");
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+}
+
+/// A decomposition transfers the storage one payload position actually
+/// holds (`rfcs/0012`). Every claim is checked against that storage
+/// before the shell is tombstoned, so a malformed decomposition changes
+/// nothing at all.
+#[cfg(test)]
+mod decomposition_claims {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(90);
+    const MAYBE: ItemId = ItemId(91);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![(
+                FILE,
+                RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(name, Ty::I64)],
+                    affine: true,
+                },
+            )],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// `%0` holds `Some(file)`; `%1` holds that same payload value, and
+    /// `%2` holds an unrelated, separately constructed `File`.
+    fn frame(
+        interpreter: &Interpreter<'_>,
+    ) -> (HashMap<ValueId, Value>, ResourceHandle, ResourceHandle) {
+        let real = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let unrelated = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(real)],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(real));
+        values.insert(ValueId(2), Value::Resource(unrelated));
+        (values, real, unrelated)
+    }
+
+    fn assert_refused_without_mutation(
+        interpreter: &Interpreter<'_>,
+        values: &mut HashMap<ValueId, Value>,
+        taken: &[(usize, ValueId)],
+        case: usize,
+        what: &str,
+    ) {
+        let before = values.clone();
+        let result =
+            interpreter.decompose_variant(values, &HashMap::new(), ValueId(0), MAYBE, case, taken);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            *values, before,
+            "{what}: a refused decomposition changed the frame"
+        );
+        let again =
+            interpreter.decompose_variant(values, &HashMap::new(), ValueId(0), MAYBE, case, taken);
+        assert_eq!(result, again, "{what}: the refusal is not deterministic");
+        assert_eq!(*values, before, "{what}: the retry mutated the frame");
+    }
+
+    #[test]
+    fn a_claim_naming_an_unrelated_value_is_refused_and_the_shell_is_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, unrelated) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(2))],
+            0,
+            "claim naming an unrelated value of the same shape",
+        );
+        for handle in [real, unrelated] {
+            assert!(
+                interpreter.resources.borrow().observe(handle).is_ok(),
+                "no resource may have been touched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_naming_a_value_this_frame_never_computed_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(9))],
+            0,
+            "claim naming an uncomputed value",
+        );
+    }
+
+    #[test]
+    fn a_claim_of_a_position_out_of_range_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(3, ValueId(1))],
+            0,
+            "claim of a position out of range",
+        );
+    }
+
+    #[test]
+    fn a_decomposition_naming_the_inactive_case_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[],
+            1,
+            "decomposition of a case that is not live",
+        );
+    }
+
+    #[test]
+    fn one_bad_claim_after_a_good_one_leaves_the_shell_entirely_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, _) = frame(&interpreter);
+        // Position 0 is claimed correctly; position 3 does not exist.
+        // Validating claim by claim and writing as it goes would have
+        // tombstoned position 0 before discovering the second.
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(1)), (3, ValueId(1))],
+            0,
+            "a valid claim followed by an invalid one",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(real).is_ok(),
+            "the real payload is still exactly where it was"
+        );
+    }
+
+    #[test]
+    fn the_matching_claim_moves_exactly_that_position_out_of_the_shell() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, _) = frame(&interpreter);
+        interpreter
+            .decompose_variant(
+                &mut values,
+                &HashMap::new(),
+                ValueId(0),
+                MAYBE,
+                0,
+                &[(0, ValueId(1))],
+            )
+            .expect("claiming the value the position actually holds must succeed");
+        assert_eq!(
+            values.get(&ValueId(0)),
+            Some(&Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Moved],
+            }),
+            "the shell keeps its case and loses exactly the claimed position"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(real).is_ok(),
+            "the payload itself is untouched -- only who owns it changed"
+        );
+    }
+}
+
+/// The declaration a position requires of a record, variant or resource
+/// standing in it (`rfcs/0008`, `rfcs/0012`).
+///
+/// `None` only for the root of a graph, which declares its own identity.
+/// A position whose declared type is a primitive requires *no*
+/// aggregate at all, so one turning up there is refused outright --
+/// which is exactly the shape that hid a live resource inside an `i64`
+/// field. Deliberately not consulted for a primitive value, so a plain
+/// integer in an `i64` field never asks for a declaration.
+fn required_declaration(
+    expected: Option<&Ty>,
+) -> Result<Option<(ItemId, Vec<Ty>)>, InterpreterError> {
+    match expected {
+        None => Ok(None),
+        Some(Ty::Named(item, _)) => Ok(Some((*item, Vec::new()))),
+        Some(Ty::Applied(item, args)) => Ok(Some((*item, args.clone()))),
+        Some(Ty::Param(..) | Ty::Var(_) | Ty::Never) => Err(invalid(
+            "a runtime value fills a position whose declared type was never resolved",
+        )),
+        Some(_) => Err(invalid(
+            "a runtime aggregate or resource stands in a position whose declared type owns nothing",
+        )),
+    }
+}
+
+/// Every runtime value is checked against the type its declaration says
+/// it has, before any ownership operation touches it (`rfcs/0011`,
+/// `rfcs/0012`).
+///
+/// Counting fields and type arguments is not enough. A `Wrapper` whose
+/// one declared field is `i64` but whose runtime slot holds a live
+/// `Resource` passed every count-based check, and was destroyed with the
+/// resource inside it left alive and unreachable, because a field whose
+/// *declared* type is not affine was never looked at.
+#[cfg(test)]
+mod value_shape {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(120);
+    const WRAPPER: ItemId = ItemId(121);
+    const HOLDER: ItemId = ItemId(122);
+    const BOXY: ItemId = ItemId(123);
+    const MAYBE: ItemId = ItemId(124);
+    const OTHER: ItemId = ItemId(125);
+
+    /// `File` (a resource with one `i64`), `Wrapper` (a resource with
+    /// one `i64`), `Holder` (a record with one `File`), `Box[T]`,
+    /// `Maybe[T]` and `Other` (a second record with one `i64`).
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        let resource_with_int = |affine| RecordLayout {
+            name,
+            type_params: Vec::new(),
+            fields: vec![(name, Ty::I64)],
+            affine,
+        };
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (FILE, resource_with_int(true)),
+                (WRAPPER, resource_with_int(true)),
+                (OTHER, resource_with_int(false)),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    type RecordState = (ItemId, u64, bool, Vec<Value>);
+
+    fn snapshot(interpreter: &Interpreter<'_>) -> (Vec<RecordState>, Vec<String>) {
+        let table: Vec<RecordState> = interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.item,
+                    r.generation,
+                    r.status == ResourceStatus::Alive,
+                    r.fields.clone(),
+                )
+            })
+            .collect();
+        (table, interpreter.event_log())
+    }
+
+    fn assert_refused_without_mutation(interpreter: &Interpreter<'_>, value: Value, what: &str) {
+        let before = snapshot(interpreter);
+        let result = interpreter.drop_value(value.clone());
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(interpreter),
+            "{what}: a refused destruction changed the resource table or the event log"
+        );
+        let again = interpreter.drop_value(value);
+        assert_eq!(result, again, "{what}: the refusal is not deterministic");
+        assert_eq!(
+            before,
+            snapshot(interpreter),
+            "{what}: the retry mutated state"
+        );
+    }
+
+    #[test]
+    fn a_resource_hidden_in_a_non_affine_field_is_refused_and_stays_alive() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let hidden = file(&interpreter, 1);
+        // `Wrapper` declares one `i64` field. This one holds a live
+        // resource, which a count-based check walks straight past.
+        let wrapper = interpreter
+            .resources
+            .borrow_mut()
+            .construct(WRAPPER, vec![Value::Resource(hidden)]);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(wrapper),
+            "a resource hidden in an `i64` field",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(hidden).is_ok(),
+            "the hidden resource must still be alive and reachable"
+        );
+    }
+
+    #[test]
+    fn an_integer_in_a_resource_typed_field_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Int(7)],
+            },
+            "an integer where a `File` is declared",
+        );
+    }
+
+    #[test]
+    fn a_record_naming_the_wrong_declaration_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        // `Holder`'s field is declared `File`; this value claims to be
+        // an `Other`, which is a different declaration entirely.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Record {
+                    item: OTHER,
+                    type_args: Vec::new(),
+                    fields: vec![Value::Resource(live)],
+                }],
+            },
+            "a record naming a different declaration than its position declares",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_variant_naming_the_wrong_declaration_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: HOLDER,
+                    type_args: Vec::new(),
+                    case: 0,
+                    payload: vec![Value::Resource(live)],
+                }],
+            },
+            "a variant naming a declaration the position does not declare",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_resource_handle_of_the_wrong_declaration_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // A `Wrapper` handle standing where a `File` is declared.
+        let wrapper = interpreter
+            .resources
+            .borrow_mut()
+            .construct(WRAPPER, vec![Value::Int(0)]);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(wrapper)],
+            },
+            "a resource handle of a different declaration",
+        );
+        assert!(interpreter.resources.borrow().observe(wrapper).is_ok());
+    }
+
+    #[test]
+    fn a_value_of_the_right_length_but_the_wrong_kind_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        // One field, as declared -- but a `Variant` where a `Record` is.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Variant {
+                item: HOLDER,
+                type_args: Vec::new(),
+                case: 0,
+                payload: vec![Value::Resource(live)],
+            },
+            "a variant value for a record declaration",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_tombstone_in_a_non_affine_field_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // Nothing can have moved out of an `i64`: there is no ownership
+        // there to move.
+        let wrapper = interpreter
+            .resources
+            .borrow_mut()
+            .construct(WRAPPER, vec![Value::Moved]);
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Resource(wrapper),
+            "a tombstone where a non-affine field is declared",
+        );
+    }
+
+    #[test]
+    fn a_tombstone_in_an_affine_field_is_accepted() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let untouched = file(&interpreter, 1);
+        // The `File` really was moved out of this `Holder` already.
+        interpreter
+            .drop_value(Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Moved],
+            })
+            .expect("a partially moved aggregate destroys what is left");
+        assert!(interpreter.resources.borrow().observe(untouched).is_ok());
+    }
+
+    #[test]
+    fn a_nested_generic_instantiation_is_validated_all_the_way_down() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        // `Box[Maybe[File]]` whose `Maybe` claims to hold an `i64`.
+        assert_refused_without_mutation(
+            &interpreter,
+            Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::I64],
+                    case: 0,
+                    payload: vec![Value::Resource(live)],
+                }],
+            },
+            "a nested instantiation disagreeing with the position it fills",
+        );
+        assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+
+    #[test]
+    fn a_well_formed_nested_generic_graph_is_accepted() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let live = file(&interpreter, 1);
+        interpreter
+            .drop_value(Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(live)],
+                }],
+            })
+            .expect("a well-formed nested generic graph must be destroyed");
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("drop:{}", live.id.0)],
+            "exactly the one resource it owns"
+        );
+    }
+
+    #[test]
+    fn a_resource_owning_itself_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let outer = interpreter
+            .resources
+            .borrow_mut()
+            .construct(HOLDER, vec![Value::Int(0)]);
+        // Point the resource's own field back at itself. Destroying it
+        // would have to destroy it first.
+        interpreter.resources.borrow_mut().records[outer.id.0 as usize].fields =
+            vec![Value::Resource(outer)];
+        let before = snapshot(&interpreter);
+        let result = interpreter.drop_value(Value::Resource(outer));
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "an ownership cycle must be refused, got {result:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(&interpreter),
+            "a refused destruction changed state"
+        );
+    }
+}
+
+/// An ordinary (non-`take`) parameter observes, and so does everything
+/// reachable through it (`rfcs/0011`, `rfcs/0012`).
+///
+/// The runtime's own backstop for that: binding an observing parameter
+/// produces an observing *view* of the whole value, however deeply the
+/// owner handles are buried, and reading through an observer never hands
+/// back an owning handle. `nir::verify` already rejects the NIR that
+/// would need this; this is the independent second answer, not a
+/// substitute.
+#[cfg(test)]
+mod transitive_observation {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(140);
+    const SESSION: ItemId = ItemId(141);
+    const BOXY: ItemId = ItemId(142);
+    const MAYBE: ItemId = ItemId(143);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// Every resource handle `value` carries inline, in order.
+    fn handles(value: &Value, out: &mut Vec<ResourceHandle>) {
+        match value {
+            Value::Resource(handle) => out.push(*handle),
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    handles(field, out);
+                }
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    handles(slot, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_all_observers(value: &Value, what: &str) {
+        let mut found = Vec::new();
+        handles(value, &mut found);
+        assert!(!found.is_empty(), "{what}: the fixture carries no handles");
+        for handle in found {
+            assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "{what}: an owning handle survived into an observing view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_of_resources_becomes_an_observing_view_throughout() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let value = Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::Named(FILE, Symbol(0))],
+            fields: vec![Value::Resource(owned)],
+        };
+        let view = interpreter
+            .to_observer_if_resource(value.clone())
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Box[File]` bound to an observing parameter");
+        let mut original = Vec::new();
+        handles(&value, &mut original);
+        assert_eq!(
+            original,
+            vec![owned],
+            "the caller's own value is untouched: it still holds its owning handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owned).is_ok(),
+            "nothing about the resource itself changed"
+        );
+    }
+
+    #[test]
+    fn a_variant_payload_becomes_an_observing_view() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(owned)],
+            })
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Maybe[File]` bound to an observing parameter");
+    }
+
+    #[test]
+    fn a_deeply_nested_value_becomes_an_observing_view_at_every_level() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))])],
+                fields: vec![Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(owned)],
+                }],
+            })
+            .expect("observing a well-formed value must succeed");
+        assert_all_observers(&view, "a `Box[Maybe[File]]`");
+    }
+
+    #[test]
+    fn reading_a_field_through_an_observer_yields_an_observer() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(inner)]);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(session)
+            .expect("downgrading an owner must succeed");
+        let field = interpreter
+            .resources
+            .borrow()
+            .observe_field(observer, 0)
+            .expect("reading a field of an observed resource must succeed");
+        let Value::Resource(handle) = field else {
+            panic!("the field holds a resource, got {field:?}");
+        };
+        assert_eq!(
+            handle.role,
+            RuntimeOwnershipRole::Observer,
+            "reading through an observer must never hand back an owning handle"
+        );
+    }
+
+    #[test]
+    fn reading_a_field_through_an_owner_still_yields_the_owner() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = file(&interpreter, 1);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(inner)]);
+        let field = interpreter
+            .resources
+            .borrow()
+            .observe_field(session, 0)
+            .expect("reading a field of an owned resource must succeed");
+        assert_eq!(
+            field,
+            Value::Resource(inner),
+            "an owner reading its own field still reaches the owning handle"
+        );
+    }
+
+    #[test]
+    fn an_observing_view_cannot_be_transferred_or_destroyed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(Value::Record {
+                item: BOXY,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                fields: vec![Value::Resource(owned)],
+            })
+            .expect("observing a well-formed value must succeed");
+        let before = interpreter.resources.borrow().records[owned.id.0 as usize].generation;
+        assert!(
+            matches!(
+                interpreter.drop_value(view.clone()),
+                Err(InterpreterError::InvalidOperation(_))
+            ),
+            "destroying through an observing view must be refused"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[owned.id.0 as usize].generation,
+            before,
+            "a refused destruction changed a generation"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owned).is_ok(),
+            "the caller still owns its resource"
+        );
+    }
+}
+
+/// The runtime's own exit backstop against malformed NIR (`rfcs/0011`):
+/// a frame that leaves any live resource still owned is an error, and a
+/// resource nested inside a record, a variant or another resource is
+/// just as owned as a bare handle.
+///
+/// `nir::verify` already rejects the NIR that would reach here; this is
+/// the independent second answer, not a substitute for it.
+#[cfg(test)]
+mod leak_backstop {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(150);
+    const SESSION: ItemId = ItemId(151);
+    const BOXY: ItemId = ItemId(152);
+    const MAYBE: ItemId = ItemId(153);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    fn boxed(value: Value, held: Ty) -> Value {
+        Value::Record {
+            item: BOXY,
+            type_args: vec![held],
+            fields: vec![value],
+        }
+    }
+
+    fn frame(entries: Vec<(u32, Value)>) -> HashMap<ValueId, Value> {
+        entries
+            .into_iter()
+            .map(|(id, value)| (ValueId(id), value))
+            .collect()
+    }
+
+    #[test]
+    fn a_resource_nested_in_a_record_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            7,
+            boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))),
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(7)),
+            "a `Box[File]` abandoned at an exit still owns its `File`"
+        );
+    }
+
+    #[test]
+    fn a_resource_nested_in_a_variant_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            3,
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(owned)],
+            },
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(3)),
+            "an active case's payload is owned exactly like a bare handle"
+        );
+    }
+
+    #[test]
+    fn a_resource_nested_several_levels_down_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            2,
+            boxed(
+                Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(owned)],
+                },
+                Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))]),
+            ),
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(2)),
+            "depth changes nothing about who owns it"
+        );
+    }
+
+    #[test]
+    fn an_observing_view_is_never_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))))
+            .expect("observing a well-formed value must succeed");
+        let values = frame(vec![(1, view)]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "this frame never owned what an observing view points at"
+        );
+    }
+
+    #[test]
+    fn a_fully_destroyed_aggregate_is_never_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let value = boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0)));
+        interpreter
+            .drop_value(value)
+            .expect("destroying a well-formed aggregate must succeed");
+        let values = frame(vec![(1, Value::Moved)]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "nothing is left to leak"
+        );
+    }
+
+    #[test]
+    fn the_lowest_owning_value_id_is_reported_whatever_the_map_order() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = file(&interpreter, 1);
+        let second = file(&interpreter, 2);
+        let values = frame(vec![
+            (9, boxed(Value::Resource(first), Ty::Named(FILE, Symbol(0)))),
+            (
+                4,
+                boxed(Value::Resource(second), Ty::Named(FILE, Symbol(0))),
+            ),
+            (2, Value::Int(0)),
+        ]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(4)),
+            "the lowest owning id, deterministically, never whatever the map yields first"
+        );
+    }
+
+    #[test]
+    fn a_resource_owning_itself_terminates_and_is_reported_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        interpreter.resources.borrow_mut().records[owner.id.0 as usize].fields =
+            vec![Value::Resource(owner)];
+        let values = frame(vec![(5, Value::Resource(owner))]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(5)),
+            "a cycle must terminate, and it is still a leak"
+        );
+    }
+
+    #[test]
+    fn a_stale_handle_owning_a_live_child_is_still_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let child = file(&interpreter, 1);
+        let owner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(child)]);
+        // The outer handle goes stale, but the record it names still
+        // owns a live `File` that nothing else can reach.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(owner)
+            .expect("transferring to make the outer handle stale");
+        let values = frame(vec![(6, Value::Resource(owner))]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "a stale handle owns nothing: the current owner holds the record"
+        );
     }
 }

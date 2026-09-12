@@ -1,0 +1,35 @@
+// A partially moved aggregate stays usable for exactly what `rfcs/0012`
+// says it does: reading an unaffected field -- affine or not -- through
+// the same place chain, reinitializing an emptied one, or structurally
+// dropping what remains. Only using it as a *whole* value is rejected.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+    count: i64,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+        count: 10,
+    };
+    value input = session.input;
+    // `count` is an ordinary, non-affine field: reading it through a
+    // partially moved parent is still perfectly valid.
+    value count = session.count;
+    // So is reading an unaffected affine sibling's own non-affine field.
+    value other = session.output.descriptor;
+    drop session;
+    return sink(input) + count + other;
+}

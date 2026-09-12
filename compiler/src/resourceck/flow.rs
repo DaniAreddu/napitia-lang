@@ -12,19 +12,38 @@
 //! way) -- there is no separate depth limit to enforce here that
 //! parsing didn't already enforce on the input that produced this tree.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirPattern, HirStmt, ItemId, LocalId,
+    TypeParamId,
 };
+use crate::place::{FieldId, Place, Projection};
 use crate::source::{SourceId, Span};
-use crate::symbol::Interner;
+use crate::symbol::{Interner, Symbol};
 use crate::types::Ty;
 
+use super::AffineContext;
 use super::plan::{CheckedDeferPlan, CleanupAction, ConsumeInfo};
 use super::state::ResourceState;
+
+/// One resource-typed (or transitively affine) local's own current
+/// structural state, keyed by the exact [`Place`] the state describes
+/// (`rfcs/0012`): the bare root (empty projections) is exactly what a
+/// whole `resource` local already was in Alpha 0.1.7, and a projected
+/// key (`session.input`) is that same tracking generalized one field
+/// at a time. A key absent from this map is always `Available` --
+/// its own initial, untouched state, whether that is because it was
+/// never affine enough to need an entry at all, or because it simply
+/// has not been touched yet -- *except* when some ancestor place (a
+/// shorter prefix sharing the same root) is itself recorded as
+/// anything other than `Available`, in which case that ancestor's own
+/// state dominates: moving/dropping a whole aggregate consumes every
+/// field reachable through it, whether or not each one individually
+/// has its own entry here (see [`FlowChecker::place_state`]).
+type PlaceStates = HashMap<Place<LocalId>, ResourceState>;
 
 mod codes {
     /// A resource-typed binding is read, moved, or dropped after it was
@@ -67,14 +86,13 @@ mod codes {
     /// it is rejected here rather than silently mis-lowered into a
     /// double-drop or a leak.
     pub const UNSUPPORTED_COMPOUND_RESOURCE_ORIGIN: &str = "U0008";
-    // U0009 ("resource field extraction") retired: `typeck`'s own
-    // RESOURCE_FIELD_IN_ORDINARY_AGGREGATE (T0064) now rejects a
-    // resource-typed field in *any* aggregate -- record, variant, or
-    // another resource -- at the declaring type's own declaration
-    // (`rfcs/0011`, Blocker 8's own "Nested resources" scope limit), so
-    // no well-typed HIR can ever reach a resource-typed field projection
-    // for this stage to check in the first place. Never reused for a
-    // different diagnostic: a stale code in an old build's cached output
+    // U0009 ("resource field extraction") retired: Alpha 0.1.8
+    // (`rfcs/0012`) lifts the blanket rejection this code used to
+    // enforce -- a resource-typed field is now tracked structurally,
+    // field by field, through `resolve_place`/`check_place_read`/
+    // `apply_place_move` below, rather than rejected outright. Never
+    // reused for a different diagnostic: a stale code in an old build's
+    // cached output
     // must never silently start meaning something else.
     /// A `mutable` resource-typed binding is reassigned while it still
     /// owns an available (or `defer`-protected) value (Blocker 4) --
@@ -120,6 +138,13 @@ mod codes {
     /// argument merely observes": no `consume_sites` entries are
     /// recorded for this call's own arguments at all when this fires.
     pub const MALFORMED_CALLEE_TAKE_FLAGS: &str = "U0013";
+    /// A partially-moved aggregate (one or more of its own affine fields
+    /// already moved out) is used as a whole value -- observed,
+    /// returned, transferred, copied, or passed as a whole (`rfcs/0012`).
+    /// Only accessing an unaffected field, reinserting into an empty
+    /// one, or structurally dropping the remaining owned fields is still
+    /// permitted on it.
+    pub const PARTIAL_PARENT_USED_AS_WHOLE: &str = "U0014";
 }
 
 pub use codes::*;
@@ -165,8 +190,8 @@ enum ConsumeKind {
 /// against loop entry.
 #[derive(Default)]
 struct LoopFrame {
-    break_states: Vec<HashMap<LocalId, ResourceState>>,
-    continue_states: Vec<HashMap<LocalId, ResourceState>>,
+    break_states: Vec<PlaceStates>,
+    continue_states: Vec<PlaceStates>,
     /// `pending_cleanup.len()` at the point this loop's own body began
     /// being checked -- every entry registered at or after this index
     /// is this exact iteration's own responsibility (the body's own
@@ -195,6 +220,19 @@ pub struct FlowChecker<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<crate::hir::ExprId, Ty>,
     affine_items: &'a HashSet<ItemId>,
+    /// Every declared variant's own `ItemId` (`rfcs/0012`) -- a
+    /// variant's own payload is never individually addressable outside a
+    /// pattern match (there is no `.field` syntax for it, unlike a
+    /// record), so which case is actually live at a given point is not
+    /// something static analysis can know in general. An affine
+    /// variant-typed place is therefore always tracked, and structurally
+    /// dropped, as one opaque whole-value unit -- see [`Self::
+    /// structural_drop_targets`]/[`Self::place_is_wholly_available`],
+    /// which consult this set specifically so neither ever treats
+    /// [`AffineContext::aggregate_field_types`]'s own *flattened,
+    /// cross-case* payload list for a variant as if it were one record's
+    /// own named field vector.
+    variant_items: &'a HashSet<ItemId>,
     /// Every known function/extend-method's own per-parameter `take`
     /// flags, by `ItemId`, in declared order -- read back to decide
     /// whether a `Call` argument transfers ownership or merely observes
@@ -204,14 +242,29 @@ pub struct FlowChecker<'a> {
     /// no `take` parameters at all, matching this milestone's own
     /// observation-by-default rule.
     take_flags: &'a HashMap<ItemId, Vec<bool>>,
+    /// `typeck`'s own transitive-affinity metadata (`rfcs/0012`),
+    /// bundled -- see [`AffineContext`]'s own doc comment for what each
+    /// field is and why this stage never re-derives it. Read through
+    /// [`Self::aggregate_field_types`]/[`Self::declared_resources`]/
+    /// [`Self::item_type_params`]/[`Self::field_projections`] accessors
+    /// below rather than `self.affine.<field>` directly, purely so every
+    /// call site keeps reading the same as it did before this was
+    /// bundled.
+    affine: &'a AffineContext<'a>,
     source: SourceId,
     interner: &'a Interner,
     diagnostics: &'a mut Vec<Diagnostic>,
-    /// Every resource-typed *owned* local's own current state -- take
-    /// parameters and `value`/`mutable` bindings. A local absent here is
-    /// either not a resource type at all, or an ordinary (observing)
-    /// parameter (see `observing` below).
-    states: HashMap<LocalId, ResourceState>,
+    /// Every resource-typed (or transitively affine) *owned* place's
+    /// own current structural state -- take parameters and `value`/
+    /// `mutable` bindings' own root place, and every affine field
+    /// reached through one that has actually been touched (moved,
+    /// dropped, or reinitialized) at least once. A key absent here is
+    /// either not affine at all, or still in its own initial,
+    /// untouched `Available` state (see [`Self::place_state`], which
+    /// also accounts for a shorter ancestor place dominating a key that
+    /// is technically present but whose own root/ancestor has already
+    /// been consumed as a whole).
+    states: PlaceStates,
     /// Every resource-typed *ordinary* (non-`take`) parameter -- never
     /// entered into `states` at all, since the callee never owns it;
     /// tracked separately purely to reject an attempt to move, return,
@@ -234,7 +287,7 @@ pub struct FlowChecker<'a> {
     /// finishes, on every exit from it -- an observing defer's own
     /// protection only ever lasts until the deferred call itself would
     /// actually run.
-    defer_scopes: Vec<HashSet<LocalId>>,
+    defer_scopes: Vec<HashSet<Place<LocalId>>>,
     /// Every bare `loop`'s own body block id (Blocker: infinite-loop
     /// reachability) for which [`Self::finish_loop`] found no reachable
     /// `break` at all -- a `loop` with no exit of its own genuinely never
@@ -282,11 +335,14 @@ pub struct FlowChecker<'a> {
 }
 
 impl<'a> FlowChecker<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         local_types: &'a HashMap<LocalId, Ty>,
         expr_types: &'a HashMap<crate::hir::ExprId, Ty>,
         affine_items: &'a HashSet<ItemId>,
+        variant_items: &'a HashSet<ItemId>,
         take_flags: &'a HashMap<ItemId, Vec<bool>>,
+        affine: &'a AffineContext<'a>,
         source: SourceId,
         interner: &'a Interner,
         diagnostics: &'a mut Vec<Diagnostic>,
@@ -295,7 +351,9 @@ impl<'a> FlowChecker<'a> {
             local_types,
             expr_types,
             affine_items,
+            variant_items,
             take_flags,
+            affine,
             source,
             interner,
             diagnostics,
@@ -342,8 +400,9 @@ impl<'a> FlowChecker<'a> {
                 continue;
             }
             if param.take {
-                self.states.insert(param.local, ResourceState::Available);
-                self.pending_cleanup.push(CleanupAction::Drop(param.local));
+                let place = Place::root(param.local);
+                self.states.insert(place.clone(), ResourceState::Available);
+                self.pending_cleanup.push(CleanupAction::Drop(place));
             } else {
                 self.observing.insert(param.local);
             }
@@ -361,26 +420,29 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
-    /// Filters `self.pending_cleanup[marker..]` down to what is still
-    /// actually owed at this exact point -- a `Drop` for a local this
-    /// exit's own `self.states` proves is still `Available`/
-    /// `DropScheduled` (still needs destroying), never one already
-    /// `Moved`/`Dropped`/`Error` (someone else's responsibility, or
-    /// already diagnosed) -- reversed, since cleanup replays last
-    /// registered first. A `Defer` entry is always kept: its own
-    /// presence here already means its scope has not released it yet.
+    /// Expands `self.pending_cleanup[marker..]` down to what is still
+    /// actually owed at this exact point -- reversed, since cleanup
+    /// replays last registered first. A `Drop(root)` entry (registered
+    /// once, when the local itself became owned) expands here, fresh,
+    /// into every place `structural_drop_targets` proves is still
+    /// actually live under it right now -- an aggregate registered as a
+    /// single whole-value obligation may need zero, one, or several
+    /// concrete destroy actions by the time this exact exit is reached,
+    /// depending what has been moved out of it since. A `Defer` entry
+    /// is always kept: its own presence here already means its scope
+    /// has not released it yet.
     fn snapshot_cleanup(&self, marker: usize) -> Vec<CleanupAction> {
         self.pending_cleanup[marker..]
             .iter()
             .rev()
-            .filter(|action| match action {
-                CleanupAction::Drop(local) => matches!(
-                    self.states.get(local),
-                    Some(ResourceState::Available | ResourceState::DropScheduled)
-                ),
-                CleanupAction::Defer(_) => true,
+            .flat_map(|action| match action {
+                CleanupAction::Drop(place) => self
+                    .structural_drop_targets(place)
+                    .into_iter()
+                    .map(CleanupAction::Drop)
+                    .collect::<Vec<_>>(),
+                CleanupAction::Defer(id) => vec![CleanupAction::Defer(*id)],
             })
-            .cloned()
             .collect()
     }
 
@@ -408,12 +470,12 @@ impl<'a> FlowChecker<'a> {
     /// *not*-exited block; dead code after an unconditional break/
     /// continue is never walked at all, see `stmt_diverges`), which
     /// must still see its own protection exactly as it was.
-    fn released_snapshot(&self, from_scope: usize) -> HashMap<LocalId, ResourceState> {
+    fn released_snapshot(&self, from_scope: usize) -> PlaceStates {
         let mut states = self.states.clone();
         for scope in &self.defer_scopes[from_scope.min(self.defer_scopes.len())..] {
-            for local in scope {
-                if let Some(ResourceState::DropScheduled) = states.get(local) {
-                    states.insert(*local, ResourceState::Available);
+            for place in scope {
+                if let Some(ResourceState::DropScheduled) = states.get(place) {
+                    states.insert(place.clone(), ResourceState::Available);
                 }
             }
         }
@@ -426,8 +488,466 @@ impl<'a> FlowChecker<'a> {
             .is_some_and(|ty| self.is_affine(ty))
     }
 
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`): `self.
+    /// affine_items` already *is* the transitive set for a plain,
+    /// non-generic `Ty::Named` (computed once by `super::check_module`,
+    /// mirroring `typeck::Checker::is_affine`'s own declaration-time
+    /// query); a `Ty::Applied` instead substitutes its own concrete
+    /// arguments into the declaration's field types fresh, the same way
+    /// `typeck`'s own equivalent does, since the same generic
+    /// declaration can be affine for one instantiation and not another.
+    /// Place *decomposition* (`resolve_place`/`structural_drop_targets`)
+    /// is intentionally narrower than this: a generic instantiation is
+    /// tracked as a single whole-value place only, exactly like Alpha
+    /// 0.1.7's own resources always were, never decomposed field by
+    /// field -- this query alone still needs to answer soundly for one,
+    /// so `take`/observation/whole-move accounting stays correct even
+    /// though per-field tracking does not extend into it.
     fn is_affine(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Named(item, _) if self.affine_items.contains(item))
+        match ty {
+            Ty::Named(item, _) => self.affine_items.contains(item),
+            Ty::Applied(item, args) => {
+                if self.affine.declared_resources.contains(item) {
+                    return true;
+                }
+                // Missing or arity-disagreeing generic metadata is never
+                // an *empty* substitution (`rfcs/0008`): an
+                // unsubstituted `Ty::Param` answers `false`, which
+                // would let a genuinely affine instantiation be treated
+                // as a freely-copyable value with no ownership to
+                // track. Fail closed -- treat it as affine, so every
+                // ownership obligation is still demanded.
+                let type_params = self.affine.item_type_params.get(item);
+                let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
+                    return true;
+                };
+                let subst: HashMap<TypeParamId, Ty> = type_params
+                    .iter()
+                    .copied()
+                    .zip(args.iter().cloned())
+                    .collect();
+                self.affine
+                    .aggregate_field_types
+                    .get(item)
+                    .into_iter()
+                    .flatten()
+                    .any(|fty| self.is_affine(&crate::types::substitute(fty, &subst)))
+            }
+            _ => false,
+        }
+    }
+
+    /// This place's own current structural state (`rfcs/0012`): the
+    /// exact key's own recorded state if present, but dominated by the
+    /// *shortest* ancestor prefix (sharing the same root) that is
+    /// itself recorded as anything other than `Available` -- moving or
+    /// dropping a whole aggregate consumes every field reachable
+    /// through it, whether or not each one individually ever got its
+    /// own map entry. A key with no recorded ancestor or exact entry at
+    /// all is simply still in its own initial, untouched `Available`
+    /// state.
+    fn place_state(&self, place: &Place<LocalId>) -> ResourceState {
+        for len in 0..=place.projections.len() {
+            let prefix = Place {
+                root: place.root,
+                projections: place.projections[..len].to_vec(),
+            };
+            if let Some(state) = self.states.get(&prefix)
+                && *state != ResourceState::Available
+            {
+                return *state;
+            }
+        }
+        ResourceState::Available
+    }
+
+    /// `true` iff every place reachable through `place` (`place` itself,
+    /// and every affine descendant field `structural_drop_targets` could
+    /// ever reach) is currently `Available` -- what a *whole-value* use
+    /// (observed, returned, transferred, copied, passed as a whole)
+    /// requires, but a mere child access, a reinsertion into one empty
+    /// child, or a structural drop of the remaining owned fields does
+    /// not (`rfcs/0012`). `ty` is `place`'s own current type -- the
+    /// caller already has it (from `local_types`/`aggregate_field_types`)
+    /// and re-resolving it here a second time would risk disagreeing
+    /// with the caller's own idea of what `place` even refers to.
+    fn place_is_wholly_available(&self, place: &Place<LocalId>, ty: &Ty) -> bool {
+        // A self-referential declaration (`record A { a: A }`, or one
+        // a parser recovery folded into itself) has an infinite place
+        // tree. `typeck::cycles` already rejects it as an infinite
+        // layout -- but this stage still runs on the same HIR, because
+        // checking never stops at the first error, so it needs its own
+        // bound or it descends forever. Answering "whole" here only
+        // affects a program that is already rejected.
+        if place.projections.len() >= crate::limits::MAX_GENERIC_DEPTH {
+            return true;
+        }
+        if self.place_state(place) != ResourceState::Available {
+            return false;
+        }
+        // A variant (whose live case is only a runtime fact), or an
+        // item with malformed generic metadata, is not decomposed at
+        // all -- `place_state` above already answered the whole
+        // question for it. A generic *record* instantiation now is
+        // decomposed, through its own substituted field types.
+        let Some((item, fields)) = self.decomposable_fields(ty) else {
+            return true;
+        };
+        fields
+            .iter()
+            .enumerate()
+            .filter(|(_, fty)| self.is_affine(fty))
+            .all(|(index, fty)| {
+                self.place_is_wholly_available(&place.field(item, FieldId(index as u32)), fty)
+            })
+    }
+
+    /// Sets `place`'s own leaf state, first clearing every strictly
+    /// deeper entry it now supersedes -- moving or dropping `place` as
+    /// a whole consumes everything reachable through it, so a stale,
+    /// finer-grained entry for one of its own descendants (recorded
+    /// before this exact move/drop) must never again be consulted; the
+    /// new state at `place` itself now dominates all of them via
+    /// [`Self::place_state`]'s own prefix walk regardless, but removing
+    /// them too keeps the map's own size bounded by how many places are
+    /// *actually* still individually tracked, not how many ever were.
+    fn set_place_state(&mut self, place: &Place<LocalId>, state: ResourceState) {
+        self.states
+            .retain(|key, _| key.root != place.root || !place.is_ancestor_of(key) || key == place);
+        self.states.insert(place.clone(), state);
+    }
+
+    /// Resolves `expr` to the stable [`Place`] it names, if it names one
+    /// at all (`rfcs/0012`): a bare local, or a `Field` access chain
+    /// rooted in one, through nothing but further `Field` accesses --
+    /// never through a call, a construction, or any other expression
+    /// that produces a fresh, not-yet-owned value with no place of its
+    /// own. `None` for anything else (a temporary): extracting an
+    /// affine field out of one would leak its own siblings, since
+    /// nothing owns the temporary itself to structurally clean the rest
+    /// of it up -- the caller falls back to `reject_leaked_temporary`
+    /// for that case, exactly as Alpha 0.1.7 already does for reading a
+    /// non-affine field off one.
+    fn resolve_place(&self, expr: &HirExpr) -> Option<Place<LocalId>> {
+        match expr {
+            HirExpr::Local { local, .. } => Some(Place::root(*local)),
+            HirExpr::Field { id, base, .. } => {
+                let base_place = self.resolve_place(base)?;
+                let (owner, field) = self.affine.field_projections.get(id).copied()?;
+                Some(base_place.field(owner, FieldId(field as u32)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `place`'s own current type, resolved the same way a place is
+    /// built: `local_types` for the root, then one `aggregate_field_types`
+    /// lookup per projection. `None` only for malformed metadata (an
+    /// owner/field this stage's own checked `field_projections` should
+    /// never actually disagree with `aggregate_field_types` about, since
+    /// both ultimately come from the same `typeck` pass).
+    fn place_ty(&self, place: &Place<LocalId>) -> Option<Ty> {
+        let mut ty = self.local_types.get(&place.root)?.clone();
+        for projection in &place.projections {
+            let Projection::Field { owner, field } = projection else {
+                return None;
+            };
+            // The owner's own type arguments come from this place's
+            // *current* type at this exact step, and are substituted
+            // into the selected field's declared type before the walk
+            // continues from it (`rfcs/0008`, `rfcs/0012`) -- otherwise
+            // `Box[File]`'s own `item` field would resolve to a bare,
+            // never-affine `Ty::Param`.
+            let args: Vec<Ty> = match &ty {
+                Ty::Named(item, _) if item == owner => Vec::new(),
+                Ty::Applied(item, args) if item == owner => args.clone(),
+                _ => return None,
+            };
+            let field_ty = self
+                .affine
+                .aggregate_field_types
+                .get(owner)?
+                .get(field.0 as usize)?
+                .clone();
+            ty = self.substitute_field(*owner, &args, &field_ty)?;
+        }
+        Some(ty)
+    }
+
+    /// `field_ty` with `owner`'s own declared type parameters replaced
+    /// by `args` (`rfcs/0008`). `None` -- never a partial or empty
+    /// substitution -- when `owner` has no recorded type-parameter list
+    /// at all (an item `typeck` never registered; every real
+    /// record/variant always gets one, empty for a non-generic
+    /// declaration) or when its arity disagrees with `args`: an
+    /// unsubstituted `Ty::Param` escaping here would answer "not
+    /// affine" for a genuinely affine field.
+    fn substitute_field(&self, owner: ItemId, args: &[Ty], field_ty: &Ty) -> Option<Ty> {
+        let params = self.affine.item_type_params.get(&owner)?;
+        if params.len() != args.len() {
+            return None;
+        }
+        let subst: HashMap<TypeParamId, Ty> =
+            params.iter().copied().zip(args.iter().cloned()).collect();
+        Some(crate::types::substitute(field_ty, &subst))
+    }
+
+    /// `place`'s own declared aggregate item, its concrete type
+    /// arguments, and its already-substituted field types -- the shared
+    /// shape both [`Self::place_is_wholly_available`] and
+    /// [`Self::structural_drop_targets`] decompose an affine aggregate
+    /// through, generic or not. `None` for anything that is not a
+    /// decomposable record/resource: a primitive, a variant (whose live
+    /// case is a runtime fact -- see `variant_items`), or an item with
+    /// malformed generic metadata.
+    fn decomposable_fields(&self, ty: &Ty) -> Option<(ItemId, Vec<Ty>)> {
+        let (item, args): (ItemId, Vec<Ty>) = match ty {
+            Ty::Named(item, _) => (*item, Vec::new()),
+            Ty::Applied(item, args) => (*item, args.clone()),
+            _ => return None,
+        };
+        if self.variant_items.contains(&item) {
+            return None;
+        }
+        let declared = self.affine.aggregate_field_types.get(&item)?;
+        let substituted = declared
+            .iter()
+            .map(|fty| self.substitute_field(item, &args, fty))
+            .collect::<Option<Vec<Ty>>>()?;
+        Some((item, substituted))
+    }
+
+    /// Every place `place` structurally owns that is currently still
+    /// `Available` -- what a structural `drop`/scope-exit destruction of
+    /// `place` must actually destroy, in the exact deterministic order
+    /// `rfcs/0012` specifies: an aggregate's own affine fields, in
+    /// *reverse* declaration order, each recursively expanded the same
+    /// way first, followed by `place` itself *only* if `place`'s own
+    /// type is a declared `resource` (an ordinary, non-`resource`
+    /// aggregate has no separate runtime identity of its own to destroy
+    /// beyond its fields). A place already `Moved`/`Dropped`/`Error`
+    /// contributes nothing at all -- already someone else's
+    /// responsibility, or already diagnosed. A generic (`Ty::Applied`)
+    /// place is never decomposed (see `is_affine`'s own doc comment):
+    /// it contributes itself alone, exactly like Alpha 0.1.7's own
+    /// whole-value resources always did.
+    fn structural_drop_targets(&self, place: &Place<LocalId>) -> Vec<Place<LocalId>> {
+        // Bounded for the same reason `place_is_wholly_available` is:
+        // a self-referential declaration has an infinite place tree,
+        // and this stage still walks it on HIR `typeck::cycles` has
+        // already rejected. Contributing the place itself matches how
+        // every other non-decomposable shape (a variant, malformed
+        // generic metadata) is treated.
+        if place.projections.len() >= crate::limits::MAX_GENERIC_DEPTH {
+            return vec![place.clone()];
+        }
+        // `DropScheduled` still needs destroying here exactly like
+        // `Available` does -- it means only that an observing `defer`
+        // has *already run* by the time this exact exit replays cleanup
+        // (`check_defer` promotes straight back to `Available` once its
+        // own protecting scope ends, so a place already reaching a real
+        // exit while still `DropScheduled` is one whose defer is part
+        // of *this same* cleanup replay, ordered before it): the
+        // resource is still owned and must still be destroyed, just not
+        // moved or dropped *early*, out from under a pending defer that
+        // still needs it -- `apply_place_move`/`check_consume` already
+        // separately reject that.
+        if !matches!(
+            self.place_state(place),
+            ResourceState::Available | ResourceState::DropScheduled
+        ) {
+            return Vec::new();
+        }
+        let Some(ty) = self.place_ty(place) else {
+            return Vec::new();
+        };
+        // A variant's own live payload can only be identified at
+        // runtime (whichever case is actually active) -- never
+        // decomposed into `aggregate_field_types`'s own flattened,
+        // cross-case payload list as if it were one record's own named
+        // fields (see `variant_items`'s own doc comment). Contributed
+        // as a single opaque target regardless of `declared_resources`
+        // (a variant is never itself declared `resource`, but still
+        // needs exactly one "destroy whatever is actually live inside"
+        // action of its own): `nir::lower` reads this back as a place
+        // to move-then-drop as a whole, and the interpreter recursively
+        // destroys only the active case's own affine payload fields
+        // when that drop actually runs. Same single-target treatment
+        // for an item with malformed generic metadata, which is never
+        // decomposed on a substitution nobody could build.
+        let Some((item, fields)) = self.decomposable_fields(&ty) else {
+            return vec![place.clone()];
+        };
+        let mut targets = Vec::new();
+        for (index, field_ty) in fields.iter().enumerate().rev() {
+            if self.is_affine(field_ty) {
+                targets.extend(
+                    self.structural_drop_targets(&place.field(item, FieldId(index as u32))),
+                );
+            }
+        }
+        if self.affine.declared_resources.contains(&item) {
+            targets.push(place.clone());
+        }
+        targets
+    }
+
+    /// The field name/span this diagnostic is reported against --
+    /// `expr` is always the exact `HirExpr::Field` [`Self::resolve_place`]
+    /// just resolved `place` from, but this stays *total* rather than
+    /// asserting that: every call site here is reached from a
+    /// structural match on `HirExpr::Field`, yet a panic primitive on a
+    /// path a hand-built HIR could ever reach is exactly what this
+    /// milestone's own no-panic-on-malformed-input rule forbids. An
+    /// unnamed target falls back to the expression's own span and a
+    /// generic label, which still produces a well-formed diagnostic.
+    fn field_name_and_span(expr: &HirExpr) -> (Option<Symbol>, Span) {
+        match expr {
+            HirExpr::Field { name, span, .. } => (Some(*name), *span),
+            other => (None, other.span()),
+        }
+    }
+
+    /// How a structural field is named in a diagnostic -- its declared
+    /// name, or a generic stand-in when the target was not a named
+    /// field access at all (see [`Self::field_name_and_span`]).
+    fn field_display(&self, name: Option<Symbol>) -> String {
+        match name {
+            Some(name) => self.interner.resolve(name).to_string(),
+            None => "this field".to_string(),
+        }
+    }
+
+    /// Rejects any *consuming* use of a place reached through an
+    /// ordinary (non-`take`) parameter (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Observation is transitive. An ordinary parameter is a call-scoped
+    /// view of a value the caller still owns, and so is every field,
+    /// payload and nested place reached through it. Reading one is
+    /// exactly what observation is for; moving it out, destroying it or
+    /// overwriting it is not.
+    ///
+    /// `nir::verify` rejects the lowered form of all three outright, so
+    /// this layer has to reject the source -- otherwise `check` accepts
+    /// a program `ir` and `run` refuse, and the refusal arrives as an
+    /// internal `V` diagnostic with no source to point at.
+    ///
+    /// Returns `true` when the use was rejected.
+    fn reject_observed_place(
+        &mut self,
+        place: &Place<LocalId>,
+        name: Option<Symbol>,
+        span: Span,
+        what: &str,
+    ) -> bool {
+        if place.projections.is_empty() || !self.observing.contains(&place.root) {
+            return false;
+        }
+        self.diagnose(
+            OBSERVATION_ESCAPES,
+            span,
+            format!(
+                "`{}` is reached through an ordinary parameter's own call-scoped observation and \
+                 cannot be {what}",
+                self.field_display(name)
+            ),
+            "observation escapes its call",
+        );
+        true
+    }
+
+    /// Validates an *observing* use of `place` (`rfcs/0012`): still
+    /// usable for ordinary reads and further projection while
+    /// `Available`/`DropScheduled`, but a use-after-move or
+    /// use-after-drop is reported the same way a whole local's would
+    /// be, since it is exactly the same underlying violation, now at a
+    /// finer grain. Never transitions `place`'s own state -- observing
+    /// never consumes.
+    fn check_place_read(&mut self, place: &Place<LocalId>, expr: &HirExpr) {
+        let (name, span) = Self::field_name_and_span(expr);
+        match self.place_state(place) {
+            ResourceState::Available | ResourceState::DropScheduled | ResourceState::Error => {}
+            ResourceState::Moved => {
+                self.diagnose(
+                    USE_AFTER_MOVE,
+                    span,
+                    format!(
+                        "`{}` was already moved and cannot be used",
+                        self.field_display(name)
+                    ),
+                    "use after move",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::Dropped => {
+                self.diagnose(
+                    USE_AFTER_DROP,
+                    span,
+                    format!(
+                        "`{}` was already dropped and cannot be used",
+                        self.field_display(name)
+                    ),
+                    "use after drop",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+        }
+    }
+
+    /// Transfers ownership of `place` (`rfcs/0012`): the structural
+    /// generalization of [`Self::check_consume`], for an individual
+    /// affine field rather than a whole local. Moving a child updates
+    /// only that child's own entry -- a sibling field, and the parent's
+    /// own ability to be structurally dropped later, are both
+    /// completely unaffected (the parent's own *whole-value* use is
+    /// separately gated by [`Self::reject_partial_whole_use`]).
+    fn apply_place_move(&mut self, place: &Place<LocalId>, expr: &HirExpr) {
+        let (name, span) = Self::field_name_and_span(expr);
+        if self.reject_observed_place(place, name, span, "moved out") {
+            return;
+        }
+        match self.place_state(place) {
+            ResourceState::Available => {
+                self.set_place_state(place, ResourceState::Moved);
+            }
+            ResourceState::Error => {}
+            ResourceState::Moved => {
+                self.diagnose(
+                    USE_AFTER_MOVE,
+                    span,
+                    format!(
+                        "`{}` was already moved and cannot be moved again",
+                        self.field_display(name)
+                    ),
+                    "use after move",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::Dropped => {
+                self.diagnose(
+                    USE_AFTER_DROP,
+                    span,
+                    format!(
+                        "`{}` was already dropped and cannot be moved",
+                        self.field_display(name)
+                    ),
+                    "use after drop",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::DropScheduled => {
+                self.diagnose(
+                    MOVE_AFTER_DEFER_CAPTURED,
+                    span,
+                    format!(
+                        "`{}` is still needed by a pending `defer` and cannot be moved away",
+                        self.field_display(name)
+                    ),
+                    "moved before its defer ran",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+        }
     }
 
     fn diverges(&self, id: crate::hir::ExprId) -> bool {
@@ -491,9 +1011,9 @@ impl<'a> FlowChecker<'a> {
         self.defer_scopes.push(HashSet::new());
         self.check_block_ctx_inner(block, kind);
         let scope = self.defer_scopes.pop().expect("pushed immediately above");
-        for local in scope {
-            if let Some(ResourceState::DropScheduled) = self.states.get(&local) {
-                self.states.insert(local, ResourceState::Available);
+        for place in scope {
+            if let Some(ResourceState::DropScheduled) = self.states.get(&place) {
+                self.states.insert(place, ResourceState::Available);
             }
         }
     }
@@ -579,8 +1099,9 @@ impl<'a> FlowChecker<'a> {
         }
         self.check_expr_ctx(&b.value, ConsumeKind::Other);
         if self.is_resource_local(b.local) {
-            self.states.insert(b.local, ResourceState::Available);
-            self.pending_cleanup.push(CleanupAction::Drop(b.local));
+            let place = Place::root(b.local);
+            self.states.insert(place.clone(), ResourceState::Available);
+            self.pending_cleanup.push(CleanupAction::Drop(place));
         }
     }
 
@@ -656,6 +1177,19 @@ impl<'a> FlowChecker<'a> {
                         }
                     })
                     .collect();
+                // Each argument's own exact place (`rfcs/0012`), in
+                // declaration order -- see `CheckedDeferPlan::
+                // arg_places`.
+                let arg_places: Vec<Option<Place<LocalId>>> = args
+                    .iter()
+                    .map(|a| {
+                        if self.is_affine_expr(a.id()) {
+                            self.resolve_place(a)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let registration_order = self.next_defer_registration;
                 self.next_defer_registration += 1;
                 self.defer_plans.insert(
@@ -664,6 +1198,7 @@ impl<'a> FlowChecker<'a> {
                         callee: *item,
                         arg_modes,
                         arg_types,
+                        arg_places,
                         return_type,
                         registration_order,
                     },
@@ -676,20 +1211,53 @@ impl<'a> FlowChecker<'a> {
         // replays this cleanup action, rather than this stage trying
         // to describe a NIR-level call itself.
         self.pending_cleanup.push(CleanupAction::Defer(expr.id()));
-        let mut observed = HashSet::new();
-        collect_observed_locals(expr, &mut observed);
-        for local in observed {
-            if let Some(ResourceState::Available) = self.states.get(&local) {
-                self.states.insert(local, ResourceState::DropScheduled);
+        // The *exact* places this `defer` observes (`rfcs/0012`), not
+        // merely the roots they are reached through: `defer
+        // inspect(session.input)` protects `session.input` alone, so an
+        // unaffected sibling (`session.output`) stays freely movable
+        // while the parent as a whole does not (see
+        // `reject_partial_whole_use`, which reports a defer-protected
+        // descendant as its own violation rather than a partial move).
+        let observed = self.observed_places(expr);
+        for place in observed {
+            if self.place_state(&place) == ResourceState::Available {
+                self.states
+                    .insert(place.clone(), ResourceState::DropScheduled);
                 // Blocker 9: remembered against *this* defer's own
                 // enclosing block so `check_block_ctx` can release this
                 // exact protection once that block's own walk ends,
                 // rather than leaving it protected indefinitely.
                 if let Some(scope) = self.defer_scopes.last_mut() {
-                    scope.insert(local);
+                    scope.insert(place);
                 }
             }
         }
+    }
+
+    /// Every exact place this `defer` argument expression observes
+    /// (`rfcs/0012`). A field access chain that resolves to a stable
+    /// affine place contributes that whole place; anything else
+    /// contributes whatever roots it reaches through, exactly as
+    /// before. Collected through this stage's own `resolve_place`, so a
+    /// place recorded here is the identical key `apply_place_move`/
+    /// `check_place_read` already compare against -- never a
+    /// second, parallel notion of "the same field".
+    fn observed_places(&self, expr: &HirExpr) -> Vec<Place<LocalId>> {
+        let mut out = Vec::new();
+        collect_observed_places(self, expr, &mut out);
+        out
+    }
+
+    /// `true` iff some place strictly *under* `root` is currently held
+    /// by a pending observing `defer` (`rfcs/0012`) -- what makes an
+    /// otherwise-complete parent unusable as a whole value: moving or
+    /// dropping it would destroy the very descendant that `defer` still
+    /// needs to observe when it runs. A boolean `any`, so `self.states`'
+    /// own iteration order cannot affect the answer.
+    fn has_defer_protected_descendant(&self, root: &Place<LocalId>) -> bool {
+        self.states.iter().any(|(key, state)| {
+            key != root && root.is_ancestor_of(key) && *state == ResourceState::DropScheduled
+        })
     }
 
     fn check_drop(&mut self, expr: &HirExpr, span: Span) {
@@ -700,13 +1268,30 @@ impl<'a> FlowChecker<'a> {
         // precise diagnostic (`double drop`, not the generic `use after
         // drop` a plain read would report for the same case).
         let HirExpr::Local { local, name, .. } = expr else {
-            // A non-local drop target (already rejected by typeck's own
-            // static-type check if it isn't even a resource) has no
-            // owned binding here to transition; still walked with
-            // `ConsumeKind::Other` for whatever nested reads/moves it
-            // does contain -- a compound `if`/`match`/`handle` origin
-            // here hits the same `nir::lower` limitation as any other
-            // non-`return` consuming position (Blocker 2).
+            // `drop session.input;` destroys exactly that one
+            // structural field (`rfcs/0012`) -- handled here, in its own
+            // right, rather than falling through to the ordinary
+            // field-move path: a field destroyed by `drop` becomes
+            // `Dropped`, not `Moved`, so a second `drop` of the same
+            // field reports a real double drop (and a later *use* of it
+            // a use-after-drop) instead of the generic use-after-move a
+            // plain transfer would.
+            if let HirExpr::Field { .. } = expr
+                && self.is_affine_expr(expr.id())
+                && let Some(place) = self.resolve_place(expr)
+                && !place.projections.is_empty()
+            {
+                self.check_field_drop(&place, expr, span);
+                return;
+            }
+            // Any other non-local drop target (already rejected by
+            // typeck's own static-type check if it isn't even a
+            // resource) has no owned place here to transition; still
+            // walked with `ConsumeKind::Other` for whatever nested
+            // reads/moves it does contain -- a compound `if`/`match`/
+            // `handle` origin here hits the same `nir::lower`
+            // limitation as any other non-`return` consuming position
+            // (Blocker 2).
             self.check_expr_ctx(expr, ConsumeKind::Other);
             return;
         };
@@ -722,12 +1307,59 @@ impl<'a> FlowChecker<'a> {
             );
             return;
         }
-        let Some(state) = self.states.get(local).copied() else {
+        let root = Place::root(*local);
+        let Some(state) = self.states.get(&root).copied() else {
             return;
         };
         match state {
+            // A partially-moved aggregate's own *root* state is still
+            // `Available` (only its children's own entries changed) --
+            // structurally destroying it here means destroying exactly
+            // its still-live descendants (`structural_drop_targets`),
+            // never re-deriving "the whole thing" blindly: a field
+            // already moved out is never touched again, and the outer
+            // identity itself (if this is a declared `resource`) is
+            // included by that same walk, last.
             ResourceState::Available => {
-                self.states.insert(*local, ResourceState::Dropped);
+                // A descendant an observing `defer` is still holding
+                // makes this whole-value destruction illegal
+                // (`rfcs/0012`): LIFO replay runs that defer *after*
+                // this drop, so it would observe a field this very
+                // statement destroyed. Rejected here rather than left
+                // for the runtime to discover.
+                if self.has_defer_protected_descendant(&root) {
+                    self.diagnose(
+                        MOVE_AFTER_DEFER_CAPTURED,
+                        span,
+                        format!(
+                            "`{}` has a field a pending `defer` still needs and cannot be dropped \
+                             yet",
+                            self.local_name(*local, *name)
+                        ),
+                        "a field is still needed by a pending defer",
+                    );
+                    self.set_place_state(&root, ResourceState::Error);
+                    return;
+                }
+                // Structurally destroys exactly `root`'s own still-live
+                // descendants (`rfcs/0012`) -- computed *before*
+                // transitioning `root` itself, so it still reflects
+                // whatever has already been moved out of it -- recorded
+                // directly under this exact drop expression's own
+                // `ExprId`, reusing `cleanup_edges`'s own existing shape
+                // (an explicit `drop` is its own one-off exit, not a
+                // scope-exit snapshot, so `pending_cleanup`'s marker
+                // mechanism does not apply here at all): `nir::lower`
+                // looks this up by this same id instead of naively
+                // dropping `root`'s own bare whole value, which would
+                // silently leak every one of its own remaining owned
+                // fields.
+                let targets = self.structural_drop_targets(&root);
+                self.cleanup_edges.insert(
+                    expr.id(),
+                    targets.into_iter().map(CleanupAction::Drop).collect(),
+                );
+                self.set_place_state(&root, ResourceState::Dropped);
             }
             ResourceState::Error => {}
             ResourceState::Moved => {
@@ -740,7 +1372,7 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "drop after move",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
             ResourceState::Dropped => {
                 self.diagnose(
@@ -749,7 +1381,7 @@ impl<'a> FlowChecker<'a> {
                     format!("`{}` was already dropped", self.local_name(*local, *name)),
                     "double drop",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
             ResourceState::DropScheduled => {
                 self.diagnose(
@@ -761,7 +1393,83 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "dropped before its defer ran",
                 );
-                self.states.insert(*local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
+            }
+        }
+    }
+
+    /// `drop <place>;` where `<place>` is an individual affine field
+    /// rather than a whole local (`rfcs/0012`) -- the structural
+    /// counterpart of [`Self::check_drop`]'s own whole-local handling,
+    /// sharing its exact shape: the still-live descendants this exact
+    /// field owns are recorded as this drop's own one-off cleanup plan
+    /// (keyed by this expression's own id, the same way a whole local's
+    /// already is, so `nir::lower` replays it rather than naively
+    /// destroying the field's own whole value and leaking whatever was
+    /// already moved out of it), and the field itself transitions to
+    /// `Dropped`.
+    fn check_field_drop(&mut self, place: &Place<LocalId>, expr: &HirExpr, span: Span) {
+        let (name, _) = Self::field_name_and_span(expr);
+        if self.reject_observed_place(place, name, span, "dropped") {
+            return;
+        }
+        match self.place_state(place) {
+            ResourceState::Available => {
+                if self.has_defer_protected_descendant(place) {
+                    self.diagnose(
+                        MOVE_AFTER_DEFER_CAPTURED,
+                        span,
+                        format!(
+                            "`{}` has a field a pending `defer` still needs and cannot be dropped \
+                             yet",
+                            self.field_display(name)
+                        ),
+                        "a field is still needed by a pending defer",
+                    );
+                    self.set_place_state(place, ResourceState::Error);
+                    return;
+                }
+                let targets = self.structural_drop_targets(place);
+                self.cleanup_edges.insert(
+                    expr.id(),
+                    targets.into_iter().map(CleanupAction::Drop).collect(),
+                );
+                self.record_consume(expr.id(), ConsumeInfo::Transfer);
+                self.set_place_state(place, ResourceState::Dropped);
+            }
+            ResourceState::Error => {}
+            ResourceState::Moved => {
+                self.diagnose(
+                    USE_AFTER_MOVE,
+                    span,
+                    format!(
+                        "`{}` was already moved and cannot be dropped",
+                        self.field_display(name)
+                    ),
+                    "drop after move",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::Dropped => {
+                self.diagnose(
+                    DOUBLE_DROP,
+                    span,
+                    format!("`{}` was already dropped", self.field_display(name)),
+                    "double drop",
+                );
+                self.set_place_state(place, ResourceState::Error);
+            }
+            ResourceState::DropScheduled => {
+                self.diagnose(
+                    MOVE_AFTER_DEFER_CAPTURED,
+                    span,
+                    format!(
+                        "`{}` is still needed by a pending `defer` and cannot be dropped early",
+                        self.field_display(name)
+                    ),
+                    "dropped before its defer ran",
+                );
+                self.set_place_state(place, ResourceState::Error);
             }
         }
     }
@@ -875,30 +1583,54 @@ impl<'a> FlowChecker<'a> {
     /// already follows.
     fn finish_loop(
         &mut self,
-        entry: HashMap<LocalId, ResourceState>,
-        after_base: Option<HashMap<LocalId, ResourceState>>,
+        entry: PlaceStates,
+        after_base: Option<PlaceStates>,
         frame: LoopFrame,
         fallthrough_reachable: bool,
-        fallthrough_state: HashMap<LocalId, ResourceState>,
+        fallthrough_state: PlaceStates,
         span: Span,
-    ) -> HashMap<LocalId, ResourceState> {
-        let mut backedges: Vec<&HashMap<LocalId, ResourceState>> =
-            frame.continue_states.iter().collect();
+    ) -> PlaceStates {
+        let mut backedges: Vec<&PlaceStates> = frame.continue_states.iter().collect();
         if fallthrough_reachable {
             backedges.push(&fallthrough_state);
         }
 
-        let mut poisoned: HashSet<LocalId> = HashSet::new();
-        for (local, entry_state) in &entry {
-            if *entry_state == ResourceState::Error {
+        // Every place already tracked before the loop, plus every place
+        // a backedge newly introduced for a root *already* tracked
+        // before the loop (a field touched for the first time during
+        // one iteration, of an aggregate declared outside the loop) --
+        // never a place whose own root is itself declared inside the
+        // loop body (out of scope for this comparison entirely,
+        // exactly as before: comparing against `entry`, where it never
+        // existed, would be meaningless).
+        let tracked_roots: HashSet<LocalId> = entry.keys().map(|p| p.root).collect();
+        let mut compare_keys: BTreeSet<Place<LocalId>> = entry.keys().cloned().collect();
+        for backedge in &backedges {
+            for key in backedge.keys() {
+                if tracked_roots.contains(&key.root) {
+                    compare_keys.insert(key.clone());
+                }
+            }
+        }
+        let default_for = |states: &PlaceStates, key: &Place<LocalId>| -> ResourceState {
+            states
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| entry.get(key).copied().unwrap_or(ResourceState::Available))
+        };
+
+        let mut poisoned: HashSet<Place<LocalId>> = HashSet::new();
+        for key in &compare_keys {
+            let entry_state = default_for(&entry, key);
+            if entry_state == ResourceState::Error {
                 continue;
             }
             let disagrees = backedges.iter().any(|backedge| {
-                let backedge_state = backedge.get(local).copied().unwrap_or(*entry_state);
-                backedge_state != *entry_state && backedge_state != ResourceState::Error
+                let backedge_state = default_for(backedge, key);
+                backedge_state != entry_state && backedge_state != ResourceState::Error
             });
             if disagrees {
-                poisoned.insert(*local);
+                poisoned.insert(key.clone());
             }
         }
         for _ in &poisoned {
@@ -913,7 +1645,7 @@ impl<'a> FlowChecker<'a> {
             );
         }
 
-        let mut edges: Vec<&HashMap<LocalId, ResourceState>> = frame.break_states.iter().collect();
+        let mut edges: Vec<&PlaceStates> = frame.break_states.iter().collect();
         if let Some(base) = &after_base {
             edges.push(base);
         }
@@ -922,26 +1654,36 @@ impl<'a> FlowChecker<'a> {
             // exit either -- "after the loop" is itself unreachable.
             return entry;
         };
-        let mut after: HashMap<LocalId, ResourceState> = entry
-            .keys()
-            .map(|local| {
-                let state = first.get(local).copied().unwrap_or(entry[local]);
-                (*local, state)
-            })
-            .collect();
-        for local in &poisoned {
-            after.insert(*local, ResourceState::Error);
+        let mut after_keys = compare_keys;
+        for key in first.keys() {
+            if tracked_roots.contains(&key.root) {
+                after_keys.insert(key.clone());
+            }
         }
-        let mut disagreements: HashSet<LocalId> = HashSet::new();
+        for edge in rest {
+            for key in edge.keys() {
+                if tracked_roots.contains(&key.root) {
+                    after_keys.insert(key.clone());
+                }
+            }
+        }
+        let mut after: PlaceStates = after_keys
+            .iter()
+            .map(|key| (key.clone(), default_for(first, key)))
+            .collect();
+        for key in &poisoned {
+            after.insert(key.clone(), ResourceState::Error);
+        }
+        let mut disagreements: HashSet<Place<LocalId>> = HashSet::new();
         for other in rest {
-            for (local, current) in after.iter_mut() {
-                if poisoned.contains(local) {
+            for (key, current) in after.iter_mut() {
+                if poisoned.contains(key) {
                     continue;
                 }
-                let other_state = other.get(local).copied().unwrap_or(entry[local]);
+                let other_state = default_for(other, key);
                 let joined = current.join(other_state);
                 if joined == ResourceState::Error && *current != ResourceState::Error {
-                    disagreements.insert(*local);
+                    disagreements.insert(key.clone());
                 }
                 *current = joined;
             }
@@ -1071,14 +1813,29 @@ impl<'a> FlowChecker<'a> {
                     self.record_consume(value.id(), ConsumeInfo::Transfer);
                 }
                 self.check_expr_ctx(value, ConsumeKind::Other);
-                if let HirExpr::Local {
-                    local, name, span, ..
-                } = target.as_ref()
-                    && self.is_resource_local(*local)
-                {
-                    self.check_reassignment(*local, *name, *span);
-                } else {
-                    self.check_expr(target);
+                match target.as_ref() {
+                    HirExpr::Local {
+                        local, name, span, ..
+                    } if self.is_resource_local(*local) => {
+                        self.check_reassignment(&Place::root(*local), *name, *span);
+                    }
+                    HirExpr::Field {
+                        name, span, base, ..
+                    } if self.is_affine_expr(target.id()) => {
+                        match self.resolve_place(target) {
+                            Some(place) => self.check_reassignment(&place, *name, *span),
+                            None => {
+                                // The base isn't a stable place at all
+                                // (a temporary) -- there is no place
+                                // here to reinitialize into in the
+                                // first place; fall back to the
+                                // ordinary read-and-leak-check path.
+                                self.check_expr(base);
+                                self.reject_leaked_temporary(base);
+                            }
+                        }
+                    }
+                    _ => self.check_expr(target),
                 }
             }
             HirExpr::Call {
@@ -1124,6 +1881,21 @@ impl<'a> FlowChecker<'a> {
                     }
                 }
                 let take_flags = self.take_flags_for_callee(callee);
+                // A variant case constructor (`FileResult.Found(file)`)
+                // always transfers every one of its own payload
+                // arguments (`rfcs/0012`) -- exactly like `RecordLiteral`
+                // fields already do, and completely unlike an ordinary
+                // call's own non-`take` parameter, which only ever
+                // observes: constructing a variant case is itself the
+                // one and only place its own payload becomes owned by
+                // something, so there is no "observing" shape of it to
+                // fall back to. `take_flags_for_callee` correctly has no
+                // entry at all for this callee shape (a case constructor
+                // is not a declared function), which is exactly why this
+                // needs its own explicit check here rather than falling
+                // through to the ordinary `unwrap_or(false)` default
+                // below.
+                let is_variant_construct = matches!(callee.as_ref(), HirExpr::CaseRef { .. });
                 for (index, arg) in args.iter().enumerate() {
                     // `false` here only ever means "this callee is not a
                     // direct function reference at all" (a variant case
@@ -1134,10 +1906,11 @@ impl<'a> FlowChecker<'a> {
                     // `HirExpr::Function` callee specifically, the guard
                     // above already proved a same-length entry exists,
                     // so `flags.get(index)` can never actually miss here.
-                    let takes = take_flags
-                        .and_then(|flags| flags.get(index))
-                        .copied()
-                        .unwrap_or(false);
+                    let takes = is_variant_construct
+                        || take_flags
+                            .and_then(|flags| flags.get(index))
+                            .copied()
+                            .unwrap_or(false);
                     if self.is_affine_expr(arg.id()) {
                         self.record_consume(
                             arg.id(),
@@ -1166,18 +1939,62 @@ impl<'a> FlowChecker<'a> {
                     }
                 }
             }
-            // No well-typed field projection can ever be affine-typed
-            // itself (`typeck`'s own RESOURCE_FIELD_IN_ORDINARY_AGGREGATE
-            // already rejects a resource-typed field in any aggregate at
-            // its own declaration -- see the retired U0009 above), so
-            // there is nothing left for this arm to consume-check about
-            // the *projected field*, regardless of `kind` -- but `base`
-            // itself can still be a bare resource temporary directly
-            // (`make_file().descriptor`, Blocker 3): read once for this
-            // one field, then discarded with nothing to destroy it.
+            // A well-typed field projection *can* now be affine-typed
+            // itself (`rfcs/0012`, lifting Alpha 0.1.7's blanket
+            // rejection of a resource-typed field in any aggregate): if
+            // it is, and `base` resolves to a stable place (a bare
+            // local, or a further field chain rooted in one), the field
+            // itself is the place actually being read/consumed here,
+            // not `base` as a whole -- `base`'s own remaining fields are
+            // completely unaffected (`rfcs/0012`'s "unaffected sibling
+            // field" rule). `base` is walked through `resolve_place`
+            // itself (never `check_expr(base)` first): an intermediate
+            // `Field` in the chain must not be treated as a *whole-value
+            // read* of its own base, which would wrongly reject reading
+            // through an already-partially-moved intermediate aggregate
+            // (`session.output` after `session.input` was moved is
+            // still valid). A non-affine field, or a field whose own
+            // `base` is not a stable place at all (a temporary), keeps
+            // exactly Alpha 0.1.7's original behavior.
             HirExpr::Field { base, .. } => {
-                self.check_expr(base);
-                self.reject_leaked_temporary(base);
+                if kind == ConsumeKind::Read && self.is_affine_expr(expr.id()) {
+                    match self.resolve_place(expr) {
+                        Some(place) => self.check_place_read(&place, expr),
+                        None => {
+                            self.check_expr(base);
+                            self.reject_leaked_temporary(base);
+                        }
+                    }
+                } else if kind != ConsumeKind::Read && self.is_affine_expr(expr.id()) {
+                    match self.resolve_place(expr) {
+                        Some(place) => {
+                            self.apply_place_move(&place, expr);
+                            self.record_consume(expr.id(), ConsumeInfo::Transfer);
+                        }
+                        None => {
+                            self.check_expr(base);
+                            self.reject_leaked_temporary(base);
+                        }
+                    }
+                } else if let Some(place) = self.resolve_place(expr) {
+                    // A *non-affine* field of an affine aggregate
+                    // (`session.count`) reached through a stable place
+                    // chain (`rfcs/0012`): what must still be intact is
+                    // the chain reaching it, not the whole aggregate --
+                    // reading an unaffected field of a partially moved
+                    // parent is exactly what a partial move is supposed
+                    // to leave possible, and is what `U0014`'s own
+                    // advice tells the user to do. Walking `base`
+                    // through the ordinary whole-value read path
+                    // instead would reject it. A use after the *parent*
+                    // itself was moved or dropped is still rejected:
+                    // `place_state`'s own prefix walk lets the
+                    // ancestor's state dominate.
+                    self.check_place_read(&place, expr);
+                } else {
+                    self.check_expr(base);
+                    self.reject_leaked_temporary(base);
+                }
             }
             HirExpr::Cast { expr, .. } => self.check_expr(expr),
             HirExpr::Try { expr, id, .. } => {
@@ -1210,7 +2027,22 @@ impl<'a> FlowChecker<'a> {
                 span,
                 ..
             } => {
-                self.check_expr(scrutinee);
+                // An affine scrutinee is *decomposed* by matching it,
+                // never merely observed (`rfcs/0012`): whichever case
+                // is actually active hands its own payload to that
+                // arm's own pattern -- see `check_pattern` -- so the
+                // scrutinee's own place (if it names one at all, e.g. a
+                // bare local) must itself become `Moved` here, or its
+                // own later implicit end-of-scope cleanup would try to
+                // structurally destroy the very same payload a pattern
+                // binding already took ownership of, double-dropping
+                // it. A non-affine scrutinee keeps its own original,
+                // purely observing read.
+                if self.is_affine_expr(scrutinee.id()) {
+                    self.check_expr_ctx(scrutinee, ConsumeKind::Other);
+                } else {
+                    self.check_expr(scrutinee);
+                }
                 let kind = self.check_compound_origin(*id, *span, kind, "match");
                 self.check_match_arms(*id, *span, arms, kind);
             }
@@ -1436,9 +2268,15 @@ impl<'a> FlowChecker<'a> {
         if self.observing.contains(&local) {
             return;
         }
-        let Some(state) = self.states.get(&local).copied() else {
+        let root = Place::root(local);
+        let Some(state) = self.states.get(&root).copied() else {
             return;
         };
+        if state == ResourceState::Available
+            && self.reject_partial_whole_use(&root, local, name, span)
+        {
+            return;
+        }
         match state {
             ResourceState::Available | ResourceState::DropScheduled => {}
             ResourceState::Error => {}
@@ -1452,7 +2290,7 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "use after move",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
             ResourceState::Dropped => {
                 self.diagnose(
@@ -1464,16 +2302,70 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "use after drop",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
         }
     }
 
+    /// `true` (having already diagnosed [`PARTIAL_PARENT_USED_AS_WHOLE`])
+    /// iff `root`'s own type is an aggregate currently missing at least
+    /// one of its own affine fields (`rfcs/0012`): a partially-moved
+    /// aggregate may only be used for accessing an unaffected child
+    /// place, reinserting into an empty child, or structural cleanup --
+    /// never observed, returned, transferred, copied, or passed as a
+    /// whole. Only ever called once `root`'s own recorded state is
+    /// already known to be `Available` (a `Moved`/`Dropped`/`Error`
+    /// whole-value use is a different, already-existing diagnostic).
+    fn reject_partial_whole_use(
+        &mut self,
+        root: &Place<LocalId>,
+        local: LocalId,
+        name: crate::symbol::Symbol,
+        span: Span,
+    ) -> bool {
+        let Some(ty) = self.place_ty(root) else {
+            return false;
+        };
+        if self.place_is_wholly_available(root, &ty) {
+            return false;
+        }
+        // A descendant an observing `defer` is still holding is not a
+        // *partially moved* parent (`rfcs/0012`): the field is entirely
+        // intact, and this parent becomes usable as a whole again the
+        // moment that defer's own scope ends. Reported as its own
+        // violation so the diagnostic names the real reason.
+        if self.has_defer_protected_descendant(root) {
+            self.diagnose(
+                MOVE_AFTER_DEFER_CAPTURED,
+                span,
+                format!(
+                    "`{}` has a field a pending `defer` still needs and cannot be moved or \
+                     dropped as a whole yet",
+                    self.local_name(local, name)
+                ),
+                "a field is still needed by a pending defer",
+            );
+            return true;
+        }
+        self.diagnose(
+            PARTIAL_PARENT_USED_AS_WHOLE,
+            span,
+            format!(
+                "`{}` has had one or more of its own fields moved out and cannot be used as a \
+                 whole value -- access an unaffected field, reinsert into an empty one, or drop \
+                 it to clean up what remains",
+                self.local_name(local, name)
+            ),
+            "partially moved value used as a whole",
+        );
+        true
+    }
+
     /// Transitions `local`'s own state to `Moved` -- the only shape an
-    /// existing owned binding can be consumed *from* is a bare local
-    /// reference naming one. Moving a resource-typed value *out of* a
-    /// field (`take other.file`) is not supported this milestone --
-    /// only a whole binding may ever be moved.
+    /// existing owned *whole* binding can be consumed *from* is a bare
+    /// local reference naming one; consuming an individual affine field
+    /// out of one goes through [`Self::apply_place_move`] instead
+    /// (`rfcs/0012`).
     fn check_consume(&mut self, local: LocalId, name: crate::symbol::Symbol, span: Span) {
         if self.observing.contains(&local) {
             self.diagnose(
@@ -1487,12 +2379,18 @@ impl<'a> FlowChecker<'a> {
             );
             return;
         }
-        let Some(state) = self.states.get(&local).copied() else {
+        let root = Place::root(local);
+        let Some(state) = self.states.get(&root).copied() else {
             return;
         };
+        if state == ResourceState::Available
+            && self.reject_partial_whole_use(&root, local, name, span)
+        {
+            return;
+        }
         match state {
             ResourceState::Available => {
-                self.states.insert(local, ResourceState::Moved);
+                self.set_place_state(&root, ResourceState::Moved);
             }
             ResourceState::Error => {}
             ResourceState::Moved => {
@@ -1505,7 +2403,7 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "use after move",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
             ResourceState::Dropped => {
                 self.diagnose(
@@ -1517,7 +2415,7 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "use after drop",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
             ResourceState::DropScheduled => {
                 self.diagnose(
@@ -1529,28 +2427,34 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "moved before its defer ran",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(&root, ResourceState::Error);
             }
         }
     }
 
-    /// Reassigning a `mutable` resource-typed binding (Blocker 4):
-    /// accepted -- and transitions `local` to `Available`, exactly
-    /// like a fresh binding -- only when the path-sensitive state
-    /// already proves the slot holds nothing needing destruction
-    /// (`Moved`/`Dropped`) on every incoming path; an `Available` or
-    /// `DropScheduled` old value would otherwise be silently
-    /// overwritten and leaked, since nothing would ever destroy it
-    /// again. A local absent from `self.states` (an ordinary, non-
-    /// resource-typed target the caller already filtered out, or one
-    /// this checker never saw declared) has nothing here to protect.
-    fn check_reassignment(&mut self, local: LocalId, name: crate::symbol::Symbol, span: Span) {
-        let Some(state) = self.states.get(&local).copied() else {
+    /// Reassigning a `mutable` resource-typed binding, or reinitializing
+    /// an individual empty affine field (`session.input = open_file();`,
+    /// `rfcs/0012`): accepted -- and transitions `place` back to
+    /// `Available`, exactly like a fresh binding -- only when the
+    /// path-sensitive state already proves that exact place holds
+    /// nothing needing destruction (`Moved`/`Dropped`) on every incoming
+    /// path; an `Available` or `DropScheduled` old value would otherwise
+    /// be silently overwritten and leaked, since nothing would ever
+    /// destroy it again. A place absent from `self.states` with no
+    /// affine type at all (an ordinary, non-resource-typed target the
+    /// caller already filtered out) has nothing here to protect.
+    fn check_reassignment(
+        &mut self,
+        place: &Place<LocalId>,
+        name: crate::symbol::Symbol,
+        span: Span,
+    ) {
+        if self.reject_observed_place(place, Some(name), span, "reassigned") {
             return;
-        };
-        match state {
+        }
+        match self.place_state(place) {
             ResourceState::Moved | ResourceState::Dropped => {
-                self.states.insert(local, ResourceState::Available);
+                self.set_place_state(place, ResourceState::Available);
             }
             ResourceState::Error => {}
             ResourceState::Available | ResourceState::DropScheduled => {
@@ -1560,11 +2464,11 @@ impl<'a> FlowChecker<'a> {
                     format!(
                         "`{}` still owns a resource that was never moved or dropped; \
                          reassigning it would leak the old value",
-                        self.local_name(local, name)
+                        self.interner.resolve(name)
                     ),
                     "reassigning a live resource",
                 );
-                self.states.insert(local, ResourceState::Error);
+                self.set_place_state(place, ResourceState::Error);
             }
         }
     }
@@ -1701,7 +2605,7 @@ impl<'a> FlowChecker<'a> {
             let mut locals = Vec::new();
             Self::pattern_locals(&arm.pattern, &mut locals);
             for local in locals {
-                self.states.remove(&local);
+                self.states.remove(&Place::root(local));
             }
             branches.push((self.states.clone(), diverges));
         }
@@ -1777,7 +2681,7 @@ impl<'a> FlowChecker<'a> {
             }
             self.pending_cleanup.truncate(marker);
             for local in locals {
-                self.states.remove(&local);
+                self.states.remove(&Place::root(local));
             }
             branches.push((self.states.clone(), diverges));
         }
@@ -1816,8 +2720,10 @@ impl<'a> FlowChecker<'a> {
         match pattern {
             HirPattern::Bind { local, .. } => {
                 if self.is_resource_local(*local) {
-                    self.states.insert(*local, ResourceState::Available);
-                    self.pending_cleanup.push(CleanupAction::Drop(*local));
+                    self.states
+                        .insert(Place::root(*local), ResourceState::Available);
+                    self.pending_cleanup
+                        .push(CleanupAction::Drop(Place::root(*local)));
                 }
             }
             HirPattern::Variant { args, .. } => {
@@ -1876,19 +2782,21 @@ impl<'a> FlowChecker<'a> {
 /// contributing to an ordinary type join. If every branch diverges, the
 /// join itself is unreachable code; `entry` is returned unchanged (there
 /// is no reachable use past this point for it to matter).
-/// Only ever produces a state for a local already present in `entry`
-/// (Blocker 11): a local one specific branch/arm declares fresh --
-/// an ordinary binding local to its own block, or a `handle` pattern's
-/// own binding -- does not exist outside that branch/arm at all, and
-/// must never leak into the state checked for whichever one actually
-/// ran. Built by iterating `entry`'s own keys, never a branch's, so a
-/// branch-local key present only in `first` can never survive into
-/// `joined` even by accident.
-fn join_branch_states(
-    entry: &HashMap<LocalId, ResourceState>,
-    branches: &[(HashMap<LocalId, ResourceState>, bool)],
-) -> HashMap<LocalId, ResourceState> {
-    let reachable: Vec<&HashMap<LocalId, ResourceState>> = branches
+/// Only ever produces a state for a place whose own *root* is already
+/// present in `entry` (Blocker 11): a local one specific branch/arm
+/// declares fresh -- an ordinary binding local to its own block, or a
+/// `handle` pattern's own binding -- does not exist outside that
+/// branch/arm at all, and must never leak into the state checked for
+/// whichever one actually ran. A *field* of an aggregate whose own root
+/// *is* already tracked in `entry` is still compared even if this is
+/// the first branch to ever touch that exact field (`rfcs/0012`): its
+/// implicit default on every other branch is simply its own state in
+/// `entry` (typically `Available`, its untouched default) -- skipping
+/// it just because no branch had touched it *yet* would silently miss
+/// exactly the "moved on only one branch" case this join exists to
+/// catch.
+fn join_branch_states(entry: &PlaceStates, branches: &[(PlaceStates, bool)]) -> PlaceStates {
+    let reachable: Vec<&PlaceStates> = branches
         .iter()
         .filter(|(_, diverges)| !*diverges)
         .map(|(states, _)| states)
@@ -1896,16 +2804,28 @@ fn join_branch_states(
     let Some((first, rest)) = reachable.split_first() else {
         return entry.clone();
     };
-    let mut joined: HashMap<LocalId, ResourceState> = entry
-        .keys()
-        .map(|local| {
-            let state = first.get(local).copied().unwrap_or(entry[local]);
-            (*local, state)
+    let tracked_roots: HashSet<LocalId> = entry.keys().map(|p| p.root).collect();
+    let mut keys: BTreeSet<Place<LocalId>> = entry.keys().cloned().collect();
+    for branch in &reachable {
+        for key in branch.keys() {
+            if tracked_roots.contains(&key.root) {
+                keys.insert(key.clone());
+            }
+        }
+    }
+    let default_for = |key: &Place<LocalId>| -> ResourceState {
+        entry.get(key).copied().unwrap_or(ResourceState::Available)
+    };
+    let mut joined: PlaceStates = keys
+        .iter()
+        .map(|key| {
+            let state = first.get(key).copied().unwrap_or_else(|| default_for(key));
+            (key.clone(), state)
         })
         .collect();
     for other in rest {
-        for (local, state) in joined.iter_mut() {
-            let other_state = other.get(local).copied().unwrap_or(entry[local]);
+        for (key, state) in joined.iter_mut() {
+            let other_state = other.get(key).copied().unwrap_or_else(|| default_for(key));
             *state = state.join(other_state);
         }
     }
@@ -1925,7 +2845,17 @@ fn join_branch_states(
 /// `defer` still needs whenever it is observed through anything other
 /// than a bare call argument, letting a later `drop`/move of it slip
 /// past this stage's own `U0004` check undetected.
-fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
+/// Appends `place` unless it is already recorded -- a `Vec` rather than
+/// a `HashSet` specifically so the protected places stay in a
+/// deterministic, source-order sequence no `HashMap`/`HashSet`
+/// iteration order can perturb.
+fn push_place(out: &mut Vec<Place<LocalId>>, place: Place<LocalId>) {
+    if !out.contains(&place) {
+        out.push(place);
+    }
+}
+
+fn collect_observed_places(checker: &FlowChecker, expr: &HirExpr, out: &mut Vec<Place<LocalId>>) {
     match expr {
         HirExpr::Int { .. }
         | HirExpr::Float { .. }
@@ -1937,96 +2867,117 @@ fn collect_observed_locals(expr: &HirExpr, out: &mut HashSet<LocalId>) {
         | HirExpr::ProtocolMethodRef { .. }
         | HirExpr::Continue { .. }
         | HirExpr::Error { .. } => {}
-        HirExpr::Local { local, .. } => {
-            out.insert(*local);
-        }
+        HirExpr::Local { local, .. } => push_place(out, Place::root(*local)),
         HirExpr::Unary { operand, .. }
         | HirExpr::Cast { expr: operand, .. }
-        | HirExpr::Try { expr: operand, .. } => collect_observed_locals(operand, out),
+        | HirExpr::Try { expr: operand, .. } => collect_observed_places(checker, operand, out),
         HirExpr::Binary { left, right, .. } => {
-            collect_observed_locals(left, out);
-            collect_observed_locals(right, out);
+            collect_observed_places(checker, left, out);
+            collect_observed_places(checker, right, out);
         }
         HirExpr::Assign { target, value, .. } => {
-            collect_observed_locals(target, out);
-            collect_observed_locals(value, out);
+            collect_observed_places(checker, target, out);
+            collect_observed_places(checker, value, out);
         }
         HirExpr::Call { callee, args, .. } => {
-            collect_observed_locals(callee, out);
+            collect_observed_places(checker, callee, out);
             for arg in args {
-                collect_observed_locals(arg, out);
+                collect_observed_places(checker, arg, out);
             }
         }
-        HirExpr::Field { base, .. } => collect_observed_locals(base, out),
+        // The exact place, when this access resolves to a stable affine
+        // one (`rfcs/0012`): `defer inspect(session.input)` protects
+        // `session.input` itself, never the whole `session` root it is
+        // reached through -- an unaffected sibling (`session.output`)
+        // must stay freely movable while the defer is pending. Anything
+        // else (a non-affine field, or a chain rooted in a temporary)
+        // keeps the original root-granularity behavior.
+        HirExpr::Field { base, .. } => {
+            if checker.is_affine_expr(expr.id())
+                && let Some(place) = checker.resolve_place(expr)
+            {
+                push_place(out, place);
+            } else {
+                collect_observed_places(checker, base, out);
+            }
+        }
         HirExpr::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            collect_observed_locals(condition, out);
-            collect_observed_locals_block(then_branch, out);
+            collect_observed_places(checker, condition, out);
+            collect_observed_places_block(checker, then_branch, out);
             match else_branch {
-                Some(HirElse::Block(block)) => collect_observed_locals_block(block, out),
-                Some(HirElse::If(inner)) => collect_observed_locals(inner, out),
+                Some(HirElse::Block(block)) => collect_observed_places_block(checker, block, out),
+                Some(HirElse::If(inner)) => collect_observed_places(checker, inner, out),
                 None => {}
             }
         }
         HirExpr::Match {
             scrutinee, arms, ..
         } => {
-            collect_observed_locals(scrutinee, out);
+            collect_observed_places(checker, scrutinee, out);
             for arm in arms {
-                collect_observed_locals_arm_body(&arm.body, out);
+                collect_observed_places_arm_body(checker, &arm.body, out);
             }
         }
-        HirExpr::Block(block) => collect_observed_locals_block(block, out),
+        HirExpr::Block(block) => collect_observed_places_block(checker, block, out),
         HirExpr::Return { value, .. } | HirExpr::Break { value, .. } => {
             if let Some(value) = value {
-                collect_observed_locals(value, out);
+                collect_observed_places(checker, value, out);
             }
         }
         HirExpr::RecordLiteral { fields, .. } => {
             for field in fields {
-                collect_observed_locals(&field.value, out);
+                collect_observed_places(checker, &field.value, out);
             }
         }
-        HirExpr::Raise { operand, .. } => collect_observed_locals(operand, out),
+        HirExpr::Raise { operand, .. } => collect_observed_places(checker, operand, out),
         HirExpr::Handle { operand, arms, .. } => {
-            collect_observed_locals(operand, out);
+            collect_observed_places(checker, operand, out);
             for arm in arms {
-                collect_observed_locals_arm_body(&arm.body, out);
+                collect_observed_places_arm_body(checker, &arm.body, out);
             }
         }
     }
 }
 
-fn collect_observed_locals_arm_body(body: &HirMatchArmBody, out: &mut HashSet<LocalId>) {
+fn collect_observed_places_arm_body(
+    checker: &FlowChecker,
+    body: &HirMatchArmBody,
+    out: &mut Vec<Place<LocalId>>,
+) {
     match body {
-        HirMatchArmBody::Expr(e) => collect_observed_locals(e, out),
-        HirMatchArmBody::Block(block) => collect_observed_locals_block(block, out),
+        HirMatchArmBody::Expr(e) => collect_observed_places(checker, e, out),
+        HirMatchArmBody::Block(block) => collect_observed_places_block(checker, block, out),
     }
 }
 
-fn collect_observed_locals_block(block: &HirBlock, out: &mut HashSet<LocalId>) {
+fn collect_observed_places_block(
+    checker: &FlowChecker,
+    block: &HirBlock,
+    out: &mut Vec<Place<LocalId>>,
+) {
     for stmt in &block.statements {
         match stmt {
-            HirStmt::Binding(b) => collect_observed_locals(&b.value, out),
-            HirStmt::Expr(e) => collect_observed_locals(e, out),
+            HirStmt::Binding(b) => collect_observed_places(checker, &b.value, out),
+            HirStmt::Expr(e) => collect_observed_places(checker, e, out),
             HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => {
-                collect_observed_locals(expr, out)
+                collect_observed_places(checker, expr, out)
             }
             HirStmt::While {
                 condition, body, ..
             } => {
-                collect_observed_locals(condition, out);
-                collect_observed_locals_block(body, out);
+                collect_observed_places(checker, condition, out);
+                collect_observed_places_block(checker, body, out);
             }
-            HirStmt::Loop { body, .. } => collect_observed_locals_block(body, out),
+            HirStmt::Loop { body, .. } => collect_observed_places_block(checker, body, out),
         }
     }
     if let Some(tail) = &block.tail {
-        collect_observed_locals(tail, out);
+        collect_observed_places(checker, tail, out);
     }
 }
 
@@ -2041,32 +2992,34 @@ mod tests {
         // binding after `check_handle_arms`'s own explicit strip) must
         // never survive into the state checked for code after every
         // branch, regardless of which branch actually ran.
-        let entry: HashMap<LocalId, ResourceState> =
-            HashMap::from([(LocalId(0), ResourceState::Available)]);
-        let first: HashMap<LocalId, ResourceState> = HashMap::from([
-            (LocalId(0), ResourceState::Moved),
-            (LocalId(1), ResourceState::Available), // branch-local, absent from entry
+        let entry: PlaceStates =
+            HashMap::from([(Place::root(LocalId(0)), ResourceState::Available)]);
+        let first: PlaceStates = HashMap::from([
+            (Place::root(LocalId(0)), ResourceState::Moved),
+            (Place::root(LocalId(1)), ResourceState::Available), // branch-local, absent from entry
         ]);
-        let second: HashMap<LocalId, ResourceState> =
-            HashMap::from([(LocalId(0), ResourceState::Moved)]);
+        let second: PlaceStates = HashMap::from([(Place::root(LocalId(0)), ResourceState::Moved)]);
         let joined = join_branch_states(&entry, &[(first, false), (second, false)]);
         assert_eq!(
             joined,
-            HashMap::from([(LocalId(0), ResourceState::Moved)]),
+            HashMap::from([(Place::root(LocalId(0)), ResourceState::Moved)]),
             "a branch-local key must not appear in the joined state at all"
         );
     }
 
     #[test]
     fn every_reachable_branchs_own_state_for_an_entry_local_still_agrees_or_joins_to_error() {
-        let entry: HashMap<LocalId, ResourceState> =
-            HashMap::from([(LocalId(0), ResourceState::Available)]);
-        let agreeing: HashMap<LocalId, ResourceState> =
-            HashMap::from([(LocalId(0), ResourceState::Moved)]);
-        let disagreeing: HashMap<LocalId, ResourceState> =
-            HashMap::from([(LocalId(0), ResourceState::Available)]);
+        let entry: PlaceStates =
+            HashMap::from([(Place::root(LocalId(0)), ResourceState::Available)]);
+        let agreeing: PlaceStates =
+            HashMap::from([(Place::root(LocalId(0)), ResourceState::Moved)]);
+        let disagreeing: PlaceStates =
+            HashMap::from([(Place::root(LocalId(0)), ResourceState::Available)]);
         let joined = join_branch_states(&entry, &[(agreeing, false), (disagreeing, false)]);
-        assert_eq!(joined.get(&LocalId(0)), Some(&ResourceState::Error));
+        assert_eq!(
+            joined.get(&Place::root(LocalId(0))),
+            Some(&ResourceState::Error)
+        );
     }
 
     /// A call whose own callee resolves directly to a declared function
@@ -2082,7 +3035,18 @@ mod tests {
         let local_types: HashMap<LocalId, Ty> = HashMap::new();
         let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
         let affine_items: HashSet<ItemId> = HashSet::new();
+        let variant_items: HashSet<ItemId> = HashSet::new();
         let take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
+        let aggregate_field_types: HashMap<ItemId, Vec<Ty>> = HashMap::new();
+        let declared_resources: HashSet<ItemId> = HashSet::new();
+        let item_type_params: HashMap<ItemId, Vec<TypeParamId>> = HashMap::new();
+        let field_projections: HashMap<ExprId, (ItemId, usize)> = HashMap::new();
+        let affine = AffineContext {
+            aggregate_field_types: &aggregate_field_types,
+            declared_resources: &declared_resources,
+            item_type_params: &item_type_params,
+            field_projections: &field_projections,
+        };
         let mut map = crate::source::SourceMap::new();
         let source = map.add_file("t.npt", "");
         let mut interner = Interner::new();
@@ -2092,7 +3056,9 @@ mod tests {
             &local_types,
             &expr_types,
             &affine_items,
+            &variant_items,
             &take_flags,
+            &affine,
             source,
             &interner,
             &mut diagnostics,
@@ -2127,8 +3093,19 @@ mod tests {
         let local_types: HashMap<LocalId, Ty> = HashMap::new();
         let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
         let affine_items: HashSet<ItemId> = HashSet::new();
+        let variant_items: HashSet<ItemId> = HashSet::new();
         let mut take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
         take_flags.insert(ItemId(0), vec![false, false]);
+        let aggregate_field_types: HashMap<ItemId, Vec<Ty>> = HashMap::new();
+        let declared_resources: HashSet<ItemId> = HashSet::new();
+        let item_type_params: HashMap<ItemId, Vec<TypeParamId>> = HashMap::new();
+        let field_projections: HashMap<ExprId, (ItemId, usize)> = HashMap::new();
+        let affine = AffineContext {
+            aggregate_field_types: &aggregate_field_types,
+            declared_resources: &declared_resources,
+            item_type_params: &item_type_params,
+            field_projections: &field_projections,
+        };
         let mut map = crate::source::SourceMap::new();
         let source = map.add_file("t.npt", "");
         let mut interner = Interner::new();
@@ -2138,7 +3115,9 @@ mod tests {
             &local_types,
             &expr_types,
             &affine_items,
+            &variant_items,
             &take_flags,
+            &affine,
             source,
             &interner,
             &mut diagnostics,

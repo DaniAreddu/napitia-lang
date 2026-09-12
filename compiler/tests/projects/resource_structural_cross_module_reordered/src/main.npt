@@ -1,0 +1,58 @@
+import sessions.wrap;
+import sessions.sink;
+import sessions.open;
+import sessions.OpenError;
+import sessions.Held;
+import sessions.Session as Connection;
+import sessions.File as ResourceFile;
+
+// Transfers exactly one field of an imported resource-containing
+// aggregate, then structurally destroys what remains of it.
+func first(descriptor: i64) -> i64 raises OpenError {
+    value connection = open(descriptor)?;
+    value input: ResourceFile = connection.input;
+    drop connection;
+    return sink(input);
+}
+
+// A postfix `?` fires while one field has already been transferred out:
+// the propagation edge still destroys the moved-out field's new owner
+// and the aggregate's own remaining fields, exactly once each.
+func chained(descriptor: i64) -> i64 raises OpenError {
+    value connection: Connection = open(descriptor)?;
+    value input = connection.input;
+    value other = open(descriptor - 100)?;
+    drop other;
+    drop connection;
+    return sink(input);
+}
+
+// An imported variant whose payload is an affine record, ignored by `_`
+// in the arm that matched: the record's own resource is destroyed
+// across the module boundary, not leaked.
+func held(descriptor: i64) -> i64 raises OpenError {
+    value connection = open(descriptor)?;
+    value output = connection.output;
+    drop connection;
+    value carried: Held = wrap(output);
+    return match carried {
+        Carrying(_) => 1,
+        Nothing => 0,
+    };
+}
+
+func main() -> i64 {
+    value a = handle first(5) {
+        success value_ => value_,
+        failure OpenError.Refused => -1,
+    };
+    value b = handle chained(7) {
+        success value_ => value_,
+        failure OpenError.Refused => -2,
+    };
+    value c = handle held(9) {
+        success value_ => value_,
+        failure OpenError.Refused => -3,
+    };
+    return a + b + c;
+}

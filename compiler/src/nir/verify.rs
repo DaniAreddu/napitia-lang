@@ -507,6 +507,23 @@ mod codes {
     /// per edge, so verification and interpretation agree that the NIR
     /// is malformed.
     pub const EDGE_INTO_ENTRY_BLOCK: &str = "V0098";
+    /// Something reachable through an *observation* is transferred,
+    /// destroyed, decomposed or reinitialized (`rfcs/0011`,
+    /// `rfcs/0012`).
+    ///
+    /// An ordinary (non-`take`) parameter is a call-scoped observation
+    /// of a value the caller still owns, and so is everything reachable
+    /// through it. Availability alone cannot express that -- a field of
+    /// an observed aggregate is perfectly "there", and reading it is
+    /// exactly what observation is for -- so ownership is tracked as a
+    /// second axis, and no projection ever moves along it.
+    ///
+    /// Complements `RESOURCE_OBSERVER_CONSUMED` (V0079), which applies
+    /// the same rule to a *nominally* resource-typed value: this one
+    /// covers the gap that lattice cannot see, an ordinary record that
+    /// merely contains affine fields, and every place projected out of
+    /// one.
+    pub const OBSERVER_CANNOT_TRANSFER: &str = "V0099";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -6391,6 +6408,9 @@ enum OwnershipViolation {
     /// position of its own live case unclaimed -- a resource the shell
     /// no longer owns and nothing else does either.
     IncompleteDecomposition(ValueId),
+    /// Something reachable through an observation is transferred,
+    /// destroyed, decomposed or reinitialized.
+    ObserverTransfer(ValueId),
 }
 
 /// Path-sensitive structural ownership verification (`rfcs/0012`),
@@ -6539,6 +6559,15 @@ fn verify_structural_places(
     let is_affine =
         |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
 
+    // Ownership is the second axis. A value this frame merely *observes*
+    // is available -- readable, passable to another observing parameter
+    // -- and is never this frame's to give away, destroy, take apart or
+    // overwrite. A slot and the loads of it are one place here, exactly
+    // as they are everywhere else in this pass.
+    let observed = observed_values(function, &is_affine);
+    let is_observed =
+        |v: ValueId| -> bool { observed.contains(&v) || observed.contains(&origin(v)) };
+
     // Every value whose *only* use anywhere in this function is as a
     // `Drop` operand (`rfcs/0012`). A structural destruction of one
     // field is expressed as a `Transfer` read of it immediately
@@ -6649,6 +6678,13 @@ fn verify_structural_places(
                     ..
                 } => {
                     let place = canonical(place);
+                    // Moving a field out of an observation takes
+                    // ownership the caller never handed over. Reading
+                    // one is fine, and is the point.
+                    if *mode == crate::nir::OwnershipMode::Transfer && is_observed(place.root) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*result));
+                        continue;
+                    }
                     if resolve_place_state(&facts, &place) != FieldState::Full {
                         violations.push(OwnershipViolation::UseAfterMove(*result));
                         continue;
@@ -6683,6 +6719,12 @@ fn verify_structural_places(
                     taken,
                 } => {
                     let shell = Place::root(origin(*value));
+                    // Taking an observed variant apart claims payload
+                    // positions the caller still owns.
+                    if is_observed(*value) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*value));
+                        continue;
+                    }
                     if resolve_place_state(&facts, &shell) != FieldState::Full {
                         violations.push(OwnershipViolation::DoubleCleanup(*value));
                         continue;
@@ -6743,6 +6785,13 @@ fn verify_structural_places(
                 }
                 Instruction::StorePlace { place, value } => {
                     let place = canonical(place);
+                    // Writing through an observer overwrites storage
+                    // the caller still owns, leaking whatever was
+                    // there.
+                    if is_observed(place.root) {
+                        violations.push(OwnershipViolation::ObserverTransfer(*value));
+                        continue;
+                    }
                     if resolve_place_state(&facts, &place) != FieldState::Empty {
                         violations.push(OwnershipViolation::OverwriteLive(*value));
                         continue;
@@ -6759,6 +6808,7 @@ fn verify_structural_places(
                         &mut violations,
                         &is_affine,
                         &origin,
+                        &is_observed,
                         *value,
                         true,
                         *value,
@@ -6777,6 +6827,7 @@ fn verify_structural_places(
                         &mut violations,
                         &is_affine,
                         &origin,
+                        &is_observed,
                         *value,
                         false,
                         *value,
@@ -6789,6 +6840,7 @@ fn verify_structural_places(
                             &mut violations,
                             &is_affine,
                             &origin,
+                            &is_observed,
                             *value,
                             true,
                             *value,
@@ -6825,6 +6877,7 @@ fn verify_structural_places(
                             &mut violations,
                             &is_affine,
                             &origin,
+                            &is_observed,
                             *source,
                             true,
                             *result,
@@ -6837,6 +6890,7 @@ fn verify_structural_places(
                                 &mut violations,
                                 &is_affine,
                                 &origin,
+                                &is_observed,
                                 *field,
                                 true,
                                 *result,
@@ -6850,6 +6904,7 @@ fn verify_structural_places(
                                 &mut violations,
                                 &is_affine,
                                 &origin,
+                                &is_observed,
                                 *field,
                                 true,
                                 *result,
@@ -6865,6 +6920,7 @@ fn verify_structural_places(
                                     &mut violations,
                                     &is_affine,
                                     &origin,
+                                    &is_observed,
                                     *arg,
                                     true,
                                     *result,
@@ -6913,6 +6969,7 @@ fn verify_structural_places(
                     &mut violations,
                     &is_affine,
                     &origin,
+                    &is_observed,
                     *value,
                     true,
                     *value,
@@ -6924,6 +6981,7 @@ fn verify_structural_places(
                     &mut violations,
                     &is_affine,
                     &origin,
+                    &is_observed,
                     *value,
                     true,
                     *value,
@@ -6938,6 +6996,7 @@ fn verify_structural_places(
                             &mut violations,
                             &is_affine,
                             &origin,
+                            &is_observed,
                             *arg,
                             true,
                             *arg,
@@ -7152,6 +7211,12 @@ fn verify_structural_places(
                     v,
                     "destroys or transfers a place that was already consumed on a path reaching it",
                 ),
+                OwnershipViolation::ObserverTransfer(v) => (
+                    codes::OBSERVER_CANNOT_TRANSFER,
+                    v,
+                    "transfers, destroys, takes apart or reinitializes something reachable only \
+                     through an observation, which the caller still owns",
+                ),
                 OwnershipViolation::IncompleteDecomposition(v) => (
                     codes::MISSING_STRUCTURAL_CLEANUP,
                     v,
@@ -7239,11 +7304,18 @@ fn consume_root(
     violations: &mut Vec<OwnershipViolation>,
     is_affine: &impl Fn(ValueId) -> bool,
     origin: &impl Fn(ValueId) -> ValueId,
+    is_observed: &impl Fn(ValueId) -> bool,
     value: ValueId,
     require_whole: bool,
     reporter: ValueId,
 ) {
     if !is_affine(value) {
+        return;
+    }
+    // Consuming is giving away, and an observer has nothing to give:
+    // whatever this reaches, the caller still owns it.
+    if is_observed(value) {
+        violations.push(OwnershipViolation::ObserverTransfer(reporter));
         return;
     }
     let place = Place::root(origin(value));
@@ -7278,6 +7350,89 @@ fn observe_root(
     } else if !place_is_whole(facts, &place) {
         violations.push(OwnershipViolation::PartialWhole(reporter));
     }
+}
+
+/// Every value in this function that is an *observation* rather than an
+/// owner (`rfcs/0011`, `rfcs/0012`) -- a call-scoped view of something
+/// the caller still owns.
+///
+/// Ownership is a second axis alongside availability, and this is the
+/// half availability cannot express: a field of an observed aggregate is
+/// perfectly *there*, and reading it is exactly what observation is for,
+/// but nothing reached through it may be transferred, destroyed,
+/// decomposed or reinitialized.
+///
+/// It is a property of the value rather than of the path -- an ordinary
+/// (non-`take`) affine parameter is observed for its whole life -- so
+/// this is a least fixed point over definitions and uses, and a join
+/// can never lose it. Every projection out of an observation is an
+/// observation in turn: reading a field, extracting a payload, loading
+/// a slot an observing alias was stored into. No step ever moves the
+/// other way along this axis, which is exactly the laundering it
+/// closes.
+fn observed_values(function: &Function, is_affine: &impl Fn(ValueId) -> bool) -> HashSet<ValueId> {
+    let mut observed: HashSet<ValueId> = function
+        .params
+        .iter()
+        .filter(|param| !param.take && is_affine(param.value))
+        .map(|param| param.value)
+        .collect();
+    // Definitions may appear in any block order, so this runs to a
+    // fixed point rather than in one pass. The set only ever grows and
+    // is bounded by the values this function defines.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Value { result, kind, .. } => {
+                        let source = match kind {
+                            ValueKind::PlaceRead { place, .. } => Some(place.root),
+                            ValueKind::RecordField { base, .. } => Some(*base),
+                            ValueKind::VariantPayload { base, .. } => Some(*base),
+                            ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                                Some(*source)
+                            }
+                            ValueKind::Load(slot) => Some(*slot),
+                            _ => None,
+                        };
+                        if let Some(source) = source
+                            && observed.contains(&source)
+                            && observed.insert(*result)
+                        {
+                            changed = true;
+                        }
+                    }
+                    // Whatever a slot was last given, it can give back.
+                    Instruction::Store { slot, value, .. } => {
+                        if observed.contains(value) && observed.insert(*slot) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::StorePlace { place, value } => {
+                        if observed.contains(value) && observed.insert(place.root) {
+                            changed = true;
+                        }
+                    }
+                    // The decomposition itself is rejected below; the
+                    // fact still propagates so nothing downstream of it
+                    // looks like an owner either.
+                    Instruction::DecomposeVariant { value, taken, .. } => {
+                        if observed.contains(value) {
+                            for (_, owner) in taken {
+                                if observed.insert(*owner) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Drop { .. } => {}
+                }
+            }
+        }
+    }
+    observed
 }
 
 /// Every root this function itself owns and must therefore have fully
@@ -15916,6 +16071,7 @@ mod structural_ownership {
                             | codes::DECOMPOSITION_OUTSIDE_REFINEMENT
                             | codes::DECOMPOSITION_CLAIM_MISMATCH
                             | codes::UNCLAIMED_PAYLOAD_OWNERSHIP
+                            | codes::OBSERVER_CANNOT_TRANSFER
                     )
                 })
                 .collect();
@@ -20657,6 +20813,437 @@ mod structural_ownership {
             assert!(
                 !forward.is_empty(),
                 "the fixture must actually diagnose something"
+            );
+        }
+    }
+
+    /// An ordinary (non-`take`) parameter is an *observation*, and so is
+    /// everything reachable through it (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Availability alone cannot express that: a field of an observed
+    /// aggregate is perfectly "there", and reading it is legal, but
+    /// nothing reached through an observer may be transferred,
+    /// destroyed, decomposed or reinitialized. Ownership is a second
+    /// axis, and projecting a field never moves along it.
+    #[cfg(test)]
+    mod observation {
+        use super::*;
+
+        fn observed_box(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: false,
+            }]
+        }
+
+        fn owned_box(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.box_file.clone(),
+                take: true,
+            }]
+        }
+
+        fn box_field() -> Place<ValueId> {
+            Place::root(ValueId(0)).field(BOXY, FieldId(0))
+        }
+
+        fn single_block(instructions: Vec<Instruction>, result: u32) -> Vec<BasicBlock> {
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(result))),
+            }]
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_have_its_field_read() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Observe),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "observing a field of an observed aggregate is exactly what observation is for"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_have_its_field_moved_out() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Transfer),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "moving a field out of an observed aggregate takes ownership it never had"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_be_dropped() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(vec![drop_of(0), int(2, 0)], 2),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "destroying an observed aggregate destroys the caller's own value"
+            );
+        }
+
+        #[test]
+        fn an_observed_aggregate_may_not_be_reinitialized() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        int(3, 1),
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                        },
+                        Instruction::StorePlace {
+                            place: box_field(),
+                            value: ValueId(1),
+                        },
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "writing through an observer overwrites storage the caller still owns"
+            );
+        }
+
+        #[test]
+        fn an_observed_variant_may_not_be_decomposed() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.envelope.clone(),
+                                kind: ValueKind::VariantPayload {
+                                    base: ValueId(0),
+                                    variant: HOLDER,
+                                    case: 0,
+                                    index: 0,
+                                },
+                            },
+                            Instruction::DecomposeVariant {
+                                value: ValueId(0),
+                                variant: HOLDER,
+                                case: 0,
+                                taken: vec![(0, ValueId(1))],
+                            },
+                            drop_of(1),
+                            int(2, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(3, 0)],
+                        terminator: Terminator::Return(Some(ValueId(3))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "taking an observed variant apart claims payload the caller still owns"
+            );
+        }
+
+        #[test]
+        fn a_taken_aggregate_may_have_its_field_moved_out() {
+            let mut fx = fixture();
+            let f = under_test(
+                owned_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Transfer),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a `take` parameter really is this frame's to take apart"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_a_record_field_projection() {
+            let mut fx = fixture();
+            // `RecordField` reads the same storage a place read would;
+            // it may not launder an observation into an owner.
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordField {
+                                base: ValueId(0),
+                                record: BOXY,
+                                field: 0,
+                            },
+                        },
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a field projection of an observer is still an observer"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_a_variant_payload_projection() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.envelope.clone(),
+                                kind: ValueKind::VariantPayload {
+                                    base: ValueId(0),
+                                    variant: HOLDER,
+                                    case: 0,
+                                    index: 0,
+                                },
+                            },
+                            drop_of(1),
+                            int(2, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(3, 0)],
+                        terminator: Terminator::Return(Some(ValueId(3))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a payload read of an observed variant is still an observer"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_an_observing_place_read() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), box_field(), OwnershipMode::Observe),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "reading an observed field observes it; it does not hand it over"
+            );
+        }
+
+        #[test]
+        fn an_observation_survives_being_moved_into_a_new_value() {
+            let mut fx = fixture();
+            let f = under_test(
+                observed_box(&fx),
+                Ty::I64,
+                single_block(
+                    vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Move { source: ValueId(0) },
+                        },
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "moving an observed value out of this frame is the escape observation forbids"
+            );
+        }
+
+        #[test]
+        fn a_nested_observed_resource_field_may_not_be_moved_out() {
+            let mut fx = fixture();
+            // `Session` is a declared resource with two `File` fields.
+            // An ordinary parameter of it observes every one of them.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(
+                            1,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(1),
+                        int(2, 0),
+                    ],
+                    2,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a nested field of an observed resource is observed too"
+            );
+        }
+
+        #[test]
+        fn an_observed_value_may_be_passed_on_as_an_observation() {
+            let mut fx = fixture();
+            // `observe(File) -> i64` takes an ordinary parameter, so
+            // handing it an observed field passes the observation on
+            // rather than giving anything away.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Call(
+                                OBSERVE,
+                                Vec::new(),
+                                vec![ValueId(1)],
+                                Vec::new(),
+                            ),
+                        },
+                    ],
+                    2,
+                ),
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "passing an observation to an observing parameter gives nothing away"
+            );
+        }
+
+        #[test]
+        fn an_observed_value_may_not_be_handed_to_a_take_parameter() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                single_block(
+                    vec![
+                        read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                        },
+                        int(3, 0),
+                    ],
+                    3,
+                ),
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "a `take` parameter consumes its argument, which an observer may not give"
             );
         }
     }

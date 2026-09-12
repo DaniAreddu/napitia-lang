@@ -354,16 +354,26 @@ struct AccessResult {
 }
 
 /// A complete, not-yet-applied plan for one structural store
-/// (`rfcs/0012`): every resource identity the source graph carries and
-/// the generation each one moves to, collected before anything is
-/// mutated.
+/// (`rfcs/0012`), collected before anything is mutated.
 ///
-/// `moving` exists to make a duplicated identity visible: validating
-/// values recursively cannot see it, because each occurrence
-/// independently observes the one live handle and passes.
+/// The two sets answer different questions and must not be confused.
+///
+/// `reachable` is the *whole* ownership graph the source carries,
+/// including everything a resource holds in its own `ResourceRecord`
+/// rather than inline in the value. Stopping at a resource's outer
+/// handle -- as this once did -- hides exactly the cases that matter: a
+/// child duplicated between a resource and its own container, an
+/// identity the destination is reached through, and an ownership cycle
+/// no destruction order could ever satisfy.
+///
+/// `transitions` is only the identities whose ownership *handle* really
+/// crosses this boundary, with the generation each one moves to. A
+/// child that stays nested inside a moved parent never crosses: its
+/// owner is the same resource it always was, so its generation must not
+/// change and handles to it stay current.
 #[derive(Default)]
 struct StorePlan {
-    moving: HashSet<ResourceId>,
+    reachable: HashSet<ResourceId>,
     transitions: Vec<(ResourceId, u64)>,
 }
 
@@ -734,14 +744,26 @@ impl<'a> Interpreter<'a> {
         let mut plan = StorePlan::default();
         let rebuilt = self.plan_transfer(&incoming, &mut plan)?;
         self.validate_store_target(&root, &place.projections)?;
-        // Traversing the destination reads resources of its own. If the
-        // source carries one of those same identities, transferring it
-        // would invalidate the very handle the install has to reach
-        // through -- so the two graphs must be disjoint.
+        // The two ownership graphs must be disjoint, and both halves of
+        // that matter.
+        //
+        // An identity the destination is *traversed through* would be
+        // invalidated by the very transfer whose install has to reach
+        // through it -- and, since the source would then own it,
+        // becomes a cycle no destruction order can satisfy.
+        //
+        // An identity the destination merely *owns* somewhere else,
+        // off the traversal path, is equally fatal: installing the
+        // source would give one identity two owners inside one value.
+        // Neither is visible from the outer handles alone, which is why
+        // `plan.reachable` and this walk both go all the way down.
         let mut destination = Vec::new();
         self.destination_identities(&root, &place.projections, &mut destination)?;
-        for id in destination {
-            if plan.moving.contains(&id) {
+        let mut destination_owned = HashSet::new();
+        self.collect_owned_identities(&root, &mut destination_owned, 0)?;
+        destination_owned.extend(destination);
+        for id in destination_owned {
+            if plan.reachable.contains(&id) {
                 return Err(invalid(
                     "a structural store's own source and destination share a resource identity",
                 ));
@@ -987,14 +1009,23 @@ impl<'a> Interpreter<'a> {
                         "cannot transfer ownership of a resource that was already dropped",
                     ));
                 }
-                if !plan.moving.insert(handle.id) {
+                if !plan.reachable.insert(handle.id) {
                     return Err(invalid(
                         "a structural store's own source carries the same resource identity more \
                          than once",
                     ));
                 }
                 let generation = record.generation + 1;
+                let nested = record.fields.clone();
+                drop(table);
                 plan.transitions.push((handle.id, generation));
+                // Everything this resource owns stays nested inside it:
+                // its generation does not change, but its identity is
+                // still part of the graph being moved, and must be
+                // visible to the duplicate, cycle and overlap checks.
+                for field in &nested {
+                    self.collect_owned_identities(field, &mut plan.reachable, 1)?;
+                }
                 Ok(Value::Resource(ResourceHandle {
                     id: handle.id,
                     generation,
@@ -1050,6 +1081,63 @@ impl<'a> Interpreter<'a> {
             Value::Moved => Err(invalid("transfer of a value that was already moved")),
             Value::Dropped => Err(invalid("transfer of a value that was already destroyed")),
             other => Ok(other.clone()),
+        }
+    }
+
+    /// Every resource identity `value` owns, however deeply, including
+    /// the ones held inside a resource's own `ResourceRecord` rather
+    /// than inline (`rfcs/0012`).
+    ///
+    /// This is the half a value-only walk cannot see. A `Session` value
+    /// is one handle; the `File` it owns lives in the resource table,
+    /// so stopping at the handle hides a child duplicated between the
+    /// session and its own container, a child the destination is
+    /// reached through, and any ownership cycle.
+    ///
+    /// An identity reached twice is refused outright: within one graph
+    /// that is either a duplicate -- one identity with two owners -- or
+    /// a cycle, and it is also what makes this walk terminate.
+    fn collect_owned_identities(
+        &self,
+        value: &Value,
+        out: &mut HashSet<ResourceId>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime ownership graph is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => {
+                if !out.insert(handle.id) {
+                    return Err(invalid(
+                        "a runtime ownership graph reaches the same resource identity twice, \
+                         either duplicated or through a cycle",
+                    ));
+                }
+                let nested = {
+                    let table = self.resources.borrow();
+                    table.record(*handle)?.fields.clone()
+                };
+                for field in &nested {
+                    self.collect_owned_identities(field, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.collect_owned_identities(field, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.collect_owned_identities(slot, out, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -5483,6 +5571,8 @@ mod store_place_transfer {
     const MIXED: ItemId = ItemId(65);
     const SESSION: ItemId = ItemId(66);
     const MAYBE: ItemId = ItemId(67);
+    const NEST: ItemId = ItemId(68);
+    const LINKED: ItemId = ItemId(69);
 
     /// `File` (a declared `resource`), `Holder` (an ordinary record with
     /// one `File` field), `Box[T]` (generic, one field), `Pair` (two
@@ -5563,6 +5653,27 @@ mod store_place_transfer {
                         type_params: Vec::new(),
                         fields: vec![(name, Ty::Named(FILE, name))],
                         affine: true,
+                    },
+                ),
+                (
+                    NEST,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(SESSION, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    LINKED,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![
+                            (name, Ty::Named(SESSION, name)),
+                            (name, Ty::Named(FILE, name)),
+                        ],
+                        affine: false,
                     },
                 ),
             ],
@@ -6377,6 +6488,297 @@ mod store_place_transfer {
                 .expect("well-formed metadata"),
             "the destination owns the transferred graph"
         );
+        interpreter
+            .drop_value(stored)
+            .expect("destroying the new owner must succeed exactly once");
+    }
+
+    // -- the complete owned graph, not just the outer handles ----------
+    //
+    // A resource's own children live in the resource table, not in the
+    // value, so planning a transfer by walking only the value stops at
+    // the outer handle. Duplicates, ownership cycles and
+    // source/destination overlap all hide below that line
+    // (`rfcs/0012`).
+
+    /// Replaces `owner`'s single field with `child`, directly in the
+    /// resource table -- what the runtime itself does when a resource
+    /// is constructed around another.
+    fn own(interpreter: &Interpreter<'_>, owner: ResourceHandle, child: Value) {
+        interpreter.resources.borrow_mut().records[owner.id.0 as usize].fields = vec![child];
+    }
+
+    /// A `Session` whose one `File` field is empty.
+    fn session(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved])
+    }
+
+    /// A `Nest` owning `inner`.
+    fn nest(interpreter: &Interpreter<'_>, inner: ResourceHandle) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(NEST, vec![Value::Resource(inner)])
+    }
+
+    fn a_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    #[test]
+    fn a_duplicate_reached_through_a_resource_and_directly_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        let owner = session(&interpreter);
+        own(&interpreter, owner, Value::Resource(shared));
+        // `Linked` carries the `Session` that owns `shared`, and
+        // `shared` itself. One identity, two owners -- invisible to
+        // anything that stops at the `Session`'s outer handle.
+        let (mut values, destination) = destination_typed(
+            Ty::Named(LINKED, Symbol(0)),
+            Value::Record {
+                item: LINKED,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(owner), Value::Resource(shared)],
+            },
+        );
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared, owner],
+            "one identity owned both directly and through a resource",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_nested_several_levels_down_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        let inner = session(&interpreter);
+        own(&interpreter, inner, Value::Resource(shared));
+        let outer = nest(&interpreter, inner);
+        // `outer -> inner -> shared`, with `shared` alongside it again.
+        let (mut values, destination) = destination_typed(
+            Ty::Named(LINKED, Symbol(0)),
+            Value::Record {
+                item: LINKED,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(inner), Value::Resource(shared)],
+            },
+        );
+        values.insert(ValueId(4), Value::Resource(outer));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared, inner, outer],
+            "the same identity twice, two levels apart",
+        );
+    }
+
+    #[test]
+    fn a_source_descendant_that_is_the_destination_spine_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // The destination is written *through* `spine`, and the source
+        // owns `spine` below its own outer handle. Transferring it
+        // would invalidate the very handle the install walks through,
+        // and leave `spine` owning the thing it lives inside.
+        let spine = session(&interpreter);
+        let carrier = nest(&interpreter, spine);
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(carrier));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine, carrier],
+            "a source descendant that is the destination's own spine",
+        );
+    }
+
+    #[test]
+    fn a_destination_descendant_that_is_in_the_source_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let shared = a_file(&interpreter, 1);
+        // The destination container already owns `shared` in a sibling
+        // of the slot being written, and the source carries it too.
+        // Neither is on the traversal path, so only a full walk of the
+        // destination's own graph can see it.
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Record {
+                item: HOLDERS,
+                type_args: Vec::new(),
+                fields: vec![
+                    Value::Record {
+                        item: HOLDER,
+                        type_args: Vec::new(),
+                        fields: vec![Value::Moved],
+                    },
+                    Value::Record {
+                        item: HOLDER,
+                        type_args: Vec::new(),
+                        fields: vec![Value::Resource(shared)],
+                    },
+                ],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(shared));
+        let destination = Place {
+            root: ValueId(0),
+            projections: vec![
+                Projection::Field {
+                    owner: HOLDERS,
+                    field: FieldId(0),
+                },
+                Projection::Field {
+                    owner: HOLDER,
+                    field: FieldId(0),
+                },
+            ],
+        };
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[shared],
+            "a destination descendant that is also in the source",
+        );
+    }
+
+    #[test]
+    fn a_direct_ownership_cycle_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = session(&interpreter);
+        // `spine` would end up owning itself.
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(spine));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine],
+            "a resource stored into itself",
+        );
+    }
+
+    #[test]
+    fn an_indirect_ownership_cycle_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let spine = session(&interpreter);
+        let middle = nest(&interpreter, spine);
+        // Writing `middle` into `spine`'s own empty field closes the
+        // loop `spine -> middle -> spine`, two links long.
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(spine));
+        values.insert(ValueId(2), Value::Resource(middle));
+        let destination = place(0, field(SESSION, 0));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(2),
+            &[spine, middle],
+            "an ownership cycle two links long",
+        );
+    }
+
+    #[test]
+    fn a_stale_child_inside_a_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let stale = a_file(&interpreter, 1);
+        let carrier = session(&interpreter);
+        own(&interpreter, carrier, Value::Resource(stale));
+        // The nested handle goes stale without the carrier knowing.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(stale)
+            .expect("transferring to create a stale nested handle");
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[],
+            "a stale handle nested inside the resource being transferred",
+        );
+    }
+
+    #[test]
+    fn a_malformed_value_nested_inside_a_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let carrier = session(&interpreter);
+        // `Session` declares one `File` field; this one holds an `i64`.
+        own(&interpreter, carrier, Value::Int(7));
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &destination,
+            ValueId(1),
+            &[],
+            "a nested value disagreeing with the resource's own declaration",
+        );
+    }
+
+    #[test]
+    fn a_nested_child_keeps_its_own_generation_when_its_parent_moves() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let child = a_file(&interpreter, 1);
+        let carrier = session(&interpreter);
+        own(&interpreter, carrier, Value::Resource(child));
+        let before = interpreter.resources.borrow().records[child.id.0 as usize].generation;
+        let (mut values, destination) =
+            destination_typed(Ty::Named(SESSION, Symbol(0)), Value::Resource(carrier));
+
+        interpreter
+            .store_place_transfer(&mut values, &HashMap::new(), &destination, ValueId(1))
+            .expect("a well-formed nested transfer must succeed");
+
+        assert_eq!(
+            interpreter.resources.borrow().records[child.id.0 as usize].generation,
+            before,
+            "ownership of the child never crossed the boundary, so its handle stays current"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(child).is_ok(),
+            "the child is still reachable through its unchanged handle"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(carrier).is_err(),
+            "the carrier's own handle moved, so the caller's copy is stale"
+        );
+        let stored = values.remove(&ValueId(0)).expect("the destination");
         interpreter
             .drop_value(stored)
             .expect("destroying the new owner must succeed exactly once");

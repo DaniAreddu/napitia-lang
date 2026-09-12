@@ -6376,57 +6376,50 @@ fn verify_structural_places(
         return;
     }
 
+    // Every CFG edge, carrying the slot that edge itself initializes.
+    // An `Invoke` writes ownership into `ok_slot` on its success edge
+    // and into each error target's own slot on that failure edge, and
+    // into nothing on any other edge. The fact therefore belongs to the
+    // *edge*: two logical edges may reach the same target block while
+    // initializing different slots, so recording it against the target
+    // would either demand cleanup on a path that never received the
+    // value or lose the leak on the path that did.
     let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    let mut incoming_edges: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut incoming_edges: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
     for block in &function.blocks {
+        let mut edges: Vec<(BlockId, Option<ValueId>)> = Vec::new();
         match &block.terminator {
-            Terminator::Branch(target) => {
-                successors.entry(block.id).or_default().push(*target);
-                incoming_edges.entry(*target).or_default().push(block.id);
-            }
+            Terminator::Branch(target) => edges.push((*target, None)),
             Terminator::CondBranch {
                 then_block,
                 else_block,
                 ..
             } => {
-                successors
-                    .entry(block.id)
-                    .or_default()
-                    .extend([*then_block, *else_block]);
-                incoming_edges
-                    .entry(*then_block)
-                    .or_default()
-                    .push(block.id);
-                incoming_edges
-                    .entry(*else_block)
-                    .or_default()
-                    .push(block.id);
+                edges.push((*then_block, None));
+                edges.push((*else_block, None));
             }
             Terminator::Switch { cases, .. } => {
-                successors.entry(block.id).or_default().extend(cases);
-                for target in cases {
-                    incoming_edges.entry(*target).or_default().push(block.id);
-                }
+                edges.extend(cases.iter().map(|target| (*target, None)));
             }
             Terminator::Invoke {
+                ok_slot,
                 ok_target,
                 err_targets,
                 ..
             } => {
-                successors.entry(block.id).or_default().push(*ok_target);
-                successors
-                    .entry(block.id)
-                    .or_default()
-                    .extend(err_targets.iter().map(|t| t.target));
-                incoming_edges.entry(*ok_target).or_default().push(block.id);
+                edges.push((*ok_target, Some(*ok_slot)));
                 for target in err_targets {
-                    incoming_edges
-                        .entry(target.target)
-                        .or_default()
-                        .push(block.id);
+                    edges.push((target.target, Some(target.slot)));
                 }
             }
             Terminator::Return(_) | Terminator::Raise { .. } => {}
+        }
+        for (target, slot) in edges {
+            successors.entry(block.id).or_default().push(target);
+            incoming_edges
+                .entry(target)
+                .or_default()
+                .push((block.id, slot));
         }
     }
 
@@ -6574,11 +6567,19 @@ fn verify_structural_places(
                 && is_affine(*result)
                 && origin(*result) == *result
             {
-                // A payload *read* owns nothing. The shell still owns
-                // what it read until a `DecomposeVariant` claims that
-                // exact extraction, so the result starts `Empty` and
-                // becomes this frame's own only at the claim.
-                let state = if matches!(kind, ValueKind::VariantPayload { .. }) {
+                // Two kinds own nothing at their own definition.
+                //
+                // A payload *read*: the shell still owns what it read
+                // until a `DecomposeVariant` claims that exact
+                // extraction.
+                //
+                // An `Alloc`: it produces uninitialized storage, not a
+                // value. The slot becomes owned when something writes
+                // it -- a `Store`, or the `Invoke` edge that fills it
+                // -- and treating the allocation itself as ownership
+                // made an `Invoke`'s result slot look owned on the
+                // failure edge that never wrote it.
+                let state = if matches!(kind, ValueKind::VariantPayload { .. } | ValueKind::Alloc) {
                     FieldState::Empty
                 } else {
                     FieldState::Full
@@ -6746,6 +6747,19 @@ fn verify_structural_places(
                     }
                     crate::nir::OwnershipMode::Observe => {
                         observe_root(&facts, &mut violations, &is_affine, &origin, *value, *value);
+                        // The slot now holds an observing alias. It owns
+                        // nothing -- the owner it aliases still owes the
+                        // cleanup -- but it is *there*, and reading it
+                        // back is legal. An `Alloc` alone leaves the slot
+                        // empty, so without this the very next `Load` of
+                        // it would look like a use after move.
+                        if is_affine(*slot) {
+                            set_place_state(
+                                &mut facts,
+                                &Place::root(origin(*slot)),
+                                FieldState::Full,
+                            );
+                        }
                     }
                 },
                 Instruction::Value { result, kind, .. } => match kind {
@@ -6904,6 +6918,20 @@ fn verify_structural_places(
                 && origin(*result) == *result
             {
                 entry_facts.insert(Place::root(*result), FieldState::Empty);
+            }
+        }
+        // An `Invoke`'s own result slots are absent until the edge that
+        // writes them is taken, so a sibling edge never inherits one.
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            for slot in std::iter::once(*ok_slot).chain(err_targets.iter().map(|t| t.slot)) {
+                if is_affine(slot) && origin(slot) == slot {
+                    entry_facts.insert(Place::root(slot), FieldState::Empty);
+                }
             }
         }
     }
@@ -7127,9 +7155,10 @@ fn verify_structural_places(
                     Span::dummy(),
                     format!(
                         "function `{function_name}`: %{} still owns {} affine descendant(s) that \
-                         were never destroyed or transferred out when this exit is reached",
+                         were never destroyed or transferred out when this exit is reached (bb{})",
                         root.0,
-                        obligations.len()
+                        obligations.len(),
+                        block.id.0
                     ),
                 ));
             }
@@ -7292,6 +7321,26 @@ fn structural_cleanup_obligations(
                 _ => {}
             }
         }
+        // A successful `Invoke` transfers its callee's returned value
+        // into `ok_slot`, and a failing one transfers the raised value
+        // into that error target's own slot -- each on its own edge.
+        // Both are ownership this frame receives and owes cleanup for,
+        // exactly like a construction.
+        if let Terminator::Invoke {
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            if let Some(ty) = owns(*ok_slot) {
+                roots.push((*ok_slot, ty));
+            }
+            for target in err_targets {
+                if let Some(ty) = owns(target.slot) {
+                    roots.push((target.slot, ty));
+                }
+            }
+        }
     }
     roots.sort_by_key(|(v, _)| *v);
     roots.dedup_by_key(|(v, _)| *v);
@@ -7335,6 +7384,36 @@ fn extracted_payloads(function: &Function) -> HashMap<(ValueId, usize, usize), V
 /// malformed generic metadata stays one opaque obligation. Mirrors
 /// `resourceck::flow::structural_drop_targets`, recomputed here from
 /// NIR alone rather than trusted from it.
+/// The most precise state `facts` records for `place` (`rfcs/0012`).
+///
+/// An ancestor that is `Empty` is gone, and takes everything reachable
+/// through it, so nothing under it is ever owed. Otherwise the place's
+/// own recorded fact is the most precise answer there is: a join can
+/// leave a parent `Maybe` -- live on one predecessor, absent or consumed
+/// on another -- while a child is recorded `Empty` on every predecessor
+/// that had it at all, and reading the child through the parent would
+/// demand cleanup for something already cleaned everywhere.
+///
+/// This is deliberately *not* `resolve_place_state`, which answers the
+/// stricter question a *use* asks: there a non-`Full` ancestor makes
+/// every descendant unusable, which is exactly right for reading or
+/// moving, and too coarse for deciding what is still owed.
+fn precise_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
+    for len in 0..place.projections.len() {
+        let prefix = Place {
+            root: place.root,
+            projections: place.projections[..len].to_vec(),
+        };
+        if facts.get(&prefix) == Some(&FieldState::Empty) {
+            return FieldState::Empty;
+        }
+    }
+    match facts.get(place) {
+        Some(state) => *state,
+        None => resolve_place_state(facts, place),
+    }
+}
+
 fn remaining_obligations(
     facts: &PlaceFacts,
     place: &Place<ValueId>,
@@ -7352,7 +7431,7 @@ fn remaining_obligations(
     // `Maybe` means at least one path still holds it, and that path
     // leaks -- treating disagreement as "nothing owed" is exactly how a
     // value live on one predecessor and consumed on another escaped.
-    if resolve_place_state(facts, place) == FieldState::Empty {
+    if precise_place_state(facts, place) == FieldState::Empty {
         return;
     }
     if !is_affine_in(ty, agg) {
@@ -7396,7 +7475,7 @@ fn remaining_obligations(
                 crate::place::CaseId(case as u32),
                 crate::place::FieldId(index as u32),
             );
-            if resolve_place_state(facts, &payload_place) != FieldState::Full {
+            if precise_place_state(facts, &payload_place) == FieldState::Empty {
                 // Already transferred out on this path: whoever took it
                 // owns it now, and owes its cleanup in its own right.
                 continue;
@@ -7519,8 +7598,18 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
     let keys: BTreeSet<Place<ValueId>> = a.keys().chain(b.keys()).cloned().collect();
     keys.into_iter()
         .map(|key| {
-            let left = a.get(&key).copied().unwrap_or(FieldState::Full);
-            let right = b.get(&key).copied().unwrap_or(FieldState::Full);
+            // Each side's most precise recorded state, never a bare
+            // `unwrap_or(Full)`: a side that never recorded this exact
+            // place may still have recorded its parent, and a child of
+            // a place that is absent or already consumed is absent or
+            // consumed too. Reading it as `Full` claimed the child was
+            // live there, which turned an agreed-clean join into a
+            // `Maybe` and reported a leak for a value one side never
+            // created at all. Resolving through ancestors is wrong here
+            // too: a join leaves a parent `Maybe` while its child stays
+            // recorded `Empty`, and the parent would mask it.
+            let left = precise_place_state(a, &key);
+            let right = precise_place_state(b, &key);
             (key, merge_field(left, right))
         })
         .collect()
@@ -7581,7 +7670,7 @@ enum IncomingState<F> {
 fn in_state_for_places(
     block_id: BlockId,
     entry: BlockId,
-    incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
+    incoming_edges: &HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>>,
     reachable: &HashSet<BlockId>,
     out: &HashMap<BlockId, PlaceFacts>,
     entry_facts: &PlaceFacts,
@@ -7590,7 +7679,7 @@ fn in_state_for_places(
         return IncomingState::Entry(entry_facts.clone());
     }
     let mut acc: Option<PlaceFacts> = None;
-    for pred in incoming_edges.get(&block_id).into_iter().flatten() {
+    for (pred, generated) in incoming_edges.get(&block_id).into_iter().flatten() {
         if !reachable.contains(pred) {
             continue;
         }
@@ -7600,9 +7689,20 @@ fn in_state_for_places(
         let Some(facts) = out.get(pred) else {
             continue;
         };
-        acc = Some(match acc {
+        // An `Invoke`'s own slot becomes owned on this edge alone --
+        // never folded into a sibling edge that happens to reach the
+        // same block, which is why the fact lives on the edge.
+        let facts = match generated {
+            Some(slot) => {
+                let mut initialized = facts.clone();
+                set_place_state(&mut initialized, &Place::root(*slot), FieldState::Full);
+                initialized
+            }
             None => facts.clone(),
-            Some(previous) => merge_place_facts(&previous, facts),
+        };
+        acc = Some(match acc {
+            None => facts,
+            Some(previous) => merge_place_facts(&previous, &facts),
         });
     }
     match acc {
@@ -18072,7 +18172,8 @@ mod structural_ownership {
         #[test]
         fn a_block_waiting_for_every_predecessor_is_pending_not_an_empty_state() {
             // bb2 joins bb0 and bb1. Neither has produced an out-state.
-            let incoming = HashMap::from([(BlockId(2), vec![BlockId(0), BlockId(1)])]);
+            let incoming =
+                HashMap::from([(BlockId(2), vec![(BlockId(0), None), (BlockId(1), None)])]);
             let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
             assert_eq!(
                 in_state_for_places(
@@ -18107,7 +18208,8 @@ mod structural_ownership {
         fn a_block_waiting_for_one_predecessor_joins_only_the_ones_that_landed() {
             let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
             // bb2's back edge from bb1 has not been processed yet; bb0 has.
-            let incoming = HashMap::from([(BlockId(2), vec![BlockId(0), BlockId(1)])]);
+            let incoming =
+                HashMap::from([(BlockId(2), vec![(BlockId(0), None), (BlockId(1), None)])]);
             let reachable = HashSet::from([BlockId(0), BlockId(1), BlockId(2)]);
             assert_eq!(
                 in_state_for_places(
@@ -18126,7 +18228,7 @@ mod structural_ownership {
         #[test]
         fn an_unreachable_predecessors_computed_out_state_is_never_joined() {
             let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
-            let incoming = HashMap::from([(BlockId(2), vec![BlockId(1)])]);
+            let incoming = HashMap::from([(BlockId(2), vec![(BlockId(1), None)])]);
             // bb1 has an out-state, but nothing reaches it from the entry.
             let reachable = HashSet::from([BlockId(0), BlockId(2)]);
             assert_eq!(
@@ -19909,6 +20011,326 @@ mod structural_ownership {
                 !expected.is_empty(),
                 "the fixture must actually diagnose something"
             );
+        }
+    }
+
+    /// An `Invoke` writes ownership into a slot *on one edge only*
+    /// (`rfcs/0011`, `rfcs/0012`): the success edge initializes
+    /// `ok_slot`, and each failure edge initializes its own error slot.
+    /// The other edges initialize nothing.
+    ///
+    /// The fact therefore belongs to the edge, never to the target
+    /// block -- two logical edges may reach the same block carrying
+    /// different slots.
+    #[cfg(test)]
+    mod invoke_slots {
+        use super::*;
+        use crate::nir::InvokeErrTarget;
+
+        /// `func raiser() -> Box[File] raises Holder`.
+        fn raiser(fx: &mut Fixture) -> Function {
+            let name = fx.interner.intern("raiser");
+            Function {
+                id: RAISER,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: fx.box_file.clone(),
+                raises: vec![HOLDER],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        int(0, 1),
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::RecordCreate(
+                                BOXY,
+                                vec![fx.file.clone()],
+                                vec![ValueId(1)],
+                            ),
+                        },
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            }
+        }
+
+        /// Only the structural family, sorted, with `raiser` linked in.
+        fn codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+            let helpers = helpers(fx);
+            let raiser = raiser(fx);
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let mut functions = vec![function, raiser];
+            functions.extend(helpers);
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions,
+                records: fx.records.clone(),
+                variants: fx.variants.clone(),
+            };
+            let mut codes: Vec<&'static str> =
+                verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                    .into_iter()
+                    .map(|d| d.code)
+                    .filter(|code| {
+                        matches!(
+                            *code,
+                            codes::MISSING_STRUCTURAL_CLEANUP
+                                | codes::DUPLICATE_STRUCTURAL_CLEANUP
+                                | codes::PLACE_USE_AFTER_MOVE
+                                | codes::PARTIAL_PLACE_USED_AS_WHOLE
+                        )
+                    })
+                    .collect();
+            codes.sort_unstable();
+            codes
+        }
+
+        /// Destroys a `Box[File]` held in `slot` by moving its own field
+        /// out and dropping it.
+        fn clean_box(slot: u32, field: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                read(
+                    field,
+                    fx.file.clone(),
+                    Place::root(ValueId(slot)).field(BOXY, FieldId(0)),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(field),
+            ]
+        }
+
+        /// Destroys a `Holder` held in `slot` by testing its case.
+        fn clean_holder(slot: u32, first: u32, exit: BlockId) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(first),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(slot),
+                        variant: HOLDER,
+                        cases: vec![BlockId(first + 1), BlockId(first + 2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(first + 1),
+                    instructions: vec![drop_of(slot)],
+                    terminator: Terminator::Branch(exit),
+                },
+                BasicBlock {
+                    id: BlockId(first + 2),
+                    instructions: vec![drop_of(slot)],
+                    terminator: Terminator::Branch(exit),
+                },
+            ]
+        }
+
+        /// bb0 invokes `raiser`; the success edge lands in bb1 and the
+        /// failure edge in bb2, both eventually returning through bb9.
+        fn invoking(
+            fx: &Fixture,
+            ok_body: Vec<Instruction>,
+            err_body: Vec<Instruction>,
+        ) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.holder.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(1),
+                        ok_target: BlockId(1),
+                        err_targets: vec![InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(2),
+                            target: BlockId(2),
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: ok_body,
+                    terminator: Terminator::Branch(BlockId(9)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: err_body,
+                    terminator: Terminator::Branch(BlockId(9)),
+                },
+                BasicBlock {
+                    id: BlockId(9),
+                    instructions: vec![int(20, 0)],
+                    terminator: Terminator::Return(Some(ValueId(20))),
+                },
+            ]
+        }
+
+        fn no_params() -> Vec<Param> {
+            Vec::new()
+        }
+
+        #[test]
+        fn an_affine_success_slot_that_is_cleaned_is_accepted() {
+            let mut fx = fixture();
+            let ok = clean_box(1, 3, &fx);
+            let mut blocks = invoking(&fx, ok, Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert_eq!(
+                codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each edge's own slot is destroyed on the edge that created it"
+            );
+        }
+
+        #[test]
+        fn an_affine_success_slot_left_undestroyed_is_reported() {
+            let mut fx = fixture();
+            let mut blocks = invoking(&fx, Vec::new(), Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert!(
+                codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the success edge created an owned `Box[File]` that nothing destroys"
+            );
+        }
+
+        #[test]
+        fn the_failure_edge_owes_nothing_for_the_success_slot() {
+            let mut fx = fixture();
+            // The success edge cleans its own slot; the failure edge
+            // never received it and must not be blamed for it.
+            let ok = clean_box(1, 3, &fx);
+            let mut blocks = invoking(&fx, ok, Vec::new());
+            let exit = BlockId(9);
+            blocks[2].terminator = Terminator::Branch(BlockId(3));
+            blocks.extend(clean_holder(2, 3, exit));
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert_eq!(
+                codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a slot initialized on one edge is owed nothing on a sibling edge"
+            );
+        }
+
+        #[test]
+        fn an_affine_error_slot_left_undestroyed_is_reported() {
+            let mut fx = fixture();
+            let ok = clean_box(1, 3, &fx);
+            let blocks = invoking(&fx, ok, Vec::new());
+            let f = under_test(no_params(), Ty::I64, blocks);
+            assert!(
+                codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the failure edge created an owned `Holder` that nothing destroys"
+            );
+        }
+
+        #[test]
+        fn success_and_failure_edges_reaching_one_block_keep_their_own_slots() {
+            let mut fx = fixture();
+            // Both edges land in bb1. Only one of the two slots is
+            // initialized on each, so demanding either unconditionally
+            // would be wrong -- and demanding neither would lose both
+            // leaks.
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.box_file.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: RAISER,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(1),
+                            ok_target: BlockId(1),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(2),
+                                target: BlockId(1),
+                            }],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![int(20, 0)],
+                        terminator: Terminator::Return(Some(ValueId(20))),
+                    },
+                ],
+            );
+            let found = codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "both slots reach this block still owned on their own edge, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn reversing_the_error_target_order_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let straight = under_test(no_params(), Ty::I64, invoking(&fx, Vec::new(), Vec::new()));
+            let mut blocks = invoking(&fx, Vec::new(), Vec::new());
+            blocks.swap(1, 2);
+            let swapped = under_test(no_params(), Ty::I64, blocks);
+            let forward = codes(&mut fx, straight);
+            let reversed = codes(&mut fx, swapped);
+            assert_eq!(
+                forward, reversed,
+                "the order the error targets are listed in must not change the result"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
+        }
+
+        #[test]
+        fn the_same_invoke_reports_byte_identical_diagnostics_twice() {
+            let mut fx = fixture();
+            let blocks = invoking(&fx, Vec::new(), Vec::new());
+            let first = codes(&mut fx, under_test(no_params(), Ty::I64, blocks.clone()));
+            let second = codes(&mut fx, under_test(no_params(), Ty::I64, blocks));
+            assert_eq!(first, second, "the refusal must be deterministic");
         }
     }
 }

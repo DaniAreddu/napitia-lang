@@ -894,6 +894,23 @@ impl<'a> Interpreter<'a> {
                     "a variant decomposition claims a position whose ownership already moved",
                 ));
             }
+            // The receiving value must be the value this position
+            // actually holds. A different value of the same shape would
+            // leave the real payload owned by nothing while this frame
+            // acquired an obligation for something it never received --
+            // and the shell would be tombstoned for a transfer that
+            // never happened.
+            let Some(receiver) = values.get(owner) else {
+                return Err(invalid(
+                    "a variant decomposition hands a payload to a value this frame never computed",
+                ));
+            };
+            if receiver != slot {
+                return Err(invalid(
+                    "a variant decomposition hands a payload position to a value that is not what \
+                     that position holds",
+                ));
+            }
         }
         // Phase 2 -- commit.
         for (index, _) in taken {
@@ -6834,5 +6851,221 @@ mod drop_transaction {
         let second = interpreter.drop_value(malformed());
         assert_eq!(first, second, "the refusal must be deterministic");
         assert!(interpreter.resources.borrow().observe(live).is_ok());
+    }
+}
+
+/// A decomposition transfers the storage one payload position actually
+/// holds (`rfcs/0012`). Every claim is checked against that storage
+/// before the shell is tombstoned, so a malformed decomposition changes
+/// nothing at all.
+#[cfg(test)]
+mod decomposition_claims {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(90);
+    const MAYBE: ItemId = ItemId(91);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![(
+                FILE,
+                RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(name, Ty::I64)],
+                    affine: true,
+                },
+            )],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// `%0` holds `Some(file)`; `%1` holds that same payload value, and
+    /// `%2` holds an unrelated, separately constructed `File`.
+    fn frame(
+        interpreter: &Interpreter<'_>,
+    ) -> (HashMap<ValueId, Value>, ResourceHandle, ResourceHandle) {
+        let real = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let unrelated = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        let mut values = HashMap::new();
+        values.insert(
+            ValueId(0),
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(real)],
+            },
+        );
+        values.insert(ValueId(1), Value::Resource(real));
+        values.insert(ValueId(2), Value::Resource(unrelated));
+        (values, real, unrelated)
+    }
+
+    fn assert_refused_without_mutation(
+        interpreter: &Interpreter<'_>,
+        values: &mut HashMap<ValueId, Value>,
+        taken: &[(usize, ValueId)],
+        case: usize,
+        what: &str,
+    ) {
+        let before = values.clone();
+        let result =
+            interpreter.decompose_variant(values, &HashMap::new(), ValueId(0), MAYBE, case, taken);
+        assert!(
+            matches!(result, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured error, got {result:?}"
+        );
+        assert_eq!(
+            *values, before,
+            "{what}: a refused decomposition changed the frame"
+        );
+        let again =
+            interpreter.decompose_variant(values, &HashMap::new(), ValueId(0), MAYBE, case, taken);
+        assert_eq!(result, again, "{what}: the refusal is not deterministic");
+        assert_eq!(*values, before, "{what}: the retry mutated the frame");
+    }
+
+    #[test]
+    fn a_claim_naming_an_unrelated_value_is_refused_and_the_shell_is_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, unrelated) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(2))],
+            0,
+            "claim naming an unrelated value of the same shape",
+        );
+        for handle in [real, unrelated] {
+            assert!(
+                interpreter.resources.borrow().observe(handle).is_ok(),
+                "no resource may have been touched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_naming_a_value_this_frame_never_computed_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(9))],
+            0,
+            "claim naming an uncomputed value",
+        );
+    }
+
+    #[test]
+    fn a_claim_of_a_position_out_of_range_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(3, ValueId(1))],
+            0,
+            "claim of a position out of range",
+        );
+    }
+
+    #[test]
+    fn a_decomposition_naming_the_inactive_case_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, _, _) = frame(&interpreter);
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[],
+            1,
+            "decomposition of a case that is not live",
+        );
+    }
+
+    #[test]
+    fn one_bad_claim_after_a_good_one_leaves_the_shell_entirely_untouched() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, _) = frame(&interpreter);
+        // Position 0 is claimed correctly; position 3 does not exist.
+        // Validating claim by claim and writing as it goes would have
+        // tombstoned position 0 before discovering the second.
+        assert_refused_without_mutation(
+            &interpreter,
+            &mut values,
+            &[(0, ValueId(1)), (3, ValueId(1))],
+            0,
+            "a valid claim followed by an invalid one",
+        );
+        assert!(
+            interpreter.resources.borrow().observe(real).is_ok(),
+            "the real payload is still exactly where it was"
+        );
+    }
+
+    #[test]
+    fn the_matching_claim_moves_exactly_that_position_out_of_the_shell() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (mut values, real, _) = frame(&interpreter);
+        interpreter
+            .decompose_variant(
+                &mut values,
+                &HashMap::new(),
+                ValueId(0),
+                MAYBE,
+                0,
+                &[(0, ValueId(1))],
+            )
+            .expect("claiming the value the position actually holds must succeed");
+        assert_eq!(
+            values.get(&ValueId(0)),
+            Some(&Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Moved],
+            }),
+            "the shell keeps its case and loses exactly the claimed position"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(real).is_ok(),
+            "the payload itself is untouched -- only who owns it changed"
+        );
     }
 }

@@ -476,6 +476,25 @@ mod codes {
     /// same question of a payload *read*: this one covers the transfer
     /// of ownership, which a read never performs.
     pub const DECOMPOSITION_OUTSIDE_REFINEMENT: &str = "V0095";
+    /// A `DecomposeVariant` claims an owner that is not the value the
+    /// matching `ValueKind::VariantPayload` extraction produced
+    /// (`rfcs/0012`).
+    ///
+    /// Decomposition transfers *storage*, so the receiving value must
+    /// be the one that named that exact base, case and payload
+    /// position. A different value of the same declared type is a
+    /// different object: claiming it would leave the real payload owned
+    /// by nothing, and hand this frame an obligation for something it
+    /// never received.
+    pub const DECOMPOSITION_CLAIM_MISMATCH: &str = "V0096";
+    /// A payload extraction is destroyed or transferred without any
+    /// decomposition having transferred ownership of it (`rfcs/0012`).
+    ///
+    /// `ValueKind::VariantPayload` is a read. The shell still owns what
+    /// it read until a `DecomposeVariant` claims that exact extraction,
+    /// so consuming the read result destroys storage the shell will
+    /// destroy again.
+    pub const UNCLAIMED_PAYLOAD_OWNERSHIP: &str = "V0097";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -1195,6 +1214,7 @@ fn verify_function(
     // first with no diagnostic) -- every SSA value must have exactly
     // one definition, across parameters *and* instruction results,
     // regardless of which block they're in.
+    let extractions = payload_extractions(function);
     let mut value_types: HashMap<ValueId, Ty> = HashMap::new();
     let mut alloc_slots: HashSet<ValueId> = HashSet::new();
     let mut seen_value_ids: HashSet<ValueId> = HashSet::new();
@@ -1379,7 +1399,44 @@ fn verify_function(
                         continue;
                     };
                     let mut seen: HashSet<usize> = HashSet::new();
+                    let mut seen_owners: HashSet<ValueId> = HashSet::new();
                     for (index, owner) in taken {
+                        // One value claiming two positions would be two
+                        // separate obligations collapsed into one, and
+                        // one of the two payloads would end up owned by
+                        // nothing.
+                        if !seen_owners.insert(*owner) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DECOMPOSITION_CLAIM_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is claimed by more than one payload \
+                                     position of a single decomposition",
+                                    owner.0
+                                ),
+                            ));
+                            continue;
+                        }
+                        // Decomposition transfers *storage*: the
+                        // receiving value must be the very extraction
+                        // that read this base, case and position. A
+                        // different value of the same declared type is
+                        // a different object, and claiming it would
+                        // leave the real payload owned by nothing.
+                        if !extractions.claim_matches(*owner, *value, *variant, *case, *index) {
+                            diagnostics.push(Diagnostic::error(
+                                codes::DECOMPOSITION_CLAIM_MISMATCH,
+                                source,
+                                Span::dummy(),
+                                format!(
+                                    "function `{name}`: %{} is claimed as payload position \
+                                     {index} of %{}, but it is not the extraction that read it",
+                                    owner.0, value.0
+                                ),
+                            ));
+                            continue;
+                        }
                         let Some(payload_ty) = layout.payload.get(*index) else {
                             diagnostics.push(Diagnostic::error(
                                 codes::UNKNOWN_PLACE_FIELD,
@@ -4032,6 +4089,106 @@ fn resolve_place_ty(
     Ok(ty)
 }
 
+/// The exact storage one `ValueKind::VariantPayload` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PayloadExtraction {
+    /// Canonical, so an extraction naming one read of a slot and a
+    /// decomposition naming another read of that same slot agree about
+    /// which value they mean.
+    base: ValueId,
+    variant: ItemId,
+    case: usize,
+    index: usize,
+}
+
+/// Every payload extraction this function performs, and what each one
+/// read (`rfcs/0012`).
+///
+/// A `DecomposeVariant` hands ownership of one case's payload positions
+/// to the values in its own `taken` list. Checking only that each such
+/// value has the *declared type* of the position it claims proves
+/// nothing: any other value of that type would pass, while the real
+/// payload stayed owned by the shell and this frame acquired an
+/// obligation for something it never received. This table is what makes
+/// the claim provable.
+struct ExtractionTable {
+    extractions: HashMap<ValueId, PayloadExtraction>,
+    load_origin: HashMap<ValueId, ValueId>,
+}
+
+impl ExtractionTable {
+    /// Whether `owner` is exactly the extraction that read position
+    /// `index` of `case` out of `base`.
+    fn claim_matches(
+        &self,
+        owner: ValueId,
+        base: ValueId,
+        variant: ItemId,
+        case: usize,
+        index: usize,
+    ) -> bool {
+        let wanted = canonical_value(base, &self.load_origin);
+        self.extractions.get(&owner).is_some_and(|extraction| {
+            extraction.base == wanted
+                && extraction.variant == variant
+                && extraction.case == case
+                && extraction.index == index
+        })
+    }
+
+    /// Whether `value` is a payload extraction at all.
+    fn is_extraction(&self, value: ValueId) -> bool {
+        self.extractions.contains_key(&value)
+    }
+}
+
+fn payload_extractions(function: &Function) -> ExtractionTable {
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let mut extractions = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind:
+                    ValueKind::VariantPayload {
+                        base,
+                        variant,
+                        case,
+                        index,
+                    },
+                ..
+            } = instruction
+            {
+                extractions.insert(
+                    *result,
+                    PayloadExtraction {
+                        base: canonical_value(*base, &load_origin),
+                        variant: *variant,
+                        case: *case,
+                        index: *index,
+                    },
+                );
+            }
+        }
+    }
+    ExtractionTable {
+        extractions,
+        load_origin,
+    }
+}
+
 /// A single guaranteed fact: the value `.0` is known to be case `.2` of
 /// variant `.1`.
 ///
@@ -6413,11 +6570,20 @@ fn verify_structural_places(
             // like a double cleanup on the second iteration. Skipped
             // for a `Load`, whose canonical root is the slot it reads
             // (defined by its own `Alloc`/`Store`), not this result.
-            if let Instruction::Value { result, .. } = instruction
+            if let Instruction::Value { result, kind, .. } = instruction
                 && is_affine(*result)
                 && origin(*result) == *result
             {
-                set_place_state(&mut facts, &Place::root(*result), FieldState::Full);
+                // A payload *read* owns nothing. The shell still owns
+                // what it read until a `DecomposeVariant` claims that
+                // exact extraction, so the result starts `Empty` and
+                // becomes this frame's own only at the claim.
+                let state = if matches!(kind, ValueKind::VariantPayload { .. }) {
+                    FieldState::Empty
+                } else {
+                    FieldState::Full
+                };
+                set_place_state(&mut facts, &Place::root(*result), state);
             }
             match instruction {
                 Instruction::Value {
@@ -6792,6 +6958,21 @@ fn verify_structural_places(
     let owned_roots = structural_cleanup_obligations(function, value_types, agg);
     let payloads = extracted_payloads(function);
     let refinements = case_refinements(function);
+    let extractions = payload_extractions(function);
+    // Every extraction some decomposition claims *somewhere*. A value
+    // claimed on no path at all was never this frame's to consume; one
+    // claimed on some path and consumed twice is an ordinary double
+    // cleanup, and keeps that diagnostic.
+    let claimed_extractions: HashSet<ValueId> = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|instruction| match instruction {
+            Instruction::DecomposeVariant { taken, .. } => Some(taken),
+            _ => None,
+        })
+        .flat_map(|taken| taken.iter().map(|(_, owner)| *owner))
+        .collect();
     // An obligation only exists at an exit the block ownership *begins*
     // in actually reaches: a value owned only inside one branch is not
     // leaked by the *other* branch's own `Return`, where ownership of it
@@ -6820,6 +7001,28 @@ fn verify_structural_places(
         };
         let (exit_facts, violations) = transfer(block, &in_state);
         for violation in violations {
+            // A payload extraction no decomposition anywhere in this
+            // function claims was never this frame's to consume or
+            // transfer at all, so it gets the diagnostic that says so
+            // rather than one about a value having moved.
+            if let OwnershipViolation::UseAfterMove(v) | OwnershipViolation::DoubleCleanup(v) =
+                violation
+                && extractions.is_extraction(v)
+                && !claimed_extractions.contains(&v)
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::UNCLAIMED_PAYLOAD_OWNERSHIP,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} reads one payload position of a variant, \
+                         and is destroyed or transferred without any decomposition having \
+                         transferred ownership of it",
+                        v.0
+                    ),
+                ));
+                continue;
+            }
             let (code, value, detail) = match violation {
                 OwnershipViolation::UseAfterMove(v) => (
                     codes::PLACE_USE_AFTER_MOVE,
@@ -6870,6 +7073,7 @@ fn verify_structural_places(
         let cases = VariantCaseContext {
             refinements: &block_refinements,
             payloads: &payloads,
+            claimed: &claimed_extractions,
         };
         for (root, ty, owned_from) in &owned_roots {
             let root_origin = origin(*root);
@@ -7232,6 +7436,10 @@ fn remaining_obligations(
 struct VariantCaseContext<'a> {
     refinements: &'a HashSet<RefinementFact>,
     payloads: &'a HashMap<(ValueId, usize, usize), ValueId>,
+    /// Extractions some decomposition actually claims. An unclaimed
+    /// extraction is only a read, so the shell still owns what it read
+    /// and the payload's obligation stays with the shell.
+    claimed: &'a HashSet<ValueId>,
 }
 
 impl VariantCaseContext<'_> {
@@ -7268,7 +7476,10 @@ impl VariantCaseContext<'_> {
         if !place.projections.is_empty() {
             return None;
         }
-        self.payloads.get(&(place.root, case, index)).copied()
+        self.payloads
+            .get(&(place.root, case, index))
+            .copied()
+            .filter(|owner| self.claimed.contains(owner))
     }
 }
 
@@ -15519,6 +15730,8 @@ mod structural_ownership {
                             | codes::MISSING_STRUCTURAL_CLEANUP
                             | codes::DUPLICATE_STRUCTURAL_CLEANUP
                             | codes::DECOMPOSITION_OUTSIDE_REFINEMENT
+                            | codes::DECOMPOSITION_CLAIM_MISMATCH
+                            | codes::UNCLAIMED_PAYLOAD_OWNERSHIP
                     )
                 })
                 .collect();
@@ -16633,6 +16846,17 @@ mod structural_ownership {
     /// -- the scrutinee itself is never consumed whole, so the extracted
     /// payload is this function's own sole obligation.
     fn payload_extraction(fx: &Fixture, destroy_payload: bool) -> Vec<BasicBlock> {
+        payload_extraction_with(fx, true, destroy_payload)
+    }
+
+    /// `claim_payload` decides whether a `DecomposeVariant` actually
+    /// transfers the extraction to this frame. Without it the read owns
+    /// nothing, and the shell still owns what it read.
+    fn payload_extraction_with(
+        fx: &Fixture,
+        claim_payload: bool,
+        destroy_payload: bool,
+    ) -> Vec<BasicBlock> {
         let mut full = vec![Instruction::Value {
             result: ValueId(1),
             ty: fx.envelope.clone(),
@@ -16643,6 +16867,14 @@ mod structural_ownership {
                 index: 0,
             },
         }];
+        if claim_payload {
+            full.push(Instruction::DecomposeVariant {
+                value: ValueId(0),
+                variant: HOLDER,
+                case: 0,
+                taken: vec![(0, ValueId(1))],
+            });
+        }
         if destroy_payload {
             full.push(drop_of(1));
         }
@@ -16707,6 +16939,27 @@ mod structural_ownership {
             structural_codes(&mut fx, f),
             Vec::<&str>::new(),
             "destroying the extracted payload discharges the obligation"
+        );
+    }
+
+    #[test]
+    fn an_extracted_affine_record_payload_destroyed_without_a_claim_is_rejected() {
+        let mut fx = fixture();
+        // The read alone transfers nothing: the shell still owns this
+        // payload, and will destroy it again.
+        let blocks = payload_extraction_with(&fx, false, true);
+        let f = under_test(
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }],
+            Ty::I64,
+            blocks,
+        );
+        assert!(
+            structural_codes(&mut fx, f).contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP),
+            "destroying an unclaimed extraction destroys storage the shell still owns"
         );
     }
 
@@ -18824,6 +19077,414 @@ mod structural_ownership {
             assert!(
                 !forward.is_empty(),
                 "the fixture must actually diagnose something"
+            );
+        }
+    }
+
+    /// A decomposition transfers ownership of *specific storage*, so
+    /// each claimed owner must be the very value that extraction
+    /// produced -- having the right declared type proves nothing
+    /// (`rfcs/0012`).
+    ///
+    /// And a `ValueKind::VariantPayload` is only a read: ownership of a
+    /// payload begins when a decomposition claims that exact extraction,
+    /// never merely because it was read.
+    #[cfg(test)]
+    mod payload_binding {
+        use super::*;
+
+        fn params(fx: &Fixture) -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: fx.holder.clone(),
+                take: true,
+            }]
+        }
+
+        fn payload(result: u32, base: u32, case: usize, index: usize, fx: &Fixture) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty: fx.envelope.clone(),
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(base),
+                    variant: HOLDER,
+                    case,
+                    index,
+                },
+            }
+        }
+
+        fn decompose(value: u32, case: usize, taken: Vec<(usize, u32)>) -> Instruction {
+            Instruction::DecomposeVariant {
+                value: ValueId(value),
+                variant: HOLDER,
+                case,
+                taken: taken
+                    .into_iter()
+                    .map(|(index, owner)| (index, ValueId(owner)))
+                    .collect(),
+            }
+        }
+
+        /// `switch %0 { bb1 => full, bb2 => empty }`, where `full` is
+        /// whatever the test wants to try in the `Full` case block.
+        fn under_switch(full: Vec<Instruction>, result: u32) -> Vec<BasicBlock> {
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
+                        variant: HOLDER,
+                        cases: vec![BlockId(1), BlockId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: full,
+                    terminator: Terminator::Return(Some(ValueId(result))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![decompose(0, 1, Vec::new()), int(20, 0)],
+                    terminator: Terminator::Return(Some(ValueId(20))),
+                },
+            ]
+        }
+
+        #[test]
+        fn an_unrelated_value_of_the_right_type_may_not_be_claimed() {
+            let mut fx = fixture();
+            // `%3` is a brand new `Envelope`, not the shell's payload.
+            // Claiming it would leave the real payload owned by nothing
+            // and hand this frame a second obligation it never received.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(9)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: fx.envelope.clone(),
+                            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(4)]),
+                        },
+                        decompose(0, 0, vec![(0, 3)]),
+                        drop_of(3),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            let mut blocks = f.blocks.clone();
+            blocks[0].instructions.push(int(9, 0));
+            let f = under_test(params(&fx), Ty::I64, blocks);
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "a same-typed value that is not the extraction must be rejected"
+            );
+        }
+
+        #[test]
+        fn the_exact_extraction_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "claiming the extraction this decomposition's own base produced is the whole point"
+            );
+        }
+
+        #[test]
+        fn an_extraction_from_another_base_may_not_be_claimed() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(
+                vec![
+                    payload(2, 6, 0, 0, &fx),
+                    decompose(0, 0, vec![(0, 2)]),
+                    drop_of(2),
+                    int(5, 0),
+                ],
+                5,
+            );
+            // A second, independent `Holder`, extracted from in the same
+            // block but belonging to nothing this decomposition names.
+            blocks[0].instructions.push(Instruction::Value {
+                result: ValueId(6),
+                ty: fx.holder.clone(),
+                kind: ValueKind::VariantCreate {
+                    variant: HOLDER,
+                    case: 1,
+                    type_args: Vec::new(),
+                    payload: Vec::new(),
+                },
+            });
+            let f = under_test(params(&fx), Ty::I64, blocks);
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "an extraction out of a different value is not this shell's payload"
+            );
+        }
+
+        #[test]
+        fn an_extraction_of_another_position_may_not_be_claimed() {
+            let mut fx = fixture();
+            // `Full` declares one payload position, so index 1 does not
+            // exist -- but the claim names position 0 with a value read
+            // from position 1.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 1, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "the claimed position must be the position the extraction read"
+            );
+        }
+
+        #[test]
+        fn an_extraction_of_another_case_may_not_be_claimed() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 1, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_CLAIM_MISMATCH),
+                "the claimed case must be the case the extraction read"
+            );
+        }
+
+        #[test]
+        fn one_extraction_may_not_be_claimed_by_two_decompositions_on_one_path() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+                "the shell is already emptied, so a second decomposition of it has nothing to take"
+            );
+        }
+
+        #[test]
+        fn an_extraction_destroyed_without_any_decomposition_is_rejected() {
+            let mut fx = fixture();
+            // Reading a payload position is a read. Destroying what it
+            // read, then destroying the shell that still owns it, is a
+            // double destruction of the same storage.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![payload(2, 0, 0, 0, &fx), drop_of(2), drop_of(0), int(5, 0)],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP),
+                "a payload read confers no ownership at all"
+            );
+        }
+
+        #[test]
+        fn an_extraction_transferred_without_any_decomposition_is_rejected() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(vec![payload(2, 0, 0, 0, &fx), drop_of(0)], 2);
+            blocks[1].terminator = Terminator::Return(Some(ValueId(2)));
+            let f = under_test(params(&fx), fx.envelope.clone(), blocks);
+            let codes = all_codes(&mut fx, f);
+            assert!(
+                codes.contains(&codes::UNCLAIMED_PAYLOAD_OWNERSHIP)
+                    || codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "returning an unclaimed extraction transfers storage this frame never owned, \
+                 got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn a_claimed_payload_may_be_returned_instead_of_destroyed() {
+            let mut fx = fixture();
+            let mut blocks = under_switch(
+                vec![payload(2, 0, 0, 0, &fx), decompose(0, 0, vec![(0, 2)])],
+                2,
+            );
+            blocks[1].terminator = Terminator::Return(Some(ValueId(2)));
+            blocks[2].instructions = vec![
+                decompose(0, 1, Vec::new()),
+                Instruction::Value {
+                    result: ValueId(7),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(8)]),
+                },
+                Instruction::Value {
+                    result: ValueId(20),
+                    ty: fx.envelope.clone(),
+                    kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(7)]),
+                },
+            ];
+            blocks[0].instructions.push(int(8, 0));
+            let f = under_test(params(&fx), fx.envelope.clone(), blocks);
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "an arm that returns its claimed payload transfers it instead of destroying it"
+            );
+        }
+
+        #[test]
+        fn a_wildcard_payload_is_claimed_and_destroyed_in_the_same_block() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a discarded payload is claimed and destroyed the instant the arm commits"
+            );
+        }
+
+        #[test]
+        fn the_shell_may_not_be_dropped_after_it_was_decomposed() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                under_switch(
+                    vec![
+                        payload(2, 0, 0, 0, &fx),
+                        decompose(0, 0, vec![(0, 2)]),
+                        drop_of(2),
+                        drop_of(0),
+                        int(5, 0),
+                    ],
+                    5,
+                ),
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DUPLICATE_STRUCTURAL_CLEANUP),
+                "the shell was emptied by the decomposition and owns nothing to destroy"
+            );
+        }
+
+        #[test]
+        fn two_arms_of_one_case_may_each_claim_the_shared_extraction() {
+            let mut fx = fixture();
+            // One extraction is genuinely shared by every arm reachable
+            // through a case; each arm commits on its own disjoint path,
+            // so both claims are correct and neither may be rejected.
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.holder.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(1),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(1), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![payload(2, 0, 0, 0, &fx)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(3),
+                            else_block: BlockId(4),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(20, 0)],
+                        terminator: Terminator::Return(Some(ValueId(20))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![decompose(0, 0, vec![(0, 2)]), drop_of(2), int(5, 1)],
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: vec![decompose(0, 0, vec![(0, 2)]), drop_of(2), int(6, 2)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "two disjoint arms under one case each legitimately claim the shared extraction"
             );
         }
     }

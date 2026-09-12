@@ -6888,7 +6888,26 @@ fn verify_structural_places(
         .iter()
         .find(|b| b.id == entry)
         .expect("presence already checked above");
-    let (entry_out, _) = transfer(entry_block, &PlaceFacts::new());
+    // Every root an instruction creates starts *absent*: nothing has
+    // created it yet on any path through the entry. Without this the
+    // absence of a key reads as `Full`, so a value built on one arm of
+    // a branch is indistinguishable at the join from one that was never
+    // created on the other arm at all -- and a bypass path silently
+    // excuses a real leak, or is itself blamed for a value it never
+    // received. Parameters are deliberately not seeded: a `take`
+    // parameter really is live from the entry.
+    let mut entry_facts = PlaceFacts::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value { result, .. } = instruction
+                && is_affine(*result)
+                && origin(*result) == *result
+            {
+                entry_facts.insert(Place::root(*result), FieldState::Empty);
+            }
+        }
+    }
+    let (entry_out, _) = transfer(entry_block, &entry_facts);
 
     // `out` holds an entry for a block *only once that block's own
     // out-state has actually been computed* -- "not computed yet" is the
@@ -6929,20 +6948,21 @@ fn verify_structural_places(
         let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
             continue;
         };
-        let in_state = match in_state_for_places(id, entry, &incoming_edges, &reachable, &out) {
-            IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
-            // Nothing has proven anything about this block yet, so it
-            // runs no transfer and records no out-state: the absence of
-            // a key is exactly what keeps "not computed" apart from
-            // "computed to nothing". Popping a block before its own
-            // predecessors is ordinary -- the worklist is seeded in
-            // declaration order, which says nothing about control flow
-            // -- and a predecessor's out-state landing later re-enqueues
-            // it. Every reachable block is reached from the entry,
-            // whose out-state is fixed before this loop starts, so no
-            // reachable block can stay `Pending` once this drains.
-            IncomingState::Pending => continue,
-        };
+        let in_state =
+            match in_state_for_places(id, entry, &incoming_edges, &reachable, &out, &entry_facts) {
+                IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+                // Nothing has proven anything about this block yet, so it
+                // runs no transfer and records no out-state: the absence of
+                // a key is exactly what keeps "not computed" apart from
+                // "computed to nothing". Popping a block before its own
+                // predecessors is ordinary -- the worklist is seeded in
+                // declaration order, which says nothing about control flow
+                // -- and a predecessor's out-state landing later re-enqueues
+                // it. Every reachable block is reached from the entry,
+                // whose out-state is fixed before this loop starts, so no
+                // reachable block can stay `Pending` once this drains.
+                IncomingState::Pending => continue,
+            };
         let (new_out, _) = transfer(block, &in_state);
         let changed = out.get(&id) != Some(&new_out);
         if changed {
@@ -6973,16 +6993,17 @@ fn verify_structural_places(
         })
         .flat_map(|taken| taken.iter().map(|(_, owner)| *owner))
         .collect();
-    // An obligation only exists at an exit the block ownership *begins*
-    // in actually reaches: a value owned only inside one branch is not
-    // leaked by the *other* branch's own `Return`, where ownership of it
-    // never started. Dominance is exactly that question, and is already
-    // computed the same way for `verify_dominance`.
-    let dominators = compute_dominators(function);
 
     for block in &function.blocks {
         let in_state = if reachable.contains(&block.id) {
-            match in_state_for_places(block.id, entry, &incoming_edges, &reachable, &out) {
+            match in_state_for_places(
+                block.id,
+                entry,
+                &incoming_edges,
+                &reachable,
+                &out,
+                &entry_facts,
+            ) {
                 IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
                 // The fixpoint above has converged, so every reachable
                 // block has a computed predecessor by now and this
@@ -7075,18 +7096,20 @@ fn verify_structural_places(
             payloads: &payloads,
             claimed: &claimed_extractions,
         };
-        for (root, ty, owned_from) in &owned_roots {
+        for (root, ty) in &owned_roots {
             let root_origin = origin(*root);
             if returned == Some(root_origin) {
                 continue;
             }
-            let reaches_this_exit = *owned_from == block.id
-                || dominators
-                    .get(&block.id)
-                    .is_some_and(|d| d.contains(owned_from));
-            if !reaches_this_exit {
-                continue;
-            }
+            // Whether this exit owes cleanup is answered by the facts
+            // that actually reach it, not by dominance. Dominance asks
+            // "does *every* path here pass through the creation?"; the
+            // obligation asks "does *any* path here pass through it and
+            // still hold the value?". A branch-local aggregate reaching
+            // a shared exit answers no to the first and yes to the
+            // second, and used to be exempted -- a silent leak. The
+            // state below is `Empty` exactly when every path here either
+            // never created it or already consumed it.
             let mut obligations = Vec::new();
             remaining_obligations(
                 &exit_facts,
@@ -7214,7 +7237,7 @@ fn structural_cleanup_obligations(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
     agg: &AggregateContext,
-) -> Vec<(ValueId, Ty, BlockId)> {
+) -> Vec<(ValueId, Ty)> {
     let owns = |v: ValueId| -> Option<Ty> {
         let ty = value_types.get(&v)?;
         if !is_affine_in(ty, agg) {
@@ -7226,13 +7249,12 @@ fn structural_cleanup_obligations(
         Some(ty.clone())
     };
 
-    let entry = BlockId(0);
-    let mut roots: Vec<(ValueId, Ty, BlockId)> = Vec::new();
+    let mut roots: Vec<(ValueId, Ty)> = Vec::new();
     for param in &function.params {
         if param.take
             && let Some(ty) = owns(param.value)
         {
-            roots.push((param.value, ty, entry));
+            roots.push((param.value, ty));
         }
     }
     for block in &function.blocks {
@@ -7255,7 +7277,7 @@ fn structural_cleanup_obligations(
                             }
                     );
                     if produces_owner && let Some(ty) = owns(*result) {
-                        roots.push((*result, ty, block.id));
+                        roots.push((*result, ty));
                     }
                 }
                 // Ownership of an extracted payload begins *here*, at
@@ -7263,7 +7285,7 @@ fn structural_cleanup_obligations(
                 Instruction::DecomposeVariant { taken, .. } => {
                     for (_, owner) in taken {
                         if let Some(ty) = owns(*owner) {
-                            roots.push((*owner, ty, block.id));
+                            roots.push((*owner, ty));
                         }
                     }
                 }
@@ -7271,8 +7293,8 @@ fn structural_cleanup_obligations(
             }
         }
     }
-    roots.sort_by_key(|(v, _, _)| *v);
-    roots.dedup_by_key(|(v, _, _)| *v);
+    roots.sort_by_key(|(v, _)| *v);
+    roots.dedup_by_key(|(v, _)| *v);
     roots
 }
 
@@ -7325,7 +7347,12 @@ fn remaining_obligations(
     if depth >= MAX_GENERIC_DEPTH {
         return;
     }
-    if resolve_place_state(facts, place) != FieldState::Full {
+    // `Empty` is the only state that owes nothing: every path reaching
+    // here either never created this place or already consumed it.
+    // `Maybe` means at least one path still holds it, and that path
+    // leaks -- treating disagreement as "nothing owed" is exactly how a
+    // value live on one predecessor and consumed on another escaped.
+    if resolve_place_state(facts, place) == FieldState::Empty {
         return;
     }
     if !is_affine_in(ty, agg) {
@@ -7557,9 +7584,10 @@ fn in_state_for_places(
     incoming_edges: &HashMap<BlockId, Vec<BlockId>>,
     reachable: &HashSet<BlockId>,
     out: &HashMap<BlockId, PlaceFacts>,
+    entry_facts: &PlaceFacts,
 ) -> IncomingState<PlaceFacts> {
     if block_id == entry {
-        return IncomingState::Entry(PlaceFacts::new());
+        return IncomingState::Entry(entry_facts.clone());
     }
     let mut acc: Option<PlaceFacts> = None;
     for pred in incoming_edges.get(&block_id).into_iter().flatten() {
@@ -15739,6 +15767,28 @@ mod structural_ownership {
         codes
     }
 
+    /// Every diagnostic the whole verifier reports, rendered as
+    /// `code: message` in the exact order it was emitted -- so two runs
+    /// can be compared byte for byte, not merely as a set of codes.
+    fn rendered(fx: &mut Fixture, function: Function) -> Vec<String> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+            .into_iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
     /// Every diagnostic the whole verifier reports, unfiltered and
     /// sorted -- for asserting which *layer* owns a malformed CFG, and
     /// that no second layer reports the same defect again.
@@ -18006,7 +18056,14 @@ mod structural_ownership {
             let reachable = HashSet::from([BlockId(0)]);
             let out = HashMap::new();
             assert_eq!(
-                in_state_for_places(BlockId(0), BlockId(0), &incoming, &reachable, &out),
+                in_state_for_places(
+                    BlockId(0),
+                    BlockId(0),
+                    &incoming,
+                    &reachable,
+                    &out,
+                    &PlaceFacts::new()
+                ),
                 IncomingState::Entry(PlaceFacts::new()),
                 "the entry block's empty in-state is proven, not a placeholder"
             );
@@ -18023,7 +18080,8 @@ mod structural_ownership {
                     BlockId(0),
                     &incoming,
                     &reachable,
-                    &HashMap::new()
+                    &HashMap::new(),
+                    &PlaceFacts::new()
                 ),
                 IncomingState::Pending,
                 "nothing has been computed, which is not the same as having computed nothing"
@@ -18037,7 +18095,8 @@ mod structural_ownership {
                     BlockId(0),
                     &incoming,
                     &reachable,
-                    &HashMap::from([(BlockId(1), PlaceFacts::new())])
+                    &HashMap::from([(BlockId(1), PlaceFacts::new())]),
+                    &PlaceFacts::new()
                 ),
                 IncomingState::Ready(PlaceFacts::new()),
                 "a computed empty out-state is a real state, and must not compare equal to Pending"
@@ -18056,7 +18115,8 @@ mod structural_ownership {
                     BlockId(0),
                     &incoming,
                     &reachable,
-                    &HashMap::from([(BlockId(0), consumed.clone())])
+                    &HashMap::from([(BlockId(0), consumed.clone())]),
+                    &PlaceFacts::new()
                 ),
                 IncomingState::Ready(consumed),
                 "an unprocessed back edge contributes nothing, and never dilutes what did land"
@@ -18075,7 +18135,8 @@ mod structural_ownership {
                     BlockId(0),
                     &incoming,
                     &reachable,
-                    &HashMap::from([(BlockId(1), consumed)])
+                    &HashMap::from([(BlockId(1), consumed)]),
+                    &PlaceFacts::new()
                 ),
                 IncomingState::Pending,
                 "a dead CFG fragment may not seed reachable ownership, even having computed facts"
@@ -18375,28 +18436,6 @@ mod structural_ownership {
         }
 
         // -- determinism ---------------------------------------------------
-
-        /// Every diagnostic this pass reports, rendered as `code: message`
-        /// in the exact order it was emitted -- so two runs can be compared
-        /// byte for byte, not merely as a set of codes.
-        fn rendered(fx: &mut Fixture, function: Function) -> Vec<String> {
-            let helpers = helpers(fx);
-            let mut map = SourceMap::new();
-            let source = map.add_file("t.npt", "");
-            let mut functions = vec![function];
-            functions.extend(helpers);
-            let module = Module {
-                protocols: Vec::new(),
-                extends: Vec::new(),
-                functions,
-                records: fx.records.clone(),
-                variants: fx.variants.clone(),
-            };
-            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
-                .into_iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect()
-        }
 
         #[test]
         fn verifying_one_adversarial_module_twice_reports_byte_identical_diagnostics() {
@@ -19485,6 +19524,390 @@ mod structural_ownership {
                 all_codes(&mut fx, f),
                 Vec::<&str>::new(),
                 "two disjoint arms under one case each legitimately claim the shared extraction"
+            );
+        }
+    }
+
+    /// Whether an exit owes cleanup for a value is a question about the
+    /// *paths reaching it*, not about dominance (`rfcs/0012`).
+    ///
+    /// Dominance asks "does every path to this exit pass through the
+    /// creation?". The obligation asks "does *any* path to this exit
+    /// pass through it and still hold the value?". A branch-local
+    /// aggregate reaching a shared exit answers no to the first and yes
+    /// to the second, and was silently exempted.
+    #[cfg(test)]
+    mod ownership_presence {
+        use super::*;
+
+        fn cond_param() -> Vec<Param> {
+            vec![Param {
+                value: ValueId(0),
+                ty: Ty::Bool,
+                take: false,
+            }]
+        }
+
+        /// `%file = File { n }` then `%box = Box[File](%file)`.
+        fn build_box(file: u32, boxed: u32, n: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                int(n, 1),
+                Instruction::Value {
+                    result: ValueId(file),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(n)]),
+                },
+                Instruction::Value {
+                    result: ValueId(boxed),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone()], vec![ValueId(file)]),
+                },
+            ]
+        }
+
+        /// bb0 branches to bb1 (which builds a `Box[File]`) and bb2
+        /// (which does not); both meet at bb3, which returns.
+        fn diamond_creating_on_one_arm(fx: &Fixture, destroy: bool) -> Vec<BasicBlock> {
+            let mut arm = build_box(1, 2, 3, fx);
+            if destroy {
+                arm.push(drop_of(2));
+            }
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(0),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: arm,
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![int(4, 0)],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ]
+        }
+
+        #[test]
+        fn a_branch_local_aggregate_leaked_at_a_shared_exit_is_reported() {
+            let mut fx = fixture();
+            // bb1 does not dominate bb3, but the path bb1 -> bb3 leaks
+            // the `Box[File]` it built.
+            let blocks = diamond_creating_on_one_arm(&fx, false);
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "a value created on one arm and still live at the shared exit is leaked"
+            );
+        }
+
+        #[test]
+        fn a_branch_local_aggregate_cleaned_before_the_merge_is_accepted() {
+            let mut fx = fixture();
+            let blocks = diamond_creating_on_one_arm(&fx, true);
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "destroying it on the only arm that created it discharges the obligation"
+            );
+        }
+
+        #[test]
+        fn the_bypassing_arm_alone_is_never_diagnosed() {
+            let mut fx = fixture();
+            // bb2 creates nothing, and returns on its own. Nothing may
+            // be demanded of it for a value it never received.
+            let mut blocks = diamond_creating_on_one_arm(&fx, true);
+            blocks[2].instructions = vec![int(5, 0)];
+            blocks[2].terminator = Terminator::Return(Some(ValueId(5)));
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "an exit on a path that never created the value owes nothing"
+            );
+        }
+
+        #[test]
+        fn both_arms_creating_their_own_value_must_each_clean_it() {
+            let mut fx = fixture();
+            let mut first = build_box(1, 2, 3, &fx);
+            first.push(drop_of(2));
+            // The second arm builds its own and abandons it.
+            let second = build_box(5, 6, 7, &fx);
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: first,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: second,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            let codes = structural_codes(&mut fx, f);
+            assert!(
+                codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the arm that abandoned its own value must be reported, got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn both_arms_cleaning_their_own_value_are_accepted() {
+            let mut fx = fixture();
+            let mut first = build_box(1, 2, 3, &fx);
+            first.push(drop_of(2));
+            let mut second = build_box(5, 6, 7, &fx);
+            second.push(drop_of(6));
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: first,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: second,
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each arm discharges its own obligation on its own path"
+            );
+        }
+
+        #[test]
+        fn an_arm_that_diverges_imposes_nothing_on_the_other() {
+            let mut fx = fixture();
+            let mut blocks = diamond_creating_on_one_arm(&fx, true);
+            // The creating arm never reaches the exit at all.
+            blocks[1].instructions = build_box(1, 2, 3, &fx);
+            blocks[1].terminator = Terminator::Branch(BlockId(1));
+            let f = under_test(cond_param(), Ty::I64, blocks);
+            let codes = structural_codes(&mut fx, f);
+            assert_eq!(
+                codes,
+                Vec::<&str>::new(),
+                "a diverging arm reaches no exit, so it owes nothing there, got {codes:?}"
+            );
+        }
+
+        #[test]
+        fn a_loop_creating_and_cleaning_each_iteration_is_accepted() {
+            let mut fx = fixture();
+            let mut body = build_box(1, 2, 3, &fx);
+            body.push(drop_of(2));
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: body,
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a loop that destroys what it built each iteration owes nothing at the exit"
+            );
+        }
+
+        #[test]
+        fn a_loop_leaking_on_its_exit_path_is_reported() {
+            let mut fx = fixture();
+            let body = build_box(1, 2, 3, &fx);
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: body,
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "a loop body that never destroys what it built leaks on the way out"
+            );
+        }
+
+        #[test]
+        fn a_nested_branch_creating_deep_inside_still_owes_at_the_outer_exit() {
+            let mut fx = fixture();
+            let f = under_test(
+                cond_param(),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(4),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(2),
+                            else_block: BlockId(3),
+                        },
+                    },
+                    // Two levels in, and still reaching the one exit.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: build_box(1, 2, 3, &fx),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(5)),
+                    },
+                    BasicBlock {
+                        id: BlockId(5),
+                        instructions: vec![int(4, 0)],
+                        terminator: Terminator::Return(Some(ValueId(4))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "depth of nesting changes nothing about which paths reach the exit"
+            );
+        }
+
+        #[test]
+        fn every_block_and_predecessor_order_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = diamond_creating_on_one_arm(&fx, false);
+            let expected = rendered(&mut fx, under_test(cond_param(), Ty::I64, blocks.clone()));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    rendered(&mut fx, under_test(cond_param(), Ty::I64, rotated)),
+                    expected,
+                    "rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks.clone();
+            reversed.reverse();
+            assert_eq!(
+                rendered(&mut fx, under_test(cond_param(), Ty::I64, reversed)),
+                expected,
+                "reversing the block vector changed the diagnostics"
+            );
+            // The same diamond with its two arms swapped: the join's
+            // predecessors are discovered in the other order.
+            let mut swapped = blocks;
+            swapped[0].terminator = Terminator::CondBranch {
+                condition: ValueId(0),
+                then_block: BlockId(2),
+                else_block: BlockId(1),
+            };
+            assert_eq!(
+                rendered(&mut fx, under_test(cond_param(), Ty::I64, swapped)),
+                expected,
+                "reversing predecessor discovery order changed the diagnostics"
+            );
+            assert!(
+                !expected.is_empty(),
+                "the fixture must actually diagnose something"
             );
         }
     }

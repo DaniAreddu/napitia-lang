@@ -1197,6 +1197,22 @@ fn resource_variant_decomposition_example_runs_end_to_end() {
     assert_resource_example_runs("resource_variant_decomposition.npt", "134");
 }
 
+// Observation is transitive: an ordinary parameter is a call-scoped view
+// of a value the caller still owns, and so is every field reached
+// through it.
+
+#[test]
+fn resource_observed_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observed_aggregate.npt", "31");
+}
+
+/// Moving a field out of an observed aggregate is refused by `check`
+/// itself -- not by the verifier after `check` already accepted it.
+#[test]
+fn resource_invalid_observed_field_move_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observed_field_move.npt", "U0005");
+}
+
 /// Textual NIR shows the decomposition explicitly, on the arm's own
 /// path -- the ownership event a function-global consumption scan used
 /// to stand in for.

@@ -7536,6 +7536,21 @@ fn structural_cleanup_obligations(
                         }
                     }
                 }
+                // A transferring `Store` moves ownership *into* a slot.
+                // The value it consumed stops being this frame's
+                // obligation at that point and the slot becomes one --
+                // otherwise the obligation simply vanished, and a slot
+                // left holding an affine value at an exit leaked in
+                // silence.
+                Instruction::Store {
+                    slot,
+                    mode: crate::nir::OwnershipMode::Transfer,
+                    ..
+                } => {
+                    if let Some(ty) = owns(*slot) {
+                        roots.push((*slot, ty));
+                    }
+                }
                 _ => {}
             }
         }
@@ -21351,6 +21366,151 @@ mod structural_ownership {
             assert!(
                 structural_codes(&mut fx, f).contains(&codes::OBSERVER_CANNOT_TRANSFER),
                 "a `take` parameter consumes its argument, which an observer may not give"
+            );
+        }
+    }
+
+    /// A slot is storage, and storing an affine value into one moves the
+    /// obligation with it (`rfcs/0012`). The value is consumed by the
+    /// store; the slot now owes the cleanup, and an exit that reaches it
+    /// still holding one is a leak like any other.
+    #[cfg(test)]
+    mod slot_ownership {
+        use super::*;
+
+        fn no_params() -> Vec<Param> {
+            Vec::new()
+        }
+
+        /// `%1 = alloc Box[File]`, then a `Box[File]` built and stored
+        /// into it.
+        fn build_into_slot(fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                Instruction::Value {
+                    result: ValueId(1),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::Alloc,
+                },
+                int(2, 1),
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: fx.file.clone(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(2)]),
+                },
+                Instruction::Value {
+                    result: ValueId(4),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone()], vec![ValueId(3)]),
+                },
+                Instruction::Store {
+                    slot: ValueId(1),
+                    value: ValueId(4),
+                    mode: OwnershipMode::Transfer,
+                },
+            ]
+        }
+
+        #[test]
+        fn a_slot_left_holding_an_affine_value_is_reported() {
+            let mut fx = fixture();
+            let mut instructions = build_into_slot(&fx);
+            instructions.push(int(5, 0));
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                }],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the store moved the obligation into the slot, and nothing discharged it"
+            );
+        }
+
+        #[test]
+        fn a_slot_whose_value_is_read_back_and_destroyed_is_accepted() {
+            let mut fx = fixture();
+            let mut instructions = build_into_slot(&fx);
+            instructions.extend([
+                Instruction::Value {
+                    result: ValueId(6),
+                    ty: fx.box_file.clone(),
+                    kind: ValueKind::Load(ValueId(1)),
+                },
+                read(
+                    7,
+                    fx.file.clone(),
+                    Place::root(ValueId(6)).field(BOXY, FieldId(0)),
+                    OwnershipMode::Transfer,
+                ),
+                drop_of(7),
+                int(5, 0),
+            ]);
+            let f = under_test(
+                no_params(),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                }],
+            );
+            assert_eq!(
+                structural_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "reading the slot back and destroying what it held discharges the obligation"
+            );
+        }
+
+        #[test]
+        fn a_slot_filled_on_one_arm_only_is_reported_at_the_shared_exit() {
+            let mut fx = fixture();
+            // The bypassing arm never filled the slot, so only the arm
+            // that did can leak -- and it does.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: Ty::Bool,
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        }],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: build_into_slot(&fx)[1..].to_vec(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(5, 0)],
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert!(
+                structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+                "the arm that filled the slot leaks it at the shared exit"
             );
         }
     }

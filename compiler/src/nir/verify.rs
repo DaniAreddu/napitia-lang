@@ -459,6 +459,23 @@ mod codes {
     /// transfer had just made stale, so this is rejected outright
     /// rather than left to fail unpredictably at run time.
     pub const STORE_PLACE_SELF_ALIAS: &str = "V0093";
+    /// A `DecomposeVariant` whose own base is not *proven* to hold the
+    /// case it takes apart, on every path reaching it (`rfcs/0012`).
+    ///
+    /// Decomposition moves ownership of one specific case's payload
+    /// storage. Without a proof that the value actually holds that
+    /// case, the storage may not exist at all, and the payload of
+    /// whichever case really is live is abandoned with nothing owning
+    /// it. The proof is a real CFG fixed point over
+    /// `(canonical scrutinee, variant, case)` guarantees: it
+    /// originates on a `Switch` case edge, propagates through ordinary
+    /// edges, and is intersected at every join, so a block reachable
+    /// through two different cases has proven neither.
+    ///
+    /// Complements `PAYLOAD_OUTSIDE_REFINEMENT` (V0024), which asks the
+    /// same question of a payload *read*: this one covers the transfer
+    /// of ownership, which a read never performs.
+    pub const DECOMPOSITION_OUTSIDE_REFINEMENT: &str = "V0095";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -4015,57 +4032,152 @@ fn resolve_place_ty(
     Ok(ty)
 }
 
-/// A `variant.payload` instruction is only legal in a block reached
-/// through the matching case's own `Terminator::Switch` edge -- this
-/// re-derives that from the CFG itself, independent of how lowering
-/// happened to build it.
 /// A single guaranteed fact: the value `.0` is known to be case `.2` of
 /// variant `.1`.
+///
+/// `.0` is always *canonical* -- a `Load` result is recorded as the slot
+/// it read, so a `switch` on one read of a slot and a `decompose` of
+/// another read of that same slot are recognised as one value.
 type RefinementFact = (ValueId, ItemId, usize);
 
+/// The canonical identity `value` stands for: the slot it was loaded
+/// from, or itself.
+fn canonical_value(value: ValueId, load_origin: &HashMap<ValueId, ValueId>) -> ValueId {
+    load_origin.get(&value).copied().unwrap_or(value)
+}
+
+/// The canonical value whose storage `instruction` writes, if any --
+/// every refinement naming it stops being proven from here on.
+///
+/// A `StorePlace` into a *field* is deliberately not a kill: no field
+/// write can change which case of a variant is live.
+fn refinement_kill(
+    instruction: &Instruction,
+    load_origin: &HashMap<ValueId, ValueId>,
+) -> Option<ValueId> {
+    match instruction {
+        Instruction::Store { slot, .. } => Some(canonical_value(*slot, load_origin)),
+        Instruction::StorePlace { place, .. } if place.projections.is_empty() => {
+            Some(canonical_value(place.root, load_origin))
+        }
+        _ => None,
+    }
+}
+
 /// Every case refinement each block is *guaranteed* on arrival
-/// (`rfcs/0010`, `rfcs/0012`): the intersection of what every incoming
-/// edge independently proves, never their union.
+/// (`rfcs/0010`, `rfcs/0012`), as a real worklist fixed point over the
+/// whole CFG rather than a look at the immediate predecessors.
 ///
-/// A block reached through two different cases of the same switch, or
-/// through a switch edge and a plain branch, is guaranteed nothing about
-/// which case is live -- which is exactly right, since it is genuinely
-/// reachable either way. A block with no incoming edge at all (the entry
-/// block, or an unreachable one) is guaranteed nothing either.
+/// A refinement originates on a `Switch` case edge, propagates through
+/// every ordinary edge, and is **intersected** at every join, never
+/// unioned. So:
 ///
-/// Shared by `verify_payload_refinement`, which rejects an extraction
-/// outside its own case, and by the structural obligation check, which
-/// decomposes a variant by the case that is live at an exit.
-fn case_refinements(function: &Function) -> HashMap<BlockId, HashSet<RefinementFact>> {
-    let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
+/// * a block reached through two different cases of the same switch, or
+///   through a switch edge and a plain branch, is guaranteed nothing;
+/// * a refinement survives any number of ordinary hops, which a
+///   single-hop rule could not express;
+/// * one block's guarantee is never borrowed by a sibling, because a
+///   sibling is not a predecessor;
+/// * nested switches stay independent, because each fact names its own
+///   scrutinee;
+/// * `Branch`, `CondBranch` and `Invoke` edges generate nothing at all;
+/// * an unreachable predecessor is skipped entirely rather than
+///   intersected in, so a dead switch edge can never erase a guarantee
+///   every live path proved;
+/// * two edges from one terminator into the same block stay two edges,
+///   so a target shared by two cases has proven neither.
+///
+/// Writing a scrutinee's own storage ends what the switch proved about
+/// it -- see `refinement_kill`, and `Invoke`'s own result slots.
+struct RefinementTable {
+    /// Facts guaranteed on entry to each block. A block absent from the
+    /// map (unreachable, or never computed) guarantees nothing.
+    guaranteed: HashMap<BlockId, HashSet<RefinementFact>>,
+    /// `Load` result -> the slot it read.
+    load_origin: HashMap<ValueId, ValueId>,
+}
+
+impl RefinementTable {
+    fn canonical(&self, value: ValueId) -> ValueId {
+        canonical_value(value, &self.load_origin)
+    }
+
+    /// The facts guaranteed on entry to `block`.
+    fn on_entry(&self, block: BlockId) -> HashSet<RefinementFact> {
+        self.guaranteed.get(&block).cloned().unwrap_or_default()
+    }
+
+    /// Whether `value` is proven to hold `case` of `variant` at a point
+    /// whose currently-proven `facts` are given.
+    fn proves(
+        &self,
+        facts: &HashSet<RefinementFact>,
+        value: ValueId,
+        variant: ItemId,
+        case: usize,
+    ) -> bool {
+        facts.contains(&(self.canonical(value), variant, case))
+    }
+
+    /// Removes from `facts` everything `instruction` invalidates.
+    fn apply_kill(&self, instruction: &Instruction, facts: &mut HashSet<RefinementFact>) {
+        if let Some(root) = refinement_kill(instruction, &self.load_origin) {
+            facts.retain(|(value, _, _)| *value != root);
+        }
+    }
+
+    /// The facts still guaranteed once `block`'s own instructions have
+    /// run -- what a `Return`/`Raise` in it may rely on.
+    fn at_exit(&self, block: &BasicBlock) -> HashSet<RefinementFact> {
+        let mut facts = self.on_entry(block.id);
+        for instruction in &block.instructions {
+            self.apply_kill(instruction, &mut facts);
+        }
+        facts
+    }
+}
+
+fn case_refinements(function: &Function) -> RefinementTable {
+    let entry = BlockId(0);
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
     for block in &function.blocks {
-        match &block.terminator {
-            Terminator::Branch(target) => {
-                incoming.entry(*target).or_default().push(HashSet::new());
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
             }
+        }
+    }
+
+    // Every CFG edge, as `(predecessor, the facts that edge itself
+    // proves)`. Two edges from one terminator into the same block stay
+    // two separate entries.
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut incoming: HashMap<BlockId, Vec<(BlockId, HashSet<RefinementFact>)>> = HashMap::new();
+    for block in &function.blocks {
+        let mut edges: Vec<(BlockId, HashSet<RefinementFact>)> = Vec::new();
+        match &block.terminator {
+            Terminator::Branch(target) => edges.push((*target, HashSet::new())),
             Terminator::CondBranch {
                 then_block,
                 else_block,
                 ..
             } => {
-                incoming
-                    .entry(*then_block)
-                    .or_default()
-                    .push(HashSet::new());
-                incoming
-                    .entry(*else_block)
-                    .or_default()
-                    .push(HashSet::new());
+                edges.push((*then_block, HashSet::new()));
+                edges.push((*else_block, HashSet::new()));
             }
             Terminator::Switch {
                 scrutinee,
                 variant,
                 cases,
             } => {
+                let root = canonical_value(*scrutinee, &load_origin);
                 for (case_index, target) in cases.iter().enumerate() {
-                    let mut fact = HashSet::new();
-                    fact.insert((*scrutinee, *variant, case_index));
-                    incoming.entry(*target).or_default().push(fact);
+                    edges.push((*target, HashSet::from([(root, *variant, case_index)])));
                 }
             }
             Terminator::Invoke {
@@ -4073,41 +4185,160 @@ fn case_refinements(function: &Function) -> HashMap<BlockId, HashSet<RefinementF
                 err_targets,
                 ..
             } => {
-                incoming.entry(*ok_target).or_default().push(HashSet::new());
+                edges.push((*ok_target, HashSet::new()));
                 for target in err_targets {
-                    incoming
-                        .entry(target.target)
-                        .or_default()
-                        .push(HashSet::new());
+                    edges.push((target.target, HashSet::new()));
                 }
             }
             Terminator::Return(_) | Terminator::Raise { .. } => {}
         }
+        for (target, generated) in edges {
+            successors.entry(block.id).or_default().push(target);
+            incoming
+                .entry(target)
+                .or_default()
+                .push((block.id, generated));
+        }
     }
 
-    let mut out = HashMap::new();
-    for block in &function.blocks {
-        let guaranteed = match incoming.get(&block.id) {
-            Some(edges) => {
-                let mut edges = edges.iter();
-                match edges.next() {
-                    Some(first) => {
-                        let mut acc = first.clone();
-                        for edge in edges {
-                            acc.retain(|fact| edge.contains(fact));
-                        }
-                        acc
-                    }
-                    None => HashSet::new(),
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+
+    // An `Invoke`'s own result slots are written on its edges, so every
+    // refinement naming one stops at that terminator.
+    let terminator_kills = |terminator: &Terminator| -> Vec<ValueId> {
+        match terminator {
+            Terminator::Invoke {
+                ok_slot,
+                err_targets,
+                ..
+            } => {
+                let mut slots = vec![*ok_slot];
+                slots.extend(err_targets.iter().map(|t| t.slot));
+                slots
+            }
+            _ => Vec::new(),
+        }
+    };
+    let kill_through = |block: &BasicBlock, facts: &HashSet<RefinementFact>| {
+        let mut facts = facts.clone();
+        for instruction in &block.instructions {
+            if let Some(root) = refinement_kill(instruction, &load_origin) {
+                facts.retain(|(value, _, _)| *value != root);
+            }
+        }
+        for slot in terminator_kills(&block.terminator) {
+            let root = canonical_value(slot, &load_origin);
+            facts.retain(|(value, _, _)| *value != root);
+        }
+        facts
+    };
+
+    // `in_facts` answers `Pending` -- not an empty fact set -- until at
+    // least one reachable predecessor has produced an out-state, so a
+    // block popped before its own predecessors records nothing and is
+    // simply revisited. The lattice is the finite set of facts this
+    // function's switches can generate, ordered by inclusion, and both
+    // effects here only ever remove facts (a predecessor's out-state
+    // shrinking, or another predecessor joining the intersection), so
+    // the iteration is monotone and terminates with no pass limit.
+    let in_facts = |id: BlockId,
+                    out: &HashMap<BlockId, HashSet<RefinementFact>>|
+     -> IncomingState<HashSet<RefinementFact>> {
+        if id == entry {
+            return IncomingState::Entry(HashSet::new());
+        }
+        let mut acc: Option<HashSet<RefinementFact>> = None;
+        for (pred, generated) in incoming.get(&id).into_iter().flatten() {
+            if !reachable.contains(pred) {
+                continue;
+            }
+            let Some(pred_out) = out.get(pred) else {
+                continue;
+            };
+            let mut edge: HashSet<RefinementFact> = pred_out.clone();
+            edge.extend(generated.iter().copied());
+            acc = Some(match acc {
+                None => edge,
+                Some(previous) => previous.intersection(&edge).copied().collect(),
+            });
+        }
+        match acc {
+            Some(facts) => IncomingState::Ready(facts),
+            None => IncomingState::Pending,
+        }
+    };
+
+    let mut guaranteed: HashMap<BlockId, HashSet<RefinementFact>> = HashMap::new();
+    let Some(entry_block) = function.blocks.iter().find(|b| b.id == entry) else {
+        return RefinementTable {
+            guaranteed,
+            load_origin,
+        };
+    };
+    guaranteed.insert(entry, HashSet::new());
+    let mut out: HashMap<BlockId, HashSet<RefinementFact>> =
+        HashMap::from([(entry, kill_through(entry_block, &HashSet::new()))]);
+    let mut worklist: VecDeque<BlockId> = function
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| *id != entry && reachable.contains(id))
+        .collect();
+    let mut queued: HashSet<BlockId> = worklist.iter().copied().collect();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let Some(block) = function.blocks.iter().find(|b| b.id == id) else {
+            continue;
+        };
+        let facts = match in_facts(id, &out) {
+            IncomingState::Entry(facts) | IncomingState::Ready(facts) => facts,
+            IncomingState::Pending => continue,
+        };
+        guaranteed.insert(id, facts.clone());
+        let new_out = kill_through(block, &facts);
+        if out.get(&id) != Some(&new_out) {
+            out.insert(id, new_out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if succ != entry && reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
                 }
             }
-            None => HashSet::new(),
-        };
-        out.insert(block.id, guaranteed);
+        }
     }
-    out
+
+    RefinementTable {
+        guaranteed,
+        load_origin,
+    }
 }
 
+/// Nothing may name one specific case of a variant without a proof
+/// that the value actually holds it (`rfcs/0010`, `rfcs/0012`).
+///
+/// Two instructions do: `ValueKind::VariantPayload` *reads* one payload
+/// position of a case, and `Instruction::DecomposeVariant` *transfers
+/// ownership* of every payload position of a case. Both are checked
+/// here, against the same `case_refinements` fixed point, so the two can
+/// never disagree about what a block proved.
+///
+/// The proof is re-derived from the CFG itself, independent of how
+/// lowering happened to build it, and is deliberately not limited to the
+/// immediately preceding block: a refinement survives any number of
+/// ordinary hops, and is lost the moment a join has one predecessor that
+/// did not prove it.
+///
+/// Within a block, the facts are walked instruction by instruction, so a
+/// write to a scrutinee's own storage stops proving anything about it
+/// from that point on -- including for a later instruction in the very
+/// same block.
 fn verify_payload_refinement(
     function: &Function,
     agg: &AggregateContext,
@@ -4116,116 +4347,53 @@ fn verify_payload_refinement(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let _ = agg;
-    // Every incoming edge into each block, tracked as its own
-    // independent fact-set: empty for a plain branch/condbr edge
-    // (which guarantees no case refinement at all), or a single
-    // `(scrutinee, variant, case)` fact for a switch-case edge. Two
-    // edges into the same block -- even two cases of the same switch,
-    // or two different switches -- are kept as separate list entries:
-    // a target block reachable through more than one case of the same
-    // switch is genuinely reachable via either case, so nothing about
-    // that specific case can be assumed from having reached the block
-    // at all. This check is deliberately single-hop (unlike
-    // `verify_invoke_slot_initialization`'s own full dataflow below):
-    // `nir::lower` only ever extracts a case's own payload immediately
-    // in that case's own direct switch-target block, never in some
-    // later, indirect one, so single-hop refinement is the exact
-    // invariant real lowering needs proven.
-    let mut incoming: HashMap<BlockId, Vec<HashSet<RefinementFact>>> = HashMap::new();
+    let refinements = case_refinements(function);
     for block in &function.blocks {
-        match &block.terminator {
-            Terminator::Branch(target) => {
-                incoming.entry(*target).or_default().push(HashSet::new());
-            }
-            Terminator::CondBranch {
-                then_block,
-                else_block,
-                ..
-            } => {
-                incoming
-                    .entry(*then_block)
-                    .or_default()
-                    .push(HashSet::new());
-                incoming
-                    .entry(*else_block)
-                    .or_default()
-                    .push(HashSet::new());
-            }
-            Terminator::Switch {
-                scrutinee,
-                variant,
-                cases,
-            } => {
-                for (case_index, target) in cases.iter().enumerate() {
-                    let mut fact = HashSet::new();
-                    fact.insert((*scrutinee, *variant, case_index));
-                    incoming.entry(*target).or_default().push(fact);
-                }
-            }
-            Terminator::Invoke {
-                ok_target,
-                err_targets,
-                ..
-            } => {
-                incoming.entry(*ok_target).or_default().push(HashSet::new());
-                for target in err_targets {
-                    incoming
-                        .entry(target.target)
-                        .or_default()
-                        .push(HashSet::new());
-                }
-            }
-            Terminator::Return(_) | Terminator::Raise { .. } => {}
-        }
-    }
-
-    // A payload extraction is only sound when the SAME fact is
-    // guaranteed by EVERY incoming edge -- intersection, never union.
-    // A block with no recorded incoming edges at all (the entry block,
-    // or an otherwise-unreachable block) guarantees nothing, matching
-    // an empty intersection's identity (the universal set) only in the
-    // abstract; concretely there is no edge to ever have proven a case
-    // refinement on, so nothing is ever allowed there.
-    let guaranteed = |block_id: BlockId| -> HashSet<RefinementFact> {
-        let Some(edges) = incoming.get(&block_id) else {
-            return HashSet::new();
-        };
-        let mut edges = edges.iter();
-        let Some(first) = edges.next() else {
-            return HashSet::new();
-        };
-        let mut acc = first.clone();
-        for edge in edges {
-            acc.retain(|fact| edge.contains(fact));
-        }
-        acc
-    };
-
-    for block in &function.blocks {
-        let allowed = guaranteed(block.id);
+        let mut proven = refinements.on_entry(block.id);
         for instruction in &block.instructions {
-            if let Instruction::Value {
-                kind:
-                    ValueKind::VariantPayload {
-                        base,
-                        variant,
-                        case,
-                        ..
-                    },
-                ..
-            } = instruction
-                && !allowed.contains(&(*base, *variant, *case))
-            {
-                diagnostics.push(Diagnostic::error(
-                    codes::PAYLOAD_OUTSIDE_REFINEMENT,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
-                        block.id.0
-                    ),
-                ));
+            match instruction {
+                Instruction::Value {
+                    kind:
+                        ValueKind::VariantPayload {
+                            base,
+                            variant,
+                            case,
+                            ..
+                        },
+                    ..
+                } => {
+                    if !refinements.proves(&proven, *base, *variant, *case) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::PAYLOAD_OUTSIDE_REFINEMENT,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}` extracts a variant payload outside the control-flow edge for its case (bb{})",
+                                block.id.0
+                            ),
+                        ));
+                    }
+                }
+                Instruction::DecomposeVariant {
+                    value,
+                    variant,
+                    case,
+                    ..
+                } if !refinements.proves(&proven, *value, *variant, *case) => {
+                    diagnostics.push(Diagnostic::error(
+                        codes::DECOMPOSITION_OUTSIDE_REFINEMENT,
+                        source,
+                        Span::dummy(),
+                        format!(
+                            "function `{function_name}` takes %{} apart into case {case} of \
+                             variant {} in bb{}, where nothing proves it holds that case",
+                            value.0, variant.0, block.id.0
+                        ),
+                    ));
+                }
+                _ => {}
             }
+            refinements.apply_kill(instruction, &mut proven);
         }
     }
 }
@@ -6698,9 +6866,9 @@ fn verify_structural_places(
             Terminator::Return(None) => None,
             _ => continue,
         };
-        let empty_refinements = HashSet::new();
+        let block_refinements = refinements.at_exit(block);
         let cases = VariantCaseContext {
-            refinements: refinements.get(&block.id).unwrap_or(&empty_refinements),
+            refinements: &block_refinements,
             payloads: &payloads,
         };
         for (root, ty, owned_from) in &owned_roots {
@@ -8505,9 +8673,30 @@ mod tests {
     fn a_case_refined_target_with_an_additional_ordinary_predecessor_is_rejected() {
         // bb1 (the `Circle` case's own block, legally extracting its
         // own payload under the switch alone) also gets a plain branch
-        // predecessor from a third block -- that edge guarantees
-        // nothing, so the intersection across bb1's predecessors must
-        // now be empty and the extraction must be rejected.
+        // predecessor -- a *reachable* one, via bb2 -- and that edge
+        // guarantees nothing, so the intersection across bb1's
+        // predecessors is empty and the extraction must be rejected.
+        let mut interner = Interner::new();
+        let name = interner.intern("f");
+        let (variant, layout, ty_name) = variant_shape(&mut interner);
+        let mut function = valid_variant_switch_function(ItemId(0), name, variant, ty_name);
+        function.blocks[2].terminator = Terminator::Branch(BlockId(3));
+        function.blocks.push(BasicBlock {
+            id: BlockId(3),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+        let diagnostics =
+            verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
+        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+    }
+
+    #[test]
+    fn an_unreachable_ordinary_predecessor_does_not_erase_a_refinement() {
+        // The same third block, left unreachable. A dead edge proves
+        // nothing, but it also disproves nothing: intersecting its
+        // empty fact set in would wipe out a guarantee every genuinely
+        // live path into bb1 really did establish.
         let mut interner = Interner::new();
         let name = interner.intern("f");
         let (variant, layout, ty_name) = variant_shape(&mut interner);
@@ -8519,7 +8708,10 @@ mod tests {
         });
         let diagnostics =
             verify_one_with_aggregates(function, Vec::new(), vec![(variant, layout)], &interner);
-        assert!(codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT));
+        assert!(
+            !codes_of(&diagnostics).contains(&codes::PAYLOAD_OUTSIDE_REFINEMENT),
+            "an unreachable predecessor must contribute nothing: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -15326,6 +15518,7 @@ mod structural_ownership {
                             | codes::PARTIAL_PLACE_USED_AS_WHOLE
                             | codes::MISSING_STRUCTURAL_CLEANUP
                             | codes::DUPLICATE_STRUCTURAL_CLEANUP
+                            | codes::DECOMPOSITION_OUTSIDE_REFINEMENT
                     )
                 })
                 .collect();
@@ -17169,13 +17362,14 @@ mod structural_ownership {
         decompose_block.push(int(3, 2));
 
         let drop_block = vec![drop_of(0), int(4, 1)];
-        let (then_block, else_block) = if drop_first {
-            (drop_block, decompose_block)
+        // Taking a value apart into one case is only meaningful where
+        // the case is proven, so the decomposing branch tests it first
+        // -- exactly the shape `nir::lower` emits for a `match`.
+        let (switch_arm, drop_arm) = if drop_first {
+            (BlockId(2), BlockId(1))
         } else {
-            (decompose_block, drop_block)
+            (BlockId(1), BlockId(2))
         };
-        let then_result = if drop_first { ValueId(4) } else { ValueId(3) };
-        let else_result = if drop_first { ValueId(3) } else { ValueId(4) };
         vec![
             BasicBlock {
                 id: BlockId(0),
@@ -17187,14 +17381,36 @@ mod structural_ownership {
                 },
             },
             BasicBlock {
-                id: BlockId(1),
-                instructions: then_block,
-                terminator: Terminator::Return(Some(then_result)),
+                id: drop_arm,
+                instructions: drop_block,
+                terminator: Terminator::Return(Some(ValueId(4))),
             },
             BasicBlock {
-                id: BlockId(2),
-                instructions: else_block,
-                terminator: Terminator::Return(Some(else_result)),
+                id: switch_arm,
+                instructions: Vec::new(),
+                terminator: Terminator::Switch {
+                    scrutinee: ValueId(0),
+                    variant: HOLDER,
+                    cases: vec![BlockId(3), BlockId(4)],
+                },
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: decompose_block,
+                terminator: Terminator::Return(Some(ValueId(3))),
+            },
+            BasicBlock {
+                id: BlockId(4),
+                instructions: vec![
+                    Instruction::DecomposeVariant {
+                        value: ValueId(0),
+                        variant: HOLDER,
+                        case: 1,
+                        taken: Vec::new(),
+                    },
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
             },
         ]
     }
@@ -17378,20 +17594,36 @@ mod structural_ownership {
                 take: true,
             }],
             Ty::I64,
-            vec![BasicBlock {
-                id: BlockId(0),
-                instructions: vec![
-                    // Case 1 (`Empty`) carries no payload at all.
-                    Instruction::DecomposeVariant {
-                        value: ValueId(0),
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Switch {
+                        scrutinee: ValueId(0),
                         variant: HOLDER,
-                        case: 1,
-                        taken: Vec::new(),
+                        cases: vec![BlockId(1), BlockId(2)],
                     },
-                    int(1, 0),
-                ],
-                terminator: Terminator::Return(Some(ValueId(1))),
-            }],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![drop_of(0), int(1, 0)],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![
+                        // Case 1 (`Empty`) carries no payload at all.
+                        Instruction::DecomposeVariant {
+                            value: ValueId(0),
+                            variant: HOLDER,
+                            case: 1,
+                            taken: Vec::new(),
+                        },
+                        int(2, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                },
+            ],
         );
         assert_eq!(
             structural_codes(&mut fx, f),
@@ -17985,6 +18217,614 @@ mod structural_ownership {
                 let shape = loop_with_back_edge(&fx, restore);
                 assert_order_independent(&mut fx, shape, "a loop with a back edge");
             }
+        }
+    }
+
+    /// A `DecomposeVariant` is only meaningful where the active case is
+    /// *proven*: taking a value apart into a case it might not hold
+    /// moves ownership of storage that may not exist (`rfcs/0012`).
+    ///
+    /// The proof is a real CFG fixed point, so these cover it
+    /// end-to-end through `verify_module`, never a private helper.
+    #[cfg(test)]
+    mod decomposition_refinement {
+        use super::*;
+
+        /// `f(take holder: Holder, cond: bool, take other: Holder)`.
+        fn params(fx: &Fixture) -> Vec<Param> {
+            vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: fx.holder.clone(),
+                    take: true,
+                },
+            ]
+        }
+
+        fn switch_on(value: u32, targets: Vec<BlockId>) -> Terminator {
+            Terminator::Switch {
+                scrutinee: ValueId(value),
+                variant: HOLDER,
+                cases: targets,
+            }
+        }
+
+        fn payload(result: u32, base: u32, case: usize, fx: &Fixture) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty: fx.envelope.clone(),
+                kind: ValueKind::VariantPayload {
+                    base: ValueId(base),
+                    variant: HOLDER,
+                    case,
+                    index: 0,
+                },
+            }
+        }
+
+        fn decompose(value: u32, case: usize, taken: Vec<(usize, u32)>) -> Instruction {
+            Instruction::DecomposeVariant {
+                value: ValueId(value),
+                variant: HOLDER,
+                case,
+                taken: taken
+                    .into_iter()
+                    .map(|(index, owner)| (index, ValueId(owner)))
+                    .collect(),
+            }
+        }
+
+        /// `Full`: extract, claim and destroy the payload, then return.
+        fn take_full(first: u32, result: u32, base: u32, fx: &Fixture) -> Vec<Instruction> {
+            vec![
+                payload(first, base, 0, fx),
+                decompose(base, 0, vec![(0, first)]),
+                drop_of(first),
+                int(result, 0),
+            ]
+        }
+
+        /// The second `take` parameter is destroyed wherever it is not
+        /// the value under test, so no test is ever judged on a leak it
+        /// did not mean to create.
+        fn dispose_other() -> Instruction {
+            drop_of(2)
+        }
+
+        #[test]
+        fn a_decomposition_at_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            // Nothing whatsoever proved `%0` holds `Empty`. It might be
+            // `Full`, whose payload this silently abandons.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(3, 0)],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                }],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a decomposition with no proof of its own case must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_in_its_own_case_block_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "each arm decomposes exactly the case its own switch edge proved"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_after_several_ordinary_branches_is_accepted() {
+            let mut fx = fixture();
+            // The refinement has to survive two plain hops to reach the
+            // block that uses it -- a single-hop rule cannot see it.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(4)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "a refinement must propagate through ordinary branches"
+            );
+        }
+
+        #[test]
+        fn a_decomposition_naming_the_sibling_case_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    // Reached only through the `Empty` edge, but takes
+                    // the value apart as `Full`.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 0, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a sibling case's edge proves nothing about this case"
+            );
+        }
+
+        #[test]
+        fn a_join_of_two_different_cases_loses_the_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    // Reachable through either case: neither is proven.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a block reachable through two different cases has proven neither"
+            );
+        }
+
+        #[test]
+        fn a_join_where_only_one_path_refines_loses_the_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(3), BlockId(4)]),
+                    },
+                    // Reaches the same block having tested nothing.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "one unrefined predecessor is enough to lose the guarantee"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_switch_edge_contributes_no_refinement() {
+            let mut fx = fixture();
+            // bb9 is unreachable and names bb3 on its `Empty` edge.
+            // Intersecting that in would wipe the guarantee bb1 really
+            // proved; skipping it entirely is the only sound answer.
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: take_full(4, 5, 0, &fx),
+                        terminator: Terminator::Return(Some(ValueId(5))),
+                    },
+                    BasicBlock {
+                        id: BlockId(9),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(9), BlockId(3)]),
+                    },
+                ],
+            );
+            assert!(
+                !all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "a dead switch edge may not erase a guarantee every live path proved"
+            );
+        }
+
+        #[test]
+        fn nested_switches_refine_their_own_scrutinees_independently() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    // Inside `%0 == Full`, test `%2` as well.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(2, vec![BlockId(3), BlockId(4)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    // Both refinements hold here, and each applies only
+                    // to its own scrutinee.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: {
+                            let mut v = take_full(4, 5, 0, &fx);
+                            v.pop();
+                            v.extend(take_full(7, 8, 2, &fx));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(8))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: {
+                            let mut v = take_full(10, 11, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(12, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(12))),
+                    },
+                ],
+            );
+            assert_eq!(
+                all_codes(&mut fx, f),
+                Vec::<&str>::new(),
+                "two independent scrutinees each keep their own refinement"
+            );
+        }
+
+        #[test]
+        fn a_nested_switch_may_not_borrow_its_parents_refinement() {
+            let mut fx = fixture();
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: switch_on(2, vec![BlockId(3), BlockId(4)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![decompose(0, 1, Vec::new()), dispose_other(), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                    // `%2` was proven `Full` here; `%0` was too. Taking
+                    // `%2` apart as `Empty` is still unproven.
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: {
+                            let mut v = take_full(4, 5, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(9, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(9))),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: {
+                            let mut v = take_full(10, 11, 0, &fx);
+                            v.pop();
+                            v.push(decompose(2, 1, Vec::new()));
+                            v.push(int(12, 0));
+                            v
+                        },
+                        terminator: Terminator::Return(Some(ValueId(12))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "the inner scrutinee's own `Full` edge proves nothing about `Empty`"
+            );
+        }
+
+        #[test]
+        fn a_refinement_does_not_survive_a_store_to_its_own_scrutinee() {
+            let mut fx = fixture();
+            // `%4` is a fresh `Holder` written into the slot the
+            // scrutinee was loaded from, so the switch's guarantee no
+            // longer describes what a later load of it holds.
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(0),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(3),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::VariantCreate {
+                                    variant: HOLDER,
+                                    case: 1,
+                                    type_args: Vec::new(),
+                                    payload: Vec::new(),
+                                },
+                            },
+                            Instruction::Store {
+                                slot: ValueId(0),
+                                value: ValueId(3),
+                                mode: OwnershipMode::Transfer,
+                            },
+                            Instruction::Value {
+                                result: ValueId(5),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Load(ValueId(0)),
+                            },
+                        ],
+                        terminator: switch_on(5, vec![BlockId(1), BlockId(2)]),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(6),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::VariantCreate {
+                                    variant: HOLDER,
+                                    case: 1,
+                                    type_args: Vec::new(),
+                                    payload: Vec::new(),
+                                },
+                            },
+                            Instruction::Store {
+                                slot: ValueId(0),
+                                value: ValueId(6),
+                                mode: OwnershipMode::Transfer,
+                            },
+                            Instruction::Value {
+                                result: ValueId(7),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Load(ValueId(0)),
+                            },
+                            decompose(7, 1, Vec::new()),
+                            int(8, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(8))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "writing the scrutinee's own storage invalidates what the switch proved"
+            );
+        }
+
+        #[test]
+        fn an_invoke_edge_fabricates_no_refinement() {
+            let mut fx = fixture();
+            let builder = builder(&mut fx);
+            let _ = builder;
+            let f = under_test(
+                params(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![dispose_other()],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![decompose(0, 0, Vec::new()), int(6, 0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::DECOMPOSITION_OUTSIDE_REFINEMENT),
+                "an ordinary edge proves no case at all"
+            );
+        }
+
+        #[test]
+        fn reversing_the_block_vector_reports_the_identical_diagnostics() {
+            let mut fx = fixture();
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![dispose_other()],
+                    terminator: switch_on(0, vec![BlockId(1), BlockId(2)]),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: take_full(4, 5, 0, &fx),
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ];
+            let ps = params(&fx);
+            let forward = all_codes(&mut fx, under_test(ps.clone(), Ty::I64, blocks.clone()));
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                assert_eq!(
+                    all_codes(&mut fx, under_test(ps.clone(), Ty::I64, rotated)),
+                    forward,
+                    "rotating the block vector by {rotation} changed the diagnostics"
+                );
+            }
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                all_codes(&mut fx, under_test(ps, Ty::I64, reversed)),
+                forward,
+                "reversing the block vector changed the diagnostics"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
         }
     }
 }

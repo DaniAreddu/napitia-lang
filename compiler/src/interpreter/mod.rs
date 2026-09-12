@@ -778,17 +778,22 @@ impl<'a> Interpreter<'a> {
             }
         }
 
-        // Phase B -- atomic commit. Every fallible question was already
-        // answered above: the generation transitions are applied
-        // together, and the install walks the exact chain
-        // `validate_store_target` just proved reachable and empty.
+        // Phase B -- commit. Every fallible question was already
+        // answered above, and the one remaining step that *returns* a
+        // `Result` runs first, deliberately: the install walks the exact
+        // chain `validate_store_target` just proved reachable and empty,
+        // and it touches only destination identities, which Phase A
+        // proved disjoint from everything moving. Running it before the
+        // generation transitions means no fallible step remains after a
+        // generation has changed -- so even a failure this cannot
+        // actually reach would leave every generation as it found it.
+        let updated_root = self.store_projections(root, &place.projections, rebuilt)?;
         {
             let mut table = self.resources.borrow_mut();
             for (id, generation) in &plan.transitions {
                 table.records[id.0 as usize].generation = *generation;
             }
         }
-        let updated_root = self.store_projections(root, &place.projections, rebuilt)?;
         values.insert(root_id, updated_root);
         values.insert(source, Value::Moved);
         values.insert(source_id, Value::Moved);

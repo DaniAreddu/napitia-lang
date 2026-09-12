@@ -18785,12 +18785,36 @@ mod structural_ownership {
         /// in any of them is a regression in all of them.
         fn assert_order_independent(fx: &mut Fixture, blocks: Vec<BasicBlock>, label: &str) {
             let params = cond_params(fx);
-            let expected = rendered(fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            assert_order_independent_with(fx, params, blocks, label);
+        }
+
+        /// Compared as a sorted multiset rather than a sequence.
+        ///
+        /// *Which* diagnostics fire, and how many of each, is a property
+        /// of the program, and may not depend on storage order at all --
+        /// that is what this asserts. The sequence they arrive in
+        /// follows `function.blocks`, which *is* part of the input; for
+        /// one fixed input it is byte-identical every time, which the
+        /// determinism tests assert directly.
+        fn assert_order_independent_with(
+            fx: &mut Fixture,
+            params: Vec<Param>,
+            blocks: Vec<BasicBlock>,
+            label: &str,
+        ) {
+            let multiset = |mut found: Vec<String>| -> Vec<String> {
+                found.sort();
+                found
+            };
+            let expected = multiset(rendered(
+                fx,
+                under_test(params.clone(), Ty::I64, blocks.clone()),
+            ));
             for rotation in 1..blocks.len() {
                 let mut rotated = blocks.clone();
                 rotated.rotate_left(rotation);
                 assert_eq!(
-                    rendered(fx, under_test(params.clone(), Ty::I64, rotated)),
+                    multiset(rendered(fx, under_test(params.clone(), Ty::I64, rotated))),
                     expected,
                     "{label}: rotating the block vector by {rotation} changed the diagnostics"
                 );
@@ -18798,7 +18822,7 @@ mod structural_ownership {
             let mut reversed = blocks;
             reversed.reverse();
             assert_eq!(
-                rendered(fx, under_test(params, Ty::I64, reversed)),
+                multiset(rendered(fx, under_test(params, Ty::I64, reversed))),
                 expected,
                 "{label}: reversing the block vector changed the diagnostics"
             );
@@ -18830,6 +18854,82 @@ mod structural_ownership {
                 let shape = loop_with_back_edge(&fx, restore);
                 assert_order_independent(&mut fx, shape, "a loop with a back edge");
             }
+        }
+
+        /// The analyses added for case refinement and for `Invoke`'s own
+        /// per-edge result slots are fixed points of their own, and the
+        /// same guarantee has to hold for them: no permutation of the
+        /// block vector may change a single diagnostic.
+        #[test]
+        fn the_newer_fixed_points_are_order_independent_too() {
+            let mut fx = fixture();
+            // A switch whose two case blocks meet again -- refinement
+            // generated on an edge, propagated, and intersected away.
+            for claim in [false, true] {
+                for destroy in [false, true] {
+                    let shape = branch_local_variant(&fx, true, claim, destroy);
+                    let params = holder_params(&fx);
+                    assert_order_independent_with(
+                        &mut fx,
+                        params,
+                        shape,
+                        "a branch-local decomposition",
+                    );
+                }
+            }
+            // One `Invoke`, two edges, two slots, one of them leaked.
+            let invoked = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.box_file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: fx.holder.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::Invoke {
+                        callee: RAISER,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(2),
+                        ok_target: BlockId(1),
+                        err_targets: vec![crate::nir::InvokeErrTarget {
+                            variant: HOLDER,
+                            slot: ValueId(3),
+                            target: BlockId(2),
+                        }],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![drop_of(0), int(4, 0)],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                },
+            ];
+            let params = take_session(&fx);
+            assert_order_independent_with(
+                &mut fx,
+                params,
+                invoked,
+                "an invoke with two result slots",
+            );
         }
     }
 

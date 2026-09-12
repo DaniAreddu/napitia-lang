@@ -2021,26 +2021,79 @@ impl<'a> Interpreter<'a> {
         values: &HashMap<ValueId, Value>,
         observing_params: &HashSet<ValueId>,
     ) -> Option<ValueId> {
-        let resources = self.resources.borrow();
-        let mut leaked: Vec<ValueId> = values
+        // Sorted first, so the *lowest* `ValueId` still owning anything
+        // is the one reported no matter what order the map iterates in.
+        let mut candidates: Vec<(&ValueId, &Value)> = values
             .iter()
             .filter(|(id, _)| !observing_params.contains(id))
-            .filter_map(|(id, value)| match value {
-                // A merely-observing handle never counts as owned here
-                // regardless of `observing_params` -- which only ever
-                // lists this frame's own *parameters* -- since a value
-                // downgraded mid-function (`store.observe`) is exactly
-                // as much a non-owner as an ordinary parameter is.
-                Value::Resource(handle) if handle.role == RuntimeOwnershipRole::Owner => resources
-                    .record(*handle)
-                    .ok()
-                    .filter(|record| record.status == ResourceStatus::Alive)
-                    .map(|_| *id),
-                _ => None,
-            })
             .collect();
-        leaked.sort();
-        leaked.into_iter().next()
+        candidates.sort_by_key(|(id, _)| **id);
+        for (id, value) in candidates {
+            let mut seen = HashSet::new();
+            if self.owns_a_live_resource(value, &mut seen, 0) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// Whether `value` still owns any live resource, however deeply
+    /// (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Looking only at a bare `Value::Resource` missed every nested one:
+    /// a `Box[File]` built inside a branch and abandoned there carries
+    /// its owner handle one level down, and the frame exited reporting
+    /// nothing. Records, variants, generic instantiations and a
+    /// resource's own `ResourceRecord` fields are all walked.
+    ///
+    /// A merely-observing handle never counts: this frame never owned
+    /// what it points at. `seen` bounds the walk, so a duplicated
+    /// identity is visited once and a cycle terminates; `depth` bounds
+    /// it again for inline nesting, which carries no identity to record.
+    ///
+    /// This is a backstop for malformed NIR, not a replacement for
+    /// `nir::verify`'s own static answer.
+    fn owns_a_live_resource(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        depth: usize,
+    ) -> bool {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Resource(handle) => {
+                if handle.role != RuntimeOwnershipRole::Owner {
+                    return false;
+                }
+                if !seen.insert(handle.id) {
+                    return false;
+                }
+                let nested = {
+                    let resources = self.resources.borrow();
+                    match resources.record(*handle) {
+                        Ok(record) if record.status == ResourceStatus::Alive => {
+                            return true;
+                        }
+                        // Stale or already destroyed: this handle owns
+                        // nothing, but a record it still names may.
+                        Ok(record) => record.fields.clone(),
+                        Err(_) => return false,
+                    }
+                };
+                nested
+                    .iter()
+                    .any(|field| self.owns_a_live_resource(field, seen, depth + 1))
+            }
+            Value::Record { fields, .. } => fields
+                .iter()
+                .any(|field| self.owns_a_live_resource(field, seen, depth + 1)),
+            Value::Variant { payload, .. } => payload
+                .iter()
+                .any(|slot| self.owns_a_live_resource(slot, seen, depth + 1)),
+            _ => false,
+        }
     }
 
     /// Calls the function named `name` with no arguments — the shape of
@@ -8379,6 +8432,260 @@ mod transitive_observation {
         assert!(
             interpreter.resources.borrow().observe(owned).is_ok(),
             "the caller still owns its resource"
+        );
+    }
+}
+
+/// The runtime's own exit backstop against malformed NIR (`rfcs/0011`):
+/// a frame that leaves any live resource still owned is an error, and a
+/// resource nested inside a record, a variant or another resource is
+/// just as owned as a bare handle.
+///
+/// `nir::verify` already rejects the NIR that would reach here; this is
+/// the independent second answer, not a substitute for it.
+#[cfg(test)]
+mod leak_backstop {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(150);
+    const SESSION: ItemId = ItemId(151);
+    const BOXY: ItemId = ItemId(152);
+    const MAYBE: ItemId = ItemId(153);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    fn boxed(value: Value, held: Ty) -> Value {
+        Value::Record {
+            item: BOXY,
+            type_args: vec![held],
+            fields: vec![value],
+        }
+    }
+
+    fn frame(entries: Vec<(u32, Value)>) -> HashMap<ValueId, Value> {
+        entries
+            .into_iter()
+            .map(|(id, value)| (ValueId(id), value))
+            .collect()
+    }
+
+    #[test]
+    fn a_resource_nested_in_a_record_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            7,
+            boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))),
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(7)),
+            "a `Box[File]` abandoned at an exit still owns its `File`"
+        );
+    }
+
+    #[test]
+    fn a_resource_nested_in_a_variant_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            3,
+            Value::Variant {
+                item: MAYBE,
+                type_args: vec![Ty::Named(FILE, Symbol(0))],
+                case: 0,
+                payload: vec![Value::Resource(owned)],
+            },
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(3)),
+            "an active case's payload is owned exactly like a bare handle"
+        );
+    }
+
+    #[test]
+    fn a_resource_nested_several_levels_down_is_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let values = frame(vec![(
+            2,
+            boxed(
+                Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![Ty::Named(FILE, Symbol(0))],
+                    case: 0,
+                    payload: vec![Value::Resource(owned)],
+                },
+                Ty::Applied(MAYBE, vec![Ty::Named(FILE, Symbol(0))]),
+            ),
+        )]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(2)),
+            "depth changes nothing about who owns it"
+        );
+    }
+
+    #[test]
+    fn an_observing_view_is_never_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let view = interpreter
+            .to_observer_if_resource(boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))))
+            .expect("observing a well-formed value must succeed");
+        let values = frame(vec![(1, view)]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "this frame never owned what an observing view points at"
+        );
+    }
+
+    #[test]
+    fn a_fully_destroyed_aggregate_is_never_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owned = file(&interpreter, 1);
+        let value = boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0)));
+        interpreter
+            .drop_value(value)
+            .expect("destroying a well-formed aggregate must succeed");
+        let values = frame(vec![(1, Value::Moved)]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "nothing is left to leak"
+        );
+    }
+
+    #[test]
+    fn the_lowest_owning_value_id_is_reported_whatever_the_map_order() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = file(&interpreter, 1);
+        let second = file(&interpreter, 2);
+        let values = frame(vec![
+            (9, boxed(Value::Resource(first), Ty::Named(FILE, Symbol(0)))),
+            (
+                4,
+                boxed(Value::Resource(second), Ty::Named(FILE, Symbol(0))),
+            ),
+            (2, Value::Int(0)),
+        ]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(4)),
+            "the lowest owning id, deterministically, never whatever the map yields first"
+        );
+    }
+
+    #[test]
+    fn a_resource_owning_itself_terminates_and_is_reported_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Moved]);
+        interpreter.resources.borrow_mut().records[owner.id.0 as usize].fields =
+            vec![Value::Resource(owner)];
+        let values = frame(vec![(5, Value::Resource(owner))]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            Some(ValueId(5)),
+            "a cycle must terminate, and it is still a leak"
+        );
+    }
+
+    #[test]
+    fn a_stale_handle_owning_a_live_child_is_still_reported() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let child = file(&interpreter, 1);
+        let owner = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(child)]);
+        // The outer handle goes stale, but the record it names still
+        // owns a live `File` that nothing else can reach.
+        let _ = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(owner)
+            .expect("transferring to make the outer handle stale");
+        let values = frame(vec![(6, Value::Resource(owner))]);
+        assert_eq!(
+            interpreter.leaked_resource(&values, &HashSet::new()),
+            None,
+            "a stale handle owns nothing: the current owner holds the record"
         );
     }
 }

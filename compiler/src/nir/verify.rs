@@ -495,6 +495,18 @@ mod codes {
     /// so consuming the read result destroys storage the shell will
     /// destroy again.
     pub const UNCLAIMED_PAYLOAD_OWNERSHIP: &str = "V0097";
+    /// A control-flow edge names `bb0`, the entry block (`rfcs/0011`).
+    ///
+    /// `bb0` is the unique entry and the one fixed boundary condition
+    /// every fixed point in this file starts from: its in-state is this
+    /// function's parameters and nothing else, and it is never
+    /// recomputed. An edge back into it would make that boundary a lie
+    /// -- a `take` parameter would be seeded live again on the second
+    /// pass, after the first had already destroyed it. Rather than let
+    /// the analyses quietly drop such an edge, it is rejected here, once
+    /// per edge, so verification and interpretation agree that the NIR
+    /// is malformed.
+    pub const EDGE_INTO_ENTRY_BLOCK: &str = "V0098";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -1202,6 +1214,50 @@ fn verify_function(
                     block.id.0
                 ),
             ));
+        }
+    }
+
+    // `bb0` is the unique entry, and the one fixed boundary condition
+    // every fixed point in this file starts from: its in-state is this
+    // function's parameters, and it is never recomputed. That is only
+    // sound if nothing branches back into it -- a second pass would
+    // seed a `take` parameter live again after the first had already
+    // destroyed it. Every edge naming it is reported here, once each,
+    // in declaration order, rather than being quietly dropped from the
+    // CFG by each analysis in turn. Unreachable edges are reported too:
+    // the NIR is malformed either way, and an analysis that never walks
+    // the edge is exactly what would miss it.
+    for block in &function.blocks {
+        let targets: Vec<BlockId> = match &block.terminator {
+            Terminator::Branch(target) => vec![*target],
+            Terminator::CondBranch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+            Terminator::Switch { cases, .. } => cases.clone(),
+            Terminator::Invoke {
+                ok_target,
+                err_targets,
+                ..
+            } => std::iter::once(*ok_target)
+                .chain(err_targets.iter().map(|t| t.target))
+                .collect(),
+            Terminator::Return(_) | Terminator::Raise { .. } => Vec::new(),
+        };
+        for target in targets {
+            if target == BlockId(0) {
+                diagnostics.push(Diagnostic::error(
+                    codes::EDGE_INTO_ENTRY_BLOCK,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{name}`: bb{} names bb0, the entry block, as a control-flow \
+                         target, which no block may do",
+                        block.id.0
+                    ),
+                ));
+            }
         }
     }
 
@@ -9128,17 +9184,17 @@ mod tests {
             blocks: vec![
                 BasicBlock {
                     id: BlockId(1),
-                    instructions: Vec::new(),
-                    terminator: Terminator::Branch(BlockId(0)),
-                },
-                BasicBlock {
-                    id: BlockId(0),
                     instructions: vec![Instruction::Value {
                         result: ValueId(0),
                         ty: Ty::I64,
                         kind: ValueKind::Const(Const::Int(1)),
                     }],
                     terminator: Terminator::Return(Some(ValueId(0))),
+                },
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
                 },
             ],
         };
@@ -20331,6 +20387,277 @@ mod structural_ownership {
             let first = codes(&mut fx, under_test(no_params(), Ty::I64, blocks.clone()));
             let second = codes(&mut fx, under_test(no_params(), Ty::I64, blocks));
             assert_eq!(first, second, "the refusal must be deterministic");
+        }
+    }
+
+    /// `bb0` is the unique entry, and the one fixed boundary condition
+    /// every fixed point in this file starts from: its in-state is the
+    /// function's parameters and nothing else. That is only sound if
+    /// nothing can branch back into it, so an edge naming `bb0` is
+    /// rejected outright rather than quietly dropped from the dataflow
+    /// (`rfcs/0011`, `rfcs/0012`).
+    #[cfg(test)]
+    mod entry_edges {
+        use super::*;
+        use crate::nir::InvokeErrTarget;
+
+        fn take_file(fx: &Fixture) -> Vec<Param> {
+            vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Bool,
+                    take: false,
+                },
+            ]
+        }
+
+        #[test]
+        fn a_branch_back_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            // Reaching bb0 twice would run its own entry seeding twice
+            // and destroy `%0` on the second pass.
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0)],
+                        terminator: Terminator::Branch(BlockId(0)),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a back edge into the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_conditional_edge_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(0),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a conditional edge into the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn a_switch_case_into_the_entry_block_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.holder.clone(),
+                    take: true,
+                }],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Switch {
+                            scrutinee: ValueId(0),
+                            variant: HOLDER,
+                            cases: vec![BlockId(0), BlockId(2)],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "a switch case naming the entry block must be rejected"
+            );
+        }
+
+        #[test]
+        fn invoke_edges_into_the_entry_block_are_each_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            drop_of(0),
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: Ty::Unit,
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(3),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: SINK,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(2),
+                            ok_target: BlockId(0),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(3),
+                                target: BlockId(0),
+                            }],
+                        },
+                    },
+                ],
+            );
+            let found = all_codes(&mut fx, f);
+            assert_eq!(
+                found
+                    .iter()
+                    .filter(|code| **code == codes::EDGE_INTO_ENTRY_BLOCK)
+                    .count(),
+                2,
+                "both the success and the failure edge name the entry block, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_edge_into_the_entry_block_is_still_rejected() {
+            let mut fx = fixture();
+            // Unreachable, so no dataflow ever walks it -- and exactly
+            // the shape a "drop it from the CFG" rule would miss.
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(9),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(0)),
+                    },
+                ],
+            );
+            assert!(
+                all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "an unreachable edge into the entry block is still malformed NIR"
+            );
+        }
+
+        #[test]
+        fn the_entry_block_with_no_incoming_edge_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_file(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![drop_of(0), int(2, 0)],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(1),
+                            then_block: BlockId(2),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(
+                !all_codes(&mut fx, f).contains(&codes::EDGE_INTO_ENTRY_BLOCK),
+                "an ordinary CFG that never names bb0 as a target is fine"
+            );
+        }
+
+        #[test]
+        fn every_block_vector_order_reports_the_identical_entry_edge_diagnostics() {
+            let mut fx = fixture();
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![drop_of(0)],
+                    terminator: Terminator::Branch(BlockId(0)),
+                },
+            ];
+            let params = take_file(&fx);
+            let forward = rendered(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            let mut reversed = blocks;
+            reversed.reverse();
+            assert_eq!(
+                rendered(&mut fx, under_test(params, Ty::I64, reversed)),
+                forward,
+                "block vector order must not change the entry-edge diagnostics"
+            );
+            assert!(
+                !forward.is_empty(),
+                "the fixture must actually diagnose something"
+            );
         }
     }
 }

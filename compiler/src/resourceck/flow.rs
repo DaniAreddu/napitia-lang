@@ -818,6 +818,44 @@ impl<'a> FlowChecker<'a> {
         }
     }
 
+    /// Rejects any *consuming* use of a place reached through an
+    /// ordinary (non-`take`) parameter (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// Observation is transitive. An ordinary parameter is a call-scoped
+    /// view of a value the caller still owns, and so is every field,
+    /// payload and nested place reached through it. Reading one is
+    /// exactly what observation is for; moving it out, destroying it or
+    /// overwriting it is not.
+    ///
+    /// `nir::verify` rejects the lowered form of all three outright, so
+    /// this layer has to reject the source -- otherwise `check` accepts
+    /// a program `ir` and `run` refuse, and the refusal arrives as an
+    /// internal `V` diagnostic with no source to point at.
+    ///
+    /// Returns `true` when the use was rejected.
+    fn reject_observed_place(
+        &mut self,
+        place: &Place<LocalId>,
+        name: Option<Symbol>,
+        span: Span,
+        what: &str,
+    ) -> bool {
+        if place.projections.is_empty() || !self.observing.contains(&place.root) {
+            return false;
+        }
+        self.diagnose(
+            OBSERVATION_ESCAPES,
+            span,
+            format!(
+                "`{}` is reached through an ordinary parameter's own call-scoped observation and \
+                 cannot be {what}",
+                self.field_display(name)
+            ),
+            "observation escapes its call",
+        );
+        true
+    }
+
     /// Validates an *observing* use of `place` (`rfcs/0012`): still
     /// usable for ordinary reads and further projection while
     /// `Available`/`DropScheduled`, but a use-after-move or
@@ -865,6 +903,9 @@ impl<'a> FlowChecker<'a> {
     /// separately gated by [`Self::reject_partial_whole_use`]).
     fn apply_place_move(&mut self, place: &Place<LocalId>, expr: &HirExpr) {
         let (name, span) = Self::field_name_and_span(expr);
+        if self.reject_observed_place(place, name, span, "moved out") {
+            return;
+        }
         match self.place_state(place) {
             ResourceState::Available => {
                 self.set_place_state(place, ResourceState::Moved);
@@ -1369,6 +1410,9 @@ impl<'a> FlowChecker<'a> {
     /// `Dropped`.
     fn check_field_drop(&mut self, place: &Place<LocalId>, expr: &HirExpr, span: Span) {
         let (name, _) = Self::field_name_and_span(expr);
+        if self.reject_observed_place(place, name, span, "dropped") {
+            return;
+        }
         match self.place_state(place) {
             ResourceState::Available => {
                 if self.has_defer_protected_descendant(place) {
@@ -2405,6 +2449,9 @@ impl<'a> FlowChecker<'a> {
         name: crate::symbol::Symbol,
         span: Span,
     ) {
+        if self.reject_observed_place(place, Some(name), span, "reassigned") {
+            return;
+        }
         match self.place_state(place) {
             ResourceState::Moved | ResourceState::Dropped => {
                 self.set_place_state(place, ResourceState::Available);

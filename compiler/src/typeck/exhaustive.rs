@@ -208,12 +208,20 @@ fn is_useful_at_depth(
             let specialized = specialize_variant(matrix, *variant, *case, arity);
             let mut new_row = args.clone();
             new_row.extend_from_slice(rest);
-            let payload_tys = variants
+            // A variant or case with no recorded payload shape is one
+            // `resolve`/`typeck` already rejected, and that layer owns
+            // the diagnostic. There is nothing here to specialize
+            // against, so the row contributes no sub-patterns -- never
+            // a silent discharge, because the program is rejected
+            // either way.
+            let payload_tys = match variants
                 .payloads
                 .get(variant)
                 .and_then(|cases| cases.get(*case))
-                .cloned()
-                .unwrap_or_default();
+            {
+                Some(tys) => tys.clone(),
+                None => Vec::new(),
+            };
             // `payload_tys` is the declaration's own *symbolic* shape
             // (may contain `Ty::Param`); substituted here with *this
             // occurrence's own* concrete type arguments (from `ty0`,

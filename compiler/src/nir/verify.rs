@@ -4333,6 +4333,13 @@ impl RefinementTable {
     }
 
     /// The facts guaranteed on entry to `block`.
+    ///
+    /// A block the fixed point never computed -- unreachable, or in a
+    /// function with no entry block at all -- guarantees *nothing*,
+    /// which is what the empty set means here. This is a must analysis:
+    /// the empty set is its most conservative answer, so a missing
+    /// entry can only ever reject more, never accept something
+    /// unproven.
     fn on_entry(&self, block: BlockId) -> HashSet<RefinementFact> {
         self.guaranteed.get(&block).cloned().unwrap_or_default()
     }

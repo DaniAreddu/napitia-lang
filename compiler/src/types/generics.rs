@@ -113,6 +113,45 @@ pub fn substitute(ty: &Ty, subst: &HashMap<TypeParamId, Ty>) -> Ty {
     substitute_at_depth(ty, subst, 0)
 }
 
+/// Pairs a declaration's own type parameters with one instantiation's
+/// concrete arguments (`rfcs/0008`) -- the map every caller of
+/// [`substitute`] needs first, and the one rule none of them may get
+/// wrong.
+///
+/// `None`, never a partial or empty map, when the two lists disagree in
+/// length. That is the whole point of the function existing: a bare
+/// `zip` over mismatched lengths silently truncates, and the parameters
+/// it drops keep their symbolic `Ty::Param` through substitution. A
+/// stage then asks whether that leftover parameter is affine, gets
+/// "no" for every instantiation, and treats a genuinely owned resource
+/// as a freely copyable value. Refusing outright makes the caller
+/// decide what an unresolvable instantiation means in its own terms --
+/// a diagnostic, or failing closed -- rather than silently answering
+/// from a map nobody could build.
+///
+/// Deliberately takes the parameter list rather than looking it up:
+/// every stage keeps its own registry of declarations (`typeck`'s
+/// `generic_params`, `resourceck`'s `item_type_params`, `nir::verify`'s
+/// `AggregateContext`, the interpreter's own module layouts), and those
+/// are not interchangeable. What *is* interchangeable, and was
+/// previously written out four times, is the arity rule and the pairing
+/// itself.
+pub fn checked_substitution(
+    params: &[TypeParamId],
+    arguments: &[Ty],
+) -> Option<HashMap<TypeParamId, Ty>> {
+    if params.len() != arguments.len() {
+        return None;
+    }
+    Some(
+        params
+            .iter()
+            .copied()
+            .zip(arguments.iter().cloned())
+            .collect(),
+    )
+}
+
 fn substitute_at_depth(ty: &Ty, subst: &HashMap<TypeParamId, Ty>, depth: usize) -> Ty {
     if depth > MAX_GENERIC_DEPTH {
         return ty.clone();
@@ -142,6 +181,41 @@ mod tests {
         let mut subst = HashMap::new();
         subst.insert(t, Ty::I64);
         assert_eq!(substitute(&Ty::Param(t, t_symbol), &subst), Ty::I64);
+    }
+
+    #[test]
+    fn a_checked_substitution_pairs_parameters_with_arguments_in_order() {
+        let subst = checked_substitution(&[TypeParamId(0), TypeParamId(1)], &[Ty::I64, Ty::Str])
+            .expect("matching arities build a map");
+        assert_eq!(subst.get(&TypeParamId(0)), Some(&Ty::I64));
+        assert_eq!(subst.get(&TypeParamId(1)), Some(&Ty::Str));
+        assert_eq!(subst.len(), 2);
+    }
+
+    #[test]
+    fn a_non_generic_declaration_with_no_arguments_builds_an_empty_map() {
+        let subst = checked_substitution(&[], &[]).expect("zero against zero is a valid pairing");
+        assert!(subst.is_empty());
+    }
+
+    /// The reason this function exists at all. A bare `zip` truncates to
+    /// the shorter side, leaving the dropped parameters symbolic through
+    /// substitution -- and a symbolic parameter answers "not affine" for
+    /// every instantiation, which is precisely the direction that leaks
+    /// a resource.
+    #[test]
+    fn a_mismatched_arity_refuses_rather_than_truncating() {
+        for (params, arguments) in [
+            (vec![TypeParamId(0), TypeParamId(1)], vec![Ty::I64]),
+            (vec![TypeParamId(0)], vec![Ty::I64, Ty::Str]),
+            (vec![TypeParamId(0)], Vec::new()),
+            (Vec::new(), vec![Ty::I64]),
+        ] {
+            assert!(
+                checked_substitution(&params, &arguments).is_none(),
+                "{params:?} against {arguments:?} must refuse, never truncate"
+            );
+        }
     }
 
     #[test]

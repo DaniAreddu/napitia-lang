@@ -911,6 +911,16 @@ fn resource_field_reinitialize_example_runs_end_to_end() {
     assert_resource_example_runs("resource_field_reinitialize.npt", "5");
 }
 
+/// Assigning a place to itself, as a whole binding and as one
+/// structural field. The right-hand side moves the value out and the
+/// assignment puts the same value straight back, so nothing is
+/// discarded -- and every stage has to agree, since an overwrite check
+/// that looked only at the destination would call it a leak.
+#[test]
+fn resource_self_assignment_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_self_assignment.npt", "7");
+}
+
 #[test]
 fn resource_variant_payload_example_runs_end_to_end() {
     assert_resource_example_runs("resource_variant_payload.npt", "8");

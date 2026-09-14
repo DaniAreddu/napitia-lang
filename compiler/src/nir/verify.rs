@@ -4128,10 +4128,7 @@ fn item_substitution(
     } else {
         return Err(());
     };
-    if params.len() != args.len() {
-        return Err(());
-    }
-    Ok(params.into_iter().zip(args.iter().cloned()).collect())
+    crate::types::checked_substitution(&params, args).ok_or(())
 }
 
 /// Resolves a structural place's own final type, starting from

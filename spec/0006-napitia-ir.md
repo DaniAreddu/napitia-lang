@@ -173,6 +173,18 @@ not consumable, while `Owned` joined with `Empty` is neither.
   identical terms. This is the whole-slot counterpart of `V0088` and is
   answered by the verifier's own reconstruction of the slot's state,
   never delegated to source-level checking;
+- one `call`/`invoke` passing the same affine place — or two places
+  where one contains the other — to both an observing argument and a
+  `take` argument is `V0101`. The taken argument owns that resource for
+  the whole call and may destroy it anywhere in the callee's body, while
+  the observing argument stays readable for exactly as long, and nothing
+  sequences those against each other. Asked once about the whole
+  argument list, so it is independent of argument order and of which
+  side contains the other; two *observations* of one place remain legal,
+  and two `take` arguments reaching one identity keep the duplicate-
+  consumption diagnostic they already had. `resourceck` reports the same
+  rule at the source level as `U0015`, and neither stage relies on the
+  other's verdict;
 - transferring, destroying, decomposing or reinitializing anything
   reachable only through an observation is `V0099`. A `store.observe`
   always leaves the slot `Observed`, whatever the stored value's own

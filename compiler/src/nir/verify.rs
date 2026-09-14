@@ -552,6 +552,30 @@ mod codes {
     /// on one path and an observing view on another, is refused
     /// conservatively rather than assumed harmless.
     pub const STORE_OVER_OWNED_SLOT: &str = "V0100";
+    /// One `Call` or `Invoke` passes the same affine place -- or two
+    /// places where one contains the other -- to both an observing
+    /// argument and a `take` argument (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// The taken argument owns that resource for the whole call and may
+    /// destroy it anywhere in the callee's body, while the observing
+    /// argument stays readable for exactly as long. Nothing sequences
+    /// those against each other, so the pairing is refused at the call
+    /// rather than reasoned about per callee body.
+    ///
+    /// This pass's own reconstruction of `resourceck`'s
+    /// `MIXED_OBSERVE_TAKE_ALIAS` (U0015), not a restatement of its
+    /// verdict: hand-built NIR never passed through the source checker,
+    /// and the two must agree without one trusting the other. Places
+    /// are rebuilt from NIR and canonicalized through `Load`, so a slot
+    /// and a load of it are recognized as the one place they are.
+    ///
+    /// Deliberately independent of argument order, and of containment
+    /// direction: taking a field of an observed aggregate and observing
+    /// a field of a taken one are the same fault seen from either end.
+    /// Two observations of one place remain legal, since neither can end
+    /// it; two `take` arguments reaching one identity are a duplicate
+    /// consumption and keep that diagnostic.
+    pub const MIXED_CALL_OWNERSHIP_ALIAS: &str = "V0101";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -6573,6 +6597,9 @@ enum OwnershipViolation {
     /// Something reachable through an observation is transferred,
     /// destroyed, decomposed or reinitialized.
     ObserverTransfer(ValueId),
+    /// One call hands the same affine place to both an observing and a
+    /// `take` argument.
+    MixedCallAlias(ValueId),
 }
 
 /// Path-sensitive structural ownership verification (`rfcs/0012`),
@@ -7211,6 +7238,21 @@ fn verify_structural_places(
                     }
                     ValueKind::Call(callee, _, args, _) => {
                         let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                        // Asked about the whole argument list, before
+                        // any single argument is judged: handing one
+                        // resource to an observing and a `take`
+                        // parameter at once is a property of the call,
+                        // and one an order-dependent walk cannot see.
+                        if call_mixes_observation_and_transfer(
+                            args,
+                            take,
+                            &consumes_arg,
+                            &is_affine,
+                            &origin,
+                        ) {
+                            violations.push(OwnershipViolation::MixedCallAlias(*result));
+                            continue;
+                        }
                         for (i, arg) in args.iter().enumerate() {
                             if consumes_arg(take, args.len(), i) {
                                 consume_root(
@@ -7290,7 +7332,24 @@ fn verify_structural_places(
                 ..
             } => {
                 let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                // The same whole-argument-list question a `Call` asks,
+                // on the same terms: an `Invoke` binds its arguments
+                // into the callee identically, so it can alias
+                // identically.
+                let mixed = call_mixes_observation_and_transfer(
+                    args,
+                    take,
+                    &consumes_arg,
+                    &is_affine,
+                    &origin,
+                );
+                if mixed && let Some(first) = args.first() {
+                    violations.push(OwnershipViolation::MixedCallAlias(*first));
+                }
                 for (i, arg) in args.iter().enumerate() {
+                    if mixed {
+                        break;
+                    }
                     if consumes_arg(take, args.len(), i) {
                         consume_root(
                             &mut facts,
@@ -7566,6 +7625,13 @@ fn verify_structural_places(
                     "transfers, destroys, takes apart or reinitializes something reachable only \
                      through an observation, which the caller still owns",
                 ),
+                OwnershipViolation::MixedCallAlias(v) => (
+                    codes::MIXED_CALL_OWNERSHIP_ALIAS,
+                    v,
+                    "passes one resource to this call as both an observing argument and a `take` \
+                     argument, so the callee may destroy it while the observation is still \
+                     readable",
+                ),
                 OwnershipViolation::IncompleteDecomposition(v) => (
                     codes::MISSING_STRUCTURAL_CLEANUP,
                     v,
@@ -7647,6 +7713,45 @@ fn verify_structural_places(
 /// consumed on this path is duplicate structural cleanup, reported
 /// against `reporter` -- the instruction result, where there is one, so
 /// the diagnostic names the operation rather than its operand.
+/// `true` iff this call's own argument list hands one affine place to
+/// both an observing and a `take` argument (`rfcs/0011`, `rfcs/0012`).
+///
+/// Overlap is structural containment in either direction, which
+/// [`Place::is_ancestor_of`] answers along with equality: taking a field
+/// of an observed aggregate and observing a field of a taken one are the
+/// same fault from either end. Roots are canonicalized through `origin`,
+/// so a slot and a `Load` of it are the one place they are.
+///
+/// A boolean over a pair of `Vec`s built in argument order, so neither
+/// the answer nor anything derived from it can depend on map iteration
+/// order.
+fn call_mixes_observation_and_transfer(
+    args: &[ValueId],
+    take: Option<&[bool]>,
+    consumes_arg: &impl Fn(Option<&[bool]>, usize, usize) -> bool,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+) -> bool {
+    let mut observed: Vec<Place<ValueId>> = Vec::new();
+    let mut taken: Vec<Place<ValueId>> = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if !is_affine(*arg) {
+            continue;
+        }
+        let place = Place::root(origin(*arg));
+        if consumes_arg(take, args.len(), index) {
+            taken.push(place);
+        } else {
+            observed.push(place);
+        }
+    }
+    taken.iter().any(|taken_place| {
+        observed.iter().any(|observed_place| {
+            taken_place.is_ancestor_of(observed_place) || observed_place.is_ancestor_of(taken_place)
+        })
+    })
+}
+
 fn consume_root(
     facts: &mut PlaceFacts,
     violations: &mut Vec<OwnershipViolation>,
@@ -16283,6 +16388,7 @@ mod structural_ownership {
     const OBSERVE: ItemId = ItemId(302);
     const BUILD: ItemId = ItemId(303);
     const RAISER: ItemId = ItemId(304);
+    const MIXED: ItemId = ItemId(305);
     const T: TypeParamId = TypeParamId(0);
 
     struct Fixture {
@@ -16509,6 +16615,7 @@ mod structural_ownership {
                             | codes::UNCLAIMED_PAYLOAD_OWNERSHIP
                             | codes::OBSERVER_CANNOT_TRANSFER
                             | codes::STORE_OVER_OWNED_SLOT
+                            | codes::MIXED_CALL_OWNERSHIP_ALIAS
                     )
                 })
                 .collect();
@@ -22747,6 +22854,28 @@ mod structural_ownership {
     /// Every diagnostic the verifier reports for `function`, with an
     /// extra callee linked in alongside the usual helpers -- unfiltered,
     /// so a code no existing allowlist mentions is still visible.
+    /// Every diagnostic rendered as `code: message` in emission order,
+    /// with an extra callee linked in -- the permutation-comparison
+    /// counterpart of [`codes_linking`].
+    fn rendered_linking(fx: &mut Fixture, function: Function, extra: Function) -> Vec<String> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function, extra];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+            .into_iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
     fn codes_linking(fx: &mut Fixture, function: Function, extra: Function) -> Vec<&'static str> {
         let helpers = helpers(fx);
         let mut map = SourceMap::new();
@@ -23532,6 +23661,280 @@ mod structural_ownership {
         let mut reversed_blocks = build(&fx);
         reversed_blocks.reverse();
         let reversed = rendered(&mut fx, under_test(Vec::new(), Ty::I64, reversed_blocks));
+        assert_eq!(
+            straight, reversed,
+            "reversing `function.blocks` changed the diagnosis"
+        );
+    }
+
+    // == one call may not observe and take one resource =================
+    //
+    // Reconstructed from NIR alone. `resourceck` reports the same fault
+    // as `U0015`, and the two must agree without either trusting the
+    // other -- hand-built NIR never passed through the source checker
+    // at all.
+
+    /// `mixed(File, take File) -> unit`: one observing parameter and one
+    /// taking parameter, in that order unless `take_first`.
+    fn mixed_callee(fx: &mut Fixture, take_first: bool) -> Function {
+        let name = fx.interner.intern("mixed");
+        let observing = Param {
+            value: ValueId(0),
+            ty: fx.file.clone(),
+            take: false,
+        };
+        let taking = Param {
+            value: ValueId(1),
+            ty: fx.file.clone(),
+            take: true,
+        };
+        let params = if take_first {
+            vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: fx.file.clone(),
+                    take: false,
+                },
+            ]
+        } else {
+            vec![observing, taking]
+        };
+        let dropped = if take_first { ValueId(0) } else { ValueId(1) };
+        Function {
+            id: MIXED,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop { value: dropped }],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    fn codes_with_mixed(
+        fx: &mut Fixture,
+        function: Function,
+        take_first: bool,
+    ) -> Vec<&'static str> {
+        let extra = mixed_callee(fx, take_first);
+        codes_linking(fx, function, extra)
+    }
+
+    /// `%2` is handed to both parameters. Which one takes ownership is
+    /// irrelevant -- the callee may end the resource through the owning
+    /// parameter while the observing one is still readable.
+    fn call_aliasing_one_file(fx: &Fixture, via_load: bool) -> Vec<Instruction> {
+        let mut instructions = Vec::new();
+        let argument = if via_load {
+            // Through a slot, so the two arguments are a slot and a
+            // `Load` of it rather than one repeated id: canonicalizing
+            // through `origin` is what makes them the same place.
+            instructions.push(alloc_of(0, fx.file.clone()));
+            instructions.extend(new_file(fx, 1, 2));
+            instructions.push(store_of(0, 2, OwnershipMode::Transfer));
+            instructions.push(load_of(3, fx.file.clone(), 0));
+            ValueId(3)
+        } else {
+            instructions.extend(new_file(fx, 1, 2));
+            ValueId(2)
+        };
+        instructions.push(Instruction::Value {
+            result: ValueId(8),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(MIXED, Vec::new(), vec![argument, argument], Vec::new()),
+        });
+        instructions.push(int(9, 0));
+        instructions
+    }
+
+    #[test]
+    fn a_call_observing_and_taking_one_resource_is_rejected() {
+        for take_first in [false, true] {
+            let mut fx = fixture();
+            let instructions = call_aliasing_one_file(&fx, false);
+            let codes = codes_with_mixed(
+                &mut fx,
+                under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+                take_first,
+            );
+            assert!(
+                codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+                "take_first={take_first}: both parameter orders name the same fault, got {codes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_aliasing_through_a_load_is_rejected() {
+        let mut fx = fixture();
+        let instructions = call_aliasing_one_file(&fx, true);
+        let codes = codes_with_mixed(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+            false,
+        );
+        assert!(
+            codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "a slot and a `Load` of it are the one place they are, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_observing_and_taking_one_resource_is_rejected() {
+        for take_first in [false, true] {
+            let mut fx = fixture();
+            let mut entry = new_file(&fx, 1, 2);
+            entry.push(alloc_of(4, Ty::Unit));
+            entry.push(alloc_of(5, fx.holder.clone()));
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: entry,
+                    terminator: Terminator::Invoke {
+                        callee: MIXED,
+                        type_args: Vec::new(),
+                        args: vec![ValueId(2), ValueId(2)],
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(4),
+                        ok_target: BlockId(1),
+                        err_targets: Vec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![int(9, 0)],
+                    terminator: Terminator::Return(Some(ValueId(9))),
+                },
+            ];
+            let mut fx2 = fixture();
+            let extra = mixed_callee(&mut fx2, take_first);
+            let codes = codes_linking(&mut fx, under_test(Vec::new(), Ty::I64, blocks), extra);
+            assert!(
+                codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+                "take_first={take_first}: an invoke binds arguments the same way, got {codes:?}"
+            );
+        }
+    }
+
+    /// Two observations of one resource stay legal: neither can end it.
+    #[test]
+    fn a_call_observing_one_resource_twice_is_accepted() {
+        let mut fx = fixture();
+        let observe_twice = {
+            let name = fx.interner.intern("both");
+            Function {
+                id: MIXED,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.file.clone(),
+                        take: false,
+                    },
+                    Param {
+                        value: ValueId(1),
+                        ty: fx.file.clone(),
+                        take: false,
+                    },
+                ],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                }],
+            }
+        };
+        let mut instructions = new_file(&fx, 1, 2);
+        instructions.push(Instruction::Value {
+            result: ValueId(8),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(2), ValueId(2)], Vec::new()),
+        });
+        instructions.push(drop_of(2));
+        instructions.push(int(9, 0));
+        let codes = codes_linking(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+            observe_twice,
+        );
+        assert!(
+            !codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "two observations cannot conflict, got {codes:?}"
+        );
+    }
+
+    /// Distinct resources in the two positions are not an alias.
+    #[test]
+    fn a_call_observing_one_resource_and_taking_another_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = new_file(&fx, 1, 2);
+        instructions.extend(new_file(&fx, 3, 4));
+        instructions.push(Instruction::Value {
+            result: ValueId(8),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(2), ValueId(4)], Vec::new()),
+        });
+        instructions.push(drop_of(2));
+        instructions.push(int(9, 0));
+        let codes = codes_with_mixed(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+            false,
+        );
+        assert!(
+            codes.is_empty(),
+            "distinct roots never alias, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn the_mixed_alias_diagnosis_is_block_permutation_independent() {
+        let mut fx = fixture();
+        let build = |fx: &Fixture| -> Vec<BasicBlock> {
+            let instructions = call_aliasing_one_file(fx, false);
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(Some(ValueId(9))),
+                },
+            ]
+        };
+        let straight_blocks = build(&fx);
+        let extra = mixed_callee(&mut fx, false);
+        let straight = rendered_linking(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, straight_blocks),
+            extra,
+        );
+        assert!(!straight.is_empty(), "the expectation is not vacuous");
+        let mut reversed_blocks = build(&fx);
+        reversed_blocks.reverse();
+        let extra = mixed_callee(&mut fx, false);
+        let reversed = rendered_linking(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, reversed_blocks),
+            extra,
+        );
         assert_eq!(
             straight, reversed,
             "reversing `function.blocks` changed the diagnosis"

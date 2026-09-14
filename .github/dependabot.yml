@@ -1,0 +1,45 @@
+# Dependency updates (`rfcs/0001`: the compiler stays close to the
+# standard library, so this has very little to watch -- which is the
+# point of watching it automatically rather than by memory).
+#
+# Two ecosystems, for two different risks.
+#
+# `cargo` covers the crate's own dependency graph. That graph is
+# deliberately tiny: one direct dependency (`toml`) and its transitive
+# closure. A graph this small is exactly the kind that goes unlooked-at
+# for a year.
+#
+# `github-actions` is the one that matters more. CI pins every action to
+# a commit rather than a tag, which is what stops a moved tag from
+# changing the code that runs against a checkout -- but a pin is a
+# snapshot, and without something to move it forward it silently becomes
+# an old, unpatched snapshot. Dependabot is what makes pinning
+# sustainable rather than a slow decay, and it rewrites the pin *and*
+# its version comment together.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /compiler
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      # Matches the Conventional Commits the repository uses
+      # (`CONTRIBUTING.md`); a dependency bump is a build change, not a
+      # feature or a fix.
+      prefix: build
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    # Workflows live at the repository root regardless of where the
+    # crate is, so this stays `/` rather than `/compiler`.
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies

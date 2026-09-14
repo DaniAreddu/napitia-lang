@@ -1767,6 +1767,164 @@ mod tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
+    // -- compound arguments carry the places they forward --------------
+    //
+    // An `if`/`match`/block argument produces one of its branches'
+    // values, so the places it may name are the union of theirs.
+    // Answering "no place" for it -- which is what a bare
+    // `resolve_place` does -- reads as "aliases nothing", and that let
+    // the same resource reach an observing and a `take` parameter with
+    // nothing noticing.
+
+    const COMPOUND_PRELUDE: &str = "resource File { descriptor: i64 } \
+         resource Session { input: File, output: File } \
+         variant Choice { Left(i64), Right(i64) } \
+         func mixed(file: File, take owner: File) -> i64 { \
+             drop owner; \
+             return file.descriptor; \
+         } \
+         func mixed_rev(take owner: File, file: File) -> i64 { \
+             value d = file.descriptor; \
+             drop owner; \
+             return d; \
+         } \
+         func obs2(a: File, b: File) -> i64 { return a.descriptor + b.descriptor } ";
+
+    fn check_compound(body: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        check(&format!("{COMPOUND_PRELUDE}{body}"))
+    }
+
+    #[test]
+    fn an_if_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed(if cond { file } else { file }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "an `if` forwards its branches' places: {diags:?}"
+        );
+    }
+
+    /// The same call with the parameters swapped. Both spellings must
+    /// name the same fault rather than one tripping a move rule.
+    #[test]
+    fn an_if_argument_is_rejected_in_either_parameter_order() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed_rev(file, if cond { file } else { file }); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "argument order must not decide the answer: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 value c = if cond { Choice.Left(1) } else { Choice.Right(2) }; \
+                 return mixed(match c { Left(n) => { file } Right(n) => { file } }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "every arm's value is a place this argument may name: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed({ file }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "a block's value is its tail's value: {diags:?}"
+        );
+    }
+
+    /// Only *one* branch overlaps. The union is what catches it -- an
+    /// analysis that took a single representative branch would accept
+    /// this half the time depending which it picked.
+    #[test]
+    fn an_if_argument_overlapping_on_only_one_branch_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(if cond { s.input } else { s.output }, s.input); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "one overlapping branch is enough: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_if_argument_naming_a_disjoint_sibling_is_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value n = mixed(if cond { s.output } else { s.output }, s.input); \
+                 value rest = s.output; \
+                 drop rest; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "disjoint sibling fields never alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_compound_observations_of_one_resource_are_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 value n = obs2(if cond { file } else { file }, file); \
+                 drop file; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "neither observation can end the resource: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_compound_argument_naming_a_distinct_resource_is_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value kept = File { descriptor: 1 }; \
+                 value given = File { descriptor: 2 }; \
+                 value n = mixed(if cond { kept } else { kept }, given); \
+                 drop kept; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "distinct resources never alias: {diags:?}"
+        );
+    }
     // -- one resource may not be observed and taken by one call --------
     //
     // The `take` parameter owns what it was given for the whole call

@@ -62,7 +62,7 @@ pub struct CheckedDeferPlan {
 }
 
 /// One entry in a checked cleanup sequence, in the exact order
-/// [`super::flow::FlowChecker`] already validated is sound: a resource
+/// `super::flow::FlowChecker` already validated is sound: a resource
 /// local's own implicit destruction, or a `defer`'s own registered call
 /// running. Replayed in *reverse* by `nir::lower` at the exit edge it
 /// belongs to -- last declared/registered, first destroyed/run -- which

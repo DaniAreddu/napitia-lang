@@ -350,7 +350,7 @@ pub struct TypeckResult {
     /// variant's case payload types (flattened across cases), combined
     /// -- unsubstituted, exactly as declared (a generic item's own
     /// field may still be `Ty::Param`) -- keyed by that item's own
-    /// `ItemId` (`rfcs/0012`). What [`Checker::is_affine`] itself walks
+    /// `ItemId` (`rfcs/0012`). What `Checker::is_affine` itself walks
     /// internally, exposed so `resourceck` can recompute the same
     /// transitive-affinity answer over its own HIR-rooted walk without
     /// re-deriving field *type* resolution (name lookup, generic

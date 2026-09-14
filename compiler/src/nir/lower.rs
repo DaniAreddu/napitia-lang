@@ -97,10 +97,10 @@ pub fn lower_module(
 
 /// Like [`lower_module`], but for a caller that can supply each
 /// declaring module's own dotted path -- read back by
-/// [`canonical_raises`] so two variants sharing a bare name from
+/// `canonical_raises` so two variants sharing a bare name from
 /// *different* modules still canonicalize to a stable, module-
 /// qualified order rather than an ambiguous tie (`rfcs/0007`,
-/// `rfcs/0010`). Always runs in [`ModulePathMode::Project`], even if
+/// `rfcs/0010`). Always runs in `ModulePathMode::Project`, even if
 /// `module_path_of` happens to be empty -- unlike `lower_module`'s own
 /// `SingleFile` mode, an empty table here means every lookup inside it
 /// is a genuine metadata gap, not "no project at all".

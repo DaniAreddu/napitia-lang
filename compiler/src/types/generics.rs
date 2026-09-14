@@ -103,7 +103,7 @@ pub enum Evidence {
 /// than panicking, so a caller passing an incomplete map degrades to a
 /// partially-substituted type instead of crashing.
 ///
-/// Bounded by [`MAX_GENERIC_DEPTH`] the same way every other stage that
+/// Bounded by `MAX_GENERIC_DEPTH` the same way every other stage that
 /// walks a nested type application is: past that depth, recursion simply
 /// stops and returns the type unchanged at that point, rather than
 /// exhausting the native call stack. A type that deep was already

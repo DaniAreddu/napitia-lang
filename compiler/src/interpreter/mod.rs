@@ -447,7 +447,7 @@ pub enum Value {
     /// exactly the field slot a `PlaceRead { mode: Transfer }` just took
     /// ownership out of, inside a plain `Record`/`Variant` value (a
     /// `resource`'s own fields are tombstoned directly in its
-    /// `ResourceTable` record instead -- see [`ResourceRecord::fields`]
+    /// `ResourceTable` record instead -- see `ResourceRecord::fields`
     /// -- since they are never held inline the way an ordinary
     /// aggregate's are). Reading a `Moved` field is a structured runtime
     /// error, never a silent `Unit`/default value -- `nir::verify`

@@ -58,7 +58,7 @@ use crate::symbol::Interner;
 use crate::types::Ty;
 
 /// `typeck`'s own transitive-affinity metadata (`rfcs/0012`), bundled
-/// into one reference so [`check_module`]/[`flow::FlowChecker::new`]
+/// into one reference so [`check_module`]/`flow::FlowChecker::new`
 /// don't each need four more separate parameters for it. Every field
 /// mirrors the identically-named [`crate::typeck::TypeckResult`] field
 /// it is built from directly -- see each one's own doc comment there.

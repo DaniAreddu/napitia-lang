@@ -168,6 +168,17 @@ impl ResourceTable {
     /// observation must never be silently promoted into an owner, no
     /// matter what `nir::verify` already statically guarantees about
     /// the module this frame happens to be executing.
+    ///
+    /// Test-only, and deliberately so. Every ownership transfer the
+    /// interpreter really performs now goes through
+    /// [`Interpreter::plan_transfer`] and [`Interpreter::commit_transfer`],
+    /// which validate the *whole* operation before moving any of it;
+    /// this one-resource-at-a-time version is exactly the shape that
+    /// left an operation half-applied when a later field turned out to
+    /// be invalid. Keeping it out of the non-test build means a future
+    /// caller cannot reintroduce that shape without the compiler saying
+    /// so. Tests still use it to mint a deliberately stale handle.
+    #[cfg(test)]
     fn transfer(&mut self, handle: ResourceHandle) -> Result<ResourceHandle, InterpreterError> {
         if handle.role != RuntimeOwnershipRole::Owner {
             return Err(invalid(
@@ -750,7 +761,7 @@ impl<'a> Interpreter<'a> {
         // be refused before any of that reasoning is trusted.
         self.validate_owned_graph(&incoming)?;
         let mut plan = StorePlan::default();
-        let rebuilt = self.plan_transfer(&incoming, &mut plan)?;
+        let rebuilt = self.plan_transfer(&incoming, &mut plan, 0)?;
         self.validate_store_target(&root, &place.projections)?;
         // The two ownership graphs must be disjoint, and both halves of
         // that matter.
@@ -788,12 +799,7 @@ impl<'a> Interpreter<'a> {
         // generation has changed -- so even a failure this cannot
         // actually reach would leave every generation as it found it.
         let updated_root = self.store_projections(root, &place.projections, rebuilt)?;
-        {
-            let mut table = self.resources.borrow_mut();
-            for (id, generation) in &plan.transitions {
-                table.records[id.0 as usize].generation = *generation;
-            }
-        }
+        self.commit_transfer(&plan);
         values.insert(root_id, updated_root);
         values.insert(source, Value::Moved);
         values.insert(source_id, Value::Moved);
@@ -1003,11 +1009,26 @@ impl<'a> Interpreter<'a> {
     /// The post-transfer generation is *computed*, never applied, so
     /// the rebuilt value can be constructed in full while the resource
     /// table still holds its pre-transfer state.
+    ///
+    /// `plan` may already carry other roots of the same operation, and
+    /// is meant to: a call with several `take` arguments, or an
+    /// aggregate with several fields, plans all of them into one plan so
+    /// that an identity duplicated *across* two roots is caught before
+    /// either is committed. `depth` bounds inline aggregate nesting,
+    /// which carries no resource identity of its own to record and so
+    /// cannot be bounded by `plan.reachable` the way a resource graph
+    /// is.
     fn plan_transfer(
         &self,
         value: &Value,
         plan: &mut StorePlan,
+        depth: usize,
     ) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
         match value {
             Value::Resource(handle) => {
                 if handle.role != RuntimeOwnershipRole::Owner {
@@ -1059,7 +1080,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = fields
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan))
+                    .map(|field| self.plan_transfer(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Record {
                     item: *item,
@@ -1082,7 +1103,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = payload
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan))
+                    .map(|field| self.plan_transfer(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *item,
@@ -1623,6 +1644,37 @@ impl<'a> Interpreter<'a> {
         self.validate_value_against_ty(value, None, &mut seen, 0)
     }
 
+    /// Validates one call argument against its parameter's own declared
+    /// type, before anything is bound (`rfcs/0008`, `rfcs/0011`).
+    ///
+    /// The declared type is used where it is actually *resolved*, at
+    /// every depth. A generic function's parameter is declared with
+    /// `Ty::Param` -- either as the whole type (`value: T`) or nested
+    /// inside an instantiation (`value: Box[T]`) -- and one parametric
+    /// NIR body is shared by every instantiation (`rfcs/0008`), so at
+    /// this boundary there is no concrete type to check the runtime
+    /// value against: a `Box[File]` really does arrive where `Box[T]`
+    /// is written, and demanding they match would reject every generic
+    /// call. Checking only the outermost constructor is not enough
+    /// either, since `Applied`'s own arguments are compared
+    /// structurally.
+    ///
+    /// The value's own internal consistency is checked either way:
+    /// shape against its own declaration, field and payload counts,
+    /// tombstones only where something could have moved out, and no
+    /// resource identity reached twice.
+    ///
+    /// `seen` is fresh per argument, deliberately. An identity appearing
+    /// in two *different* arguments is only a fault when both take
+    /// ownership, and that is the shared [`StorePlan`]'s question, not
+    /// this one: two observations of the same resource are perfectly
+    /// legal.
+    fn validate_argument(&self, value: &Value, declared: &Ty) -> Result<(), InterpreterError> {
+        let expected = fully_resolved(declared).then_some(declared);
+        let mut seen = HashSet::new();
+        self.validate_value_against_ty(value, expected, &mut seen, 0)
+    }
+
     /// Recursively destroys `value` (`rfcs/0012`): a `resource` handle
     /// goes through the ordinary resource table drop; a plain, still-
     /// affine `Variant`'s own *active* case is walked to destroy every
@@ -1903,42 +1955,52 @@ impl<'a> Interpreter<'a> {
     /// `record.create`/`variant.create`'s own field/payload arguments
     /// (`resourceck`/`nir::verify` already require every one of those to
     /// be an unconditional transfer, mirrored here).
+    ///
+    /// Transactional, exactly like [`Self::store_place_transfer`] and
+    /// for the identical reason: the whole graph is walked, validated
+    /// and *planned* first, and no generation moves until nothing
+    /// fallible is left. Recursing field by field and bumping each
+    /// generation as it went -- which this used to do -- meant a second
+    /// field that turned out to be an observer, stale, duplicated or
+    /// cyclic returned `Err` with the *first* field already transferred:
+    /// the caller's handle stale, the new owning handle discarded with
+    /// the failed result, and the resource permanently unreachable and
+    /// undestroyable.
+    ///
+    /// For an operation spanning several roots -- a call's `take`
+    /// arguments, an aggregate's fields -- do not call this once per
+    /// root. Share one [`StorePlan`] across [`Self::plan_transfer`] for
+    /// all of them and [`Self::commit_transfer`] once at the end, so a
+    /// failure anywhere leaves *every* root untouched and an identity
+    /// duplicated across two roots is still caught.
     fn transfer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
-        match value {
-            Value::Resource(handle) => Ok(Value::Resource(
-                self.resources.borrow_mut().transfer(handle)?,
-            )),
-            // A transfer rebuilds the aggregate around freshly-generated
-            // handles, so it must carry this value's own type arguments
-            // across unchanged: an ownership transfer is not the place
-            // a `Box[File]` quietly becomes a `Box[T]`.
-            Value::Record {
-                item,
-                type_args,
-                fields,
-            } => Ok(Value::Record {
-                item,
-                type_args,
-                fields: fields
-                    .into_iter()
-                    .map(|f| self.transfer_if_resource(f))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
-            Value::Variant {
-                item,
-                type_args,
-                case,
-                payload,
-            } => Ok(Value::Variant {
-                item,
-                type_args,
-                case,
-                payload: payload
-                    .into_iter()
-                    .map(|f| self.transfer_if_resource(f))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
-            other => Ok(other),
+        let mut plan = StorePlan::default();
+        let rebuilt = self.plan_transfer(&value, &mut plan, 0)?;
+        self.commit_transfer(&plan);
+        Ok(rebuilt)
+    }
+
+    /// Applies a fully-built [`StorePlan`]'s own generation transitions
+    /// -- the one and only point at which a planned transfer becomes
+    /// real.
+    ///
+    /// Infallible by construction, which is the whole discipline: every
+    /// question that could fail was answered while planning, so a caller
+    /// can order this last and know that no error can leave the resource
+    /// table half-moved. Callers must therefore have already completed
+    /// every other fallible step of the operation before calling it.
+    fn commit_transfer(&self, plan: &StorePlan) {
+        let mut table = self.resources.borrow_mut();
+        for (id, generation) in &plan.transitions {
+            // Indexing is sound: every entry originates from
+            // `plan_transfer`, which produced it only after
+            // `ResourceTable::record` proved the id in range, and the
+            // table only ever grows.
+            table
+                .records
+                .get_mut(id.0 as usize)
+                .expect("a planned transition names a record `plan_transfer` already resolved")
+                .generation = *generation;
         }
     }
 
@@ -2021,10 +2083,19 @@ impl<'a> Interpreter<'a> {
     /// never actually be `Some` for NIR that passed both; this is this
     /// frame's own independent runtime backstop, not a substitute for
     /// either.
+    /// `exiting` names the resource identities that are *leaving* this
+    /// frame with the value it is returning or raising, and which
+    /// therefore are not leaks. It exists because the transfer that
+    /// hands them over has deliberately not happened yet: the frame may
+    /// still be rejected here, and nothing may have moved if it is. The
+    /// old ordering transferred first and let the resulting stale
+    /// handles fall out of this walk on their own -- correct only for
+    /// the frames that were never going to be rejected.
     fn leaked_resource(
         &self,
         values: &HashMap<ValueId, Value>,
         observing_params: &HashSet<ValueId>,
+        exiting: &HashSet<ResourceId>,
     ) -> Option<ValueId> {
         // Sorted first, so the *lowest* `ValueId` still owning anything
         // is the one reported no matter what order the map iterates in.
@@ -2035,7 +2106,7 @@ impl<'a> Interpreter<'a> {
         candidates.sort_by_key(|(id, _)| **id);
         for (id, value) in candidates {
             let mut seen = HashSet::new();
-            if self.owns_a_live_resource(value, &mut seen, 0) {
+            if self.owns_a_live_resource(value, &mut seen, 0, exiting) {
                 return Some(*id);
             }
         }
@@ -2063,6 +2134,7 @@ impl<'a> Interpreter<'a> {
         value: &Value,
         seen: &mut HashSet<ResourceId>,
         depth: usize,
+        exiting: &HashSet<ResourceId>,
     ) -> bool {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return false;
@@ -2070,6 +2142,14 @@ impl<'a> Interpreter<'a> {
         match value {
             Value::Resource(handle) => {
                 if handle.role != RuntimeOwnershipRole::Owner {
+                    return false;
+                }
+                // Leaving with the returned or raised value, along with
+                // everything nested inside it: not this frame's to
+                // account for any more. `exiting` already holds the
+                // whole reachable graph, not merely its outer handles,
+                // so there is nothing further down to walk.
+                if exiting.contains(&handle.id) {
                     return false;
                 }
                 if !seen.insert(handle.id) {
@@ -2089,14 +2169,14 @@ impl<'a> Interpreter<'a> {
                 };
                 nested
                     .iter()
-                    .any(|field| self.owns_a_live_resource(field, seen, depth + 1))
+                    .any(|field| self.owns_a_live_resource(field, seen, depth + 1, exiting))
             }
             Value::Record { fields, .. } => fields
                 .iter()
-                .any(|field| self.owns_a_live_resource(field, seen, depth + 1)),
+                .any(|field| self.owns_a_live_resource(field, seen, depth + 1, exiting)),
             Value::Variant { payload, .. } => payload
                 .iter()
-                .any(|slot| self.owns_a_live_resource(slot, seen, depth + 1)),
+                .any(|slot| self.owns_a_live_resource(slot, seen, depth + 1, exiting)),
             _ => false,
         }
     }
@@ -2224,22 +2304,48 @@ impl<'a> Interpreter<'a> {
                 _ => None,
             })
             .collect();
-        let mut values: HashMap<ValueId, Value> = HashMap::new();
+        // Binding the parameters is one transaction over *all* of them,
+        // not a per-argument one (`rfcs/0011`, `rfcs/0012`).
+        //
+        // A `take` parameter transfers ownership into this call: the
+        // caller's own handle (if `arg` is a resource at all -- an
+        // ordinary value passed to a meaningless `take` on non-resource
+        // data, already rejected at check time, is left untouched here)
+        // is invalidated, and this frame receives the current owner's
+        // own fresh handle. An ordinary (observing) parameter never
+        // transfers: `arg` is bound as a view of exactly what it was
+        // given.
+        //
+        // Phase A -- validate and plan every argument, mutating
+        // nothing. One shared `StorePlan` across all of them, which is
+        // what makes an identity passed to *two* different `take`
+        // parameters visible as the duplicate it is: planning each
+        // argument in isolation would see one live handle twice and
+        // accept both. Building the observing views here too costs
+        // nothing (they allocate a new value and mutate no state) and
+        // keeps every fallible step ahead of the commit.
+        let mut plan = StorePlan::default();
+        let mut bindings: Vec<(ValueId, Value)> = Vec::with_capacity(function.params.len());
         for (param, arg) in function.params.iter().zip(args) {
-            // A `take` parameter transfers ownership into this call
-            // (`rfcs/0011`, Blocker 8): the caller's own handle (if
-            // `arg` is a resource at all -- an ordinary value passed to
-            // a meaningless `take` on non-resource data, already
-            // rejected at check time, is left untouched here) is
-            // invalidated, and this frame receives the current owner's
-            // own fresh handle. An ordinary (observing) parameter never
-            // transfers: `arg` is bound exactly as given.
-            let arg = if param.take {
-                self.transfer_if_resource(arg)?
+            // Every argument, not only the transferred ones: the
+            // planner and the observing downgrade both reason about
+            // declared types, so a value that disagrees with its own
+            // declaration is refused before either is trusted -- the
+            // same order `store_place_transfer` uses.
+            self.validate_argument(&arg, &param.ty)?;
+            let bound = if param.take {
+                self.plan_transfer(&arg, &mut plan, 0)?
             } else {
                 self.to_observer_if_resource(arg)?
             };
-            values.insert(param.value, arg);
+            bindings.push((param.value, bound));
+        }
+        // Phase B -- commit. Every argument is known good, so no
+        // generation moves until all of them are.
+        self.commit_transfer(&plan);
+        let mut values: HashMap<ValueId, Value> = HashMap::new();
+        for (id, bound) in bindings {
+            values.insert(id, bound);
         }
 
         // `BlockId(0)` is the entry block by definition (the verifier
@@ -2295,6 +2401,28 @@ impl<'a> Interpreter<'a> {
                         )?;
                     }
                     crate::nir::Instruction::Store { slot, value, mode } => {
+                        // The runtime's own equivalent of the verifier's
+                        // `STORE_OVER_OWNED_SLOT` (V0100). Writing the
+                        // slot discards whatever it held, so if that is
+                        // still a live owner the write would make the
+                        // resource permanently unreachable and
+                        // undestroyable. Checked *before* the incoming
+                        // value is transferred, so a refused store bumps
+                        // no generation at all.
+                        //
+                        // A backstop for malformed NIR, not a substitute
+                        // for the static answer: verified NIR can never
+                        // reach it.
+                        if let Some(existing) = values.get(slot) {
+                            let mut seen = HashSet::new();
+                            if self.owns_a_live_resource(existing, &mut seen, 0, &HashSet::new()) {
+                                return Err(invalid(format!(
+                                    "a store would overwrite a slot (%{}) that still owns an \
+                                     undestroyed resource",
+                                    slot.0
+                                )));
+                            }
+                        }
                         let v = get(&values, value)?;
                         let v = match mode {
                             // A transferring store immediately
@@ -2365,20 +2493,37 @@ impl<'a> Interpreter<'a> {
                     // A returned resource transfers ownership back to
                     // the caller (`rfcs/0011`, Blocker 8) -- the same
                     // transfer a `take` argument gets, just on the way
-                    // out instead of in. Transferred first, so its own
-                    // now-stale entry in `values` is already excluded by
-                    // the leak check that follows.
-                    let returned = self.transfer_if_resource(get(&values, id)?)?;
-                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                    // out instead of in.
+                    //
+                    // Planned but *not* applied first, because the leak
+                    // backstop below can still reject this frame. This
+                    // used to transfer outright and rely on the
+                    // resulting stale entry in `values` to hide the
+                    // returned value from the leak check -- so a frame
+                    // that turned out to be leaking something else
+                    // returned `Err` having already bumped the returned
+                    // resource's generation, leaving the caller's own
+                    // handles stale for a call that never completed.
+                    // Instead the identities that really cross the
+                    // boundary are named explicitly, and the commit
+                    // happens only once nothing fallible is left.
+                    let mut plan = StorePlan::default();
+                    let returned = self.plan_transfer(&get(&values, id)?, &mut plan, 0)?;
+                    if let Some(leaked) =
+                        self.leaked_resource(&values, &observing_params, &plan.reachable)
+                    {
                         return Err(invalid(format!(
                             "function returned while still owning an undestroyed resource (%{})",
                             leaked.0
                         )));
                     }
+                    self.commit_transfer(&plan);
                     return Ok(Outcome::Returned(returned));
                 }
                 Terminator::Return(None) => {
-                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                    if let Some(leaked) =
+                        self.leaked_resource(&values, &observing_params, &HashSet::new())
+                    {
                         return Err(invalid(format!(
                             "function returned while still owning an undestroyed resource (%{})",
                             leaked.0
@@ -2465,13 +2610,22 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 Terminator::Raise { value } => {
-                    let raised = get(&values, value)?;
-                    if let Some(leaked) = self.leaked_resource(&values, &observing_params) {
+                    // A raised value leaves this frame exactly as a
+                    // returned one does (`rfcs/0010`), so it transfers
+                    // on the same terms and in the same order: plan,
+                    // let the leak backstop judge the frame it is
+                    // actually leaving, and only then commit.
+                    let mut plan = StorePlan::default();
+                    let raised = self.plan_transfer(&get(&values, value)?, &mut plan, 0)?;
+                    if let Some(leaked) =
+                        self.leaked_resource(&values, &observing_params, &plan.reachable)
+                    {
                         return Err(invalid(format!(
                             "function raised while still owning an undestroyed resource (%{})",
                             leaked.0
                         )));
                     }
+                    self.commit_transfer(&plan);
                     return Ok(Outcome::Raised(raised));
                 }
             }
@@ -2650,10 +2804,20 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ValueKind::RecordCreate(item, type_args, field_ids) => {
-                let fields = field_ids
-                    .iter()
-                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // Every field is planned into one shared plan before any
+                // of them moves (`rfcs/0012`). Transferring field by
+                // field meant a construction that failed on its *last*
+                // field had already moved all the earlier ones, with the
+                // fresh owning handles thrown away along with the failed
+                // result -- and an identity appearing in two different
+                // fields looked live to each of them in turn.
+                let mut plan = StorePlan::default();
+                let mut fields = Vec::with_capacity(field_ids.len());
+                for id in field_ids {
+                    let value = get(values, id)?;
+                    fields.push(self.plan_transfer(&value, &mut plan, 0)?);
+                }
+                self.commit_transfer(&plan);
                 // A `resource` gets its own unique runtime identity
                 // (Blocker 8) rather than being represented inline the
                 // same way an ordinary, freely-copyable record is --
@@ -2705,15 +2869,21 @@ impl<'a> Interpreter<'a> {
                 type_args,
                 payload,
             } => {
-                let payload = payload
-                    .iter()
-                    .map(|id| get(values, id).and_then(|v| self.transfer_if_resource(v)))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // One plan across the whole payload, for the identical
+                // reason `RecordCreate` uses one across the whole field
+                // list.
+                let mut plan = StorePlan::default();
+                let mut values_out = Vec::with_capacity(payload.len());
+                for id in payload {
+                    let value = get(values, id)?;
+                    values_out.push(self.plan_transfer(&value, &mut plan, 0)?);
+                }
+                self.commit_transfer(&plan);
                 Ok(Value::Variant {
                     item: *variant,
                     type_args: type_args.clone(),
                     case: *case,
-                    payload,
+                    payload: values_out,
                 })
             }
             ValueKind::VariantPayload {
@@ -7809,6 +7979,22 @@ mod decomposition_claims {
 /// which is exactly the shape that hid a live resource inside an `i64`
 /// field. Deliberately not consulted for a primitive value, so a plain
 /// integer in an `i64` field never asks for a declaration.
+/// Whether `ty` names a concrete type all the way down, with no
+/// still-symbolic generic parameter anywhere inside it (`rfcs/0008`).
+///
+/// `Applied`'s own arguments are part of its identity and are compared
+/// structurally, so a `Box[T]` is no more checkable against a runtime
+/// `Box[File]` than a bare `T` is: an unresolved parameter at *any*
+/// depth means the position has no concrete type to check against at
+/// this boundary.
+fn fully_resolved(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param(..) | Ty::Var(_) | Ty::Never | Ty::Error => false,
+        Ty::Applied(_, arguments) => arguments.iter().all(fully_resolved),
+        _ => true,
+    }
+}
+
 fn required_declaration(
     expected: Option<&Ty>,
 ) -> Result<Option<(ItemId, Vec<Ty>)>, InterpreterError> {
@@ -8547,7 +8733,7 @@ mod leak_backstop {
             boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))),
         )]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             Some(ValueId(7)),
             "a `Box[File]` abandoned at an exit still owns its `File`"
         );
@@ -8568,7 +8754,7 @@ mod leak_backstop {
             },
         )]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             Some(ValueId(3)),
             "an active case's payload is owned exactly like a bare handle"
         );
@@ -8592,7 +8778,7 @@ mod leak_backstop {
             ),
         )]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             Some(ValueId(2)),
             "depth changes nothing about who owns it"
         );
@@ -8608,7 +8794,7 @@ mod leak_backstop {
             .expect("observing a well-formed value must succeed");
         let values = frame(vec![(1, view)]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             None,
             "this frame never owned what an observing view points at"
         );
@@ -8625,7 +8811,7 @@ mod leak_backstop {
             .expect("destroying a well-formed aggregate must succeed");
         let values = frame(vec![(1, Value::Moved)]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             None,
             "nothing is left to leak"
         );
@@ -8646,7 +8832,7 @@ mod leak_backstop {
             (2, Value::Int(0)),
         ]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             Some(ValueId(4)),
             "the lowest owning id, deterministically, never whatever the map yields first"
         );
@@ -8664,7 +8850,7 @@ mod leak_backstop {
             vec![Value::Resource(owner)];
         let values = frame(vec![(5, Value::Resource(owner))]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             Some(ValueId(5)),
             "a cycle must terminate, and it is still a leak"
         );
@@ -8688,9 +8874,1186 @@ mod leak_backstop {
             .expect("transferring to make the outer handle stale");
         let values = frame(vec![(6, Value::Resource(owner))]);
         assert_eq!(
-            interpreter.leaked_resource(&values, &HashSet::new()),
+            interpreter.leaked_resource(&values, &HashSet::new(), &HashSet::new()),
             None,
             "a stale handle owns nothing: the current owner holds the record"
+        );
+    }
+}
+
+/// Blocker 3: every ownership transfer is one transaction, spanning the
+/// whole operation rather than one field or one argument of it.
+///
+/// `transfer_if_resource` used to recurse and bump each resource's
+/// generation as it reached it. A later field that turned out to be an
+/// observer, stale, duplicated or cyclic then returned `Err` with the
+/// earlier fields already moved: the caller's handles stale, the fresh
+/// owning handles discarded along with the failed result, and the
+/// resources permanently unreachable. The same shape appeared once per
+/// place ownership crosses a boundary -- `take` parameters bound one at
+/// a time, `record.create`/`variant.create` field by field, and
+/// `return`/`raise` transferring *before* the leak backstop could still
+/// reject the frame.
+///
+/// Every test here asserts the same contract: on rejection, the frame's
+/// values, the resource table (identity, generation, status and fields)
+/// and the event log are all exactly as they were, and repeating the
+/// operation produces a byte-identical error.
+#[cfg(test)]
+mod transfer_transaction {
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(80);
+    const PAIR: ItemId = ItemId(81);
+    const HOLDER: ItemId = ItemId(82);
+    const MAYBE: ItemId = ItemId(83);
+    const TWO_TAKES: ItemId = ItemId(84);
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, Symbol(0))
+    }
+
+    /// `File` (a declared `resource` with one `i64` field), `Pair` (two
+    /// `File` fields), `Holder` (one `File` field) and `Maybe[T]`.
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: vec![two_take_files()],
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, file_ty()), (name, file_ty())],
+                        affine: false,
+                    },
+                ),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, file_ty())],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                crate::nir::VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name), Ty::Param(param, name)],
+                        },
+                        crate::nir::CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// `f(take a: File, take b: File)`, destroying both.
+    fn two_take_files() -> Function {
+        Function {
+            id: TWO_TAKES,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Drop { value: ValueId(0) },
+                    Instruction::Drop { value: ValueId(1) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// Everything a rejected operation must leave exactly as it found
+    /// it: every resource record's own identity, generation, status and
+    /// fields, plus the execution's own event log. Rendered rather than
+    /// compared field by field so a difference anywhere in the table --
+    /// including one this test never thought to name -- still shows up.
+    fn runtime_state(interpreter: &Interpreter<'_>) -> String {
+        format!(
+            "table={:?} events={:?}",
+            interpreter.resources.borrow().records,
+            interpreter.event_log()
+        )
+    }
+
+    /// The frame's own values, in `ValueId` order so no `HashMap`
+    /// iteration order can reach the comparison.
+    fn frame_state(values: &HashMap<ValueId, Value>) -> String {
+        let mut entries: Vec<(&ValueId, &Value)> = values.iter().collect();
+        entries.sort_by_key(|(id, _)| **id);
+        format!("{entries:?}")
+    }
+
+    /// Runs `attempt` twice and asserts that it is rejected both times
+    /// with a byte-identical error, having changed no runtime state at
+    /// all either time. This is the whole contract in one helper: a
+    /// partially-applied transfer shows up as either a state difference
+    /// or a *different* second error (the first attempt having already
+    /// moved something the second then finds stale).
+    fn rejected_without_a_trace(
+        interpreter: &Interpreter<'_>,
+        what: &str,
+        mut attempt: impl FnMut() -> Result<(), InterpreterError>,
+    ) {
+        let before = runtime_state(interpreter);
+        let first = attempt().expect_err(what);
+        assert_eq!(
+            runtime_state(interpreter),
+            before,
+            "{what}: the rejected operation changed runtime state"
+        );
+        let second = attempt().expect_err(what);
+        assert_eq!(
+            runtime_state(interpreter),
+            before,
+            "{what}: repeating the rejected operation changed runtime state"
+        );
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "{what}: the retry produced a different error, so the first attempt left a trace"
+        );
+    }
+
+    fn pair_of(first: Value, second: Value) -> Value {
+        Value::Record {
+            item: PAIR,
+            type_args: Vec::new(),
+            fields: vec![first, second],
+        }
+    }
+
+    // -- `call_function`: all `take` arguments planned together ---------
+
+    #[test]
+    fn a_call_whose_second_take_argument_is_an_observer_transfers_neither() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+        let callee = two_take_files();
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a `take` parameter may not be given an observing handle",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![Value::Resource(owner), Value::Resource(observer)],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owner).is_ok(),
+            "the first argument's own handle must still be current: the call never happened"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_second_take_argument_is_stale_transfers_neither() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        // Moved elsewhere, so `other` itself is now a stale handle.
+        let _current = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(other)
+            .expect("the first transfer succeeds");
+        let callee = two_take_files();
+
+        rejected_without_a_trace(&interpreter, "a stale handle may not be taken", || {
+            interpreter
+                .call_function(
+                    &callee,
+                    vec![Value::Resource(owner), Value::Resource(other)],
+                    Vec::new(),
+                )
+                .map(|_| ())
+        });
+        assert!(
+            interpreter.resources.borrow().observe(owner).is_ok(),
+            "the first argument's own handle must still be current"
+        );
+    }
+
+    #[test]
+    fn one_identity_passed_to_two_take_parameters_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let callee = two_take_files();
+
+        // Planning each argument in isolation would see one live handle
+        // twice and accept both, giving the callee two owners of one
+        // resource. One shared plan across every argument is what makes
+        // the duplicate visible.
+        rejected_without_a_trace(
+            &interpreter,
+            "one identity may not be taken by two parameters of the same call",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![Value::Resource(owner), Value::Resource(owner)],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+    }
+
+    #[test]
+    fn a_call_whose_arguments_are_all_valid_transfers_each_exactly_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        let callee = two_take_files();
+
+        interpreter
+            .call_function(
+                &callee,
+                vec![Value::Resource(first), Value::Resource(second)],
+                Vec::new(),
+            )
+            .expect("two distinct live owners are a legal pair of `take` arguments");
+
+        let table = interpreter.resources.borrow();
+        for handle in [first, second] {
+            let record = &table.records[handle.id.0 as usize];
+            assert_eq!(
+                record.generation,
+                handle.generation + 1,
+                "each identity's generation moves exactly once, never twice and never not at all"
+            );
+            assert_eq!(
+                record.status,
+                ResourceStatus::Dropped,
+                "the callee destroyed what it was given"
+            );
+        }
+    }
+
+    // -- aggregates: all fields planned together ------------------------
+
+    #[test]
+    fn an_aggregate_whose_second_field_is_an_observer_transfers_neither() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+
+        rejected_without_a_trace(
+            &interpreter,
+            "an observing handle may not be transferred into an aggregate",
+            || {
+                interpreter
+                    .transfer_if_resource(pair_of(
+                        Value::Resource(owner),
+                        Value::Resource(observer),
+                    ))
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owner).is_ok(),
+            "the first field's own handle must still be current"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_whose_second_field_is_stale_transfers_neither() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let _current = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(other)
+            .expect("the first transfer succeeds");
+
+        rejected_without_a_trace(&interpreter, "a stale field may not be transferred", || {
+            interpreter
+                .transfer_if_resource(pair_of(Value::Resource(owner), Value::Resource(other)))
+                .map(|_| ())
+        });
+        assert!(
+            interpreter.resources.borrow().observe(owner).is_ok(),
+            "the first field's own handle must still be current"
+        );
+    }
+
+    #[test]
+    fn one_identity_in_two_fields_of_one_aggregate_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+
+        rejected_without_a_trace(
+            &interpreter,
+            "one identity may not occupy two fields of one aggregate",
+            || {
+                interpreter
+                    .transfer_if_resource(pair_of(Value::Resource(owner), Value::Resource(owner)))
+                    .map(|_| ())
+            },
+        );
+    }
+
+    #[test]
+    fn an_ownership_cycle_between_two_resources_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        {
+            let mut table = interpreter.resources.borrow_mut();
+            table.records[first.id.0 as usize].fields = vec![Value::Resource(second)];
+            table.records[second.id.0 as usize].fields = vec![Value::Resource(first)];
+        }
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a cycle no destruction order could satisfy is refused",
+            || {
+                interpreter
+                    .transfer_if_resource(Value::Resource(first))
+                    .map(|_| ())
+            },
+        );
+    }
+
+    #[test]
+    fn a_resource_owning_itself_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let only = new_file(&interpreter, 1);
+        interpreter.resources.borrow_mut().records[only.id.0 as usize].fields =
+            vec![Value::Resource(only)];
+
+        rejected_without_a_trace(&interpreter, "a self-cycle is refused", || {
+            interpreter
+                .transfer_if_resource(Value::Resource(only))
+                .map(|_| ())
+        });
+    }
+
+    #[test]
+    fn a_record_create_failing_on_its_last_field_moves_none_of_the_earlier_ones() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(owner));
+        values.insert(ValueId(1), Value::Resource(observer));
+        let kind = ValueKind::RecordCreate(PAIR, Vec::new(), vec![ValueId(0), ValueId(1)]);
+
+        let frame_before = frame_state(&values);
+        rejected_without_a_trace(
+            &interpreter,
+            "a construction that fails on its last field moves nothing",
+            || interpreter.eval(&kind, &values, &[]).map(|_| ()),
+        );
+        assert_eq!(
+            frame_state(&values),
+            frame_before,
+            "the frame's own values are untouched by a refused construction"
+        );
+    }
+
+    #[test]
+    fn a_variant_create_failing_on_its_last_payload_moves_none_of_the_earlier_ones() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(owner));
+        values.insert(ValueId(1), Value::Resource(observer));
+        let kind = ValueKind::VariantCreate {
+            variant: MAYBE,
+            case: 0,
+            type_args: vec![file_ty()],
+            payload: vec![ValueId(0), ValueId(1)],
+        };
+
+        let frame_before = frame_state(&values);
+        rejected_without_a_trace(
+            &interpreter,
+            "a variant construction that fails on its last payload moves nothing",
+            || interpreter.eval(&kind, &values, &[]).map(|_| ()),
+        );
+        assert_eq!(
+            frame_state(&values),
+            frame_before,
+            "the frame's own values are untouched by a refused construction"
+        );
+    }
+
+    // -- exits: nothing moves before the leak backstop has spoken -------
+
+    /// `f(take a: File, take b: File) -> File` that returns `a` and
+    /// simply abandons `b` -- a frame the leak backstop must reject.
+    fn returns_one_leaks_the_other() -> Function {
+        Function {
+            id: ItemId(85),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: file_ty(),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_return_rejected_by_the_leak_backstop_moves_no_generation() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let returned = new_file(&interpreter, 1);
+        let leaked = new_file(&interpreter, 2);
+        let callee = returns_one_leaks_the_other();
+
+        // The arguments are transferred *into* the frame legitimately,
+        // so the generations that matter are the ones the frame holds
+        // when it tries to leave.
+        let inside_returned =
+            interpreter.resources.borrow().records[returned.id.0 as usize].generation;
+        let result = interpreter.call_function(
+            &callee,
+            vec![Value::Resource(returned), Value::Resource(leaked)],
+            Vec::new(),
+        );
+        let error = result
+            .map(|_| ())
+            .expect_err("a frame abandoning a live resource must be rejected");
+        assert!(
+            format!("{error:?}").contains("undestroyed resource"),
+            "the leak backstop is what rejected it, got {error:?}"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[returned.id.0 as usize].generation,
+            inside_returned + 1,
+            "the returned value's generation moved exactly once -- when it was taken *into* the \
+             frame -- and never again for the return the backstop refused"
+        );
+    }
+
+    /// `f(take a: File, take b: File) -> Pair` returning an aggregate
+    /// built from `a` and a *stale* handle, so the return's own transfer
+    /// is what fails.
+    fn returns_a_half_valid_aggregate() -> Function {
+        Function {
+            id: ItemId(86),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: Ty::Named(PAIR, Symbol(0)),
+                take: true,
+            }],
+            return_type: Ty::Named(PAIR, Symbol(0)),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_returned_aggregate_with_one_invalid_child_moves_neither_child() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+        let callee = returns_a_half_valid_aggregate();
+
+        // The `take` parameter binding itself is the first transaction
+        // and it must refuse the pair outright, so neither child moves.
+        rejected_without_a_trace(
+            &interpreter,
+            "an aggregate with an observing child may not cross a boundary",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![pair_of(Value::Resource(good), Value::Resource(observer))],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            interpreter.resources.borrow().observe(good).is_ok(),
+            "the valid child's own handle must still be current"
+        );
+    }
+
+    /// `f(take a: Holder)` that raises `a` -- so the raise's own
+    /// transfer is the operation under test.
+    fn raises_its_argument() -> Function {
+        Function {
+            id: ItemId(87),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: Ty::Applied(MAYBE, vec![file_ty()]),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Raise { value: ValueId(0) },
+            }],
+        }
+    }
+
+    #[test]
+    fn a_raise_whose_transfer_fails_moves_nothing() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let good = new_file(&interpreter, 1);
+        let other = new_file(&interpreter, 2);
+        let observer = interpreter
+            .resources
+            .borrow()
+            .to_observer(other)
+            .expect("a fresh owner may be observed");
+        let callee = raises_its_argument();
+        let raised = Value::Variant {
+            item: MAYBE,
+            type_args: vec![file_ty()],
+            case: 0,
+            payload: vec![Value::Resource(good), Value::Resource(observer)],
+        };
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a raised value carrying an observing handle may not cross the boundary",
+            || {
+                interpreter
+                    .call_function(&callee, vec![raised.clone()], Vec::new())
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            interpreter.resources.borrow().observe(good).is_ok(),
+            "the valid payload's own handle must still be current"
+        );
+    }
+
+    // -- ordering and determinism ---------------------------------------
+
+    #[test]
+    fn a_valid_aggregate_transfer_moves_every_identity_exactly_once() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+
+        let moved = interpreter
+            .transfer_if_resource(pair_of(Value::Resource(first), Value::Resource(second)))
+            .expect("two distinct live owners are a legal pair of fields");
+
+        let Value::Record { fields, .. } = &moved else {
+            unreachable!("a transferred record is still a record")
+        };
+        let table = interpreter.resources.borrow();
+        for (index, handle) in [first, second].into_iter().enumerate() {
+            let Value::Resource(rebuilt) = fields[index] else {
+                unreachable!("each field is still a resource handle")
+            };
+            assert_eq!(
+                rebuilt.id, handle.id,
+                "field {index} keeps its own identity across the transfer"
+            );
+            assert_eq!(
+                rebuilt.generation,
+                handle.generation + 1,
+                "field {index}'s generation moves exactly once"
+            );
+            assert_eq!(
+                table.records[handle.id.0 as usize].generation, rebuilt.generation,
+                "the rebuilt handle is the one the table now considers current"
+            );
+        }
+        assert!(
+            table.observe(first).is_err() && table.observe(second).is_err(),
+            "both of the caller's own handles went stale together"
+        );
+    }
+
+    #[test]
+    fn planning_alone_moves_no_generation_at_all() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        let before = runtime_state(&interpreter);
+
+        // The plan is complete -- every identity resolved, every new
+        // generation computed, the whole value rebuilt -- and yet
+        // nothing has moved. That separation is the entire mechanism:
+        // it is what lets an operation abandon a fully-formed plan at
+        // any point with no trace.
+        let mut plan = StorePlan::default();
+        let rebuilt = interpreter
+            .plan_transfer(
+                &pair_of(Value::Resource(first), Value::Resource(second)),
+                &mut plan,
+                0,
+            )
+            .expect("both fields are live owners");
+        assert_eq!(
+            plan.transitions.len(),
+            2,
+            "both identities are planned to move"
+        );
+        assert_eq!(
+            runtime_state(&interpreter),
+            before,
+            "planning must not change a single generation, status or field"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(first).is_ok()
+                && interpreter.resources.borrow().observe(second).is_ok(),
+            "the caller's own handles are still current until the commit"
+        );
+
+        interpreter.commit_transfer(&plan);
+        assert_ne!(
+            runtime_state(&interpreter),
+            before,
+            "the commit is what makes the planned transfer real"
+        );
+        drop(rebuilt);
+    }
+
+    // -- the runtime's own defence against overwriting a live slot ------
+
+    #[test]
+    fn a_store_over_a_slot_that_still_owns_a_resource_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        // Hand-built NIR the verifier would reject under V0100: two
+        // transferring stores into one slot, with nothing emptying it in
+        // between. The runtime is the independent backstop.
+        let function = Function {
+            id: ItemId(88),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: file_ty(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Transfer,
+                    },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        let error = interpreter
+            .call_function(
+                &function,
+                vec![Value::Resource(first), Value::Resource(second)],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("the second store would lose the first resource");
+        assert!(
+            format!("{error:?}").contains("still owns an undestroyed resource"),
+            "the store itself must refuse, rather than silently discarding an owner, got \
+             {error:?}"
+        );
+        // The second store is refused *before* it transfers, so the
+        // value it was going to install never moved.
+        assert_eq!(
+            interpreter.resources.borrow().records[second.id.0 as usize].generation,
+            second.generation + 1,
+            "the second resource moved only for the `take` binding, never for the refused store"
+        );
+    }
+
+    // -- argument validation against the declared parameter type --------
+
+    #[test]
+    fn an_argument_disagreeing_with_a_resolved_parameter_type_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let callee = two_take_files();
+
+        // `two_take_files` declares both parameters `File`. A `Pair`
+        // standing where a `File` is declared is malformed, and must be
+        // refused before the *other* argument is transferred.
+        rejected_without_a_trace(
+            &interpreter,
+            "a value of the wrong declared type may not be bound",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![
+                            Value::Resource(owner),
+                            pair_of(Value::Int(1), Value::Int(2)),
+                        ],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+        assert!(
+            interpreter.resources.borrow().observe(owner).is_ok(),
+            "the valid first argument must not have been transferred"
+        );
+    }
+
+    /// The other side of the same rule, and the false positive it would
+    /// be easy to introduce: a *generic* parameter has no concrete type
+    /// to check against at this boundary, at any depth. `Box[T]` is
+    /// declared, `Box[File]` arrives, and that is exactly correct --
+    /// one parametric NIR body is shared by every instantiation
+    /// (`rfcs/0008`). Comparing them would reject every generic call.
+    #[test]
+    fn an_argument_filling_a_generic_parameter_is_not_compared_against_it() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let param = crate::hir::TypeParamId(0);
+        let owner = new_file(&interpreter, 1);
+
+        for declared in [
+            // The whole parameter is symbolic.
+            Ty::Param(param, Symbol(0)),
+            // Concrete constructor, symbolic argument: checking only
+            // the outermost one would still reject this, because
+            // `Applied`'s arguments are compared structurally.
+            Ty::Applied(MAYBE, vec![Ty::Param(param, Symbol(0))]),
+        ] {
+            assert!(
+                !fully_resolved(&declared),
+                "{declared:?} carries an unresolved parameter"
+            );
+            let value = match &declared {
+                Ty::Param(..) => Value::Resource(owner),
+                _ => Value::Variant {
+                    item: MAYBE,
+                    type_args: vec![file_ty()],
+                    case: 1,
+                    payload: Vec::new(),
+                },
+            };
+            interpreter
+                .validate_argument(&value, &declared)
+                .expect("a generic position accepts the instantiation that arrives at it");
+        }
+
+        // A resolved declaration is still checked, so the relaxation is
+        // scoped to genuinely symbolic positions and nothing else.
+        assert!(
+            interpreter
+                .validate_argument(&Value::Int(1), &Ty::Named(FILE, Symbol(0)))
+                .is_err(),
+            "a resolved position still rejects a value of the wrong kind"
+        );
+    }
+}
+
+/// The verifier and the interpreter must agree about who owns what.
+///
+/// These reconstruct ownership from completely different material --
+/// `nir::verify` from the NIR, the interpreter from runtime values and
+/// its resource table -- so agreement is a real property to test, not a
+/// tautology. Disagreement in either direction is a defect: the
+/// verifier accepting something the interpreter refuses is an unsound
+/// static answer, and the verifier refusing something the interpreter
+/// accepts is a false positive that would reject a working program.
+#[cfg(test)]
+mod stage_agreement {
+    use super::*;
+    use crate::hir::ItemRegistry;
+    use crate::nir::{BasicBlock, BlockId, Instruction, RecordLayout, verify_module};
+    use crate::source::SourceMap;
+    use crate::symbol::Interner;
+
+    const FILE: ItemId = ItemId(70);
+    const ENVELOPE: ItemId = ItemId(71);
+    const MAIN: ItemId = ItemId(72);
+
+    /// `File` (a declared `resource`) and `Envelope` (an ordinary record
+    /// with one `File` field -- affine only *transitively*, and so never
+    /// a key in the nominal resource lattice at all: the exact gap the
+    /// laundering hid in).
+    fn layouts(interner: &mut Interner) -> Vec<(ItemId, RecordLayout)> {
+        let file = interner.intern("File");
+        let envelope = interner.intern("Envelope");
+        let field = interner.intern("f");
+        vec![
+            (
+                FILE,
+                RecordLayout {
+                    name: file,
+                    type_params: Vec::new(),
+                    fields: vec![(field, Ty::I64)],
+                    affine: true,
+                },
+            ),
+            (
+                ENVELOPE,
+                RecordLayout {
+                    name: envelope,
+                    type_params: Vec::new(),
+                    fields: vec![(field, Ty::Named(FILE, file))],
+                    affine: false,
+                },
+            ),
+        ]
+    }
+
+    /// The blocker's own reproduction, as NIR:
+    ///
+    /// ```text
+    /// %0 = alloc Envelope
+    /// %2 = Envelope(File(0))
+    /// store.observe %0, %2
+    /// %3 = load %0
+    /// drop %3          ; destroys through a merely-observing view
+    /// drop %2
+    /// ```
+    ///
+    /// The interpreter always refused the first `drop`: `store.observe`
+    /// runs the value through `to_observer_if_resource`, so `%3` carries
+    /// observer handles. The verifier used to accept both drops, because
+    /// its observation set only marked the slot observed when the
+    /// *stored value* already was -- and `%2` was a genuine owner.
+    fn laundering_module(interner: &mut Interner) -> Module {
+        let name = interner.intern("main");
+        let file = Ty::Named(FILE, interner.intern("File"));
+        let envelope = Ty::Named(ENVELOPE, interner.intern("Envelope"));
+        Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            records: layouts(interner),
+            variants: Vec::new(),
+            functions: vec![Function {
+                id: MAIN,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: envelope.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(0)),
+                        },
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: file,
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(1)]),
+                        },
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: envelope.clone(),
+                            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(4)]),
+                        },
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: OwnershipMode::Observe,
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: envelope,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Drop { value: ValueId(3) },
+                        Instruction::Drop { value: ValueId(2) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn the_verifier_and_the_interpreter_both_refuse_an_observing_store_laundered_into_an_owner() {
+        let mut interner = Interner::new();
+        let module = laundering_module(&mut interner);
+
+        // The interpreter's own answer, which never changed: dropping
+        // through the observing view the slot handed back is refused.
+        let interpreter = Interpreter::new(&module);
+        let runtime = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("destroying through an observing handle must be refused at run time");
+        assert!(
+            format!("{runtime:?}").contains("merely-observing"),
+            "the interpreter refuses it as an observation, got {runtime:?}"
+        );
+
+        // The verifier must reach the same conclusion statically,
+        // rather than accepting a program the runtime will refuse.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics
+                .iter()
+                // `V0099` is the stable code for OBSERVER_CANNOT_TRANSFER;
+                // the string is the published contract, so asserting it
+                // directly is what a downstream consumer would rely on.
+                .any(|d| d.code == "V0099"),
+            "the verifier must statically reject what the interpreter refuses, got {:?}",
+            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// The other direction, and the one a sticky observation would
+    /// break: a slot that held a view, was finished with, and then
+    /// legally received a real owner. Both stages must *accept* it.
+    #[test]
+    fn the_verifier_and_the_interpreter_both_accept_a_slot_reused_as_a_real_owner() {
+        let mut interner = Interner::new();
+        let name = interner.intern("main");
+        let file_sym = interner.intern("File");
+        let file = Ty::Named(FILE, file_sym);
+        let int = |result: u32| Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(0)),
+        };
+        let make_file = |descriptor: u32, result: u32| Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::Named(FILE, file_sym),
+            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(descriptor)]),
+        };
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            records: layouts(&mut interner),
+            variants: Vec::new(),
+            functions: vec![Function {
+                id: MAIN,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(0),
+                            ty: file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                        int(1),
+                        make_file(1, 2),
+                        // A view of `%2`, read back, then `%2` is
+                        // destroyed through its own owning identity.
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(2),
+                            mode: OwnershipMode::Observe,
+                        },
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: file.clone(),
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Drop { value: ValueId(2) },
+                        // The slot now owns nothing, so it may legally
+                        // be given a real owner -- which this frame
+                        // then destroys through the slot itself.
+                        int(4),
+                        make_file(4, 5),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(5),
+                            mode: OwnershipMode::Transfer,
+                        },
+                        Instruction::Value {
+                            result: ValueId(6),
+                            ty: file,
+                            kind: ValueKind::Load(ValueId(0)),
+                        },
+                        Instruction::Drop { value: ValueId(6) },
+                    ],
+                    terminator: Terminator::Return(None),
+                }],
+            }],
+        };
+
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let diagnostics = verify_module(&module, source, &interner, &ItemRegistry::default());
+        assert!(
+            diagnostics.is_empty(),
+            "an observation is a fact about a path, not a life sentence on a slot: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+        );
+
+        let interpreter = Interpreter::new(&module);
+        interpreter
+            .call_item(MAIN, Vec::new())
+            .expect("the interpreter must accept exactly what the verifier accepted");
+        // `%3` was only ever a view, so nothing destroyed it twice and
+        // exactly two resources were created and destroyed.
+        assert_eq!(
+            interpreter
+                .event_log()
+                .iter()
+                .filter(|event| event.starts_with("drop:"))
+                .count(),
+            2,
+            "each of the two real owners is destroyed exactly once"
         );
     }
 }

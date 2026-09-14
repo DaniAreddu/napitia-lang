@@ -610,6 +610,45 @@ Storing a value into a place rooted at that very value is rejected in
 both stages: `V0093` statically, and at run time for the same shape
 reached through a `Load` of the destination's own slot.
 
+### Every ownership boundary is the same transaction
+
+`StorePlace` is not special. The same plan-then-commit discipline covers
+every point ownership crosses a boundary, because they all fail the same
+way without it: a `take` argument, a returned or raised value, a
+`record.create`/`variant.create` field, a `Move`/`DeferCapture` source,
+and a transferring `Store`. Transferring one field at a time and
+bumping each generation on the way meant an operation that turned out to
+be invalid at its *last* element had already moved every earlier one --
+the caller's handles stale, the fresh owning handles discarded with the
+failed result, and those resources permanently unreachable and
+undestroyable.
+
+Two consequences shape the interface:
+
+* **The transaction spans the whole operation, not one root of it.** A
+  call with several `take` parameters plans all of them into one plan
+  before committing any, and an aggregate plans all of its fields
+  together. Planning each root separately would let one identity passed
+  to two `take` parameters -- or placed in two fields -- look live to
+  each of them in turn, handing out two owners of one resource; a
+  shared plan sees the duplicate. Every argument is also validated
+  against its parameter's own declared type first, wherever that type is
+  concrete: a generic parameter is declared `Ty::Param` and one
+  parametric body is shared by every instantiation (`rfcs/0008`), so
+  there is no concrete type to compare against at that boundary.
+* **The commit is the last step, after every other fallible one.** For
+  `Return` and `Raise` this means the transfer is planned but not
+  applied until the leak backstop has judged the frame: the identities
+  that will cross the boundary are named explicitly and excluded from
+  the leak walk, rather than being hidden from it by handles the
+  transfer already made stale. A frame the backstop rejects has moved
+  nothing.
+
+A refused operation anywhere in this family leaves the frame's values,
+the resource table, every generation and status, and the event log
+exactly as it found them, and repeating it reports a byte-identical
+error.
+
 ### Mixed-container traversal
 
 Because those two storage disciplines differ, a place walking a chain

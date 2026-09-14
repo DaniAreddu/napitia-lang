@@ -1051,6 +1051,20 @@ fn resource_invalid_local_double_drop_example_is_u0003_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_local_double_drop.npt", "U0003");
 }
 
+/// One call handing the same resource to an observing and a `take`
+/// parameter. The taken parameter may destroy it anywhere in the body
+/// while the observation stays readable, and no signature says which
+/// order the body uses -- so every stage refuses the pairing.
+///
+/// Reported as `U0015` at every stage because the pipeline stops at the
+/// first one that refuses; the NIR verifier's own independent answer
+/// (`V0101`) is exercised on hand-built NIR, which never passes through
+/// the source checker at all.
+#[test]
+fn resource_invalid_mixed_observe_take_example_is_u0015_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_mixed_observe_take.npt", "U0015");
+}
+
 #[test]
 fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_defer_parent_drop.npt", "U0004");

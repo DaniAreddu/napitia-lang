@@ -1231,3 +1231,135 @@ fn textual_nir_shows_variant_decomposition_on_the_claiming_path() {
         "expected the sibling branch's whole-value drop: {text}"
     );
 }
+
+// -- Cross-stage ownership agreement (`rfcs/0011`, `rfcs/0012`) -------
+//
+// The three stages each reconstruct ownership independently -- the
+// source checker from HIR, `nir::verify` from NIR alone, the interpreter
+// from runtime values -- and that independence is the point: each is a
+// backstop for the others rather than a restatement. What it must never
+// become is disagreement. A program the source checker accepts must not
+// then be rejected downstream for ownership, and the internal `Vxxxx`
+// family must never reach a user who wrote a program `check` accepted.
+
+/// Every `.npt` example, so a newly added one is swept in automatically
+/// rather than needing to be listed here.
+fn every_example() -> Vec<String> {
+    let dir = format!("{}/../examples", env!("CARGO_MANIFEST_DIR"));
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the examples directory must exist")
+        .map(|entry| entry.expect("a readable directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".npt"))
+        .collect();
+    // Sorted so a failure names the same example run to run.
+    names.sort();
+    assert!(
+        names.len() > 20,
+        "the sweep must actually be finding the examples, found {}",
+        names.len()
+    );
+    names
+}
+
+/// A source `check` accepted must never be rejected by `ir` afterwards,
+/// and `ir` must never leak an internal diagnostic.
+///
+/// `ir` is where `nir::verify` runs, so this is the exact seam an
+/// over-strict NIR ownership rule would break: a false positive there
+/// shows up as a program that checks cleanly and then fails to compile,
+/// blaming the user for a defect in the verifier.
+#[test]
+fn no_example_that_checks_cleanly_is_rejected_by_ir() {
+    for name in every_example() {
+        let path = example(&name);
+        if !napitia(&["check", &path]).status.success() {
+            continue;
+        }
+        let ired = napitia(&["ir", &path]);
+        let err = stderr(&ired);
+        assert!(
+            ired.status.success(),
+            "`{name}` passes `check` but `ir` rejected it: {err}"
+        );
+        assert!(
+            !err.contains("V0") && !err.contains("I0"),
+            "`ir` leaked an internal diagnostic for `{name}`, which `check` had accepted: {err}"
+        );
+    }
+}
+
+/// The same seam one stage further on: a source `check` accepted must
+/// never have the *interpreter* reject it for ownership, and must never
+/// see an internal `Vxxxx`/`Ixxxx` code either.
+///
+/// `run` may still legitimately fail -- a `main` that raises is a real
+/// program outcome, not a defect -- so this asserts what must never
+/// happen rather than demanding success: no ownership rejection, no
+/// internal diagnostic, no panic.
+#[test]
+fn no_example_that_checks_cleanly_is_rejected_by_run_for_ownership() {
+    // The vocabulary the ownership backstops use when they refuse
+    // something. Any of these reaching a user whose program `check`
+    // accepted means the stages disagree.
+    let ownership_refusals = [
+        "undestroyed resource",
+        "merely-observing resource handle",
+        "already dropped",
+        "stale resource handle",
+        "still owns an undestroyed resource",
+        "same resource identity",
+    ];
+    for name in every_example() {
+        let path = example(&name);
+        if !napitia(&["check", &path]).status.success() {
+            continue;
+        }
+        let output = napitia(&["run", &path]);
+        let err = stderr(&output);
+        assert!(
+            !err.contains("V0") && !err.contains("I0"),
+            "`run` leaked an internal diagnostic for `{name}`, which `check` had accepted: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`run` panicked on `{name}`, which `check` had accepted: {err}"
+        );
+        for refusal in ownership_refusals {
+            assert!(
+                !err.contains(refusal),
+                "`run` refused `{name}` for ownership ({refusal}), but `check` had accepted it: \
+                 {err}"
+            );
+        }
+    }
+}
+
+/// Whatever a stage decides, it must decide the same way twice, at every
+/// stage, for every example -- the property every `HashMap`/`HashSet` in
+/// the ownership analyses has to preserve.
+#[test]
+fn every_example_produces_identical_output_at_every_stage_across_two_runs() {
+    for name in every_example() {
+        let path = example(&name);
+        for cmd in ["check", "ir", "run"] {
+            let first = napitia(&[cmd, &path]);
+            let second = napitia(&[cmd, &path]);
+            assert_eq!(
+                first.status.code(),
+                second.status.code(),
+                "`{cmd}` on `{name}` was not deterministic in its exit code"
+            );
+            assert_eq!(
+                stderr(&first),
+                stderr(&second),
+                "`{cmd}` on `{name}` was not deterministic on stderr"
+            );
+            assert_eq!(
+                stdout(&first),
+                stdout(&second),
+                "`{cmd}` on `{name}` was not deterministic on stdout"
+            );
+        }
+    }
+}

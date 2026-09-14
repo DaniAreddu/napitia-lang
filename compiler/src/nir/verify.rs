@@ -24040,4 +24040,183 @@ mod structural_ownership {
             "reversing `function.blocks` changed the diagnosis"
         );
     }
+
+    // == deadness is a fact about a path, not about the program =========
+    //
+    // `RESOURCE_ORIGIN_CONFLICT` asks whether *this location*, on a path
+    // reaching this use, denotes an identity that was destroyed on that
+    // same path. It used to ask two separate questions -- "might this
+    // location denote A" and "was A destroyed anywhere" -- and read the
+    // conjunction as though both held on one path.
+
+    /// The source shape that exposed it:
+    ///
+    /// ```text
+    /// mutable f = File { .. };
+    /// if c { f = f } else { drop f; f = File { .. } }
+    /// sink(f)
+    /// ```
+    ///
+    /// The `then` branch leaves `f` denoting the original identity,
+    /// alive. The `else` branch destroys that identity and then gives
+    /// `f` a *different* one. Neither path reaches `sink` with `f`
+    /// denoting something destroyed, so neither is a conflict.
+    fn exclusive_paths(fx: &Fixture, drop_branch_first: bool) -> Vec<BasicBlock> {
+        let mut reassigning = new_file(fx, 5, 6);
+        reassigning.insert(0, drop_of(3));
+        reassigning.push(store_of(0, 6, OwnershipMode::Transfer));
+        // The surviving branch stores the slot's own contents back,
+        // which is a no-op and leaves the original identity in place.
+        let surviving = vec![
+            load_of(4, fx.file.clone(), 0),
+            store_of(0, 4, OwnershipMode::Transfer),
+        ];
+        let (first, second) = if drop_branch_first {
+            (reassigning, surviving)
+        } else {
+            (surviving, reassigning)
+        };
+        let mut entry = vec![alloc_of(0, fx.file.clone())];
+        entry.extend(new_file(fx, 1, 2));
+        entry.push(store_of(0, 2, OwnershipMode::Transfer));
+        entry.push(load_of(3, fx.file.clone(), 0));
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: entry,
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(9),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: first,
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: second,
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![load_of(7, fx.file.clone(), 0), drop_of(7), int(8, 0)],
+                terminator: Terminator::Return(Some(ValueId(8))),
+            },
+        ]
+    }
+
+    #[test]
+    fn identities_reached_on_mutually_exclusive_paths_do_not_conflict() {
+        let mut fx = fixture();
+        let blocks = exclusive_paths(&fx, false);
+        let codes = all_codes(&mut fx, under_test(bool_param_9(), Ty::I64, blocks));
+        assert!(
+            !codes.contains(&codes::RESOURCE_ORIGIN_CONFLICT),
+            "the destroyed identity and the surviving one are reached on different paths, got \
+             {codes:?}"
+        );
+    }
+
+    /// The same program with the two branches swapped, and with the
+    /// block vector reversed: which predecessor is discovered first must
+    /// not decide the answer.
+    #[test]
+    fn exclusive_path_analysis_is_predecessor_and_block_order_independent() {
+        let mut fx = fixture();
+        let straight_blocks = exclusive_paths(&fx, false);
+        let straight = rendered(
+            &mut fx,
+            under_test(bool_param_9(), Ty::I64, straight_blocks),
+        );
+        let swapped_blocks = exclusive_paths(&fx, true);
+        let swapped = rendered(&mut fx, under_test(bool_param_9(), Ty::I64, swapped_blocks));
+        assert_eq!(
+            straight, swapped,
+            "swapping which branch drops changed the diagnosis"
+        );
+        let mut reversed_blocks = exclusive_paths(&fx, false);
+        reversed_blocks.reverse();
+        let reversed = rendered(
+            &mut fx,
+            under_test(bool_param_9(), Ty::I64, reversed_blocks),
+        );
+        assert_eq!(
+            straight, reversed,
+            "reversing `function.blocks` changed the diagnosis"
+        );
+    }
+
+    /// The violation the check exists for, which must survive the fix:
+    /// two locations denoting one identity, one of them destroyed, the
+    /// other used afterwards -- on the *same* path.
+    #[test]
+    fn an_identity_destroyed_through_another_alias_on_the_same_path_still_conflicts() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Transfer));
+        // Two loads of one slot: two locations, one identity.
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.push(load_of(4, fx.file.clone(), 0));
+        instructions.push(drop_of(3));
+        instructions.push(drop_of(4));
+        instructions.push(int(5, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+        );
+        assert!(
+            !codes.is_empty(),
+            "destroying one identity through two aliases is still rejected, got {codes:?}"
+        );
+    }
+
+    /// And the loop shape: an identity destroyed on the back edge must
+    /// still be seen as destroyed on the second iteration.
+    #[test]
+    fn a_destroyed_identity_carried_around_a_back_edge_still_conflicts() {
+        let mut fx = fixture();
+        let mut entry = vec![alloc_of(0, fx.file.clone())];
+        entry.extend(new_file(&fx, 1, 2));
+        entry.push(store_of(0, 2, OwnershipMode::Transfer));
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: entry,
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                // Loads and destroys the slot's contents every
+                // iteration, without ever refilling it.
+                instructions: vec![load_of(3, fx.file.clone(), 0), drop_of(3)],
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(9),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![int(4, 0)],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            },
+        ];
+        let codes = all_codes(&mut fx, under_test(bool_param_9(), Ty::I64, blocks));
+        assert!(
+            !codes.is_empty(),
+            "the second iteration destroys an already-destroyed identity, got {codes:?}"
+        );
+    }
+
+    fn bool_param_9() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(9),
+            ty: Ty::Bool,
+            take: false,
+        }]
+    }
 }

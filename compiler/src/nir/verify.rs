@@ -23236,4 +23236,70 @@ mod structural_ownership {
             "storing a slot's own contents back into it discards nothing, got {codes:?}"
         );
     }
+
+    // -- affinity fails closed on an unresolvable instantiation --------
+    //
+    // `rfcs/0008`/`rfcs/0012` require every affinity query with no
+    // diagnostic channel of its own to answer *affine* when it cannot
+    // build a substitution. The two answers are not symmetric: saying
+    // "affine" for something that is not costs a spurious cleanup
+    // obligation, which some other check reports; saying "not affine"
+    // for something that is drops the obligation entirely and leaks in
+    // silence. `types::checked_substitution` refusing rather than
+    // truncating is what makes the question reach this branch at all.
+
+    /// `Box` declares one type parameter, so `Box[File, i64]` is an
+    /// instantiation no substitution can be built for. The value must
+    /// still be treated as owning something.
+    fn wrong_arity_box(fx: &Fixture) -> Ty {
+        Ty::Applied(BOXY, vec![fx.file.clone(), Ty::I64])
+    }
+
+    #[test]
+    fn a_value_of_an_unresolvable_instantiation_still_owes_cleanup() {
+        let mut fx = fixture();
+        let mut instructions = new_file(&fx, 1, 2);
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: wrong_arity_box(&fx),
+            kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone(), Ty::I64], vec![ValueId(2)]),
+        });
+        // `%3` is never destroyed. If the arity failure had answered
+        // "not affine", it would look like an ordinary copyable value
+        // and this exit would be clean -- with the `File` inside it
+        // leaked and nothing saying so.
+        instructions.push(int(4, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 4)),
+        );
+        assert!(
+            codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "an instantiation no substitution can be built for must fail closed to affine, so \
+             abandoning it is still a leak, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_instantiation_is_still_refused_as_an_observer_transfer() {
+        let mut fx = fixture();
+        // The same type, reached as an ordinary observing parameter:
+        // failing closed must not stop the *ownership* axis working
+        // either, or an observed value of this type could be destroyed.
+        let params = vec![Param {
+            value: ValueId(0),
+            ty: wrong_arity_box(&fx),
+            take: false,
+        }];
+        let instructions = vec![drop_of(0), int(1, 0)];
+        let codes = structural_codes(
+            &mut fx,
+            under_test(params, Ty::I64, single_block(instructions, 1)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "an unresolvable instantiation is affine, so destroying an observed one is still \
+             giving away what the caller owns, got {codes:?}"
+        );
+    }
 }

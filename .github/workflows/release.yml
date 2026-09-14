@@ -1,0 +1,180 @@
+name: Release
+
+# Cutting a release is pushing a `v*` tag. The tag is the trigger and
+# the source of truth for the version, so there is no separate input to
+# get out of step with it -- and `verify` refuses outright if the tag
+# and `compiler/Cargo.toml` disagree.
+#
+# `workflow_dispatch` is here for rehearsal: it builds and uploads the
+# artifacts without publishing anything, so the packaging can be
+# exercised on a branch before a tag exists.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+# Read-only by default. Exactly one job below raises this, and only to
+# what it needs.
+permissions:
+  contents: read
+
+# Never cancel a release midway: a half-finished publish is worse than
+# a slow one, and two runs for the same tag should queue rather than
+# race to create the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A release must not be able to ship something `CI` would have
+  # rejected. This repeats the same three checks rather than trusting
+  # that the tagged commit happened to be green: a tag can be pushed at
+  # any commit, including one that never ran CI at all.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path compiler/Cargo.toml --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path compiler/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path compiler/Cargo.toml --locked
+
+      # The one check CI does not make. A tag that disagrees with the
+      # manifest produces a release whose binaries report a different
+      # version than the release names, which is the kind of thing
+      # nobody notices until they are trying to reproduce a bug.
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' compiler/Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "tag ${GITHUB_REF_NAME} claims version '${tag}'," >&2
+            echo "but compiler/Cargo.toml declares '${manifest}'." >&2
+            exit 1
+          fi
+          echo "tag and manifest agree on ${manifest}"
+
+  build:
+    needs: verify
+    strategy:
+      # One platform failing should not hide whether the others build.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            binary: napitia
+          - os: macos-latest
+            name: macos-arm64
+            binary: napitia
+          - os: windows-latest
+            name: windows-x86_64
+            binary: napitia.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
+        with:
+          toolchain: "1.97.1"
+
+      - name: cargo build --release
+        run: cargo build --manifest-path compiler/Cargo.toml --locked --release
+
+      # Proves the artifact actually runs on the platform it was built
+      # for, rather than only that it linked.
+      - name: Smoke-test the binary
+        shell: bash
+        run: compiler/target/release/${{ matrix.binary }} --version
+
+      - name: Stage the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "compiler/target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          cp LICENSE README.md dist/
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: napitia-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    # Only a real tag publishes. A `workflow_dispatch` run stops after
+    # `build`, having proved the packaging works without creating
+    # anything.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only elevated permission in this file, on the only job that
+    # needs it.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download every platform's artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      - name: Package one archive per platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name="$(basename "$dir")"
+            tar -czf "release/${name}-${GITHUB_REF_NAME}.tar.gz" -C "$dir" .
+          done
+          ( cd release && sha256sum *.tar.gz > SHA256SUMS )
+          ls -l release
+
+      # `gh` is preinstalled on the runner, so this needs no third-party
+      # action and no additional pin. An alpha tag is marked prerelease
+      # so it never becomes the "latest" release people land on.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-alpha*|*-beta*|*-rc*) prerelease="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            ${prerelease} \
+            release/*

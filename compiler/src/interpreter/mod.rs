@@ -2506,31 +2506,18 @@ impl<'a> Interpreter<'a> {
                         // for the static answer: verified NIR can never
                         // reach it.
                         //
-                        // Exempt when the source *is* the destination's
-                        // own current contents -- `session = session`,
-                        // whose source is a `Load` of the very slot
-                        // being written. What it installs is what was
-                        // already there, so nothing is discarded, and
-                        // the verifier exempts the identical shape.
-                        // Canonicalized through `load_origin`, so a
-                        // `Load` result and the slot it read are one
-                        // storage here exactly as they are there.
-                        let stores_its_own_contents = canonical_root(&load_origin, *value)
-                            == canonical_root(&load_origin, *slot);
-                        if let Some(existing) =
-                            values.get(slot).filter(|_| !stores_its_own_contents)
-                        {
-                            let mut seen = HashSet::new();
-                            if self.owns_a_live_resource(existing, &mut seen, 0, &HashSet::new()) {
-                                return Err(invalid(format!(
-                                    "a store would overwrite a slot (%{}) that still owns an \
-                                     undestroyed resource",
-                                    slot.0
-                                )));
-                            }
-                        }
-                        let v = get(&values, value)?;
-                        let v = match mode {
+                        // What the destination is allowed to hold
+                        // depends on which identities this store
+                        // *retires*, and only a transferring store
+                        // retires any. Deciding that by comparing the
+                        // source's canonical root against the slot's --
+                        // as this once did, for both modes alike -- was
+                        // unsound twice over: a matching root does not
+                        // make a historical `Load` the slot's current
+                        // value, and an observing store retires nothing
+                        // no matter where its source came from.
+                        let incoming = get(&values, value)?;
+                        let (installed, retired) = match mode {
                             // A transferring store immediately
                             // invalidates `value`'s own prior identity
                             // (`rfcs/0011`): any later read through that
@@ -2538,16 +2525,49 @@ impl<'a> Interpreter<'a> {
                             // table's own generation check, exactly
                             // like a `take` argument's or a `return`'s
                             // own transfer already does.
-                            crate::nir::OwnershipMode::Transfer => self.transfer_if_resource(v)?,
+                            //
+                            // Planned rather than applied, so the
+                            // overwrite check below can ask the one
+                            // question that matters -- does the
+                            // destination still own anything this
+                            // transfer is *not* taking with it -- while
+                            // the table is still untouched.
+                            crate::nir::OwnershipMode::Transfer => {
+                                self.validate_owned_graph(&incoming)?;
+                                let mut plan = StorePlan::default();
+                                let rebuilt = self.plan_transfer(&incoming, &mut plan, 0)?;
+                                (Some(rebuilt), plan)
+                            }
                             // An observing store never transfers -- and
                             // must never let the slot's own later reads
                             // inherit owning access either, even when
                             // `value` itself is presently an owner: the
                             // slot is always a merely-observing window
-                            // (`rfcs/0011`).
-                            crate::nir::OwnershipMode::Observe => {
-                                self.to_observer_if_resource(v)?
+                            // (`rfcs/0011`). It retires nothing, so an
+                            // owner in the destination is discarded
+                            // outright, its own loaded value included.
+                            crate::nir::OwnershipMode::Observe => (None, StorePlan::default()),
+                        };
+                        if let Some(existing) = values.get(slot) {
+                            let mut seen = HashSet::new();
+                            if self.owns_a_live_resource(existing, &mut seen, 0, &retired.reachable)
+                            {
+                                return Err(invalid(format!(
+                                    "a store would overwrite a slot (%{}) that still owns an \
+                                     undestroyed resource",
+                                    slot.0
+                                )));
                             }
+                        }
+                        // Every fallible step is behind us, so the
+                        // commit and the install can no longer leave the
+                        // table half-moved.
+                        let v = match installed {
+                            Some(rebuilt) => {
+                                self.commit_transfer(&retired);
+                                rebuilt
+                            }
+                            None => self.to_observer_if_resource(incoming)?,
                         };
                         values.insert(*slot, v);
                     }
@@ -10088,6 +10108,7 @@ mod transfer_transaction {
             "and it really is the resource that was passed in"
         );
     }
+
     // -- argument validation against the declared parameter type --------
 
     #[test]

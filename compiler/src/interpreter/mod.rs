@@ -10109,6 +10109,208 @@ mod transfer_transaction {
         );
     }
 
+    // -- self-stores at run time, judged by mode ------------------------
+
+    /// Builds `f(take a: File)` whose body fills `%0`, loads it into
+    /// `%2`, and stores `%2` back into `%0` under `mode`. The two modes
+    /// are the same instruction sequence with one flag changed, which
+    /// is exactly the point: the answers must differ.
+    fn self_store_function(mode: OwnershipMode, tail: Vec<Instruction>) -> Function {
+        let mut instructions = vec![
+            Instruction::Value {
+                result: ValueId(0),
+                ty: file_ty(),
+                kind: ValueKind::Alloc,
+            },
+            Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(1),
+                mode: OwnershipMode::Transfer,
+            },
+            Instruction::Value {
+                result: ValueId(2),
+                ty: file_ty(),
+                kind: ValueKind::Load(ValueId(0)),
+            },
+            Instruction::Store {
+                slot: ValueId(0),
+                value: ValueId(2),
+                mode,
+            },
+        ];
+        instructions.extend(tail);
+        Function {
+            id: ItemId(91),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(1),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_transferring_self_store_is_accepted_at_run_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let function = self_store_function(
+            OwnershipMode::Transfer,
+            vec![
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: file_ty(),
+                    kind: ValueKind::Load(ValueId(0)),
+                },
+                Instruction::Drop { value: ValueId(3) },
+            ],
+        );
+
+        interpreter
+            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .expect("a transferring self-store empties the slot before refilling it");
+        assert_eq!(
+            interpreter.resources.borrow().records[owner.id.0 as usize].status,
+            ResourceStatus::Dropped,
+            "the one resource is destroyed exactly once, through the slot"
+        );
+    }
+
+    /// The same body with `store.observe`, which retires nothing. The
+    /// loaded value keeps the owner, so overwriting the slot discards
+    /// it -- and the runtime must refuse before touching anything, on
+    /// the same terms the verifier reports `V0100`.
+    #[test]
+    fn an_observing_self_store_is_refused_at_run_time_without_mutating() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let function = self_store_function(OwnershipMode::Observe, Vec::new());
+
+        // Two moves are lawful before the refused one, and both happen:
+        // the `take` binding transfers the argument into the frame, and
+        // the body's first `store.transfer` moves it into the slot. The
+        // observing self-store that follows must add none.
+        let before_generation =
+            interpreter.resources.borrow().records[owner.id.0 as usize].generation;
+        let error = interpreter
+            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .map(|_| ())
+            .expect_err("an observing store may not discard the owner the slot holds");
+        assert!(
+            format!("{error:?}").contains("still owns an undestroyed resource"),
+            "the store itself must refuse, got {error:?}"
+        );
+        let after = interpreter.resources.borrow();
+        let record = &after.records[owner.id.0 as usize];
+        assert_eq!(
+            record.generation,
+            before_generation + 2,
+            "exactly the `take` binding and the first store moved it; the refused observing \
+             store moved nothing"
+        );
+        assert_eq!(
+            record.status,
+            ResourceStatus::Alive,
+            "a refused store destroys nothing"
+        );
+    }
+
+    /// A `Load` taken before the slot was emptied and refilled is a
+    /// *historical* value, not the slot's current contents. Storing it
+    /// back must not be waved through just because its canonical root
+    /// matches the destination.
+    #[test]
+    fn a_stale_historical_load_stored_back_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        let function = Function {
+            id: ItemId(92),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: file_ty(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    // Snapshot, then empty the slot and refill it with a
+                    // different resource.
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: file_ty(),
+                        kind: ValueKind::Load(ValueId(0)),
+                    },
+                    Instruction::Drop { value: ValueId(3) },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    // `%3` names the destroyed first resource. Its root
+                    // is still `%0`, and that must not be enough.
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(3),
+                        mode: OwnershipMode::Transfer,
+                    },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        let error = interpreter
+            .call_function(
+                &function,
+                vec![Value::Resource(first), Value::Resource(second)],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("a destroyed historical load may not be stored back");
+        assert!(
+            !format!("{error:?}").contains("still owns an undestroyed resource"),
+            "the stale source itself is the fault, not the destination: {error:?}"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[second.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "the resource the slot legitimately held was not destroyed by the refused store"
+        );
+    }
     // -- argument validation against the declared parameter type --------
 
     #[test]

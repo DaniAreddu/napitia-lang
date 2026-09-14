@@ -213,14 +213,28 @@ jobs:
         with:
           persist-credentials: false
 
+      # The archive is fetched from a GitHub release, which is mutable:
+      # whoever can publish that release can replace the asset, and this
+      # binary then runs against a checkout. Pinning the version alone
+      # does not prevent that -- only pinning the *bytes* does.
+      #
+      # The digest is recorded here, in this repository, under review.
+      # `sha256sum -c` fails the job if the download does not match it,
+      # so a replaced asset stops the workflow instead of executing.
+      # Bumping the version means changing this line too, which is the
+      # point: it becomes a reviewable change rather than a silent one.
       - name: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
         run: |
           set -euo pipefail
-          version=1.7.7
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           curl -fsSL --retry 3 \
-            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" \
-            -o actionlint.tar.gz
-          tar -xzf actionlint.tar.gz actionlint
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}" \
+            -o "${archive}"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "${archive}" actionlint
           ./actionlint -color
 
       # Every action must be pinned to a full commit SHA. A tag is

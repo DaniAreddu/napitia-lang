@@ -108,3 +108,41 @@ feat/* -> alpha -> beta -> prod
 ```
 
 Do not commit directly to `alpha`, `beta`, or `prod`.
+
+## Releasing
+
+A release is cut by pushing a tag. There is no release branch to
+prepare and no separate version input to keep in step: the tag names
+the version, and `.github/workflows/release.yml` refuses to publish if
+it disagrees with `compiler/Cargo.toml`.
+
+1. Land the version bump like any other change — edit `version` in
+   `compiler/Cargo.toml`, commit it as `chore(release): <version>`, and
+   let it flow `feat/* -> alpha -> beta -> prod`.
+2. Tag the commit on `prod` with a leading `v`, matching the manifest
+   exactly:
+
+   ```bash
+   git tag v0.1.8-alpha.1
+   git push origin v0.1.8-alpha.1
+   ```
+
+3. The workflow takes it from there. It re-runs the same three checks
+   this document already requires — a tag can be pushed at any commit,
+   including one CI never saw, so being green is proven rather than
+   assumed — then builds `napitia` for Linux, macOS and Windows,
+   smoke-tests each binary with `--version`, and publishes one archive
+   per platform plus a `SHA256SUMS` file to a GitHub release.
+
+A tag containing `-alpha`, `-beta` or `-rc` is published as a
+prerelease, so an in-progress milestone never becomes the release
+people land on by default. While this project is pre-1.0 that is every
+tag.
+
+To rehearse the packaging without publishing anything, run the workflow
+manually (`workflow_dispatch`) from any branch: everything runs except
+the publishing step, and the built artifacts are attached to the run.
+
+Nothing about a release is manual beyond the tag — deliberately. A
+release built from a working copy is a release nobody else can
+reproduce.

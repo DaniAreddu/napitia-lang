@@ -602,8 +602,11 @@ impl<'a> Interpreter<'a> {
     /// to this one instantiation's concrete shape (`rfcs/0008`).
     /// `None` -- never a partial or empty map -- when `item` has no
     /// recorded layout at all, or when its declared arity disagrees with
-    /// `args`: an unmapped `Ty::Param` would stay symbolic and answer
-    /// "not affine", which is the one direction that leaks.
+    /// `args` (see [`crate::types::checked_substitution`], which owns
+    /// that second rule for every stage): an unmapped `Ty::Param` would
+    /// stay symbolic and answer "not affine", which is the one direction
+    /// that leaks. Resolving the parameter list against this module's
+    /// own layouts is the half that stays here.
     fn type_substitution(
         &self,
         item: ItemId,
@@ -622,10 +625,7 @@ impl<'a> Interpreter<'a> {
                     .find(|(id, _)| *id == item)
                     .map(|(_, v)| v.type_params.iter().map(|(id, _)| *id).collect())
             })?;
-        if params.len() != args.len() {
-            return None;
-        }
-        Some(params.into_iter().zip(args.iter().cloned()).collect())
+        crate::types::checked_substitution(&params, args)
     }
 
     /// `true` iff this *runtime* value is transitively affine -- what

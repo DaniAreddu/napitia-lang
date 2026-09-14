@@ -9973,9 +9973,14 @@ mod transfer_transaction {
             ],
         };
 
-        let error = interpreter
-            .call_function(&caller, vec![Value::Resource(existing)], Vec::new())
-            .expect_err("invoke must not discard the previous owner");
+        let error = match interpreter.call_function(
+            &caller,
+            vec![Value::Resource(existing)],
+            Vec::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invoke must not discard the previous owner"),
+        };
         assert!(
             format!("{error:?}").contains("an invoke would overwrite a slot"),
             "the invoke must refuse before running its callee, got {error:?}"

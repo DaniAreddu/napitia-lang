@@ -2505,7 +2505,21 @@ impl<'a> Interpreter<'a> {
                         // A backstop for malformed NIR, not a substitute
                         // for the static answer: verified NIR can never
                         // reach it.
-                        if let Some(existing) = values.get(slot) {
+                        //
+                        // Exempt when the source *is* the destination's
+                        // own current contents -- `session = session`,
+                        // whose source is a `Load` of the very slot
+                        // being written. What it installs is what was
+                        // already there, so nothing is discarded, and
+                        // the verifier exempts the identical shape.
+                        // Canonicalized through `load_origin`, so a
+                        // `Load` result and the slot it read are one
+                        // storage here exactly as they are there.
+                        let stores_its_own_contents = canonical_root(&load_origin, *value)
+                            == canonical_root(&load_origin, *slot);
+                        if let Some(existing) =
+                            values.get(slot).filter(|_| !stores_its_own_contents)
+                        {
                             let mut seen = HashSet::new();
                             if self.owns_a_live_resource(existing, &mut seen, 0, &HashSet::new()) {
                                 return Err(invalid(format!(
@@ -9994,6 +10008,86 @@ mod transfer_transaction {
         );
     }
 
+    /// The runtime counterpart of the verifier's own exemption: a store
+    /// whose source is a `Load` of the very slot being written --
+    /// `session = session` -- discards nothing, because what it installs
+    /// is what was already there.
+    ///
+    /// The overwrite backstop must not refuse it. `check` and `ir` both
+    /// accept this program, so a false positive here is a stage
+    /// disagreement that reaches the user as a runtime failure on a
+    /// program every earlier stage passed.
+    #[test]
+    fn a_store_of_a_slots_own_contents_is_not_refused_as_an_overwrite() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        // `%0` is the slot; `%2` is a `Load` of it, stored straight
+        // back. `%1` is the incoming owner that fills the slot first.
+        let function = Function {
+            id: ItemId(89),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(1),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: file_ty(),
+                        kind: ValueKind::Alloc,
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: file_ty(),
+                        kind: ValueKind::Load(ValueId(0)),
+                    },
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: file_ty(),
+                        kind: ValueKind::Load(ValueId(0)),
+                    },
+                    Instruction::Drop { value: ValueId(3) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        interpreter
+            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .expect("storing a slot's own contents back into it discards nothing");
+        assert_eq!(
+            interpreter
+                .event_log()
+                .iter()
+                .filter(|event| event.starts_with("drop:"))
+                .count(),
+            1,
+            "the one resource is destroyed exactly once"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[owner.id.0 as usize].status,
+            ResourceStatus::Dropped,
+            "and it really is the resource that was passed in"
+        );
+    }
     // -- argument validation against the declared parameter type --------
 
     #[test]

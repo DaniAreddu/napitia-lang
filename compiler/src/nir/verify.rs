@@ -7077,7 +7077,23 @@ fn verify_structural_places(
                     // predecessor, and a `MaybeOwned` join (owner on one
                     // path, observer on another) is conservatively
                     // refused too rather than assumed harmless.
-                    if is_affine(*slot) && resolve_place_state(&facts, &destination).may_own() {
+                    //
+                    // Unless the source *is* the destination's own
+                    // current contents -- `session = session`, whose
+                    // source lowers to a `Load` of the very slot being
+                    // written. Consuming it empties the slot a moment
+                    // before the store refills it, so nothing is
+                    // discarded; this check runs before that consumption
+                    // and would otherwise see a still-owning slot and
+                    // report a leak that cannot happen. Compared through
+                    // `origin`, so a `Load` result and the slot it read
+                    // are recognized as the one place they are, exactly
+                    // as everywhere else in this pass.
+                    let stores_its_own_contents = origin(*value) == origin(*slot);
+                    if is_affine(*slot)
+                        && !stores_its_own_contents
+                        && resolve_place_state(&facts, &destination).may_own()
+                    {
                         violations.push(OwnershipViolation::OverwriteOwnedSlot(*slot));
                         continue;
                     }
@@ -23193,5 +23209,39 @@ mod structural_ownership {
                 "case {case}: reversing `function.blocks` changed the result"
             );
         }
+    }
+
+    /// `session = session` in source: the store's own source is a
+    /// `Load` of the very slot it writes, so consuming it empties the
+    /// slot a moment before the store refills it and nothing is
+    /// discarded at all.
+    ///
+    /// The overwrite check reads the destination's state *before* the
+    /// source is consumed, so without an explicit exemption it sees a
+    /// slot that still owns a value and reports a leak that cannot
+    /// happen. `check` accepts this program, so a false positive here
+    /// surfaces to the user as an internal `V0100` from `ir` -- exactly
+    /// the cross-stage disagreement the whole-slot check exists to
+    /// prevent.
+    #[test]
+    fn a_store_whose_source_is_the_slots_own_contents_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        // `%4` *is* what the slot holds; storing it back is a no-op.
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.push(load_of(5, fx.box_file.clone(), 0));
+        instructions.push(drop_of(5));
+        instructions.push(int(6, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 6)),
+        );
+        assert!(
+            codes.is_empty(),
+            "storing a slot's own contents back into it discards nothing, got {codes:?}"
+        );
     }
 }

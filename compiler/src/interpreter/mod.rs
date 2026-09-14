@@ -2536,6 +2536,27 @@ impl<'a> Interpreter<'a> {
             ));
         }
 
+        // The one place a call is recorded, and it means exactly one
+        // thing: this callee's frame was successfully entered, with
+        // every boundary check already passed -- arity, capability
+        // evidence, generic instantiation, argument types, handle
+        // liveness, duplicate transfers and observe/take aliasing.
+        //
+        // It used to be written at the `ValueKind::Call` site *before*
+        // any of that ran, so a call rejected at the boundary still left
+        // a record of having happened. Emitting it here instead makes
+        // every entry path -- `Call`, `Invoke`, a protocol method, the
+        // public API -- agree without each having to remember to.
+        //
+        // Deliberately not a claim about the body: a runtime error
+        // *after* this point leaves the event standing, because the
+        // frame really was entered and whatever it did before failing
+        // really did happen.
+        #[cfg(test)]
+        self.event_log
+            .borrow_mut()
+            .push(format!("call:{}", function.id.0));
+
         loop {
             let block = function
                 .blocks
@@ -3017,8 +3038,6 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .map(|e| resolve_evidence(current_evidence, e))
                     .collect::<Result<Vec<_>, _>>()?;
-                #[cfg(test)]
-                self.event_log.borrow_mut().push(format!("call:{}", item.0));
                 // An ordinary `Call` never targets a fallible function
                 // (`rfcs/0010`) -- that always lowers to `Invoke` instead
                 // (the verifier's job to guarantee). A `Raised` outcome
@@ -4343,7 +4362,16 @@ mod tests {
         assert_eq!(outcome, Ok(Value::Int(0)));
         assert_eq!(
             log,
-            vec!["call:inspect", "drop:1", "call:inspect", "drop:0"],
+            // `call:main` leads every log now: a call event means "this
+            // frame was entered after its boundary preflight passed", and
+            // the entry frame qualifies exactly as a nested one does.
+            vec![
+                "call:main",
+                "call:inspect",
+                "drop:1",
+                "call:inspect",
+                "drop:0"
+            ],
             "expected declaration-reversed interleaving of defers and drops, \
              not defers and drops running as two separate groups"
         );
@@ -4369,7 +4397,7 @@ mod tests {
         assert_eq!(outcome, Ok(Value::Int(0)));
         assert_eq!(
             log,
-            vec!["call:consume", "drop:0"],
+            vec!["call:main", "call:consume", "drop:0"],
             "consume's own take parameter must be dropped exactly once, inside \
              consume itself, with no separate drop in the caller's own frame"
         );
@@ -11058,6 +11086,233 @@ mod transfer_transaction {
             interpreter.resources.borrow().records[owner.id.0 as usize].status,
             ResourceStatus::Alive,
             "and nothing unrelated was touched either"
+        );
+    }
+
+    // -- a call event means the frame was entered -----------------------
+    //
+    // Exercised through the real `ValueKind::Call` evaluation path, not
+    // by invoking `call_function` directly: the defect being guarded
+    // against was an event written at the *call site* before any
+    // boundary check ran, which a direct call would never have shown.
+
+    /// A caller whose one instruction is `call @callee(args...)`, so
+    /// running it drives the same path a compiled program does.
+    fn caller_of(callee: ItemId, args: Vec<ValueId>, params: Vec<Param>) -> Function {
+        Function {
+            id: ItemId(120),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(50),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(callee, Vec::new(), args, Vec::new()),
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    /// Every event the run produced *after* the caller's own entry, so
+    /// the assertions are about the nested call rather than about the
+    /// frame that made it.
+    fn nested_events(interpreter: &Interpreter<'_>) -> Vec<String> {
+        interpreter
+            .event_log()
+            .into_iter()
+            .skip_while(|event| event != "call:120")
+            .skip(1)
+            .collect()
+    }
+
+    #[test]
+    fn a_call_rejected_for_arity_records_no_call_event() {
+        let mut module = module();
+        module.functions.push(two_take_files());
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        // `two_take_files` wants two arguments; this call site passes one.
+        let caller = caller_of(
+            TWO_TAKES,
+            vec![ValueId(1)],
+            vec![Param {
+                value: ValueId(1),
+                ty: file_ty(),
+                take: false,
+            }],
+        );
+
+        interpreter
+            .call_function(&caller, &[], vec![Value::Resource(owner)], Vec::new())
+            .map(|_| ())
+            .expect_err("the callee takes two arguments");
+        assert!(
+            nested_events(&interpreter).is_empty(),
+            "a call refused at the boundary never happened: {:?}",
+            interpreter.event_log()
+        );
+    }
+
+    #[test]
+    fn a_call_rejected_for_a_mixed_alias_records_no_call_event() {
+        let mut module = module();
+        module
+            .functions
+            .push(observe_and_take_callee(file_ty(), file_ty(), false, false));
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let caller = caller_of(
+            ItemId(93),
+            vec![ValueId(1), ValueId(1)],
+            vec![Param {
+                value: ValueId(1),
+                ty: file_ty(),
+                take: false,
+            }],
+        );
+
+        interpreter
+            .call_function(&caller, &[], vec![Value::Resource(owner)], Vec::new())
+            .map(|_| ())
+            .expect_err("one resource may not be observed and taken by one call");
+        assert!(
+            nested_events(&interpreter).is_empty(),
+            "an aliasing call never entered its callee: {:?}",
+            interpreter.event_log()
+        );
+    }
+
+    /// Capability evidence is checked at the callee's own boundary, so
+    /// a call site supplying none for a callee that requires one is
+    /// rejected there -- after the caller's frame was entered, and
+    /// before the callee's is.
+    ///
+    /// Deliberately not a stale-handle case: a stale argument is
+    /// refused while binding the *caller's* parameters, so it never
+    /// reaches the nested boundary and would prove nothing about where
+    /// the event is written. Handle liveness at a nested boundary is
+    /// covered by the transaction tests instead.
+    #[test]
+    fn a_call_rejected_for_missing_capability_evidence_records_no_call_event() {
+        const NEEDS_EVIDENCE: ItemId = ItemId(121);
+        let mut module = module();
+        module.functions.push(Function {
+            id: NEEDS_EVIDENCE,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: vec![crate::types::CapabilityRequirement {
+                protocol: ItemId(200),
+                arguments: Vec::new(),
+            }],
+            params: Vec::new(),
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        });
+        let interpreter = Interpreter::new(&module);
+        let caller = caller_of(NEEDS_EVIDENCE, Vec::new(), Vec::new());
+
+        interpreter
+            .call_function(&caller, &[], Vec::new(), Vec::new())
+            .map(|_| ())
+            .expect_err("a callee declaring a requirement needs evidence for it");
+        assert!(
+            nested_events(&interpreter).is_empty(),
+            "a call refused for missing evidence never entered the callee: {:?}",
+            interpreter.event_log()
+        );
+    }
+
+    #[test]
+    fn a_call_rejected_for_a_generic_mismatch_records_no_call_event() {
+        let mut module = module();
+        module.functions.push(same_type_twice());
+        let interpreter = Interpreter::new(&module);
+        // `same_type_twice` is generic, and the call site supplies no
+        // type arguments -- refused before the frame is entered.
+        let caller = caller_of(
+            ItemId(97),
+            vec![ValueId(1), ValueId(2)],
+            vec![
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+            ],
+        );
+
+        interpreter
+            .call_function(
+                &caller,
+                &[],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("a generic callee needs an instantiation");
+        assert!(
+            nested_events(&interpreter).is_empty(),
+            "a generic mismatch never entered the callee: {:?}",
+            interpreter.event_log()
+        );
+    }
+
+    #[test]
+    fn a_successful_nested_call_records_exactly_one_call_event() {
+        let mut module = module();
+        module.functions.push(two_take_files());
+        let interpreter = Interpreter::new(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        let caller = caller_of(
+            TWO_TAKES,
+            vec![ValueId(1), ValueId(2)],
+            vec![
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+        );
+
+        interpreter
+            .call_function(
+                &caller,
+                &[],
+                vec![Value::Resource(first), Value::Resource(second)],
+                Vec::new(),
+            )
+            .expect("two distinct live owners are a legal pair");
+        assert_eq!(
+            nested_events(&interpreter)
+                .iter()
+                .filter(|event| event.starts_with("call:"))
+                .count(),
+            1,
+            "entering the callee once records exactly one event: {:?}",
+            interpreter.event_log()
         );
     }
     // -- argument validation against the declared parameter type --------

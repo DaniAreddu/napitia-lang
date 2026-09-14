@@ -649,6 +649,31 @@ the resource table, every generation and status, and the event log
 exactly as it found them, and repeating it reports a byte-identical
 error.
 
+### What a call event means
+
+The execution log's `call:<id>` entry means one thing: *this callee's
+frame was entered, after its boundary preflight passed*. It is written
+in one place, inside the call boundary itself, once arity, capability
+evidence, the generic instantiation, every argument's type, handle
+liveness, duplicate transfers and observe/take aliasing have all been
+accepted and the entry block is known to exist.
+
+Writing it at the call *site* instead -- which is where it used to be --
+made it a record of having attempted a call rather than having made
+one. That mattered more than it sounds: a call refused at the boundary
+deliberately changes nothing else, so a spurious event was the only
+trace it left, and the log is what the tests read to decide whether a
+rejection was clean.
+
+It is deliberately *not* a claim about the callee's body. A runtime
+error after the frame is entered leaves the event standing, because the
+frame really was entered and whatever ran before the failure really did
+run. Retracting it would be claiming to roll back arbitrary execution,
+which nothing here does.
+
+One consequence worth stating: the entry frame is entered on the same
+terms as any nested one, so `call:main` leads every log.
+
 ### Mixed-container traversal
 
 Because those two storage disciplines differ, a place walking a chain

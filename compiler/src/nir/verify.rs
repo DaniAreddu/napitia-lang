@@ -23353,4 +23353,188 @@ mod structural_ownership {
              giving away what the caller owns, got {codes:?}"
         );
     }
+
+    // == self-stores are judged by mode, never by origin equality ======
+    //
+    // Comparing `origin(value)` with `origin(slot)` says only that a
+    // `Load` came from this slot at some point. It does not say the
+    // load is still what the slot holds, and -- the part that made an
+    // exemption written that way unsound -- it says nothing about
+    // whether this store consumes it. Only a *transferring* store
+    // empties the slot before refilling it; an observing one leaves the
+    // owner sitting in the loaded value while overwriting the slot's
+    // own obligation away.
+
+    /// `session = session`: the source is a `Load` of the slot and the
+    /// store consumes it, so the slot is empty by the time the write
+    /// lands. Legal, and it needs no special case -- only that the
+    /// destination is judged *after* the consumption.
+    #[test]
+    fn a_transferring_store_of_the_slots_own_contents_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.push(load_of(5, fx.box_file.clone(), 0));
+        instructions.push(drop_of(5));
+        instructions.push(int(6, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 6)),
+        );
+        assert!(
+            codes.is_empty(),
+            "a transferring store empties the slot before refilling it, so it discards nothing, \
+             got {codes:?}"
+        );
+    }
+
+    /// The same shape with `store.observe`, which is *not* legal. The
+    /// store consumes nothing, so the loaded value keeps the owner while
+    /// the slot's own obligation is downgraded to an observation --
+    /// the owner then belongs to nobody the verifier is still watching.
+    ///
+    /// This is the case a mode-independent same-origin exemption let
+    /// through in complete silence.
+    #[test]
+    fn an_observing_store_of_the_slots_own_contents_is_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(store_of(0, 4, OwnershipMode::Observe));
+        instructions.push(int(5, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "an observing store consumes nothing, so the owner the slot held is discarded, got \
+             {codes:?}"
+        );
+    }
+
+    /// An unrelated value written over a live owner stays rejected --
+    /// the ordering change must not have turned the whole-slot check
+    /// off for the case it exists for.
+    #[test]
+    fn a_transferring_store_of_an_unrelated_value_over_an_owner_is_still_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        instructions.extend(boxed_file(&fx, 6));
+        instructions.push(store_of(0, 6, OwnershipMode::Transfer));
+        instructions.push(load_of(7, fx.box_file.clone(), 0));
+        instructions.push(drop_of(7));
+        instructions.push(int(8, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 8)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "consuming an unrelated source leaves the destination owning, got {codes:?}"
+        );
+    }
+
+    /// A nested aggregate reached through the slot: the transferring
+    /// self-store still empties before it writes, at any depth.
+    #[test]
+    fn a_transferring_self_store_of_a_nested_record_is_accepted() {
+        let mut fx = fixture();
+        let outer = Ty::Applied(BOXY, vec![fx.box_file.clone()]);
+        let mut instructions = vec![alloc_of(0, outer.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(new_outer_box(&fx, 3, 4));
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.push(load_of(5, outer.clone(), 0));
+        instructions.push(store_of(0, 5, OwnershipMode::Transfer));
+        instructions.push(load_of(6, outer, 0));
+        instructions.push(drop_of(6));
+        instructions.push(int(7, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 7)),
+        );
+        assert!(codes.is_empty(), "nesting changes nothing, got {codes:?}");
+    }
+
+    /// And the variant counterpart, for the same reason.
+    #[test]
+    fn a_transferring_self_store_of_a_variant_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.holder.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(2)]),
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: fx.holder.clone(),
+            kind: ValueKind::VariantCreate {
+                variant: HOLDER,
+                case: 0,
+                type_args: Vec::new(),
+                payload: vec![ValueId(3)],
+            },
+        });
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.push(load_of(5, fx.holder.clone(), 0));
+        instructions.push(store_of(0, 5, OwnershipMode::Transfer));
+        instructions.push(load_of(6, fx.holder.clone(), 0));
+        instructions.push(drop_of(6));
+        instructions.push(int(7, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 7)),
+        );
+        assert!(
+            codes.is_empty(),
+            "a variant behaves the same, got {codes:?}"
+        );
+    }
+
+    /// The diagnosis must not depend on where the blocks sit.
+    #[test]
+    fn the_observing_self_store_diagnosis_is_permutation_independent() {
+        let mut fx = fixture();
+        let build = |fx: &Fixture| -> Vec<BasicBlock> {
+            let mut entry = vec![alloc_of(0, fx.box_file.clone())];
+            entry.extend(boxed_file(fx, 3));
+            entry.push(store_of(0, 3, OwnershipMode::Transfer));
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: entry,
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![
+                        load_of(4, fx.box_file.clone(), 0),
+                        store_of(0, 4, OwnershipMode::Observe),
+                        int(5, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ]
+        };
+        let straight_blocks = build(&fx);
+        let straight = rendered(&mut fx, under_test(Vec::new(), Ty::I64, straight_blocks));
+        assert!(!straight.is_empty(), "the expectation is not vacuous");
+        let mut reversed_blocks = build(&fx);
+        reversed_blocks.reverse();
+        let reversed = rendered(&mut fx, under_test(Vec::new(), Ty::I64, reversed_blocks));
+        assert_eq!(
+            straight, reversed,
+            "reversing `function.blocks` changed the diagnosis"
+        );
+    }
 }

@@ -2412,6 +2412,145 @@ impl<'a> FlowChecker<'a> {
     /// place (a freshly constructed temporary) aliases nothing another
     /// argument can name and is skipped -- as is a non-affine one,
     /// which has no ownership to conflict over.
+    /// Every structural place one call argument's value could have come
+    /// from, unioned across every branch that could have produced it
+    /// (`rfcs/0011`, `rfcs/0012`). `false` means this expression's
+    /// ownership could not be accounted for at all, which the caller
+    /// must treat as a refusal rather than as "aliases nothing".
+    ///
+    /// A bare `resolve_place` is not enough here. It answers `None` for
+    /// every compound expression, and `None` was being read as "this
+    /// argument names no place" -- so
+    /// `mixed(if c { file } else { file }, file)` passed the same
+    /// resource to an observing and a `take` parameter with nothing
+    /// noticing. The value an `if` produces is one of its branches'
+    /// values, so the places it may name are the union of theirs.
+    ///
+    /// Two classes of expression are deliberately *not* failures:
+    ///
+    /// A **fresh** value -- a construction, a call's return, a literal
+    /// -- provably aliases no existing place, because it did not exist
+    /// before this call was evaluated. It contributes nothing, which is
+    /// correct rather than merely convenient.
+    ///
+    /// A **non-affine** subexpression cannot carry ownership at all, so
+    /// a branch whose value is not affine contributes nothing either.
+    ///
+    /// Anything else affine reaching the fallback is something this
+    /// analysis does not model, and is reported.
+    fn collect_argument_places(
+        &self,
+        expr: &HirExpr,
+        out: &mut Vec<Place<LocalId>>,
+        depth: usize,
+    ) -> bool {
+        // A HIR expression tree is finite, but the bound keeps a
+        // pathological nesting from exhausting the stack rather than
+        // producing a diagnostic.
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return false;
+        }
+        // Whatever this expression is, if its own value cannot own
+        // anything then it cannot alias anything either.
+        if !self.is_affine_expr(expr.id()) {
+            return true;
+        }
+        match expr {
+            HirExpr::Local { .. } | HirExpr::Field { .. } => match self.resolve_place(expr) {
+                Some(place) => {
+                    out.push(place);
+                    true
+                }
+                // A field chain rooted in something that is not a stable
+                // place (a temporary) still has to be walked: the base
+                // may itself be a compound expression forwarding real
+                // places.
+                None => match expr {
+                    HirExpr::Field { base, .. } => {
+                        self.collect_argument_places(base, out, depth + 1)
+                    }
+                    _ => false,
+                },
+            },
+            // The value is one of the branches' values, so the places it
+            // may name are the union of theirs. The condition is not
+            // part of the value.
+            HirExpr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let mut ok = self.collect_block_places(then_branch, out, depth + 1);
+                match else_branch {
+                    Some(HirElse::Block(block)) => {
+                        ok &= self.collect_block_places(block, out, depth + 1);
+                    }
+                    Some(HirElse::If(nested)) => {
+                        ok &= self.collect_argument_places(nested, out, depth + 1);
+                    }
+                    // No `else` at all: an affine `if` with no else has
+                    // no value on the missing path, which typeck already
+                    // rejects. Nothing to union.
+                    None => {}
+                }
+                ok
+            }
+            HirExpr::Match { arms, .. } => {
+                let mut ok = true;
+                for arm in arms {
+                    // Deliberately not short-circuiting: every arm is
+                    // walked so the union is complete, rather than
+                    // stopping at the first one this analysis cannot
+                    // follow.
+                    ok &= self.collect_arm_places(&arm.body, out, depth + 1);
+                }
+                ok
+            }
+            HirExpr::Handle { operand, arms, .. } => {
+                let mut ok = self.collect_argument_places(operand, out, depth + 1);
+                for arm in arms {
+                    ok &= self.collect_arm_places(&arm.body, out, depth + 1);
+                }
+                ok
+            }
+            // A block's value is its tail expression's value; its
+            // statements produce no value for this call to take.
+            HirExpr::Block(block) => self.collect_block_places(block, out, depth + 1),
+            // Freshly produced values. None of these can name a place
+            // that existed before this call, so they alias nothing.
+            HirExpr::RecordLiteral { .. } | HirExpr::Call { .. } => true,
+            // Everything else affine is unmodelled, and saying so is the
+            // whole point of the return value.
+            _ => false,
+        }
+    }
+
+    /// A block's own value is its tail's; an absent tail produces no
+    /// value and so names no place.
+    fn collect_block_places(
+        &self,
+        block: &HirBlock,
+        out: &mut Vec<Place<LocalId>>,
+        depth: usize,
+    ) -> bool {
+        match &block.tail {
+            Some(tail) => self.collect_argument_places(tail, out, depth),
+            None => true,
+        }
+    }
+
+    fn collect_arm_places(
+        &self,
+        body: &HirMatchArmBody,
+        out: &mut Vec<Place<LocalId>>,
+        depth: usize,
+    ) -> bool {
+        match body {
+            HirMatchArmBody::Expr(expr) => self.collect_argument_places(expr, out, depth),
+            HirMatchArmBody::Block(block) => self.collect_block_places(block, out, depth),
+        }
+    }
+
     fn reject_mixed_observe_take_aliases(
         &mut self,
         args: &[HirExpr],
@@ -2421,23 +2560,49 @@ impl<'a> FlowChecker<'a> {
     ) {
         let mut observed: Vec<(usize, Place<LocalId>)> = Vec::new();
         let mut taken: Vec<(usize, Place<LocalId>)> = Vec::new();
+        let mut opaque: Vec<usize> = Vec::new();
         for (index, arg) in args.iter().enumerate() {
             if !self.is_affine_expr(arg.id()) {
                 continue;
             }
-            let Some(place) = self.resolve_place(arg) else {
-                continue;
-            };
             let takes = is_variant_construct
                 || take_flags
                     .and_then(|flags| flags.get(index))
                     .copied()
                     .unwrap_or(false);
-            if takes {
-                taken.push((index, place));
-            } else {
-                observed.push((index, place));
+            let mut places = Vec::new();
+            if !self.collect_argument_places(arg, &mut places, 0) {
+                // An affine argument whose provenance this pass cannot
+                // account for is not evidence that it aliases nothing.
+                // Recorded and reported rather than skipped.
+                opaque.push(index);
+                continue;
             }
+            for place in places {
+                if takes {
+                    taken.push((index, place));
+                } else {
+                    observed.push((index, place));
+                }
+            }
+        }
+        // Fail closed, and before the overlap scan: if an argument's
+        // ownership could not be established at all, no conclusion about
+        // the *other* arguments is worth reporting either.
+        if let Some(index) = opaque.first()
+            && (!observed.is_empty() || !taken.is_empty() || opaque.len() > 1)
+        {
+            self.diagnose(
+                MIXED_OBSERVE_TAKE_ALIAS,
+                span,
+                format!(
+                    "argument {index} of this call is an affine expression whose ownership this \
+                     checker cannot follow, so it cannot be proven not to name the same resource \
+                     as another argument of the same call"
+                ),
+                "ownership of this argument cannot be established",
+            );
+            return;
         }
         // Scanned in argument order on both axes, so the pair reported
         // is a function of the call alone.

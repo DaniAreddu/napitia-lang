@@ -26,16 +26,38 @@ requires `rustc >= 1.85`); this exact toolchain is pinned in
 automatically. `compiler/Cargo.toml` deliberately leaves `rust-version`
 unset — it would claim a verified minimum supported Rust version, and
 none has been established. CI (`.github/workflows/ci.yml`) installs the
-same pinned toolchain and runs the same three checks on every branch
-push, every pull request, and on manual `workflow_dispatch`.
+same pinned toolchain and runs these same checks on every branch push,
+every pull request, and on manual `workflow_dispatch`.
 
 All contributions must pass, from the repository root:
 
 ```bash
-cargo fmt --manifest-path compiler/Cargo.toml --check
-cargo clippy --manifest-path compiler/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path compiler/Cargo.toml
+cargo fmt --manifest-path compiler/Cargo.toml --all --check
+
+cargo clippy --manifest-path compiler/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+
+cargo test --manifest-path compiler/Cargo.toml \
+  --all-targets --all-features --locked
+
+cargo test --manifest-path compiler/Cargo.toml \
+  --release --all-targets --all-features --locked
+
+RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path compiler/Cargo.toml \
+  --all-features --no-deps --locked
 ```
+
+`--locked` throughout, so a check never quietly resolves a dependency
+graph different from the committed `Cargo.lock`.
+
+The release run is not a duplicate of the debug one. `debug_assert!`
+compiles out, overflow checks change, and optimizations reorder work, so
+a suite that passes in debug genuinely can fail there — this one has.
+
+CI additionally runs the test suite on Windows and macOS, audits the
+lockfile against RustSec advisories, and lints the workflows
+themselves; none of those need to be run locally to open a pull
+request.
 
 Do not silence Clippy with a blanket `#[allow(...)]` to make a warning
 disappear. If a lint genuinely does not apply, suppress it at the narrowest

@@ -2418,8 +2418,7 @@ impl<'a> Interpreter<'a> {
         // Preserve non-take arguments until every take argument has
         // been planned. Observing aliases can then be prepared against
         // the exact generations installed by the shared commit.
-        let mut bindings: Vec<(ValueId, Value, bool)> =
-            Vec::with_capacity(function.params.len());
+        let mut bindings: Vec<(ValueId, Value, bool)> = Vec::with_capacity(function.params.len());
         for (param, arg) in function.params.iter().zip(args) {
             self.validate_argument(&arg, &param.ty)?;
             let bound = if param.take {
@@ -8097,23 +8096,6 @@ mod decomposition_claims {
     }
 }
 
-/// The declaration a position requires of a record, variant or resource
-/// standing in it (`rfcs/0008`, `rfcs/0012`).
-///
-/// `None` only for the root of a graph, which declares its own identity.
-/// A position whose declared type is a primitive requires *no*
-/// aggregate at all, so one turning up there is refused outright --
-/// which is exactly the shape that hid a live resource inside an `i64`
-/// field. Deliberately not consulted for a primitive value, so a plain
-/// integer in an `i64` field never asks for a declaration.
-/// Whether `ty` names a concrete type all the way down, with no
-/// still-symbolic generic parameter anywhere inside it (`rfcs/0008`).
-///
-/// `Applied`'s own arguments are part of its identity and are compared
-/// structurally, so a `Box[T]` is no more checkable against a runtime
-/// `Box[File]` than a bare `T` is: an unresolved parameter at *any*
-/// depth means the position has no concrete type to check against at
-/// this boundary.
 /// Matches a partially symbolic type pattern against a concrete
 /// runtime type. Repeated parameters must resolve consistently.
 fn type_pattern_matches(
@@ -8138,15 +8120,14 @@ fn type_pattern_matches(
                 && expected_args
                     .iter()
                     .zip(actual_args.iter())
-                    .all(|(expected, actual)| {
-                        type_pattern_matches(expected, actual, bindings)
-                    })
+                    .all(|(expected, actual)| type_pattern_matches(expected, actual, bindings))
         }
         Ty::Var(_) | Ty::Never | Ty::Error => false,
         _ => expected == actual,
     }
 }
 
+/// Whether a runtime type argument is concrete all the way down.
 fn fully_resolved(ty: &Ty) -> bool {
     match ty {
         Ty::Param(..) | Ty::Var(_) | Ty::Never | Ty::Error => false,
@@ -8155,6 +8136,8 @@ fn fully_resolved(ty: &Ty) -> bool {
     }
 }
 
+/// The declaration a position requires of a record, variant or resource
+/// standing in it. None is reserved for a root that declares itself.
 fn required_declaration(
     expected: Option<&Ty>,
 ) -> Result<Option<(ItemId, Vec<Ty>)>, InterpreterError> {
@@ -9946,11 +9929,7 @@ mod transfer_transaction {
                     Instruction::Value {
                         result: ValueId(1),
                         ty: file_ty(),
-                        kind: ValueKind::RecordCreate(
-                            FILE,
-                            Vec::new(),
-                            vec![ValueId(0)],
-                        ),
+                        kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
                     },
                 ],
                 terminator: Terminator::Return(Some(ValueId(1))),
@@ -10119,7 +10098,6 @@ mod transfer_transaction {
         assert!(interpreter.resources.borrow().observe(owner).is_ok());
     }
 }
-
 
 /// The verifier and the interpreter must agree about who owns what.
 ///

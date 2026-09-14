@@ -1670,9 +1670,85 @@ impl<'a> Interpreter<'a> {
     /// this one: two observations of the same resource are perfectly
     /// legal.
     fn validate_argument(&self, value: &Value, declared: &Ty) -> Result<(), InterpreterError> {
-        let expected = fully_resolved(declared).then_some(declared);
+        // First prove that the value is internally consistent. Then
+        // compare its declaration with the parameter type pattern. This
+        // lets a symbolic parameter act as a local wildcard without
+        // erasing a concrete surrounding constructor.
         let mut seen = HashSet::new();
-        self.validate_value_against_ty(value, expected, &mut seen, 0)
+        self.validate_value_against_ty(value, None, &mut seen, 0)?;
+        if self.argument_matches_declared(value, declared)? {
+            Ok(())
+        } else {
+            Err(invalid(
+                "a runtime argument disagrees with the concrete part of its parameter's declared type",
+            ))
+        }
+    }
+
+    /// Matches an argument against a possibly-partial generic type.
+    /// A type parameter is a wildcard only at its own position.
+    fn argument_matches_declared(
+        &self,
+        value: &Value,
+        declared: &Ty,
+    ) -> Result<bool, InterpreterError> {
+        match declared {
+            Ty::Param(..) => Ok(true),
+            Ty::Var(_) | Ty::Never | Ty::Error => Err(invalid(
+                "a runtime argument fills a parameter whose declared type was never resolved",
+            )),
+            Ty::Applied(expected_item, expected_args) => {
+                let (actual_item, actual_args) = match value {
+                    Value::Record {
+                        item, type_args, ..
+                    }
+                    | Value::Variant {
+                        item, type_args, ..
+                    } => (*item, type_args.clone()),
+                    Value::Resource(handle) => {
+                        let table = self.resources.borrow();
+                        (table.record(*handle)?.item, Vec::new())
+                    }
+                    _ => return Ok(false),
+                };
+                if actual_item != *expected_item
+                    || actual_args.len() != expected_args.len()
+                    || !actual_args.iter().all(fully_resolved)
+                {
+                    return Ok(false);
+                }
+                let mut bindings = HashMap::new();
+                Ok(expected_args
+                    .iter()
+                    .zip(actual_args.iter())
+                    .all(|(expected, actual)| {
+                        type_pattern_matches(expected, actual, &mut bindings)
+                    }))
+            }
+            Ty::Named(expected_item, _) => {
+                let actual_item = match value {
+                    Value::Record { item, .. } | Value::Variant { item, .. } => *item,
+                    Value::Resource(handle) => self.resources.borrow().record(*handle)?.item,
+                    _ => return Ok(false),
+                };
+                Ok(actual_item == *expected_item)
+            }
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::Isize
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::Usize => Ok(matches!(value, Value::Int(_))),
+            Ty::F32 | Ty::F64 => Ok(matches!(value, Value::Float(_))),
+            Ty::Bool => Ok(matches!(value, Value::Bool(_))),
+            Ty::Char => Ok(matches!(value, Value::Char(_))),
+            Ty::Str => Ok(matches!(value, Value::Str(_))),
+            Ty::Unit => Ok(matches!(value, Value::Unit)),
+        }
     }
 
     /// Recursively destroys `value` (`rfcs/0012`): a `resource` handle
@@ -2009,7 +2085,7 @@ impl<'a> Interpreter<'a> {
     /// parameter binding, and every `store.observe`, goes through this
     /// rather than binding the caller's own handle as-is.
     fn to_observer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
-        self.to_observing_view(value, 0)
+        self.to_observing_view(value, &StorePlan::default(), 0)
     }
 
     /// Rebuilds `value` as an observing *view* of itself: every resource
@@ -2024,16 +2100,30 @@ impl<'a> Interpreter<'a> {
     ///
     /// Nothing is mutated: a new value is built, and the caller's own
     /// keeps its owning handles.
-    fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+    fn to_observing_view(
+        &self,
+        value: Value,
+        plan: &StorePlan,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
         match value {
-            Value::Resource(handle) => Ok(Value::Resource(
-                self.resources.borrow().to_observer(handle)?,
-            )),
+            Value::Resource(handle) => {
+                // Validate against the current table first. When another
+                // argument transfers the same identity, prepare this
+                // observer with the generation installed by that commit.
+                let mut observer = self.resources.borrow().to_observer(handle)?;
+                if let Some((_, generation)) =
+                    plan.transitions.iter().find(|(id, _)| *id == handle.id)
+                {
+                    observer.generation = *generation;
+                }
+                Ok(Value::Resource(observer))
+            }
             Value::Record {
                 item,
                 type_args,
@@ -2043,7 +2133,7 @@ impl<'a> Interpreter<'a> {
                 type_args,
                 fields: fields
                     .into_iter()
-                    .map(|field| self.to_observing_view(field, depth + 1))
+                    .map(|field| self.to_observing_view(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Value::Variant {
@@ -2057,7 +2147,7 @@ impl<'a> Interpreter<'a> {
                 case,
                 payload: payload
                     .into_iter()
-                    .map(|slot| self.to_observing_view(slot, depth + 1))
+                    .map(|slot| self.to_observing_view(slot, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             other => Ok(other),
@@ -2325,26 +2415,29 @@ impl<'a> Interpreter<'a> {
         // nothing (they allocate a new value and mutate no state) and
         // keeps every fallible step ahead of the commit.
         let mut plan = StorePlan::default();
-        let mut bindings: Vec<(ValueId, Value)> = Vec::with_capacity(function.params.len());
+        // Preserve non-take arguments until every take argument has
+        // been planned. Observing aliases can then be prepared against
+        // the exact generations installed by the shared commit.
+        let mut bindings: Vec<(ValueId, Value, bool)> =
+            Vec::with_capacity(function.params.len());
         for (param, arg) in function.params.iter().zip(args) {
-            // Every argument, not only the transferred ones: the
-            // planner and the observing downgrade both reason about
-            // declared types, so a value that disagrees with its own
-            // declaration is refused before either is trusted -- the
-            // same order `store_place_transfer` uses.
             self.validate_argument(&arg, &param.ty)?;
             let bound = if param.take {
                 self.plan_transfer(&arg, &mut plan, 0)?
             } else {
-                self.to_observer_if_resource(arg)?
+                arg
             };
-            bindings.push((param.value, bound));
+            bindings.push((param.value, bound, !param.take));
         }
-        // Phase B -- commit. Every argument is known good, so no
-        // generation moves until all of them are.
+        for (_, bound, observes) in &mut bindings {
+            if *observes {
+                *bound = self.to_observing_view(bound.clone(), &plan, 0)?;
+            }
+        }
+        // Every owner and observer is valid before the one commit.
         self.commit_transfer(&plan);
         let mut values: HashMap<ValueId, Value> = HashMap::new();
-        for (id, bound) in bindings {
+        for (id, bound, _) in bindings {
             values.insert(id, bound);
         }
 
@@ -2589,6 +2682,40 @@ impl<'a> Interpreter<'a> {
                         .iter()
                         .map(|e| resolve_evidence(&evidence, e))
                         .collect::<Result<Vec<_>, _>>()?;
+
+                    // Check all possible output slots before executing
+                    // the callee. Previous occupants consumed by take
+                    // arguments are excluded because the call retires
+                    // exactly those identities.
+                    if callee_fn.params.len() == arg_values.len()
+                        && callee_fn.requirements.len() == resolved_evidence.len()
+                    {
+                        let mut incoming = StorePlan::default();
+                        for (param, arg) in callee_fn.params.iter().zip(arg_values.iter()) {
+                            self.validate_argument(arg, &param.ty)?;
+                            if param.take {
+                                self.plan_transfer(arg, &mut incoming, 0)?;
+                            }
+                        }
+                        for slot in std::iter::once(*ok_slot)
+                            .chain(err_targets.iter().map(|target| target.slot))
+                        {
+                            if let Some(existing) = values.get(&slot) {
+                                let mut seen = HashSet::new();
+                                if self.owns_a_live_resource(
+                                    existing,
+                                    &mut seen,
+                                    0,
+                                    &incoming.reachable,
+                                ) {
+                                    return Err(invalid(format!(
+                                        "an invoke would overwrite a slot (%{}) that still owns an undestroyed resource",
+                                        slot.0
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     match self.call_function(callee_fn, arg_values, resolved_evidence)? {
                         Outcome::Returned(value) => {
                             values.insert(*ok_slot, value);
@@ -7987,6 +8114,39 @@ mod decomposition_claims {
 /// `Box[File]` than a bare `T` is: an unresolved parameter at *any*
 /// depth means the position has no concrete type to check against at
 /// this boundary.
+/// Matches a partially symbolic type pattern against a concrete
+/// runtime type. Repeated parameters must resolve consistently.
+fn type_pattern_matches(
+    expected: &Ty,
+    actual: &Ty,
+    bindings: &mut HashMap<crate::hir::TypeParamId, Ty>,
+) -> bool {
+    match expected {
+        Ty::Param(id, _) => match bindings.get(id) {
+            Some(bound) => bound == actual,
+            None => {
+                bindings.insert(*id, actual.clone());
+                true
+            }
+        },
+        Ty::Applied(expected_item, expected_args) => {
+            let Ty::Applied(actual_item, actual_args) = actual else {
+                return false;
+            };
+            expected_item == actual_item
+                && expected_args.len() == actual_args.len()
+                && expected_args
+                    .iter()
+                    .zip(actual_args.iter())
+                    .all(|(expected, actual)| {
+                        type_pattern_matches(expected, actual, bindings)
+                    })
+        }
+        Ty::Var(_) | Ty::Never | Ty::Error => false,
+        _ => expected == actual,
+    }
+}
+
 fn fully_resolved(ty: &Ty) -> bool {
     match ty {
         Ty::Param(..) | Ty::Var(_) | Ty::Never | Ty::Error => false,
@@ -9162,6 +9322,62 @@ mod transfer_transaction {
     }
 
     #[test]
+    fn an_observing_argument_aliasing_a_later_take_stays_current() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let callee = Function {
+            id: ItemId(87),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::RecordField {
+                            base: ValueId(0),
+                            record: FILE,
+                            field: 0,
+                        },
+                    },
+                    Instruction::Drop { value: ValueId(1) },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        interpreter
+            .call_function(
+                &callee,
+                vec![Value::Resource(owner), Value::Resource(owner)],
+                Vec::new(),
+            )
+            .expect("the observer must share the planned take generation");
+
+        let table = interpreter.resources.borrow();
+        let record = &table.records[owner.id.0 as usize];
+        assert_eq!(record.generation, owner.generation + 1);
+        assert_eq!(record.status, ResourceStatus::Dropped);
+    }
+
+    #[test]
     fn a_call_whose_arguments_are_all_valid_transfers_each_exactly_once() {
         let module = module();
         let interpreter = Interpreter::new(&module);
@@ -9708,6 +9924,95 @@ mod transfer_transaction {
         );
     }
 
+    #[test]
+    fn an_invoke_cannot_overwrite_a_slot_that_still_owns_a_resource() {
+        const RETURNS_FILE: ItemId = ItemId(85);
+        let callee = Function {
+            id: RETURNS_FILE,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: file_ty(),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Value {
+                        result: ValueId(0),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(7)),
+                    },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: file_ty(),
+                        kind: ValueKind::RecordCreate(
+                            FILE,
+                            Vec::new(),
+                            vec![ValueId(0)],
+                        ),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        };
+        let mut module = module();
+        module.functions.push(callee);
+        let interpreter = Interpreter::new(&module);
+        let existing = new_file(&interpreter, 1);
+        let caller = Function {
+            id: ItemId(86),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Invoke {
+                        callee: RETURNS_FILE,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(0),
+                        ok_target: BlockId(1),
+                        err_targets: Vec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        };
+
+        let error = interpreter
+            .call_function(&caller, vec![Value::Resource(existing)], Vec::new())
+            .expect_err("invoke must not discard the previous owner");
+        assert!(
+            format!("{error:?}").contains("an invoke would overwrite a slot"),
+            "the invoke must refuse before running its callee, got {error:?}"
+        );
+        let table = interpreter.resources.borrow();
+        assert_eq!(
+            table.records.len(),
+            1,
+            "the rejected invoke must not execute its resource-producing callee"
+        );
+        assert_eq!(
+            table.records[existing.id.0 as usize].status,
+            ResourceStatus::Alive
+        );
+    }
+
     // -- argument validation against the declared parameter type --------
 
     #[test]
@@ -9790,7 +10095,31 @@ mod transfer_transaction {
             "a resolved position still rejects a value of the wrong kind"
         );
     }
+    #[test]
+    fn a_partial_generic_keeps_its_concrete_outer_constructor() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let param = crate::hir::TypeParamId(0);
+        let owner = new_file(&interpreter, 1);
+        let wrong_outer = Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(owner)],
+        };
+
+        assert!(
+            interpreter
+                .validate_argument(
+                    &wrong_outer,
+                    &Ty::Applied(MAYBE, vec![Ty::Param(param, Symbol(0))]),
+                )
+                .is_err(),
+            "a symbolic argument must not erase the concrete constructor"
+        );
+        assert!(interpreter.resources.borrow().observe(owner).is_ok());
+    }
 }
+
 
 /// The verifier and the interpreter must agree about who owns what.
 ///

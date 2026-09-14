@@ -24369,4 +24369,308 @@ mod structural_ownership {
             take: false,
         }]
     }
+
+    // == call aliasing is judged on structural provenance ===============
+    //
+    // Reducing an argument to `Place::root(origin(argument))` sees only
+    // `Load`. Every other way of reaching a resource -- a `PlaceRead`,
+    // a `RecordField`, a `VariantPayload`, a slot an observing store
+    // wrote -- collapsed to an unrelated root and stopped overlapping
+    // with anything, so one resource could reach an observing and a
+    // `take` parameter through two spellings and look disjoint.
+    //
+    // Every case here is hand-built NIR that never passed the source
+    // checker, which is the point: the verifier has to reach the verdict
+    // on its own.
+
+    /// `mixed(Session, take File)` -- an observing aggregate parameter
+    /// and a taking field parameter, or the reverse.
+    fn projection_callee(fx: &mut Fixture, take_first: bool) -> Function {
+        let name = fx.interner.intern("projected");
+        let (first_ty, second_ty) = if take_first {
+            (fx.file.clone(), fx.session.clone())
+        } else {
+            (fx.session.clone(), fx.file.clone())
+        };
+        Function {
+            id: MIXED,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: first_ty,
+                    take: take_first,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: second_ty,
+                    take: !take_first,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop {
+                    value: if take_first { ValueId(0) } else { ValueId(1) },
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    /// `takes_two_files(File, take File)`, for the cases where both
+    /// arguments are field-typed.
+    fn two_file_callee(fx: &mut Fixture, take_first: bool) -> Function {
+        let name = fx.interner.intern("two_files");
+        Function {
+            id: MIXED,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: fx.file.clone(),
+                    take: take_first,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: fx.file.clone(),
+                    take: !take_first,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop {
+                    value: if take_first { ValueId(0) } else { ValueId(1) },
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    /// 1. Two `PlaceRead` values naming the same affine field, one
+    ///    observing and one transferring. Two distinct `ValueId`s, one
+    ///    place -- invisible to a root-only comparison.
+    #[test]
+    fn two_place_reads_of_one_field_passed_observing_and_taking_are_rejected() {
+        for take_first in [false, true] {
+            let mut fx = fixture();
+            let instructions = vec![
+                read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+                read(
+                    2,
+                    fx.file.clone(),
+                    session_field(0),
+                    OwnershipMode::Transfer,
+                ),
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(
+                        MIXED,
+                        Vec::new(),
+                        vec![ValueId(1), ValueId(2)],
+                        Vec::new(),
+                    ),
+                },
+                int(4, 0),
+            ];
+            let extra = two_file_callee(&mut fx, take_first);
+            let under = under_test(take_session(&fx), Ty::I64, single_block(instructions, 4));
+            let codes = codes_linking(&mut fx, under, extra);
+            assert!(
+                codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+                "take_first={take_first}: two reads of one field are one place, got {codes:?}"
+            );
+        }
+    }
+
+    /// 2. Two `RecordField` values naming the same affine field.
+    #[test]
+    fn two_record_fields_of_one_place_passed_observing_and_taking_are_rejected() {
+        let mut fx = fixture();
+        let field_of = |result: u32| Instruction::Value {
+            result: ValueId(result),
+            ty: fx.file.clone(),
+            kind: ValueKind::RecordField {
+                base: ValueId(0),
+                record: SESSION,
+                field: 0,
+            },
+        };
+        let instructions = vec![
+            field_of(1),
+            field_of(2),
+            Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::Unit,
+                kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(1), ValueId(2)], Vec::new()),
+            },
+            int(4, 0),
+        ];
+        let extra = two_file_callee(&mut fx, false);
+        let under = under_test(take_session(&fx), Ty::I64, single_block(instructions, 4));
+        let codes = codes_linking(&mut fx, under, extra);
+        assert!(
+            codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "two field reads of one base name one place, got {codes:?}"
+        );
+    }
+
+    /// 3. A value observed into a slot, then loaded and passed
+    ///    observing, while the original is passed as `take`. The slot is
+    ///    a different root entirely; only following what was stored into
+    ///    it connects the two.
+    #[test]
+    fn a_value_reached_through_an_observing_slot_still_aliases_its_owner() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(3), ValueId(2)], Vec::new()),
+        });
+        instructions.push(int(5, 0));
+        let extra = two_file_callee(&mut fx, false);
+        let codes = codes_linking(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+            extra,
+        );
+        assert!(
+            codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "a slot names what was stored into it, got {codes:?}"
+        );
+    }
+
+    /// 4. Ancestor/descendant overlap: the whole aggregate observed
+    ///    while one of its fields is taken, and the reverse.
+    #[test]
+    fn an_aggregate_and_one_of_its_fields_overlap_in_either_direction() {
+        for take_first in [false, true] {
+            let mut fx = fixture();
+            let mode = if take_first {
+                OwnershipMode::Transfer
+            } else {
+                OwnershipMode::Observe
+            };
+            // `%1` is the field; `%0` is the whole session.
+            let instructions = vec![
+                read(1, fx.file.clone(), session_field(0), mode),
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(
+                        MIXED,
+                        Vec::new(),
+                        if take_first {
+                            vec![ValueId(1), ValueId(0)]
+                        } else {
+                            vec![ValueId(0), ValueId(1)]
+                        },
+                        Vec::new(),
+                    ),
+                },
+                int(3, 0),
+            ];
+            let extra = projection_callee(&mut fx, take_first);
+            let under = under_test(take_session(&fx), Ty::I64, single_block(instructions, 3));
+            let codes = codes_linking(&mut fx, under, extra);
+            assert!(
+                codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+                "take_first={take_first}: containment is overlap either way, got {codes:?}"
+            );
+        }
+    }
+
+    /// 5. Disjoint siblings stay legal: reading `input` observing while
+    ///    taking `output` names two places that never contain each
+    ///    other.
+    #[test]
+    fn two_disjoint_sibling_fields_in_one_call_are_accepted() {
+        let mut fx = fixture();
+        let instructions = vec![
+            read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+            read(
+                2,
+                fx.file.clone(),
+                session_field(1),
+                OwnershipMode::Transfer,
+            ),
+            Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::Unit,
+                kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(1), ValueId(2)], Vec::new()),
+            },
+            int(4, 0),
+        ];
+        let extra = two_file_callee(&mut fx, false);
+        let under = under_test(take_session(&fx), Ty::I64, single_block(instructions, 4));
+        let codes = codes_linking(&mut fx, under, extra);
+        assert!(
+            !codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "`input` and `output` are disjoint, got {codes:?}"
+        );
+    }
+
+    /// 6. Two observations of one identity stay legal: neither can end
+    ///    it, so there is nothing to sequence.
+    #[test]
+    fn two_projected_observations_of_one_field_are_accepted() {
+        let mut fx = fixture();
+        let observe_twice = {
+            let name = fx.interner.intern("observe_twice");
+            Function {
+                id: MIXED,
+                name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.file.clone(),
+                        take: false,
+                    },
+                    Param {
+                        value: ValueId(1),
+                        ty: fx.file.clone(),
+                        take: false,
+                    },
+                ],
+                return_type: Ty::Unit,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                }],
+            }
+        };
+        let instructions = vec![
+            read(1, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+            read(2, fx.file.clone(), session_field(0), OwnershipMode::Observe),
+            Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::Unit,
+                kind: ValueKind::Call(MIXED, Vec::new(), vec![ValueId(1), ValueId(2)], Vec::new()),
+            },
+            drop_of(0),
+            int(4, 0),
+        ];
+        let under = under_test(take_session(&fx), Ty::I64, single_block(instructions, 4));
+        let codes = codes_linking(&mut fx, under, observe_twice);
+        assert!(
+            !codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
+            "two observations cannot conflict, got {codes:?}"
+        );
+    }
 }

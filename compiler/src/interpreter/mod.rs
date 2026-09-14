@@ -10642,6 +10642,134 @@ mod transfer_transaction {
         );
     }
 
+    // -- a rejected frame entry changes nothing -------------------------
+
+    /// `f(take a: File)` with no `bb0` at all. Every boundary check
+    /// passes -- the argument is a live owner of the declared type --
+    /// and the call is then refused for having no entry block.
+    ///
+    /// That refusal used to come *after* the transfer was committed, so
+    /// a callee that never executed an instruction still bumped its
+    /// argument's generation and left the caller holding a stale handle.
+    fn callee_without_an_entry_block() -> Function {
+        Function {
+            id: ItemId(130),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            // `BlockId(7)`, deliberately: blocks exist, just not the
+            // entry one, so this is a malformed function rather than an
+            // empty one.
+            blocks: vec![BasicBlock {
+                id: BlockId(7),
+                instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_callee_without_an_entry_block_is_refused_without_mutating() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let callee = callee_without_an_entry_block();
+
+        // Snapshots every dimension a boundary rejection must leave
+        // alone: identities, generations, statuses and fields (all of
+        // which `runtime_state` renders), plus the event log, plus the
+        // caller's own frame bindings.
+        let mut frame: HashMap<ValueId, Value> = HashMap::new();
+        frame.insert(ValueId(0), Value::Resource(owner));
+        let frame_before = frame_state(&frame);
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a callee with no entry block may not consume its arguments",
+            || {
+                interpreter
+                    .call_function(&callee, &[], vec![Value::Resource(owner)], Vec::new())
+                    .map(|_| ())
+            },
+        );
+
+        assert_eq!(
+            frame_state(&frame),
+            frame_before,
+            "the caller's own bindings are untouched"
+        );
+        let table = interpreter.resources.borrow();
+        assert_eq!(
+            table.records[owner.id.0 as usize].generation, owner.generation,
+            "no generation moved, so the caller's handle is still current"
+        );
+        assert_eq!(
+            table.records[owner.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "and nothing was destroyed"
+        );
+        assert!(
+            table.observe(owner).is_ok(),
+            "the caller can still use the argument it was never able to hand over"
+        );
+    }
+
+    /// The distinction the ordering is *not* allowed to blur: a failure
+    /// after the frame has genuinely been entered is observable, because
+    /// whatever ran before it really did run.
+    #[test]
+    fn a_failure_after_frame_entry_stays_observable() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        // Enters `bb0`, destroys its argument, then branches to a block
+        // that does not exist.
+        let callee = Function {
+            id: ItemId(131),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                terminator: Terminator::Branch(BlockId(9)),
+            }],
+        };
+
+        interpreter
+            .call_function(&callee, &[], vec![Value::Resource(owner)], Vec::new())
+            .map(|_| ())
+            .expect_err("branching to a block that does not exist is an error");
+        let table = interpreter.resources.borrow();
+        assert_eq!(
+            table.records[owner.id.0 as usize].status,
+            ResourceStatus::Dropped,
+            "the frame was entered and its `drop` really happened -- this is not rolled back"
+        );
+        drop(table);
+        assert!(
+            interpreter
+                .event_log()
+                .iter()
+                .any(|event| event == "call:131"),
+            "and the frame entry is recorded, because it occurred: {:?}",
+            interpreter.event_log()
+        );
+    }
     // -- self-stores at run time, judged by mode ------------------------
 
     /// Builds `f(take a: File)` whose body fills `%0`, loads it into

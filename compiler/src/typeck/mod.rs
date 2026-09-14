@@ -898,15 +898,13 @@ impl<'a> Checker<'a> {
     /// registered; `collect_generic_params` records one -- possibly
     /// empty -- for every declared record, variant and function, so an
     /// absent entry really does mean "unknown item") or when its
-    /// declared arity disagrees with `args`. A `zip` over mismatched
-    /// lengths silently truncates, leaving an unsubstituted `Ty::Param`
-    /// behind to decide ownership.
+    /// declared arity disagrees with `args` -- see
+    /// [`crate::types::checked_substitution`], which owns that second
+    /// rule for every stage. Looking the parameter list up is this
+    /// stage's own half: `generic_params` is `typeck`'s own registry and
+    /// no other stage shares it.
     fn checked_substitution(&self, item: ItemId, args: &[Ty]) -> Option<HashMap<TypeParamId, Ty>> {
-        let params = self.generic_params.get(&item)?;
-        if params.len() != args.len() {
-            return None;
-        }
-        Some(params.iter().copied().zip(args.iter().cloned()).collect())
+        crate::types::checked_substitution(self.generic_params.get(&item)?, args)
     }
 
     /// Rejects an infinitely-sized direct (or indirect) aggregate cycle

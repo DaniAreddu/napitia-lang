@@ -1766,6 +1766,193 @@ mod tests {
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
+
+    // -- one resource may not be observed and taken by one call --------
+    //
+    // The `take` parameter owns what it was given for the whole call
+    // and may destroy it at any point in the body, while the observing
+    // parameter stays readable for exactly as long. Nothing orders
+    // those, and no signature the caller can see says which the callee
+    // does -- so the pairing is refused at the call, not reasoned about
+    // per body.
+
+    #[test]
+    fn observing_and_taking_one_resource_in_one_call_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(file: File, take owner: File) -> i64 { \
+                 drop owner; \
+                 return file.descriptor; \
+             } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return consume(file, file); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0015"], "unexpected: {diags:?}");
+    }
+
+    /// The same call with the parameters swapped. This order used to
+    /// trip `U0001` on the later read purely because the transfer
+    /// happened to come first; the fault is the pairing, so both orders
+    /// must name the same one.
+    #[test]
+    fn taking_and_observing_one_resource_in_one_call_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take owner: File, file: File) -> i64 { \
+                 value d = file.descriptor; \
+                 drop owner; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return consume(file, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "both argument orders must report the alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_a_parent_while_taking_its_field_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(observed: Session, take owner: File) -> i64 { \
+                 drop owner; \
+                 return observed.output.descriptor; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(s, s.input); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "taking a field of an observed parent is the same alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn taking_a_parent_while_observing_its_field_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(observed: File, take owner: Session) -> i64 { \
+                 value d = observed.descriptor; \
+                 drop owner; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(s.input, s); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "containment in the other direction is the same alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_resource_twice_in_one_call_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func both(a: File, b: File) -> i64 { return a.descriptor + b.descriptor } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 value n = both(file, file); \
+                 drop file; \
+                 return n; \
+             }",
+        );
+        assert!(
+            diags.is_empty(),
+            "neither observation can end the resource: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_resource_while_taking_a_different_one_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func mixed(a: File, take b: File) -> i64 { \
+                 value d = a.descriptor; \
+                 drop b; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 value kept = File { descriptor: 1 }; \
+                 value given = File { descriptor: 2 }; \
+                 value n = mixed(kept, given); \
+                 drop kept; \
+                 return n; \
+             }",
+        );
+        assert!(
+            diags.is_empty(),
+            "distinct resources never alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_sibling_field_while_taking_another_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(a: File, take b: File) -> i64 { \
+                 value d = a.descriptor; \
+                 drop b; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value n = mixed(s.output, s.input); \
+                 value rest = s.output; \
+                 drop rest; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "disjoint sibling fields are not an alias: {diags:?}"
+        );
+    }
+
+    /// Two `take` arguments reaching one identity were already rejected
+    /// by the move rules; adding the observe/take check must not have
+    /// replaced that answer with its own.
+    #[test]
+    fn taking_one_resource_twice_in_one_call_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func both(take a: File, take b: File) -> unit { drop a; drop b; } \
+             func f() { \
+                 value file = File { descriptor: 1 }; \
+                 both(file, file); \
+             }",
+        );
+        assert!(
+            !diags.is_empty(),
+            "one identity may not be transferred twice: {diags:?}"
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "two transfers are not an observe/take alias: {diags:?}"
+        );
+    }
 }
 
 /// Missing-metadata fail-closed behavior (`rfcs/0008`, `rfcs/0012`):

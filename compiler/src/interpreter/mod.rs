@@ -2285,7 +2285,7 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function `{name}`"))
             })?;
-        into_result(self.call_function(function, args, Vec::new())?)
+        into_result(self.call_function(function, &[], args, Vec::new())?)
     }
 
     /// Calls the function identified by `item` with no arguments -- a
@@ -2308,7 +2308,7 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| {
                 InterpreterError::InvalidOperation(format!("unknown function {item:?}"))
             })?;
-        into_result(self.call_function(function, args, Vec::new())?)
+        into_result(self.call_function(function, &[], args, Vec::new())?)
     }
 
     /// `evidence` is this call's own resolved capability evidence
@@ -2319,9 +2319,59 @@ impl<'a> Interpreter<'a> {
     /// own* calling frame first (see `resolve_evidence`), so a running
     /// frame's own evidence never itself needs further resolution, only
     /// a lookup.
+    /// Resolves one call site's own type arguments against the frame's
+    /// instantiation and requires the result to be concrete
+    /// (`rfcs/0008`).
+    ///
+    /// A generic body is lowered once and shared, so `outer[T]` calling
+    /// `inner[T]` really does carry `Ty::Param(T)` at the call site.
+    /// What makes it concrete is the frame: executing `outer[i64]`
+    /// carries `T -> i64`, and substituting through that is what turns
+    /// the symbolic argument back into the instantiation actually being
+    /// run. Anything still unresolved afterwards names a type nobody
+    /// can supply, and is refused rather than silently used to build a
+    /// substitution that would leave parameters symbolic.
+    fn resolve_call_type_args(
+        &self,
+        type_args: &[Ty],
+        frame_subst: &HashMap<crate::hir::TypeParamId, Ty>,
+    ) -> Result<Vec<Ty>, InterpreterError> {
+        type_args
+            .iter()
+            .map(|ty| {
+                let resolved = crate::types::substitute(ty, frame_subst);
+                if fully_resolved(&resolved) {
+                    Ok(resolved)
+                } else {
+                    Err(invalid(
+                        "a call site's own type argument is still unresolved after the calling \
+                         frame's instantiation is applied",
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// `type_args` is this invocation's own instantiation, in the
+    /// callee's declared parameter order (`rfcs/0008`). One substitution
+    /// is built from it and used for *every* parameter, which is what
+    /// makes a repeated `T` mean one type across the whole argument
+    /// list: `same[T](first: Box[T], second: Box[T])` cannot be handed a
+    /// `Box[i64]` and a `Box[bool]`, because both are checked against
+    /// the same resolved `Box[i64]`.
+    ///
+    /// The public entry points (`call`, `call_item`) pass no type
+    /// arguments, so a generic function is refused there rather than
+    /// instantiated by guesswork. Inferring one from the argument values
+    /// would have to pick a binding per argument and then reconcile
+    /// them, and a boundary that reconciles by taking the first answer
+    /// is exactly the inconsistency this substitution exists to
+    /// prevent. Callers that need a generic function instantiate it the
+    /// way NIR does: through a `Call` carrying its arguments.
     fn call_function(
         &self,
         function: &Function,
+        type_args: &[Ty],
         args: Vec<Value>,
         evidence: Vec<Evidence>,
     ) -> Result<Outcome, InterpreterError> {
@@ -2358,6 +2408,22 @@ impl<'a> Interpreter<'a> {
                 evidence.len()
             )));
         }
+        // One substitution for this whole invocation, built before any
+        // argument is looked at. `checked_substitution` refuses rather
+        // than truncating, so a generic function handed the wrong number
+        // of type arguments -- none at all included, which is how the
+        // public entry points reach it -- is rejected here instead of
+        // being validated against parameter types that stayed symbolic.
+        let declared_params: Vec<crate::hir::TypeParamId> =
+            function.type_params.iter().map(|(id, _)| *id).collect();
+        let Some(frame_subst) = crate::types::checked_substitution(&declared_params, type_args)
+        else {
+            return Err(invalid(format!(
+                "function declares {} type parameter(s) but was instantiated with {}",
+                declared_params.len(),
+                type_args.len()
+            )));
+        };
         let observing_params: HashSet<ValueId> = function
             .params
             .iter()
@@ -2414,7 +2480,12 @@ impl<'a> Interpreter<'a> {
         // is dropped.
         let mut observed_identities: HashSet<ResourceId> = HashSet::new();
         for (param, arg) in function.params.iter().zip(args) {
-            self.validate_argument(&arg, &param.ty)?;
+            // Every parameter is checked against its type under the one
+            // shared instantiation, never against the declaration's own
+            // symbolic form: that is what ties a repeated `T` together
+            // across the whole argument list.
+            let declared = crate::types::substitute(&param.ty, &frame_subst);
+            self.validate_argument(&arg, &declared)?;
             if !param.take {
                 // Per argument, then unioned. A repeat *within* one
                 // argument's graph is a genuine fault and stays one;
@@ -2480,7 +2551,7 @@ impl<'a> Interpreter<'a> {
                         let value = if let ValueKind::PlaceRead { place, mode } = kind {
                             self.access_place(&mut values, &load_origin, place, *mode)?
                         } else {
-                            self.eval(kind, &values, &evidence)?
+                            self.eval(kind, &values, &evidence, &frame_subst)?
                         };
                         values.insert(*result, value);
                     }
@@ -2707,13 +2778,18 @@ impl<'a> Interpreter<'a> {
                 }
                 Terminator::Invoke {
                     callee,
-                    type_args: _,
+                    type_args,
                     args,
                     evidence: call_evidence,
                     ok_slot,
                     ok_target,
                     err_targets,
                 } => {
+                    // Resolved through this frame's own instantiation, on
+                    // exactly the terms `ValueKind::Call` uses: an
+                    // `Invoke` inside a generic body carries its type
+                    // arguments symbolically too.
+                    let invoke_type_args = self.resolve_call_type_args(type_args, &frame_subst)?;
                     let arg_values = args
                         .iter()
                         .map(|id| get(&values, id))
@@ -2738,9 +2814,20 @@ impl<'a> Interpreter<'a> {
                     if callee_fn.params.len() == arg_values.len()
                         && callee_fn.requirements.len() == resolved_evidence.len()
                     {
+                        let callee_params: Vec<crate::hir::TypeParamId> =
+                            callee_fn.type_params.iter().map(|(id, _)| *id).collect();
+                        // Under the callee's own instantiation, as in
+                        // `call_function`: this preflight must not judge
+                        // an argument against a parameter type that is
+                        // still symbolic.
+                        let callee_subst =
+                            crate::types::checked_substitution(&callee_params, &invoke_type_args);
                         let mut incoming = StorePlan::default();
                         for (param, arg) in callee_fn.params.iter().zip(arg_values.iter()) {
-                            self.validate_argument(arg, &param.ty)?;
+                            if let Some(subst) = &callee_subst {
+                                let declared = crate::types::substitute(&param.ty, subst);
+                                self.validate_argument(arg, &declared)?;
+                            }
                             if param.take {
                                 self.plan_transfer(arg, &mut incoming, 0)?;
                             }
@@ -2764,7 +2851,12 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     }
-                    match self.call_function(callee_fn, arg_values, resolved_evidence)? {
+                    match self.call_function(
+                        callee_fn,
+                        &invoke_type_args,
+                        arg_values,
+                        resolved_evidence,
+                    )? {
                         Outcome::Returned(value) => {
                             values.insert(*ok_slot, value);
                             block_id = *ok_target;
@@ -2807,11 +2899,20 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `frame_subst` is the instantiation the *currently executing*
+    /// function was called with (`rfcs/0008`): one parametric body is
+    /// shared by every instantiation, so a nested call inside a generic
+    /// body carries its type arguments symbolically -- `outer[T]`
+    /// calling `inner[T]` lowers to `call @inner[T]`, and only the
+    /// frame knows what `T` is right now. Resolving a call site's own
+    /// type arguments through this is what turns that back into a
+    /// concrete instantiation.
     fn eval(
         &self,
         kind: &ValueKind,
         values: &HashMap<ValueId, Value>,
         current_evidence: &[Evidence],
+        frame_subst: &HashMap<crate::hir::TypeParamId, Ty>,
     ) -> Result<Value, InterpreterError> {
         match kind {
             ValueKind::Alloc => Ok(Value::Unit),
@@ -2897,7 +2998,11 @@ impl<'a> Interpreter<'a> {
             // straight past `type_args` here without needing to look at
             // it at all, the same "generics erase at runtime" approach
             // ordinary type-erased generics use.
-            ValueKind::Call(item, _type_args, args, call_evidence) => {
+            ValueKind::Call(item, type_args, args, call_evidence) => {
+                // Resolved through the frame's own instantiation, so a
+                // nested generic call inside a generic body reaches its
+                // callee concretely rather than symbolically.
+                let call_type_args = self.resolve_call_type_args(type_args, frame_subst)?;
                 let arg_values = args
                     .iter()
                     .map(|id| get(values, id))
@@ -2920,7 +3025,7 @@ impl<'a> Interpreter<'a> {
                 // here means the callee's own `raises` metadata and its
                 // actual body disagree; guarded defensively rather than
                 // silently treated as the raised value itself.
-                match self.call_function(callee, arg_values, resolved_evidence)? {
+                match self.call_function(callee, &call_type_args, arg_values, resolved_evidence)? {
                     Outcome::Returned(value) => Ok(value),
                     Outcome::Raised(_) => Err(invalid(
                         "an ordinary call's callee raised a failure; only Invoke may call a fallible function",
@@ -2934,7 +3039,7 @@ impl<'a> Interpreter<'a> {
             // the one place a protocol call actually executes.
             ValueKind::ProtocolCall {
                 protocol: _,
-                arguments: _,
+                arguments,
                 method,
                 evidence,
                 args,
@@ -2961,6 +3066,46 @@ impl<'a> Interpreter<'a> {
                 let method_item = extend_layout.methods.get(*method).ok_or_else(|| {
                     invalid("protocol call method index out of range for its extend")
                 })?;
+                // The implementing method is generic in the *extend's*
+                // own parameters, not the protocol's, so its
+                // instantiation has to be recovered rather than copied:
+                // `extend[T] Equal[Box[T]]` reached through
+                // `Equal[Box[i64]]` binds `T -> i64`. Matching the
+                // extend's declared protocol arguments against this call
+                // site's is what recovers it, and a concrete extension
+                // (`extend Equal[i64]`) simply binds nothing.
+                let call_arguments = self.resolve_call_type_args(arguments, frame_subst)?;
+                if extend_layout.protocol_arguments.len() != call_arguments.len() {
+                    return Err(invalid(
+                        "a protocol call's own type arguments do not match the arity its \
+                         extension declares",
+                    ));
+                }
+                let mut bindings: HashMap<crate::hir::TypeParamId, Ty> = HashMap::new();
+                for (declared, actual) in extend_layout
+                    .protocol_arguments
+                    .iter()
+                    .zip(call_arguments.iter())
+                {
+                    if !type_pattern_matches(declared, actual, &mut bindings) {
+                        return Err(invalid(
+                            "a protocol call's own type arguments do not match the extension \
+                             selected for it",
+                        ));
+                    }
+                }
+                let method_type_args = extend_layout
+                    .type_params
+                    .iter()
+                    .map(|(id, _)| {
+                        bindings.get(id).cloned().ok_or_else(|| {
+                            invalid(
+                                "an extension's own type parameter was not determined by the \
+                                 protocol arguments at this call site",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<Ty>, _>>()?;
                 let callee = self
                     .module
                     .functions
@@ -2971,7 +3116,7 @@ impl<'a> Interpreter<'a> {
                             "protocol call's implementing function is not present in this module",
                         )
                     })?;
-                match self.call_function(callee, arg_values, nested)? {
+                match self.call_function(callee, &method_type_args, arg_values, nested)? {
                     Outcome::Returned(value) => Ok(value),
                     Outcome::Raised(_) => Err(invalid(
                         "a protocol call's implementing method raised a failure; protocol methods that raise are not yet supported",
@@ -4617,8 +4762,12 @@ mod tests {
             .resources
             .borrow_mut()
             .construct(resource, Vec::new());
-        let outcome =
-            interpreter.call_function(&module.functions[0], vec![Value::Resource(arg)], Vec::new());
+        let outcome = interpreter.call_function(
+            &module.functions[0],
+            &[],
+            vec![Value::Resource(arg)],
+            Vec::new(),
+        );
         match outcome {
             Err(InterpreterError::InvalidOperation(_)) => {}
             Err(other) => panic!("expected a structured observer-move error, got {other:?}"),
@@ -4739,6 +4888,7 @@ mod tests {
             .construct(resource, Vec::new());
         let outcome = interpreter.call_function(
             &module.functions[0],
+            &[],
             vec![Value::Resource(handle)],
             Vec::new(),
         );
@@ -9102,6 +9252,7 @@ mod transfer_transaction {
     const HOLDER: ItemId = ItemId(82);
     const MAYBE: ItemId = ItemId(83);
     const TWO_TAKES: ItemId = ItemId(84);
+    const BOXY: ItemId = ItemId(99);
 
     fn file_ty() -> Ty {
         Ty::Named(FILE, Symbol(0))
@@ -9139,6 +9290,18 @@ mod transfer_transaction {
                         name,
                         type_params: Vec::new(),
                         fields: vec![(name, file_ty())],
+                        affine: false,
+                    },
+                ),
+                // Generic, so one declaration can be instantiated
+                // inconsistently across a call's arguments -- which is
+                // exactly what a shared substitution has to prevent.
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
                         affine: false,
                     },
                 ),
@@ -9286,6 +9449,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![Value::Resource(owner), Value::Resource(observer)],
                         Vec::new(),
                     )
@@ -9316,6 +9480,7 @@ mod transfer_transaction {
             interpreter
                 .call_function(
                     &callee,
+                    &[],
                     vec![Value::Resource(owner), Value::Resource(other)],
                     Vec::new(),
                 )
@@ -9345,6 +9510,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![Value::Resource(owner), Value::Resource(owner)],
                         Vec::new(),
                     )
@@ -9407,6 +9573,7 @@ mod transfer_transaction {
         let error = interpreter
             .call_function(
                 &callee,
+                &[],
                 vec![Value::Resource(owner), Value::Resource(owner)],
                 Vec::new(),
             )
@@ -9437,6 +9604,7 @@ mod transfer_transaction {
         interpreter
             .call_function(
                 &callee,
+                &[],
                 vec![Value::Resource(first), Value::Resource(second)],
                 Vec::new(),
             )
@@ -9588,7 +9756,11 @@ mod transfer_transaction {
         rejected_without_a_trace(
             &interpreter,
             "a construction that fails on its last field moves nothing",
-            || interpreter.eval(&kind, &values, &[]).map(|_| ()),
+            || {
+                interpreter
+                    .eval(&kind, &values, &[], &HashMap::new())
+                    .map(|_| ())
+            },
         );
         assert_eq!(
             frame_state(&values),
@@ -9622,7 +9794,11 @@ mod transfer_transaction {
         rejected_without_a_trace(
             &interpreter,
             "a variant construction that fails on its last payload moves nothing",
-            || interpreter.eval(&kind, &values, &[]).map(|_| ()),
+            || {
+                interpreter
+                    .eval(&kind, &values, &[], &HashMap::new())
+                    .map(|_| ())
+            },
         );
         assert_eq!(
             frame_state(&values),
@@ -9678,6 +9854,7 @@ mod transfer_transaction {
             interpreter.resources.borrow().records[returned.id.0 as usize].generation;
         let result = interpreter.call_function(
             &callee,
+            &[],
             vec![Value::Resource(returned), Value::Resource(leaked)],
             Vec::new(),
         );
@@ -9742,6 +9919,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![pair_of(Value::Resource(good), Value::Resource(observer))],
                         Vec::new(),
                     )
@@ -9801,7 +9979,7 @@ mod transfer_transaction {
             "a raised value carrying an observing handle may not cross the boundary",
             || {
                 interpreter
-                    .call_function(&callee, vec![raised.clone()], Vec::new())
+                    .call_function(&callee, &[], vec![raised.clone()], Vec::new())
                     .map(|_| ())
             },
         );
@@ -9954,6 +10132,7 @@ mod transfer_transaction {
         let error = interpreter
             .call_function(
                 &function,
+                &[],
                 vec![Value::Resource(first), Value::Resource(second)],
                 Vec::new(),
             )
@@ -10039,11 +10218,15 @@ mod transfer_transaction {
             ],
         };
 
-        let error =
-            match interpreter.call_function(&caller, vec![Value::Resource(existing)], Vec::new()) {
-                Err(error) => error,
-                Ok(_) => panic!("invoke must not discard the previous owner"),
-            };
+        let error = match interpreter.call_function(
+            &caller,
+            &[],
+            vec![Value::Resource(existing)],
+            Vec::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invoke must not discard the previous owner"),
+        };
         assert!(
             format!("{error:?}").contains("an invoke would overwrite a slot"),
             "the invoke must refuse before running its callee, got {error:?}"
@@ -10123,7 +10306,7 @@ mod transfer_transaction {
         };
 
         interpreter
-            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .call_function(&function, &[], vec![Value::Resource(owner)], Vec::new())
             .expect("storing a slot's own contents back into it discards nothing");
         assert_eq!(
             interpreter
@@ -10217,6 +10400,7 @@ mod transfer_transaction {
                         interpreter
                             .call_function(
                                 &callee,
+                                &[],
                                 vec![Value::Resource(owner), Value::Resource(owner)],
                                 Vec::new(),
                             )
@@ -10278,6 +10462,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![holder.clone(), Value::Resource(inner)],
                         Vec::new(),
                     )
@@ -10337,6 +10522,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![Value::Resource(inner), wrapped.clone()],
                         Vec::new(),
                     )
@@ -10379,6 +10565,7 @@ mod transfer_transaction {
         interpreter
             .call_function(
                 &callee,
+                &[],
                 vec![Value::Resource(owner), Value::Resource(owner)],
                 Vec::new(),
             )
@@ -10401,6 +10588,7 @@ mod transfer_transaction {
         interpreter
             .call_function(
                 &callee,
+                &[],
                 vec![Value::Resource(kept), Value::Resource(given)],
                 Vec::new(),
             )
@@ -10485,7 +10673,7 @@ mod transfer_transaction {
         );
 
         interpreter
-            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .call_function(&function, &[], vec![Value::Resource(owner)], Vec::new())
             .expect("a transferring self-store empties the slot before refilling it");
         assert_eq!(
             interpreter.resources.borrow().records[owner.id.0 as usize].status,
@@ -10512,7 +10700,7 @@ mod transfer_transaction {
         let before_generation =
             interpreter.resources.borrow().records[owner.id.0 as usize].generation;
         let error = interpreter
-            .call_function(&function, vec![Value::Resource(owner)], Vec::new())
+            .call_function(&function, &[], vec![Value::Resource(owner)], Vec::new())
             .map(|_| ())
             .expect_err("an observing store may not discard the owner the slot holds");
         assert!(
@@ -10604,6 +10792,7 @@ mod transfer_transaction {
         let error = interpreter
             .call_function(
                 &function,
+                &[],
                 vec![Value::Resource(first), Value::Resource(second)],
                 Vec::new(),
             )
@@ -10617,6 +10806,258 @@ mod transfer_transaction {
             interpreter.resources.borrow().records[second.id.0 as usize].status,
             ResourceStatus::Alive,
             "the resource the slot legitimately held was not destroyed by the refused store"
+        );
+    }
+
+    // -- one instantiation, shared by the whole argument list ----------
+    //
+    // A generic body is lowered once and shared, so the only thing that
+    // ties a repeated `T` together across parameters is the
+    // substitution the invocation is checked under. Building one per
+    // argument would let `same[T](Box[T], Box[T])` accept a `Box[i64]`
+    // and a `Box[bool]`, each locally consistent and jointly
+    // meaningless.
+
+    /// `same[T](first: Box[T], second: Box[T]) -> unit`.
+    fn same_type_twice() -> Function {
+        let param = crate::hir::TypeParamId(0);
+        let boxed = Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))]);
+        Function {
+            id: ItemId(97),
+            name: Symbol(0),
+            type_params: vec![(param, Symbol(0))],
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: boxed.clone(),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: boxed,
+                    take: false,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    fn boxed(inner: Ty, payload: Value) -> Value {
+        Value::Record {
+            item: BOXY,
+            type_args: vec![inner],
+            fields: vec![payload],
+        }
+    }
+
+    #[test]
+    fn a_generic_call_with_consistent_arguments_is_accepted() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        interpreter
+            .call_function(
+                &same_type_twice(),
+                &[Ty::I64],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .expect("both arguments agree with the one instantiation");
+    }
+
+    #[test]
+    fn a_generic_call_with_inconsistent_arguments_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(
+                &same_type_twice(),
+                &[Ty::I64],
+                vec![
+                    boxed(Ty::I64, Value::Int(1)),
+                    boxed(Ty::Bool, Value::Bool(true)),
+                ],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("one `T` cannot be both `i64` and `bool` in one invocation");
+        assert!(
+            format!("{error:?}").contains("disagrees with the concrete part"),
+            "the second argument is checked against the same `T = i64` the first was, got {error:?}"
+        );
+    }
+
+    /// The other half of the same rule: the instantiation is what the
+    /// arguments are checked against, so an argument that matches
+    /// *neither* is refused even when both arguments agree with each
+    /// other.
+    #[test]
+    fn a_generic_call_whose_arguments_ignore_the_instantiation_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(
+                &same_type_twice(),
+                &[Ty::I64],
+                vec![
+                    boxed(Ty::Bool, Value::Bool(true)),
+                    boxed(Ty::Bool, Value::Bool(false)),
+                ],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("`Box[bool]` does not fill `Box[T]` under `T = i64`");
+        assert!(
+            format!("{error:?}").contains("disagrees with the concrete part"),
+            "the instantiation is what arguments are checked against, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_call_with_the_wrong_outer_constructor_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let error = interpreter
+            .call_function(
+                &same_type_twice(),
+                &[file_ty()],
+                vec![
+                    boxed(file_ty(), Value::Resource(owner)),
+                    Value::Resource(owner),
+                ],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("a bare resource does not fill a `Box[T]` position");
+        assert!(
+            !format!("{error:?}").is_empty(),
+            "the constructor itself is checked, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_function_called_with_no_type_arguments_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(
+                &same_type_twice(),
+                &[],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("a generic function needs an instantiation, not a guess");
+        assert!(
+            format!("{error:?}").contains("type parameter(s) but was instantiated with 0"),
+            "the public boundary refuses rather than inferring, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_function_called_with_extra_type_arguments_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(
+                &same_type_twice(),
+                &[Ty::I64, Ty::Bool],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("an over-long instantiation is refused, never truncated");
+        assert!(
+            format!("{error:?}").contains("type parameter(s) but was instantiated with 2"),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_site_type_argument_left_unresolved_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let param = crate::hir::TypeParamId(9);
+        // No frame substitution binds `T`, so this call site names a
+        // type nobody can supply.
+        let error = interpreter
+            .resolve_call_type_args(&[Ty::Param(param, Symbol(0))], &HashMap::new())
+            .map(|_| ())
+            .expect_err("an unresolved call-site type argument is refused");
+        assert!(
+            format!("{error:?}").contains("still unresolved"),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_site_type_argument_is_resolved_through_the_frame() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let param = crate::hir::TypeParamId(0);
+        let mut frame = HashMap::new();
+        frame.insert(param, Ty::I64);
+        // `outer[i64]` calling `inner[T]` reaches `inner[i64]`.
+        let resolved = interpreter
+            .resolve_call_type_args(
+                &[Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))])],
+                &frame,
+            )
+            .expect("the frame's own instantiation resolves it");
+        assert_eq!(resolved, vec![Ty::Applied(BOXY, vec![Ty::I64])]);
+    }
+
+    #[test]
+    fn a_rejected_generic_call_mutates_nothing() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let param = crate::hir::TypeParamId(0);
+        // `f[T](take a: Box[T])` handed a `Box[bool]` under `T = File`.
+        let callee = Function {
+            id: ItemId(98),
+            name: Symbol(0),
+            type_params: vec![(param, Symbol(0))],
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))]),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a generic mismatch is refused before anything moves",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        &[file_ty()],
+                        vec![boxed(Ty::Bool, Value::Bool(true))],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[owner.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "and nothing unrelated was touched either"
         );
     }
     // -- argument validation against the declared parameter type --------
@@ -10638,6 +11079,7 @@ mod transfer_transaction {
                 interpreter
                     .call_function(
                         &callee,
+                        &[],
                         vec![
                             Value::Resource(owner),
                             pair_of(Value::Int(1), Value::Int(2)),

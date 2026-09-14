@@ -2519,21 +2519,29 @@ impl<'a> Interpreter<'a> {
                 shared.0
             )));
         }
-        // Every owner and observer is valid before the one commit.
-        self.commit_transfer(&plan);
-        let mut values: HashMap<ValueId, Value> = HashMap::new();
-        for (id, bound, _) in bindings {
-            values.insert(id, bound);
-        }
-
         // `BlockId(0)` is the entry block by definition (the verifier
         // requires exactly one to exist -- `nir::verify`), not whichever
         // block happens to be first in the vector.
+        //
+        // Checked *before* the commit, and last among the checks, so
+        // that the commit below has no fallible step after it. A
+        // malformed callee with no `bb0` used to bump every argument's
+        // generation and only then report the missing block, leaving the
+        // caller holding stale handles for a call that never ran a
+        // single instruction.
         let mut block_id = crate::nir::BlockId(0);
         if !function.blocks.iter().any(|b| b.id == block_id) {
             return Err(InterpreterError::InvalidOperation(
                 "function has no entry block (bb0)".to_string(),
             ));
+        }
+
+        // Every boundary question is now answered, so this is the last
+        // action before the frame runs and nothing after it can fail.
+        self.commit_transfer(&plan);
+        let mut values: HashMap<ValueId, Value> = HashMap::new();
+        for (id, bound, _) in bindings {
+            values.insert(id, bound);
         }
 
         // The one place a call is recorded, and it means exactly one
@@ -10633,6 +10641,7 @@ mod transfer_transaction {
             "and the taken one was consumed"
         );
     }
+
     // -- self-stores at run time, judged by mode ------------------------
 
     /// Builds `f(take a: File)` whose body fills `%0`, loads it into

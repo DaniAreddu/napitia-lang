@@ -4169,19 +4169,14 @@ fn resolve_place_ty(
         let Some((_, field_ty)) = layout.fields.get(field.0 as usize) else {
             return Err(PlaceError::UnknownField(*owner, field.0 as usize));
         };
-        if layout.type_params.len() != args.len() {
+        let params: Vec<TypeParamId> = layout.type_params.iter().map(|(id, _)| *id).collect();
+        let Some(subst) = crate::types::checked_substitution(&params, &args) else {
             return Err(PlaceError::GenericArityMismatch(
                 *owner,
-                layout.type_params.len(),
+                params.len(),
                 args.len(),
             ));
-        }
-        let subst: HashMap<TypeParamId, Ty> = layout
-            .type_params
-            .iter()
-            .map(|(id, _)| *id)
-            .zip(args)
-            .collect();
+        };
         ty = crate::types::substitute(field_ty, &subst);
     }
     Ok(ty)

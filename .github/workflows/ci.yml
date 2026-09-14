@@ -5,23 +5,59 @@ on:
   pull_request: {}
   workflow_dispatch: {}
 
+# Least privilege by default. Nothing in this workflow writes to the
+# repository, publishes anything, or reads a secret, so the token it is
+# handed should not be able to either -- and a job that later needs more
+# has to ask for it explicitly, where a reviewer will see it.
+permissions:
+  contents: read
+
+# A branch that is pushed twice in quick succession only needs its
+# newest commit checked; the older run is answering a question nobody is
+# waiting on any more. Never cancels on the default branch, where every
+# commit's own result is a record worth keeping.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/alpha' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The whole suite runs in well under a minute; anything approaching
+    # this is hung, and should say so rather than occupying a runner for
+    # the six-hour default.
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit, not a tag: a tag is mutable, so
+      # `@v4` is a promise from whoever can move it rather than a fact
+      # about the code that will run here with access to this checkout.
+      # The trailing comment records which release each commit was, so
+      # bumping one stays a reviewable change rather than an opaque hash
+      # swap.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The default leaves the job's token in `.git/config`, where
+          # any later step (or anything they invoke) can use it. Nothing
+          # here pushes, so nothing here needs it.
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
         with:
+          # The one toolchain this project is built and tested against,
+          # matching `rust-toolchain.toml` at the repository root.
           toolchain: "1.97.1"
           components: rustfmt, clippy
 
       - name: cargo fmt --check
         run: cargo fmt --manifest-path compiler/Cargo.toml --check
 
+      # `--locked` on both build steps: CI must fail if `Cargo.lock`
+      # would have to change to build, rather than silently resolving a
+      # different dependency graph than the one that was reviewed.
       - name: cargo clippy
-        run: cargo clippy --manifest-path compiler/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path compiler/Cargo.toml --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --manifest-path compiler/Cargo.toml
+        run: cargo test --manifest-path compiler/Cargo.toml --locked

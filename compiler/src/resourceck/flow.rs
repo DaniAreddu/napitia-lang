@@ -145,6 +145,32 @@ mod codes {
     /// one, or structurally dropping the remaining owned fields is still
     /// permitted on it.
     pub const PARTIAL_PARENT_USED_AS_WHOLE: &str = "U0014";
+    /// One call passes the same affine place -- or two places where one
+    /// contains the other -- to both an observing parameter and a
+    /// `take` parameter (`rfcs/0011`, `rfcs/0012`).
+    ///
+    /// The `take` parameter owns what it was given for the whole call
+    /// and may destroy it at any point in the body, while the observing
+    /// parameter stays readable for exactly as long. Nothing orders
+    /// those against each other: the callee is free to drop the owner
+    /// first and read the observation afterwards, and no signature the
+    /// caller can see says which it does. Two names for one resource,
+    /// one of which may end it, is precisely the aliasing the ownership
+    /// model exists to rule out.
+    ///
+    /// Deliberately independent of argument order. Passing the owner
+    /// first happens to trip `USE_AFTER_MOVE` on the later read, but
+    /// passing the observation first tripped nothing at all -- the
+    /// observation records no state for the later transfer to violate
+    /// -- so the two orders disagreed about the same program. This is
+    /// asked once, about the whole argument list, before any argument
+    /// is walked.
+    ///
+    /// Two *observations* of one place remain legal (neither ends it),
+    /// as do two disjoint sibling places, and two `take` arguments
+    /// reaching one identity stay rejected by the move rules that
+    /// already covered them.
+    pub const MIXED_OBSERVE_TAKE_ALIAS: &str = "U0015";
 }
 
 pub use codes::*;
@@ -1892,6 +1918,19 @@ impl<'a> FlowChecker<'a> {
                 // through to the ordinary `unwrap_or(false)` default
                 // below.
                 let is_variant_construct = matches!(callee.as_ref(), HirExpr::CaseRef { .. });
+                // Asked once, about the whole argument list, before any
+                // argument is walked: whether this call hands one
+                // resource to both an observing and a `take` parameter.
+                // Order-dependent checks cannot see it -- observing
+                // first records nothing for the later transfer to
+                // violate -- and it is a property of the call, not of
+                // any one argument.
+                self.reject_mixed_observe_take_aliases(
+                    args,
+                    take_flags,
+                    is_variant_construct,
+                    expr.span(),
+                );
                 for (index, arg) in args.iter().enumerate() {
                     // `false` here only ever means "this callee is not a
                     // direct function reference at all" (a variant case
@@ -2355,6 +2394,83 @@ impl<'a> FlowChecker<'a> {
             "partially moved value used as a whole",
         );
         true
+    }
+
+    /// Rejects a call that hands one affine resource to both an
+    /// observing and a `take` parameter ([`MIXED_OBSERVE_TAKE_ALIAS`]).
+    ///
+    /// Overlap is structural containment in either direction, not just
+    /// equality: taking `session.input` while observing `session` hands
+    /// the callee an owner of something the observation still reaches,
+    /// and observing `session.input` while taking `session` is the same
+    /// fault seen from the other end. [`Place::is_ancestor_of`] answers
+    /// both, and answers equality too.
+    ///
+    /// Reports once per call, naming the first overlapping pair in
+    /// argument order, so the diagnostic does not depend on how the
+    /// arguments were collected. An argument that resolves to no stable
+    /// place (a freshly constructed temporary) aliases nothing another
+    /// argument can name and is skipped -- as is a non-affine one,
+    /// which has no ownership to conflict over.
+    fn reject_mixed_observe_take_aliases(
+        &mut self,
+        args: &[HirExpr],
+        take_flags: Option<&'a Vec<bool>>,
+        is_variant_construct: bool,
+        span: Span,
+    ) {
+        let mut observed: Vec<(usize, Place<LocalId>)> = Vec::new();
+        let mut taken: Vec<(usize, Place<LocalId>)> = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if !self.is_affine_expr(arg.id()) {
+                continue;
+            }
+            let Some(place) = self.resolve_place(arg) else {
+                continue;
+            };
+            let takes = is_variant_construct
+                || take_flags
+                    .and_then(|flags| flags.get(index))
+                    .copied()
+                    .unwrap_or(false);
+            if takes {
+                taken.push((index, place));
+            } else {
+                observed.push((index, place));
+            }
+        }
+        // Scanned in argument order on both axes, so the pair reported
+        // is a function of the call alone.
+        let mut conflict: Option<(usize, usize)> = None;
+        for (taken_index, taken_place) in &taken {
+            for (observed_index, observed_place) in &observed {
+                if taken_place.is_ancestor_of(observed_place)
+                    || observed_place.is_ancestor_of(taken_place)
+                {
+                    let pair = (
+                        (*taken_index).min(*observed_index),
+                        (*taken_index).max(*observed_index),
+                    );
+                    conflict = Some(match conflict {
+                        None => pair,
+                        Some(previous) => previous.min(pair),
+                    });
+                }
+            }
+        }
+        if let Some((first, second)) = conflict {
+            self.diagnose(
+                MIXED_OBSERVE_TAKE_ALIAS,
+                span,
+                format!(
+                    "arguments {first} and {second} of this call name the same resource, one \
+                     observing it and one taking ownership of it -- the callee may destroy it \
+                     through the owning parameter while the observing parameter is still \
+                     readable"
+                ),
+                "one resource passed as both an observation and a transfer",
+            );
+        }
     }
 
     /// Transitions `local`'s own state to `Moved` -- the only shape an

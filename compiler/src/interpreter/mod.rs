@@ -10642,6 +10642,211 @@ mod transfer_transaction {
         );
     }
 
+    // -- `Invoke` instantiates on the same terms as `Call` ---------------
+    //
+    // A fallible call binds its arguments identically, so it has to
+    // build the same one substitution and check every argument against
+    // it. Exercised through the real `Terminator::Invoke` path, since
+    // that terminator carries its own `type_args` and was ignoring them.
+
+    /// A caller whose terminator is `invoke @callee[type_args](args)`.
+    fn invoking_caller(
+        callee: ItemId,
+        type_args: Vec<Ty>,
+        args: Vec<ValueId>,
+        params: Vec<Param>,
+        ok_slot_ty: Ty,
+    ) -> Function {
+        Function {
+            id: ItemId(140),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(50),
+                        ty: ok_slot_ty,
+                        kind: ValueKind::Alloc,
+                    }],
+                    terminator: Terminator::Invoke {
+                        callee,
+                        type_args,
+                        args,
+                        evidence: Vec::new(),
+                        ok_slot: ValueId(50),
+                        ok_target: BlockId(1),
+                        err_targets: Vec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn an_invoke_with_consistent_generic_arguments_is_accepted() {
+        let mut module = module();
+        module.functions.push(same_type_twice());
+        let interpreter = Interpreter::new(&module);
+        let caller = invoking_caller(
+            ItemId(97),
+            vec![Ty::I64],
+            vec![ValueId(1), ValueId(2)],
+            vec![
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+            ],
+            Ty::Unit,
+        );
+
+        interpreter
+            .call_function(
+                &caller,
+                &[],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .expect("both arguments agree with the one instantiation");
+    }
+
+    #[test]
+    fn an_invoke_with_inconsistent_generic_arguments_is_refused() {
+        let mut module = module();
+        module.functions.push(same_type_twice());
+        let interpreter = Interpreter::new(&module);
+        let caller = invoking_caller(
+            ItemId(97),
+            vec![Ty::I64],
+            vec![ValueId(1), ValueId(2)],
+            vec![
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: Ty::Applied(BOXY, vec![Ty::Bool]),
+                    take: false,
+                },
+            ],
+            Ty::Unit,
+        );
+
+        let error = interpreter
+            .call_function(
+                &caller,
+                &[],
+                vec![
+                    boxed(Ty::I64, Value::Int(1)),
+                    boxed(Ty::Bool, Value::Bool(true)),
+                ],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("one `T` cannot be both `i64` and `bool` in one invocation");
+        assert!(
+            format!("{error:?}").contains("disagrees with the concrete part"),
+            "the second argument is checked against the same `T = i64` the first was, got \
+             {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_invoke_with_the_wrong_generic_arity_is_refused_without_mutating() {
+        let mut module = module();
+        module.functions.push(same_type_twice());
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let caller = invoking_caller(
+            ItemId(97),
+            // `same_type_twice` declares one parameter.
+            vec![Ty::I64, Ty::Bool],
+            vec![ValueId(1), ValueId(2)],
+            vec![
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(2),
+                    ty: Ty::Applied(BOXY, vec![Ty::I64]),
+                    take: false,
+                },
+            ],
+            Ty::Unit,
+        );
+
+        // The *caller's* own frame is entered legitimately, so its
+        // `call:` event is expected. What must not appear is the
+        // callee's, and no table state may move.
+        let table_before = format!("{:?}", interpreter.resources.borrow().records);
+        let error = interpreter
+            .call_function(
+                &caller,
+                &[],
+                vec![boxed(Ty::I64, Value::Int(1)), boxed(Ty::I64, Value::Int(2))],
+                Vec::new(),
+            )
+            .map(|_| ())
+            .expect_err("an over-long instantiation is refused, never truncated");
+        assert!(
+            format!("{error:?}").contains("type parameter(s) but was instantiated with 2"),
+            "got {error:?}"
+        );
+        assert_eq!(
+            format!("{:?}", interpreter.resources.borrow().records),
+            table_before,
+            "a refused invoke moves no generation and destroys nothing"
+        );
+        assert!(
+            !interpreter.event_log().iter().any(|e| e == "call:97"),
+            "the callee's frame was never entered: {:?}",
+            interpreter.event_log()
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[owner.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "nothing unrelated was touched either"
+        );
+    }
+
+    /// An `Invoke` inside a generic body carries its type arguments
+    /// symbolically, exactly as a `Call` does, and only the running
+    /// frame knows what they resolve to.
+    #[test]
+    fn an_invoke_type_argument_is_resolved_through_the_frame() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let param = crate::hir::TypeParamId(0);
+        let mut frame = HashMap::new();
+        frame.insert(param, Ty::I64);
+        let resolved = interpreter
+            .resolve_call_type_args(
+                &[Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))])],
+                &frame,
+            )
+            .expect("the frame's own instantiation resolves it");
+        assert_eq!(resolved, vec![Ty::Applied(BOXY, vec![Ty::I64])]);
+    }
     // -- a rejected frame entry changes nothing -------------------------
 
     /// `f(take a: File)` with no `bb0` at all. Every boundary check

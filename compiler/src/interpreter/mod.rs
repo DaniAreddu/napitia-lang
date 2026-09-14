@@ -2085,7 +2085,7 @@ impl<'a> Interpreter<'a> {
     /// parameter binding, and every `store.observe`, goes through this
     /// rather than binding the caller's own handle as-is.
     fn to_observer_if_resource(&self, value: Value) -> Result<Value, InterpreterError> {
-        self.to_observing_view(value, &StorePlan::default(), 0)
+        self.to_observing_view(value, 0)
     }
 
     /// Rebuilds `value` as an observing *view* of itself: every resource
@@ -2100,30 +2100,16 @@ impl<'a> Interpreter<'a> {
     ///
     /// Nothing is mutated: a new value is built, and the caller's own
     /// keeps its owning handles.
-    fn to_observing_view(
-        &self,
-        value: Value,
-        plan: &StorePlan,
-        depth: usize,
-    ) -> Result<Value, InterpreterError> {
+    fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
         match value {
-            Value::Resource(handle) => {
-                // Validate against the current table first. When another
-                // argument transfers the same identity, prepare this
-                // observer with the generation installed by that commit.
-                let mut observer = self.resources.borrow().to_observer(handle)?;
-                if let Some((_, generation)) =
-                    plan.transitions.iter().find(|(id, _)| *id == handle.id)
-                {
-                    observer.generation = *generation;
-                }
-                Ok(Value::Resource(observer))
-            }
+            Value::Resource(handle) => Ok(Value::Resource(
+                self.resources.borrow().to_observer(handle)?,
+            )),
             Value::Record {
                 item,
                 type_args,
@@ -2133,7 +2119,7 @@ impl<'a> Interpreter<'a> {
                 type_args,
                 fields: fields
                     .into_iter()
-                    .map(|field| self.to_observing_view(field, plan, depth + 1))
+                    .map(|field| self.to_observing_view(field, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Value::Variant {
@@ -2147,7 +2133,7 @@ impl<'a> Interpreter<'a> {
                 case,
                 payload: payload
                     .into_iter()
-                    .map(|slot| self.to_observing_view(slot, plan, depth + 1))
+                    .map(|slot| self.to_observing_view(slot, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             other => Ok(other),
@@ -2415,23 +2401,52 @@ impl<'a> Interpreter<'a> {
         // nothing (they allocate a new value and mutate no state) and
         // keeps every fallible step ahead of the commit.
         let mut plan = StorePlan::default();
-        // Preserve non-take arguments until every take argument has
-        // been planned. Observing aliases can then be prepared against
-        // the exact generations installed by the shared commit.
         let mut bindings: Vec<(ValueId, Value, bool)> = Vec::with_capacity(function.params.len());
+        // Every identity any observing argument can reach, collected
+        // before anything is planned. An identity that also crosses the
+        // boundary as a `take` argument would leave the callee holding
+        // an owner it may destroy at any point *and* a view that stays
+        // readable for exactly as long, with nothing sequencing the
+        // two. That is refused outright below rather than accommodated:
+        // an earlier attempt to make it work by rebasing the observer
+        // onto the generation the transfer installs only hid the
+        // problem, since the observation is still live after the owner
+        // is dropped.
+        let mut observed_identities: HashSet<ResourceId> = HashSet::new();
         for (param, arg) in function.params.iter().zip(args) {
             self.validate_argument(&arg, &param.ty)?;
+            if !param.take {
+                // Per argument, then unioned. A repeat *within* one
+                // argument's graph is a genuine fault and stays one;
+                // the same resource observed by two different arguments
+                // is not, since neither observation can end it.
+                let mut reached = HashSet::new();
+                self.collect_owned_identities(&arg, &mut reached, 0)?;
+                observed_identities.extend(reached);
+            }
             let bound = if param.take {
                 self.plan_transfer(&arg, &mut plan, 0)?
             } else {
-                arg
+                self.to_observing_view(arg, 0)?
             };
             bindings.push((param.value, bound, !param.take));
         }
-        for (_, bound, observes) in &mut bindings {
-            if *observes {
-                *bound = self.to_observing_view(bound.clone(), &plan, 0)?;
-            }
+        // `plan.reachable` is every identity the `take` arguments carry,
+        // at any depth and through resource records as well as inline
+        // aggregates, so this one intersection covers bare resources,
+        // records, variants, generic instantiations and any nesting of
+        // them.
+        if let Some(shared) = plan
+            .reachable
+            .iter()
+            .find(|id| observed_identities.contains(id))
+        {
+            return Err(invalid(format!(
+                "one resource (#{}) is passed to this call as both an observing argument and a \
+                 `take` argument, so the callee could destroy it while the observation is still \
+                 readable",
+                shared.0
+            )));
         }
         // Every owner and observer is valid before the one commit.
         self.commit_transfer(&plan);
@@ -9339,7 +9354,7 @@ mod transfer_transaction {
     }
 
     #[test]
-    fn an_observing_argument_aliasing_a_later_take_stays_current() {
+    fn an_observing_argument_aliasing_a_later_take_is_refused() {
         let module = module();
         let interpreter = Interpreter::new(&module);
         let owner = new_file(&interpreter, 1);
@@ -9380,18 +9395,35 @@ mod transfer_transaction {
             }],
         };
 
-        interpreter
+        // This call used to be *accepted*, by rebasing the observing
+        // argument onto the generation the transfer was about to
+        // install. That only worked because this particular callee
+        // happens to read the observation before dropping the owner.
+        // Nothing in the signature says it does, and swapping those two
+        // instructions leaves the observation pointing at a destroyed
+        // resource -- so the accommodation made the caller's safety
+        // depend on the callee's statement order. The pairing is
+        // refused at the boundary instead.
+        let error = interpreter
             .call_function(
                 &callee,
                 vec![Value::Resource(owner), Value::Resource(owner)],
                 Vec::new(),
             )
-            .expect("the observer must share the planned take generation");
+            .map(|_| ())
+            .expect_err("one resource may not be observed and taken by one call");
+        assert!(
+            format!("{error:?}").contains("both an observing argument and a `take` argument"),
+            "the boundary itself must refuse the pairing, got {error:?}"
+        );
 
         let table = interpreter.resources.borrow();
         let record = &table.records[owner.id.0 as usize];
-        assert_eq!(record.generation, owner.generation + 1);
-        assert_eq!(record.status, ResourceStatus::Dropped);
+        assert_eq!(
+            record.generation, owner.generation,
+            "a refused call moves no generation"
+        );
+        assert_eq!(record.status, ResourceStatus::Alive, "and destroys nothing");
     }
 
     #[test]
@@ -10109,6 +10141,282 @@ mod transfer_transaction {
         );
     }
 
+    // -- one call may not observe and take one identity -----------------
+    //
+    // Collected recursively from both sides of the boundary and
+    // intersected, so bare resources, records, variants, generic
+    // instantiations, resource-record fields and any nesting of them are
+    // all covered by the one check.
+
+    /// `f(a, b)` with `take` on whichever position `take_first` names,
+    /// and a body that drops the owner and reads the observation in
+    /// `drop_first` order -- the two orders a caller cannot distinguish
+    /// from the signature, which is the whole reason the pairing is
+    /// refused rather than reasoned about.
+    fn observe_and_take_callee(
+        first_ty: Ty,
+        second_ty: Ty,
+        take_first: bool,
+        drop_first: bool,
+    ) -> Function {
+        let owner = if take_first { ValueId(0) } else { ValueId(1) };
+        let observed = if take_first { ValueId(1) } else { ValueId(0) };
+        let read = Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::I64,
+            kind: ValueKind::RecordField {
+                base: observed,
+                record: FILE,
+                field: 0,
+            },
+        };
+        let drop = Instruction::Drop { value: owner };
+        Function {
+            id: ItemId(93),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: first_ty,
+                    take: take_first,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: second_ty,
+                    take: !take_first,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: if drop_first {
+                    vec![drop, read]
+                } else {
+                    vec![read, drop]
+                },
+                terminator: Terminator::Return(None),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_call_observing_and_taking_one_resource_is_refused_in_either_order() {
+        for take_first in [false, true] {
+            for drop_first in [false, true] {
+                let module = module();
+                let interpreter = Interpreter::new(&module);
+                let owner = new_file(&interpreter, 1);
+                let callee = observe_and_take_callee(file_ty(), file_ty(), take_first, drop_first);
+                rejected_without_a_trace(
+                    &interpreter,
+                    "one resource may not be observed and taken by one call",
+                    || {
+                        interpreter
+                            .call_function(
+                                &callee,
+                                vec![Value::Resource(owner), Value::Resource(owner)],
+                                Vec::new(),
+                            )
+                            .map(|_| ())
+                    },
+                );
+                assert_eq!(
+                    interpreter.resources.borrow().records[owner.id.0 as usize].status,
+                    ResourceStatus::Alive,
+                    "take_first={take_first} drop_first={drop_first}: nothing was destroyed"
+                );
+            }
+        }
+    }
+
+    /// The identity is nested inside a record on the observing side and
+    /// bare on the taking side. Neither outer handle is shared, so only
+    /// a recursive collection finds the overlap.
+    #[test]
+    fn a_call_aliasing_through_a_nested_record_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = new_file(&interpreter, 1);
+        let holder = Value::Record {
+            item: HOLDER,
+            type_args: Vec::new(),
+            fields: vec![Value::Resource(inner)],
+        };
+        let callee = Function {
+            id: ItemId(94),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: Ty::Named(HOLDER, Symbol(0)),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop { value: ValueId(1) }],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a nested identity is still the same identity",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![holder.clone(), Value::Resource(inner)],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+    }
+
+    /// The same through a variant payload.
+    #[test]
+    fn a_call_aliasing_through_a_variant_payload_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let inner = new_file(&interpreter, 1);
+        // A second, distinct resource fills the other payload slot, so
+        // the only repeat is *across* the two arguments. Putting `inner`
+        // in both slots would be a duplicate within one graph -- a
+        // different fault, already rejected by the graph walk, and it
+        // would let this test pass without the boundary check running.
+        let sibling = new_file(&interpreter, 2);
+        let wrapped = Value::Variant {
+            item: MAYBE,
+            type_args: vec![file_ty()],
+            case: 0,
+            payload: vec![Value::Resource(inner), Value::Resource(sibling)],
+        };
+        let callee = Function {
+            id: ItemId(95),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: Ty::Applied(MAYBE, vec![file_ty()]),
+                    take: false,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        rejected_without_a_trace(
+            &interpreter,
+            "a payload identity is still the same identity",
+            || {
+                interpreter
+                    .call_function(
+                        &callee,
+                        vec![Value::Resource(inner), wrapped.clone()],
+                        Vec::new(),
+                    )
+                    .map(|_| ())
+            },
+        );
+    }
+
+    #[test]
+    fn a_call_observing_one_resource_twice_is_accepted_at_run_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let owner = new_file(&interpreter, 1);
+        let callee = Function {
+            id: ItemId(96),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: false,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: false,
+                },
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        interpreter
+            .call_function(
+                &callee,
+                vec![Value::Resource(owner), Value::Resource(owner)],
+                Vec::new(),
+            )
+            .expect("neither observation can end the resource");
+        assert_eq!(
+            interpreter.resources.borrow().records[owner.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "and the caller still owns it afterwards"
+        );
+    }
+
+    #[test]
+    fn a_call_observing_one_resource_and_taking_another_is_accepted_at_run_time() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let kept = new_file(&interpreter, 1);
+        let given = new_file(&interpreter, 2);
+        let callee = observe_and_take_callee(file_ty(), file_ty(), false, false);
+
+        interpreter
+            .call_function(
+                &callee,
+                vec![Value::Resource(kept), Value::Resource(given)],
+                Vec::new(),
+            )
+            .expect("distinct identities never alias");
+        let table = interpreter.resources.borrow();
+        assert_eq!(
+            table.records[kept.id.0 as usize].status,
+            ResourceStatus::Alive,
+            "the observed resource is untouched"
+        );
+        assert_eq!(
+            table.records[given.id.0 as usize].status,
+            ResourceStatus::Dropped,
+            "and the taken one was consumed"
+        );
+    }
     // -- self-stores at run time, judged by mode ------------------------
 
     /// Builds `f(take a: File)` whose body fills `%0`, loads it into

@@ -7070,41 +7070,76 @@ fn verify_structural_places(
                     // path, observer on another) is conservatively
                     // refused too rather than assumed harmless.
                     //
-                    // Unless the source *is* the destination's own
-                    // current contents -- `session = session`, whose
-                    // source lowers to a `Load` of the very slot being
-                    // written. Consuming it empties the slot a moment
-                    // before the store refills it, so nothing is
-                    // discarded; this check runs before that consumption
-                    // and would otherwise see a still-owning slot and
-                    // report a leak that cannot happen. Compared through
-                    // `origin`, so a `Load` result and the slot it read
-                    // are recognized as the one place they are, exactly
-                    // as everywhere else in this pass.
-                    let stores_its_own_contents = origin(*value) == origin(*slot);
-                    if is_affine(*slot)
-                        && !stores_its_own_contents
-                        && resolve_place_state(&facts, &destination).may_own()
-                    {
-                        violations.push(OwnershipViolation::OverwriteOwnedSlot(*slot));
-                        continue;
-                    }
+                    // *When* the destination is judged is the whole
+                    // question, and it differs by mode. There is
+                    // deliberately no "the source is the slot's own
+                    // contents" exemption: comparing origins says only
+                    // that a `Load` came from this slot at some point,
+                    // never that it is still what the slot holds, and
+                    // it says nothing at all about whether this store
+                    // consumes it. An exemption written that way let
+                    // `store.observe %slot, load(%slot)` erase a live
+                    // owner in silence -- it consumes nothing, so the
+                    // owner stayed in the loaded value while the slot's
+                    // own obligation was quietly downgraded away.
                     match mode {
                         crate::nir::OwnershipMode::Transfer => {
+                            // A transferring store consumes its source
+                            // *before* it installs anything, so the
+                            // destination must be judged in the state
+                            // that consumption leaves behind, not the
+                            // one before it. That single ordering is
+                            // what makes `session = session` legal
+                            // without a special case: consuming the
+                            // source empties the very slot being
+                            // written, so by the time the destination
+                            // is looked at it owns nothing.
+                            //
+                            // Staged, so a rejected store publishes
+                            // nothing: if either step fails, the facts
+                            // this block carries forward are exactly
+                            // the ones it had.
+                            let mut staged = facts.clone();
+                            let mut consumption = Vec::new();
                             consume_root(
-                                &mut facts,
-                                &mut violations,
+                                &mut staged,
+                                &mut consumption,
                                 &is_affine,
                                 &origin,
                                 *value,
                                 true,
                                 *value,
                             );
+                            if !consumption.is_empty() {
+                                violations.extend(consumption);
+                                continue;
+                            }
+                            if is_affine(*slot)
+                                && resolve_place_state(&staged, &destination).may_own()
+                            {
+                                violations.push(OwnershipViolation::OverwriteOwnedSlot(*slot));
+                                continue;
+                            }
+                            facts = staged;
                             if is_affine(*slot) {
                                 set_place_state(&mut facts, &destination, FieldState::OWNED);
                             }
                         }
                         crate::nir::OwnershipMode::Observe => {
+                            // An observing store consumes nothing, so
+                            // there is no later state to judge against:
+                            // whatever the destination owns now, it
+                            // still owns when the write lands, and the
+                            // write discards it. A slot holding its own
+                            // loaded value is no exception -- that load
+                            // still holds the owner afterwards, which is
+                            // precisely the leak.
+                            if is_affine(*slot)
+                                && resolve_place_state(&facts, &destination).may_own()
+                            {
+                                violations.push(OwnershipViolation::OverwriteOwnedSlot(*slot));
+                                continue;
+                            }
                             observe_root(
                                 &facts,
                                 &mut violations,
@@ -22838,11 +22873,27 @@ mod structural_ownership {
             take: false,
         }];
         let codes = structural_codes(&mut fx, under_test(params, Ty::I64, blocks));
+        // Two defects, one per store, and the analysis settles on them
+        // rather than oscillating.
+        //
+        // `bb1`'s observing store finds the slot possibly owning and
+        // consumes nothing, so it would discard that owner: `V0100`.
+        //
+        // `bb2`'s transferring store is judged on its *source* first,
+        // and on the second iteration `%2` was already transferred away
+        // by the first, so it is a duplicate consumption: `V0092`. That
+        // is the more accurate of the two answers available here --
+        // asking whether a write would discard the destination's owner
+        // is meaningless when the value being written is itself already
+        // gone -- and it is why the transferring arm consumes before it
+        // judges the destination.
         assert_eq!(
             codes,
-            vec![codes::STORE_OVER_OWNED_SLOT, codes::STORE_OVER_OWNED_SLOT],
-            "on the second iteration each store finds the slot possibly owning, and the analysis \
-             settles there rather than oscillating"
+            vec![
+                codes::DUPLICATE_STRUCTURAL_CLEANUP,
+                codes::STORE_OVER_OWNED_SLOT
+            ],
+            "each store is rejected on its own terms, and the fixed point converges"
         );
     }
 

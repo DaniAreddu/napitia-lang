@@ -157,7 +157,9 @@ jobs:
             name="$(basename "$dir")"
             tar -czf "release/${name}-${GITHUB_REF_NAME}.tar.gz" -C "$dir" .
           done
-          ( cd release && sha256sum *.tar.gz > SHA256SUMS )
+          # `./` on the glob: without it a file whose name began with a
+          # dash would be read as an option rather than an operand.
+          ( cd release && sha256sum ./*.tar.gz > SHA256SUMS )
           ls -l release
 
       # `gh` is preinstalled on the runner, so this needs no third-party

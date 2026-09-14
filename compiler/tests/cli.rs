@@ -1065,6 +1065,18 @@ fn resource_invalid_mixed_observe_take_example_is_u0015_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_mixed_observe_take.npt", "U0015");
 }
 
+/// The same alias with the observing argument spelled as an `if`.
+///
+/// The compound spelling is what makes it a distinct regression: an
+/// argument that is neither a bare local nor a field chain has no single
+/// place, and reading that as "names nothing" let this reach the
+/// interpreter as a stale handle after both earlier stages had accepted
+/// it.
+#[test]
+fn resource_invalid_compound_mixed_alias_example_is_u0015_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_compound_mixed_alias.npt", "U0015");
+}
+
 #[test]
 fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_defer_parent_drop.npt", "U0004");

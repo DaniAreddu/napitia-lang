@@ -1868,7 +1868,7 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|t| self.resolve_named_type(t))
                 .collect();
-            if resolved.len() != type_params.len() {
+            let Some(subst) = crate::types::checked_substitution(type_params, &resolved) else {
                 self.diagnostics.push(
                     Diagnostic::error(
                         codes::GENERIC_ARITY_MISMATCH,
@@ -1883,8 +1883,8 @@ impl<'a> Checker<'a> {
                     .with_primary_label("wrong number of type arguments"),
                 );
                 return None;
-            }
-            return Some((type_params.iter().copied().zip(resolved).collect(), false));
+            };
+            return Some((subst, false));
         }
         if type_params.is_empty() {
             return Some((HashMap::new(), false));

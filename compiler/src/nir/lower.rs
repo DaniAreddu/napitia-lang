@@ -1549,20 +1549,16 @@ impl<'a> Lowering<'a> {
                     "a checked place projects field {field:?}, out of range for record {owner:?}"
                 )));
             };
-            if record.type_params.len() != args.len() {
+            let params: Vec<crate::hir::TypeParamId> =
+                record.type_params.iter().map(|(id, _)| *id).collect();
+            let Some(subst) = crate::types::checked_substitution(&params, &args) else {
                 return Err(self.internal_error(&format!(
                     "a checked place projects through {owner:?}, which declares {} type \
                      parameter(s) but is applied to {} type argument(s)",
-                    record.type_params.len(),
+                    params.len(),
                     args.len()
                 )));
-            }
-            let subst: HashMap<crate::hir::TypeParamId, Ty> = record
-                .type_params
-                .iter()
-                .map(|(id, _)| *id)
-                .zip(args)
-                .collect();
+            };
             ty = crate::types::substitute(field_ty, &subst);
         }
         Ok((

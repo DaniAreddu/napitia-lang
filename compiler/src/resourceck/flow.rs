@@ -684,11 +684,7 @@ impl<'a> FlowChecker<'a> {
     /// affine" for a genuinely affine field.
     fn substitute_field(&self, owner: ItemId, args: &[Ty], field_ty: &Ty) -> Option<Ty> {
         let params = self.affine.item_type_params.get(&owner)?;
-        if params.len() != args.len() {
-            return None;
-        }
-        let subst: HashMap<TypeParamId, Ty> =
-            params.iter().copied().zip(args.iter().cloned()).collect();
+        let subst = crate::types::checked_substitution(params, args)?;
         Some(crate::types::substitute(field_ty, &subst))
     }
 

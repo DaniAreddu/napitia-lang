@@ -7069,7 +7069,14 @@ mod tests {
     /// right at the `FnBuilder` API boundary) must actually fire if a
     /// future lowering bug reintroduces this shape -- exercised here by
     /// calling the builder directly, bypassing all real lowering.
+    // `cfg(debug_assertions)`: the guard these three exercise is a
+    // `debug_assert!`, so it does not exist in a release build and the
+    // tests cannot hold there. Scoped to where the guard is, rather
+    // than promoted to a release-mode check -- it protects against a
+    // lowering bug, not against user input, and paying for it in
+    // shipped binaries would be the wrong trade.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "already terminated")]
     fn appending_a_value_after_terminate_is_caught_by_the_builder_invariant() {
         let mut fb = FnBuilder::new(Ty::Unit);
@@ -7078,6 +7085,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "already terminated")]
     fn appending_a_store_after_terminate_is_caught_by_the_builder_invariant() {
         let mut fb = FnBuilder::new(Ty::Unit);
@@ -7088,6 +7096,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "terminated twice")]
     fn terminating_a_block_twice_is_caught_by_the_builder_invariant() {
         let mut fb = FnBuilder::new(Ty::Unit);

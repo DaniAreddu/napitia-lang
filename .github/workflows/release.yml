@@ -1,43 +1,49 @@
 name: Release
 
 # Cutting a release is pushing a `v*` tag. The tag is the trigger and
-# the source of truth for the version, so there is no separate input to
-# get out of step with it -- and `verify` refuses outright if the tag
-# and `compiler/Cargo.toml` disagree.
+# the source of truth for the version, so there is nothing to get out of
+# step with it.
 #
-# `workflow_dispatch` is here for rehearsal: it builds and uploads the
-# artifacts without publishing anything, so the packaging can be
-# exercised on a branch before a tag exists.
+# `workflow_dispatch` is for rehearsal only: it builds, packages and
+# uploads artifacts to the run, and can never publish. The `publish` job
+# is guarded on the ref being a tag, so there is no input that turns a
+# rehearsal into a release by accident.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch: {}
 
-# Read-only by default. Exactly one job below raises this, and only to
-# what it needs.
+# Read-only by default. Exactly one job raises this, and only to what it
+# needs.
 permissions:
   contents: read
 
-# Never cancel a release midway: a half-finished publish is worse than
-# a slow one, and two runs for the same tag should queue rather than
-# race to create the same release.
+# Never cancel a release midway: a half-finished publish is worse than a
+# slow one, and two runs for the same tag should queue rather than race
+# to create the same release.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # A release must not be able to ship something `CI` would have
-  # rejected. This repeats the same three checks rather than trusting
-  # that the tagged commit happened to be green: a tag can be pushed at
-  # any commit, including one that never ran CI at all.
+  # A release must not ship something the ordinary gates would have
+  # rejected. These are repeated rather than assumed: a tag can be
+  # pushed at any commit, including one CI never saw.
   verify:
+    name: Verify
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Full history: the ancestry check below needs to reach both
+          # the tag and `alpha`, which a shallow clone cannot.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust
@@ -47,18 +53,47 @@ jobs:
           components: rustfmt, clippy
 
       - name: cargo fmt --check
-        run: cargo fmt --manifest-path compiler/Cargo.toml --check
+        run: cargo fmt --manifest-path compiler/Cargo.toml --all --check
 
       - name: cargo clippy
-        run: cargo clippy --manifest-path compiler/Cargo.toml --locked --all-targets -- -D warnings
+        run: >-
+          cargo clippy
+          --manifest-path compiler/Cargo.toml
+          --all-targets
+          --all-features
+          --locked
+          -- -D warnings
 
-      - name: cargo test
-        run: cargo test --manifest-path compiler/Cargo.toml --locked
+      - name: cargo test (debug)
+        run: >-
+          cargo test
+          --manifest-path compiler/Cargo.toml
+          --all-targets
+          --all-features
+          --locked
 
-      # The one check CI does not make. A tag that disagrees with the
-      # manifest produces a release whose binaries report a different
-      # version than the release names, which is the kind of thing
-      # nobody notices until they are trying to reproduce a bug.
+      - name: cargo test (release)
+        run: >-
+          cargo test
+          --manifest-path compiler/Cargo.toml
+          --release
+          --all-targets
+          --all-features
+          --locked
+
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc
+          --manifest-path compiler/Cargo.toml
+          --all-features
+          --no-deps
+          --locked
+
+      # A release whose binaries report a different version than the
+      # release names is the kind of thing nobody notices until they are
+      # trying to reproduce a bug.
       - name: Tag matches the crate version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -66,13 +101,42 @@ jobs:
           manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' compiler/Cargo.toml | head -1)"
           tag="${GITHUB_REF_NAME#v}"
           if [ "$manifest" != "$tag" ]; then
-            echo "tag ${GITHUB_REF_NAME} claims version '${tag}'," >&2
-            echo "but compiler/Cargo.toml declares '${manifest}'." >&2
+            echo "::error::tag ${GITHUB_REF_NAME} claims version '${tag}' but compiler/Cargo.toml declares '${manifest}'"
             exit 1
           fi
           echo "tag and manifest agree on ${manifest}"
 
+      # Releases come from reviewed history, not from an arbitrary
+      # commit somebody happened to tag. `alpha` is the protected branch
+      # everything merges through, so a tag not reachable from it was
+      # never reviewed.
+      - name: Tag is reachable from alpha
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/alpha:refs/remotes/origin/alpha
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/alpha; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from origin/alpha"
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} is contained in origin/alpha"
+
+      # Refusing before anything is built beats discovering it after
+      # every platform has spent its time.
+      - name: Release does not already exist
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::a release named ${GITHUB_REF_NAME} already exists; delete it or cut a new version"
+            exit 1
+          fi
+          echo "no existing release named ${GITHUB_REF_NAME}"
+
   build:
+    name: Build (${{ matrix.name }})
     needs: verify
     strategy:
       # One platform failing should not hide whether the others build.
@@ -81,15 +145,18 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+            expected_target: x86_64-unknown-linux-gnu
             binary: napitia
           - os: macos-latest
-            name: macos-arm64
+            name: macos-aarch64
+            expected_target: aarch64-apple-darwin
             binary: napitia
           - os: windows-latest
             name: windows-x86_64
+            expected_target: x86_64-pc-windows-msvc
             binary: napitia.exe
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -101,11 +168,33 @@ jobs:
         with:
           toolchain: "1.97.1"
 
-      - name: cargo build --release
-        run: cargo build --manifest-path compiler/Cargo.toml --locked --release
+      # The artifact name is a claim about the architecture inside it,
+      # and `runs-on` is not evidence for that claim -- GitHub has
+      # changed what `macos-latest` points at before, and silently
+      # shipping an arm64 binary labelled x86_64 is worse than failing.
+      # The toolchain's own host triple is the evidence.
+      - name: Host matches the target this artifact claims
+        shell: bash
+        env:
+          EXPECTED: ${{ matrix.expected_target }}
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${host}" != "${EXPECTED}" ]; then
+            echo "::error::runner host is ${host}, but this matrix entry claims ${EXPECTED}"
+            exit 1
+          fi
+          echo "host is ${host}, as claimed"
 
-      # Proves the artifact actually runs on the platform it was built
-      # for, rather than only that it linked.
+      - name: cargo build --release
+        run: >-
+          cargo build
+          --manifest-path compiler/Cargo.toml
+          --locked
+          --release
+
+      # Proves the artifact runs on the platform it was built for,
+      # rather than only that it linked.
       - name: Smoke-test the binary
         shell: bash
         run: compiler/target/release/${{ matrix.binary }} --version
@@ -114,11 +203,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp "compiler/target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
-          cp LICENSE README.md dist/
+          mkdir -p "dist/napitia-${{ matrix.name }}"
+          cp "compiler/target/release/${{ matrix.binary }}" "dist/napitia-${{ matrix.name }}/"
+          cp LICENSE README.md "dist/napitia-${{ matrix.name }}/"
 
-      - name: Upload the artifact
+      - name: Upload the staged artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: napitia-${{ matrix.name }}
@@ -126,17 +215,20 @@ jobs:
           if-no-files-found: error
 
   publish:
-    # Only a real tag publishes. A `workflow_dispatch` run stops after
-    # `build`, having proved the packaging works without creating
-    # anything.
+    name: Publish
+    # Only a real tag publishes. A `workflow_dispatch` run stops here,
+    # having proved the packaging works without creating anything.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # The only elevated permission in this file, on the only job that
-    # needs it.
+    timeout-minutes: 20
     permissions:
+      # The only elevated permissions in this file, on the only job that
+      # needs them: `contents` to create the release, the other two to
+      # sign provenance for what it uploads.
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -148,23 +240,52 @@ jobs:
         with:
           path: artifacts
 
-      - name: Package one archive per platform
+      # Reproducible archives: the same commit must produce the same
+      # bytes, so a third party can rebuild and compare checksums rather
+      # than trusting these ones.
+      #
+      # Four things otherwise leak into a tarball and differ per run --
+      # entry order, owner/group names, modification times, and the
+      # timestamp gzip writes into its own header. Each is pinned: sorted
+      # entries, numeric 0/0 ownership, every mtime set to the tagged
+      # commit's own commit date, and `gzip -n` to omit the header
+      # timestamp entirely.
+      - name: Package one reproducible archive per platform
         shell: bash
         run: |
           set -euo pipefail
+          source_epoch="$(git log -1 --format=%ct "${GITHUB_SHA}")"
+          echo "normalizing every timestamp to ${source_epoch} (the tagged commit's own date)"
           mkdir -p release
           for dir in artifacts/*/; do
-            name="$(basename "$dir")"
-            tar -czf "release/${name}-${GITHUB_REF_NAME}.tar.gz" -C "$dir" .
+            name="$(basename "${dir}")"
+            find "${dir}" -exec touch --no-dereference --date="@${source_epoch}" {} +
+            tar \
+              --sort=name \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --mtime="@${source_epoch}" \
+              --format=gnu \
+              -cf - -C "${dir}" . \
+              | gzip -n -9 > "release/${name}-${GITHUB_REF_NAME}.tar.gz"
           done
           # `./` on the glob: without it a file whose name began with a
           # dash would be read as an option rather than an operand.
           ( cd release && sha256sum ./*.tar.gz > SHA256SUMS )
-          ls -l release
+          cat release/SHA256SUMS
+
+      # Signed provenance for exactly the archives being published, so a
+      # consumer can verify where they came from rather than only that
+      # their checksum matches a file published beside them.
+      - name: Attest the release archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*.tar.gz
 
       # `gh` is preinstalled on the runner, so this needs no third-party
-      # action and no additional pin. An alpha tag is marked prerelease
-      # so it never becomes the "latest" release people land on.
+      # action and no additional pin. `--verify-tag` refuses to invent a
+      # tag that does not exist.
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -174,6 +295,7 @@ jobs:
           case "${GITHUB_REF_NAME}" in
             *-alpha*|*-beta*|*-rc*) prerelease="--prerelease" ;;
           esac
+          # shellcheck disable=SC2086 # `prerelease` is one optional flag, deliberately unquoted
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \

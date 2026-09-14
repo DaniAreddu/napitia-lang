@@ -5051,7 +5051,60 @@ enum Role {
 /// whether *every* predecessor agrees it is currently `Owned` --
 /// downgraded to `Observed` the moment even one disagrees, since an
 /// `Observed` role must never be silently widened into an owner.
-type Provenance = (BTreeSet<ValueId>, Role);
+/// Deadness is carried *here*, per location, rather than in one set
+/// beside the map, because the join is where the two have to stay
+/// together.
+///
+/// A global "these identities were destroyed somewhere" set unions
+/// across predecessors independently of the provenance it is compared
+/// against, which loses the correlation between them. Given
+///
+/// ```text
+/// if c { f = f } else { drop f; f = File { .. } }
+/// ```
+///
+/// the join says `f` may denote `{A, B}` and, separately, that `A` was
+/// destroyed somewhere -- so any later use of `f` looked like a use of
+/// a destroyed alias. It is not: on the branch where `f` denotes `A`,
+/// `A` is alive, and on the branch where `A` was destroyed, `f` denotes
+/// `B`. The two facts are true on *different* paths and were being read
+/// as though they held on the same one.
+///
+/// Keeping `dead` inside the provenance makes the union do the right
+/// thing by construction: the branch that dropped `A` also replaced
+/// `f`'s provenance wholesale, so it contributes `({B}, dead {})`, and
+/// the surviving branch contributes `({A}, dead {})`. A genuine
+/// violation still lands, because destroying an identity marks it dead
+/// in every location that currently denotes it -- so `value a = f; drop
+/// f; use a` leaves `a` at `({A}, dead {A})`, on the one path that
+/// reaches it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Provenance {
+    /// Every resource identity this location might currently denote
+    /// (more than one only just past a join where reachable
+    /// predecessors disagree).
+    ids: BTreeSet<ValueId>,
+    /// The subset of `ids` already destroyed on a path that also gave
+    /// this location that identity.
+    dead: BTreeSet<ValueId>,
+    /// Whether *every* predecessor agrees this is currently `Owned` --
+    /// downgraded to `Observed` the moment even one disagrees, since an
+    /// `Observed` role must never be silently widened into an owner.
+    role: Role,
+}
+
+impl Provenance {
+    /// A location that just received these identities: nothing it
+    /// denotes has been destroyed yet, whatever happened to those
+    /// identities through some *other* location on some other path.
+    fn live(ids: BTreeSet<ValueId>, role: Role) -> Self {
+        Self {
+            ids,
+            dead: BTreeSet::new(),
+            role,
+        }
+    }
+}
 
 /// A value/slot's own current definite-initialization state
 /// (`rfcs/0011`) -- deliberately has *no* variant that silently grants
@@ -5101,17 +5154,20 @@ fn merge_location(a: LocationState, b: LocationState) -> LocationState {
         | (LocationState::Uninitialized, LocationState::Initialized(_)) => {
             LocationState::MaybeUninitialized
         }
-        (
-            LocationState::Initialized((a_ids, a_role)),
-            LocationState::Initialized((b_ids, b_role)),
-        ) => {
-            let ids = a_ids.union(&b_ids).copied().collect();
-            let role = if a_role == Role::Owned && b_role == Role::Owned {
+        (LocationState::Initialized(a), LocationState::Initialized(b)) => {
+            // Both halves union, and they union *together*, which is
+            // the whole reason `dead` lives here: a predecessor that
+            // destroyed an identity and then gave this location a fresh
+            // one contributes no deadness at all, because replacing the
+            // provenance replaced both fields.
+            let ids = a.ids.union(&b.ids).copied().collect();
+            let dead = a.dead.union(&b.dead).copied().collect();
+            let role = if a.role == Role::Owned && b.role == Role::Owned {
                 Role::Owned
             } else {
                 Role::Observed
             };
-            LocationState::Initialized((ids, role))
+            LocationState::Initialized(Provenance { ids, dead, role })
         }
     }
 }
@@ -5312,7 +5368,7 @@ fn verify_resource_ownership(
     let resolve_ids =
         |raw: ValueId, provenance: &HashMap<ValueId, LocationState>| -> BTreeSet<ValueId> {
             match provenance.get(&raw) {
-                Some(LocationState::Initialized((ids, _))) => ids.clone(),
+                Some(LocationState::Initialized(prov)) => prov.ids.clone(),
                 _ => BTreeSet::from([raw]),
             }
         };
@@ -5346,7 +5402,6 @@ fn verify_resource_ownership(
     // legitimately succeeded.
     let check_alias_safety = |raw: ValueId,
                               provenance: &HashMap<ValueId, LocationState>,
-                              dropped_origins: &HashSet<ValueId>,
                               consumes: bool,
                               store_mode: bool,
                               uninitialized_uses: &mut Vec<ValueId>,
@@ -5356,14 +5411,19 @@ fn verify_resource_ownership(
         if !is_resource(raw) {
             return true;
         }
-        let (identities, role) = match resolve_state(raw, provenance) {
+        let Provenance { dead, role, .. } = match resolve_state(raw, provenance) {
             LocationState::Initialized(prov) => prov,
             LocationState::Uninitialized | LocationState::MaybeUninitialized => {
                 uninitialized_uses.push(raw);
                 return false;
             }
         };
-        if identities.iter().any(|o| dropped_origins.contains(o)) {
+        // This location's *own* deadness, not "was any identity it
+        // might denote destroyed somewhere". The difference is the
+        // whole point: an identity destroyed on a path that then gave
+        // this location a different one was never this location's to
+        // begin with on the path that reaches here.
+        if !dead.is_empty() {
             origin_conflicts.push(raw);
         }
         if consumes && role != Role::Owned {
@@ -5549,15 +5609,20 @@ fn verify_resource_ownership(
 
     // `State` pairs `facts` (`RESOURCE_USE_AFTER_CONSUME`'s own already-
     // consumed set), `live` (`RESOURCE_LEAKED_ON_EXIT`'s own currently-
-    // owned-and-not-yet-discharged set), `dropped_origins` (every
-    // resource identity actually destroyed by a real `Drop` reaching
-    // this point, for `RESOURCE_ORIGIN_CONFLICT`), and `provenance`
-    // (every value/slot's own current definite-initialization state,
-    // for all three of the above) -- computed together, by the same
+    // owned-and-not-yet-discharged set), and `provenance` (every
+    // value/slot's own current definite-initialization state, including
+    // which of the identities it denotes are already destroyed, for
+    // `RESOURCE_ORIGIN_CONFLICT`) -- computed together, by the same
     // single forward walk, since a consuming use always updates more
     // than one at once.
+    //
+    // There is deliberately no separate set of destroyed identities.
+    // One existed, and unioning it across predecessors independently of
+    // the provenance it was compared against is precisely what made a
+    // destruction on one branch look like a conflict for a location a
+    // *different* branch had since reassigned. Deadness belongs to the
+    // location, so the join carries both together -- see `Provenance`.
     type State = (
-        HashSet<ValueId>,
         HashSet<ValueId>,
         HashSet<ValueId>,
         HashMap<ValueId, LocationState>,
@@ -5575,7 +5640,7 @@ fn verify_resource_ownership(
     );
 
     let transfer = |block: &BasicBlock, in_state: &State| -> TransferResult {
-        let (mut facts, mut live, mut dropped_origins, mut provenance) = in_state.clone();
+        let (mut facts, mut live, mut provenance) = in_state.clone();
         let mut violations = Vec::new();
         let mut role_violations = Vec::new();
         let mut origin_conflicts = Vec::new();
@@ -5583,8 +5648,8 @@ fn verify_resource_ownership(
         // A `take`/`Invoke` argument, `Move`/`DeferCapture` source,
         // `Drop`/`store.transfer` operand, or `return`/`raise` operand
         // must be definitely initialized and `Owned`; every use,
-        // consuming or not, is checked against both that and
-        // `dropped_origins`. A rejected consuming use is treated as
+        // consuming or not, is checked against both that and its own
+        // recorded deadness. A rejected consuming use is treated as
         // non-consuming below, so it never mutates `facts`/`live` as
         // though it had legitimately succeeded.
         macro_rules! alias_safe {
@@ -5592,7 +5657,6 @@ fn verify_resource_ownership(
                 check_alias_safety(
                     $raw,
                     &provenance,
-                    &dropped_origins,
                     $consumes,
                     $store_mode,
                     &mut uninitialized_uses,
@@ -5617,7 +5681,6 @@ fn verify_resource_ownership(
                     // this same static instruction.
                     facts.remove(result);
                     live.remove(result);
-                    dropped_origins.remove(result);
                     provenance.remove(result);
                     match kind {
                         ValueKind::Call(callee, _, args, _) => {
@@ -5711,7 +5774,7 @@ fn verify_resource_ownership(
                                 let ids = resolve_ids(*source, &provenance);
                                 provenance.insert(
                                     *result,
-                                    LocationState::Initialized((
+                                    LocationState::Initialized(Provenance::live(
                                         ids,
                                         if legal { Role::Owned } else { Role::Observed },
                                     )),
@@ -5744,7 +5807,10 @@ fn verify_resource_ownership(
                                 };
                                 provenance.insert(
                                     *result,
-                                    LocationState::Initialized((BTreeSet::from([*result]), role)),
+                                    LocationState::Initialized(Provenance::live(
+                                        BTreeSet::from([*result]),
+                                        role,
+                                    )),
                                 );
                                 if *mode == crate::nir::OwnershipMode::Transfer {
                                     live.insert(*result);
@@ -5833,7 +5899,7 @@ fn verify_resource_ownership(
                         ) {
                             provenance.insert(
                                 *result,
-                                LocationState::Initialized((
+                                LocationState::Initialized(Provenance::live(
                                     BTreeSet::from([*result]),
                                     Role::Owned,
                                 )),
@@ -5903,7 +5969,10 @@ fn verify_resource_ownership(
                         } else {
                             Role::Observed
                         };
-                        provenance.insert(*slot, LocationState::Initialized((ids, role)));
+                        provenance.insert(
+                            *slot,
+                            LocationState::Initialized(Provenance::live(ids, role)),
+                        );
                     }
                     if transfers && legal && is_resource(*value) {
                         live.insert(*slot);
@@ -5925,9 +5994,23 @@ fn verify_resource_ownership(
                     // it, not only the one that performed this drop
                     // (`RESOURCE_ORIGIN_CONFLICT`) -- an illegal attempt
                     // (rejected just above) destroys nothing.
+                    //
+                    // Recorded *into each such location's own
+                    // provenance*, on this path only, rather than into
+                    // one set beside the map. A location later given a
+                    // fresh identity has its provenance replaced
+                    // wholesale and so stops carrying this, which is
+                    // exactly what keeps a sibling branch's reassignment
+                    // from being blamed for a destruction it never saw.
                     if legal && is_resource(*value) {
                         let ids = resolve_ids(*value, &provenance);
-                        dropped_origins.extend(ids);
+                        for state in provenance.values_mut() {
+                            if let LocationState::Initialized(prov) = state {
+                                let shared: Vec<ValueId> =
+                                    prov.ids.intersection(&ids).copied().collect();
+                                prov.dead.extend(shared);
+                            }
+                        }
                     }
                 }
                 // `StorePlace` always transfers `value` into a
@@ -6051,7 +6134,7 @@ fn verify_resource_ownership(
             _ => Vec::new(),
         };
         (
-            (facts, live, dropped_origins, provenance),
+            (facts, live, provenance),
             violations,
             leaks,
             role_violations,
@@ -6081,7 +6164,6 @@ fn verify_resource_ownership(
             return IncomingState::Entry((
                 HashSet::new(),
                 entry_live.clone(),
-                HashSet::new(),
                 entry_provenance.clone(),
             ));
         }
@@ -6139,26 +6221,28 @@ fn verify_resource_ownership(
             && is_resource(*slot)
         {
             acc.1.insert(*slot);
-            acc.3.insert(
+            acc.2.insert(
                 *slot,
-                LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
+                LocationState::Initialized(Provenance::live(BTreeSet::from([*slot]), Role::Owned)),
             );
         }
         for (state, extra) in edges {
-            let (other_facts, mut other_live, other_dropped, mut other_prov) = state.clone();
+            let (other_facts, mut other_live, mut other_prov) = state.clone();
             if let Some(slot) = extra
                 && is_resource(*slot)
             {
                 other_live.insert(*slot);
                 other_prov.insert(
                     *slot,
-                    LocationState::Initialized((BTreeSet::from([*slot]), Role::Owned)),
+                    LocationState::Initialized(Provenance::live(
+                        BTreeSet::from([*slot]),
+                        Role::Owned,
+                    )),
                 );
             }
             acc.0.extend(other_facts);
             acc.1.extend(other_live);
-            acc.2.extend(other_dropped);
-            acc.3 = merge_provenance(&acc.3, &other_prov);
+            acc.2 = merge_provenance(&acc.2, &other_prov);
         }
         IncomingState::Ready(acc)
     }
@@ -6181,12 +6265,18 @@ fn verify_resource_ownership(
             entry_live.insert(param.value);
             entry_provenance.insert(
                 param.value,
-                LocationState::Initialized((BTreeSet::from([param.value]), Role::Owned)),
+                LocationState::Initialized(Provenance::live(
+                    BTreeSet::from([param.value]),
+                    Role::Owned,
+                )),
             );
         } else {
             entry_provenance.insert(
                 param.value,
-                LocationState::Initialized((BTreeSet::from([param.value]), Role::Observed)),
+                LocationState::Initialized(Provenance::live(
+                    BTreeSet::from([param.value]),
+                    Role::Observed,
+                )),
             );
         }
     }
@@ -6198,12 +6288,7 @@ fn verify_resource_ownership(
         .expect("presence already checked above");
     let (entry_out, ..) = transfer(
         entry_block,
-        &(
-            HashSet::new(),
-            entry_live.clone(),
-            HashSet::new(),
-            entry_provenance.clone(),
-        ),
+        &(HashSet::new(), entry_live.clone(), entry_provenance.clone()),
     );
 
     // `out` holds a block *only once its own out-state has actually
@@ -8641,7 +8726,7 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         let b: HashMap<ValueId, LocationState> = HashMap::new();
         let merged = merge_provenance(&a, &b);
@@ -8658,7 +8743,7 @@ mod tests {
         let mut b: HashMap<ValueId, LocationState> = HashMap::new();
         b.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         let merged = merge_provenance(&a, &b);
         assert_eq!(
@@ -8815,17 +8900,20 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         a.insert(ValueId(1), LocationState::Uninitialized);
         let mut b: HashMap<ValueId, LocationState> = HashMap::new();
         b.insert(
             ValueId(1),
-            LocationState::Initialized((BTreeSet::from([ValueId(1)]), Role::Observed)),
+            LocationState::Initialized(Provenance::live(
+                BTreeSet::from([ValueId(1)]),
+                Role::Observed,
+            )),
         );
         b.insert(
             ValueId(2),
-            LocationState::Initialized((BTreeSet::from([ValueId(2)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(2)]), Role::Owned)),
         );
         let ab = merge_provenance(&a, &b);
         let ba = merge_provenance(&b, &a);
@@ -8837,7 +8925,7 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         a.insert(ValueId(1), LocationState::Uninitialized);
         a.insert(ValueId(2), LocationState::MaybeUninitialized);
@@ -8850,22 +8938,25 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         let mut b: HashMap<ValueId, LocationState> = HashMap::new();
         b.insert(ValueId(0), LocationState::Uninitialized);
         b.insert(
             ValueId(1),
-            LocationState::Initialized((BTreeSet::from([ValueId(1)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(1)]), Role::Owned)),
         );
         let mut c: HashMap<ValueId, LocationState> = HashMap::new();
         c.insert(
             ValueId(1),
-            LocationState::Initialized((BTreeSet::from([ValueId(9)]), Role::Observed)),
+            LocationState::Initialized(Provenance::live(
+                BTreeSet::from([ValueId(9)]),
+                Role::Observed,
+            )),
         );
         c.insert(
             ValueId(2),
-            LocationState::Initialized((BTreeSet::from([ValueId(2)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(2)]), Role::Owned)),
         );
         let ab_c = merge_provenance(&merge_provenance(&a, &b), &c);
         let a_bc = merge_provenance(&a, &merge_provenance(&b, &c));
@@ -8877,17 +8968,23 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(10)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(
+                BTreeSet::from([ValueId(10)]),
+                Role::Owned,
+            )),
         );
         let mut b: HashMap<ValueId, LocationState> = HashMap::new();
         b.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(20)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(
+                BTreeSet::from([ValueId(20)]),
+                Role::Owned,
+            )),
         );
         let merged = merge_provenance(&a, &b);
         assert_eq!(
             merged.get(&ValueId(0)),
-            Some(&LocationState::Initialized((
+            Some(&LocationState::Initialized(Provenance::live(
                 BTreeSet::from([ValueId(10), ValueId(20)]),
                 Role::Owned
             ))),
@@ -8904,17 +9001,20 @@ mod tests {
         let mut a: HashMap<ValueId, LocationState> = HashMap::new();
         a.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Owned)),
+            LocationState::Initialized(Provenance::live(BTreeSet::from([ValueId(0)]), Role::Owned)),
         );
         let mut b: HashMap<ValueId, LocationState> = HashMap::new();
         b.insert(
             ValueId(0),
-            LocationState::Initialized((BTreeSet::from([ValueId(0)]), Role::Observed)),
+            LocationState::Initialized(Provenance::live(
+                BTreeSet::from([ValueId(0)]),
+                Role::Observed,
+            )),
         );
         let merged = merge_provenance(&a, &b);
         assert_eq!(
             merged.get(&ValueId(0)),
-            Some(&LocationState::Initialized((
+            Some(&LocationState::Initialized(Provenance::live(
                 BTreeSet::from([ValueId(0)]),
                 Role::Observed
             ))),

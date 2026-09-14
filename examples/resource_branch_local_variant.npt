@@ -1,0 +1,78 @@
+// Variant ownership is per *path*, never per function (`rfcs/0012`).
+//
+// One branch destroys the whole value; a disjoint branch takes it apart
+// and owns the payload instead. Neither can suppress or discharge the
+// other's obligations -- an earlier design scanned the whole function
+// for "was this consumed anywhere" and let the drop in one branch
+// silently cancel the match in the other.
+resource File {
+    descriptor: i64
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+func dispose(cond: bool, take maybe: Maybe[File]) -> i64 {
+    if cond {
+        drop maybe;
+        return 1;
+    }
+
+    return match maybe {
+        Some(file) => {
+            drop file;
+            2
+        },
+        None => 0,
+    };
+}
+
+// The same shape with the branches written the other way round.
+func dispose_reversed(cond: bool, take maybe: Maybe[File]) -> i64 {
+    if cond {
+        return match maybe {
+            Some(file) => {
+                drop file;
+                2
+            },
+            None => 0,
+        };
+    }
+
+    drop maybe;
+    return 1;
+}
+
+// An arm that returns its payload transfers it instead of destroying it.
+func unwrap(take maybe: Maybe[File], take fallback: File) -> File {
+    // Exactly one of the two is returned; the other is destroyed on
+    // its own path alone.
+    return match maybe {
+        Some(file) => {
+            drop fallback;
+            file
+        },
+        None => fallback,
+    };
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func main() -> i64 {
+    value a = dispose(true, Maybe[File].Some(File { descriptor: 1 }));
+    value b = dispose(false, Maybe[File].Some(File { descriptor: 2 }));
+    value c = dispose(false, Maybe[File].None);
+    value d = dispose_reversed(true, Maybe[File].Some(File { descriptor: 3 }));
+    value e = dispose_reversed(false, Maybe[File].Some(File { descriptor: 4 }));
+    value returned = unwrap(
+        Maybe[File].Some(File { descriptor: 30 }),
+        File { descriptor: 40 },
+    );
+    return a + b + c + d + e + sink(returned);
+}

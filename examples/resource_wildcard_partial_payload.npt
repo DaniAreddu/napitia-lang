@@ -1,0 +1,37 @@
+// Two affine payload positions, one bound and one ignored: the bound
+// one transfers to its binding, the ignored one is destroyed in reverse
+// payload declaration order before the arm body runs (`rfcs/0012`).
+resource File {
+    descriptor: i64,
+}
+
+record Envelope {
+    file: File,
+}
+
+variant Pair {
+    Both(File, Envelope),
+    Neither,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func first(take pair: Pair) -> i64 {
+    return match pair {
+        // `Envelope` is a plain record that merely *contains* a
+        // resource -- ignoring it still destroys the `File` inside.
+        Both(file, _) => sink(file),
+        Neither => 0,
+    };
+}
+
+func main() -> i64 {
+    return first(Pair.Both(
+        File { descriptor: 11 },
+        Envelope { file: File { descriptor: 22 } },
+    ));
+}

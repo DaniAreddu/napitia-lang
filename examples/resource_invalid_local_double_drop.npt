@@ -1,0 +1,24 @@
+// The whole-local counterpart of `resource_invalid_field_double_drop`:
+// a local extracted out of a structural field is still an ordinary
+// owned binding, and dropping it twice is the same double drop it
+// always was (`rfcs/0011`).
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    value input = session.input;
+    drop input;
+    drop input;
+    drop session;
+    return 0;
+}

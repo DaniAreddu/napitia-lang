@@ -1,0 +1,52 @@
+// The other half of transitive observation: everything an observation
+// legitimately allows (`rfcs/0011`, `rfcs/0012`).
+//
+// An ordinary parameter may read through itself to any depth, hand what
+// it reads to another observing parameter, and project fields freely.
+// None of that gives anything away, so the caller still owns its value
+// afterwards and destroys it itself.
+resource File {
+    descriptor: i64
+}
+
+record Box {
+    item: File
+}
+
+record Crate {
+    inner: Box
+}
+
+func width(file: File) -> i64 {
+    return file.descriptor;
+}
+
+// Reads a field of an observed aggregate, and passes the observation on.
+func peek(holder: Box) -> i64 {
+    return width(holder.item);
+}
+
+// Two levels down, still only observing.
+func peek_deep(packed: Crate) -> i64 {
+    return peek(packed.inner);
+}
+
+// A `take` parameter really is this frame's, and may be taken apart.
+func consume(take holder: Box) -> i64 {
+    value file = holder.item;
+    return width(file) + sink(file);
+}
+
+func sink(take file: File) -> i64 {
+    drop file;
+    return 1;
+}
+
+func main() -> i64 {
+    value packed = Crate { inner: Box { item: File { descriptor: 10 } } };
+    value observed = peek_deep(packed);
+    drop packed.inner.item;
+
+    value owned = Box { item: File { descriptor: 20 } };
+    return observed + consume(owned);
+}

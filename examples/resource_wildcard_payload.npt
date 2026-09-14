@@ -1,0 +1,27 @@
+// An affine variant payload ignored by `_` is destroyed exactly once,
+// in the arm that actually matched, before that arm's body runs
+// (`rfcs/0012`). Nothing names it, so nothing can observe it; the
+// inactive case is never touched.
+resource File {
+    descriptor: i64,
+}
+
+variant FileResult {
+    Found(File),
+    Missing,
+}
+
+func discard(take result: FileResult) -> i64 {
+    return match result {
+        // `File` is affine and this arm ignores it: the payload is
+        // destroyed here, not leaked.
+        Found(_) => 1,
+        Missing => 0,
+    };
+}
+
+func main() -> i64 {
+    value found = discard(FileResult.Found(File { descriptor: 3 }));
+    value missing = discard(FileResult.Missing);
+    return found + missing;
+}

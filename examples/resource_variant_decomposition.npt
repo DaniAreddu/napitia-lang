@@ -1,0 +1,85 @@
+// Every shape variant decomposition has to get right (`rfcs/0012`):
+// nested generic variants, wildcard disposal, an inactive case that
+// owns nothing, a diverging arm, and a match whose arms all diverge.
+variant Fail {
+    Bad,
+}
+
+resource File {
+    descriptor: i64,
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+variant Outer {
+    Wrap(Maybe[File]),
+    Empty,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+// A generic variant nested inside another variant: each level is taken
+// apart on its own path, and the inactive cases own nothing.
+func nested(take outer: Outer) -> i64 {
+    return match outer {
+        Wrap(Some(file)) => sink(file),
+        Wrap(None) => -1,
+        Empty => -2,
+    };
+}
+
+// An arm that ignores its payload with `_` has to destroy it: nothing
+// else ever will.
+func discard(take maybe: Maybe[File]) -> i64 {
+    return match maybe {
+        Some(_) => 7,
+        None => 0,
+    };
+}
+
+// One arm diverges; the other completes normally. The diverging arm
+// still owns and destroys its own payload.
+func diverging(take maybe: Maybe[File]) -> i64 raises Fail {
+    return match maybe {
+        Some(file) => {
+            drop file;
+            raise Fail.Bad;
+        },
+        None => 5,
+    };
+}
+
+// Every arm diverges: there is no merge block at all, and each arm
+// still accounts for exactly what it owns.
+func all_diverging(take maybe: Maybe[File]) -> i64 {
+    match maybe {
+        Some(file) => {
+            return sink(file);
+        },
+        None => {
+            return 0;
+        },
+    }
+}
+
+func main() -> i64 {
+    value a = nested(Outer.Wrap(Maybe[File].Some(File { descriptor: 10 })));
+    value b = nested(Outer.Wrap(Maybe[File].None));
+    value c = nested(Outer.Empty);
+    value d = discard(Maybe[File].Some(File { descriptor: 99 }));
+    value e = discard(Maybe[File].None);
+    value f = handle diverging(Maybe[File].Some(File { descriptor: 1 })) {
+        success v => v,
+        failure Fail.Bad => 100,
+    };
+    value g = all_diverging(Maybe[File].Some(File { descriptor: 20 }));
+    value h = all_diverging(Maybe[File].None);
+    return a + b + c + d + e + f + g + h;
+}

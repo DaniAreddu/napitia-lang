@@ -386,7 +386,68 @@ fn format_instruction(
             }
         },
         Instruction::Drop { value } => format!("drop %{}", value.0),
+        Instruction::DecomposeVariant {
+            value,
+            variant,
+            case,
+            taken,
+        } => {
+            let moved: Vec<String> = taken
+                .iter()
+                .map(|(index, owner)| format!("{index}: %{}", owner.0))
+                .collect();
+            format!(
+                "decompose %{} : {}.{case} [{}]",
+                value.0,
+                registry.qualified_name(*variant, interner),
+                moved.join(", ")
+            )
+        }
+        Instruction::StorePlace { place, value } => {
+            format!(
+                "store.place {}, %{}",
+                format_place(place, registry, interner),
+                value.0
+            )
+        }
     }
+}
+
+/// Prints a structural place (`rfcs/0012`) as its root value followed by
+/// one `.@Owner.field` (or `.@Variant.case.field`) segment per
+/// projection, outermost first -- deterministic, and enough to review
+/// which exact field chain an instruction names without cross-
+/// referencing anything else in the printed module.
+fn format_place(
+    place: &crate::place::Place<ValueId>,
+    registry: &ItemRegistry,
+    interner: &Interner,
+) -> String {
+    let mut out = format!("%{}", place.root.0);
+    for projection in &place.projections {
+        match projection {
+            crate::place::Projection::Field { owner, field } => {
+                out.push_str(&format!(
+                    ".@{}.{}",
+                    qualified_ref(*owner, registry, interner),
+                    field.0
+                ));
+            }
+            crate::place::Projection::VariantField {
+                variant,
+                case,
+                field,
+            } => {
+                out.push_str(&format!(
+                    ".@{}.{}.{}",
+                    qualified_ref(*variant, registry, interner),
+                    case.0,
+                    field.0
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The operand type for a comparison instruction (looked up from
@@ -550,6 +611,13 @@ fn format_value_kind(
         ),
         ValueKind::Move { source } => format!("move %{}", source.0),
         ValueKind::DeferCapture { source } => format!("defer.capture %{}", source.0),
+        ValueKind::PlaceRead { place, mode } => {
+            let place_str = format_place(place, registry, interner);
+            match mode {
+                crate::nir::OwnershipMode::Observe => format!("load.place {place_str}"),
+                crate::nir::OwnershipMode::Transfer => format!("move.place {place_str}"),
+            }
+        }
     }
 }
 
@@ -672,6 +740,12 @@ mod tests {
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &interner,
+            &crate::resourceck::AffineContext {
+                aggregate_field_types: &typeck_result.aggregate_field_types,
+                declared_resources: &typeck_result.declared_resources,
+                item_type_params: &typeck_result.item_type_params,
+                field_projections: &typeck_result.field_projections,
+            },
         );
         assert!(
             resourceck_result.diagnostics.is_empty(),

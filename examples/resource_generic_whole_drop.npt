@@ -1,0 +1,43 @@
+// Destroying a *generic* aggregate as a whole (`rfcs/0008`,
+// `rfcs/0012`) -- as opposed to moving its fields out first, which is
+// the only shape the existing generic examples covered. A runtime value
+// carries its own concrete type arguments, so structural destruction
+// asks what `Box[File]` owns rather than what the declaration's
+// symbolic `Ty::Param(T)` owns.
+resource File {
+    descriptor: i64,
+}
+
+record Box[T] {
+    item: T,
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+func main() -> i64 {
+    // A generic record dropped whole: its substituted `File` is
+    // destroyed, not skipped.
+    value boxed = Box[File] { item: File { descriptor: 1 } };
+    drop boxed;
+
+    // Two levels of substitution.
+    value nested = Box[Box[File]] {
+        item: Box[File] { item: File { descriptor: 2 } },
+    };
+    drop nested;
+
+    // A generic variant: only the active case owns anything.
+    value present = Maybe[File].Some(File { descriptor: 3 });
+    drop present;
+
+    value absent = Maybe[File].None;
+    drop absent;
+
+    // A non-affine instantiation of the same declarations owns nothing
+    // at all and is freely readable.
+    value plain = Box[i64] { item: 7 };
+    return plain.item + plain.item;
+}

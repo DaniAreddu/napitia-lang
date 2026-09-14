@@ -1,0 +1,97 @@
+// Structural cleanup across every way out of a scope (`rfcs/0011`,
+// `rfcs/0012`): a loop with `break` and `continue`, an early `return`,
+// a `raise`, a postfix `?`, and a `handle` -- each destroying exactly
+// the fields still owned on its own path, and no others.
+variant OpenError {
+    Refused,
+}
+
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func open(descriptor: i64) -> Session {
+    return Session {
+        input: File { descriptor: descriptor },
+        output: File { descriptor: descriptor + 1 },
+    };
+}
+
+// `break` leaves the loop with `input` already moved out; the
+// structural drop at the break edge destroys only `output` and the
+// session's own outer identity.
+func take_first(limit: i64) -> i64 {
+    mutable index = 0;
+    mutable total = 0;
+    while index < limit {
+        value session = open(index);
+        index += 1;
+        if index == 1 {
+            // `continue` destroys this iteration's whole session.
+            continue;
+        }
+        value input = session.input;
+        total += sink(input);
+        if total > 0 {
+            drop session;
+            break;
+        }
+        drop session;
+    }
+    return total;
+}
+
+// An early `return` from inside the scope still destroys the session's
+// remaining fields first.
+func early(descriptor: i64) -> i64 {
+    value session = open(descriptor);
+    value input = session.input;
+    if descriptor > 0 {
+        drop session;
+        return sink(input);
+    }
+    drop session;
+    return sink(input) + 100;
+}
+
+// `raise` unwinds with the same structural cleanup a `return` gets.
+func refuse(descriptor: i64) -> i64 raises OpenError {
+    value session = open(descriptor);
+    value input = session.input;
+    drop input;
+    if descriptor < 0 {
+        raise OpenError.Refused;
+    }
+    value output = session.output;
+    drop session;
+    return sink(output);
+}
+
+// Postfix `?` propagates through the same cleanup path.
+func forward(descriptor: i64) -> i64 raises OpenError {
+    value session = open(descriptor);
+    value result = refuse(descriptor)?;
+    drop session;
+    return result;
+}
+
+func main() -> i64 {
+    value looped = take_first(4);
+    value returned = early(5);
+    value handled = handle forward(-1) {
+        success value_ => value_,
+        failure OpenError.Refused => -1,
+    };
+    return looped + returned + handled;
+}

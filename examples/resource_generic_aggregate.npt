@@ -1,0 +1,41 @@
+// A generic aggregate instantiated with an affine argument is affine,
+// and is tracked field by field exactly like a concrete one
+// (`rfcs/0008`, `rfcs/0012`): `Box[File]` owns a resource, `Box[i64]`
+// does not, and the same declaration answers both.
+resource File {
+    descriptor: i64,
+}
+
+record Box[T] {
+    item: T,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func main() -> i64 {
+    // Non-affine instantiation: freely copyable, read twice.
+    value plain = Box[i64] { item: 4 };
+    value doubled = plain.item + plain.item;
+
+    // Affine instantiation: the field is moved out, and the box is
+    // left with nothing further to destroy.
+    value boxed = Box[File] { item: File { descriptor: 10 } };
+    value file = boxed.item;
+
+    // Nested instantiation: `Box[Box[File]]` is affine through two
+    // levels of substitution.
+    value nested = Box[Box[File]] { item: Box[File] { item: File { descriptor: 20 } } };
+    value inner = nested.item.item;
+
+    // Reinitializing an emptied generic field restores it.
+    mutable refill = Box[File] { item: File { descriptor: 1 } };
+    value first = refill.item;
+    refill.item = File { descriptor: 30 };
+    value second = refill.item;
+
+    return doubled + sink(file) + sink(inner) + sink(first) + sink(second);
+}

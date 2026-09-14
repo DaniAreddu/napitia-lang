@@ -524,6 +524,34 @@ mod codes {
     /// merely contains affine fields, and every place projected out of
     /// one.
     pub const OBSERVER_CANNOT_TRANSFER: &str = "V0099";
+    /// A whole *slot* (`rfcs/0011`, `rfcs/0012`) is written while it is
+    /// not *definitely* free of an owner on every reachable path -- it
+    /// may still hold a value this frame owns, and the write would
+    /// discard that value's own cleanup obligation in silence.
+    ///
+    /// Covers every instruction that writes a whole slot, since they all
+    /// discard its previous contents on identical terms:
+    ///
+    /// - `store.transfer` over a slot that already owns a value;
+    /// - `store.observe` over one too -- an observing write loses the
+    ///   previous owner every bit as completely as a transferring one,
+    ///   since the mode describes the *incoming* value, not what was
+    ///   overwritten;
+    /// - an `Invoke`'s own `ok_slot` on its success edge, and each error
+    ///   target's own slot on that failure edge.
+    ///
+    /// Distinct from `PLACE_OVERWRITE_OF_LIVE_FIELD` (V0088), which is
+    /// the same rule one level down, for a *projected* place
+    /// reinitialized by `StorePlace`.
+    ///
+    /// Answered from this pass's own reconstruction of the slot's state
+    /// across every reachable path, never delegated to `resourceck`'s
+    /// source-level `U0010`: hand-built NIR that never passed source
+    /// checking must be rejected on exactly the same terms as lowered
+    /// NIR. A slot filled on only one predecessor, or holding an owner
+    /// on one path and an observing view on another, is refused
+    /// conservatively rather than assumed harmless.
+    pub const STORE_OVER_OWNED_SLOT: &str = "V0100";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -5811,9 +5839,22 @@ fn verify_resource_ownership(
                     );
                     // A fresh value now occupies `slot`; whatever
                     // consumption/liveness its own prior occupant
-                    // carried no longer applies (`resourceck`'s own
-                    // `U0010` already rejects overwriting a still-live
-                    // resource).
+                    // carried no longer applies.
+                    //
+                    // Discarding the prior occupant's state is only
+                    // sound because the NIR verifier itself has already
+                    // proven there was no owner there to lose:
+                    // `verify_structural_places` refuses any `Store`
+                    // whose destination may still own a value, under
+                    // `STORE_OVER_OWNED_SLOT` (V0100), and its place
+                    // lattice covers a nominal `resource` slot exactly
+                    // as it covers a transitively affine one. That is
+                    // deliberately *this* verifier's own answer and not
+                    // `resourceck`'s source-level `U0010`: hand-built
+                    // NIR never passes through the source checker at
+                    // all, and leaning on it here is precisely how a
+                    // second `store.transfer` used to erase the first
+                    // occupant's obligation in silence.
                     facts.remove(slot);
                     live.remove(slot);
                     provenance.remove(slot);
@@ -6305,52 +6346,142 @@ fn verify_resource_ownership(
     }
 }
 
-/// One structural place's own current "does it still hold its own
-/// value" status (`rfcs/0012`) -- see [`verify_structural_places`]'s own
-/// doc comment for the full three-state lattice this forms.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FieldState {
-    Full,
-    Empty,
-    Maybe,
+/// One structural place's own current status (`rfcs/0012`): what it
+/// holds, and whether *this frame* owns what it holds -- see
+/// [`verify_structural_places`]'s own doc comment for the full lattice
+/// this forms.
+///
+/// Deliberately the *set* of concrete states a place may be in at this
+/// program point, not a flat enum of pre-named joins. Two properties
+/// fall out of that and neither survives a hand-written merge table:
+/// a join is exactly set union, so it is associative, commutative and
+/// idempotent by construction and cannot disagree with itself about
+/// `join(join(a, b), c)` versus `join(a, join(b, c))`; and the two
+/// independent axes stay independently precise. A single absorbing
+/// "maybe" cannot express that difference at all, and it is exactly the
+/// difference that matters here: `Owned` joined with `Observed` is
+/// definitely *present* (so reading it is fine) and definitely not
+/// consumable, while `Owned` joined with `Empty` is neither.
+///
+/// The absence of a key still reads as [`FieldState::OWNED`], which is
+/// what a freshly constructed aggregate's own fields all start as.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FieldState(u8);
+
+impl FieldState {
+    /// Holds nothing: never created on this path, or already moved out
+    /// or destroyed.
+    const EMPTY: FieldState = FieldState(1);
+    /// Holds a value this frame owns and must therefore destroy or
+    /// transfer before any exit.
+    const OWNED: FieldState = FieldState(2);
+    /// Holds a merely-*observing* view of a value someone else owns
+    /// (`rfcs/0011`) -- readable, and never this frame's to give away,
+    /// destroy, take apart or overwrite-with-loss.
+    const OBSERVED: FieldState = FieldState(4);
+
+    /// The join of two predecessors' own state for the identical place:
+    /// set union, so a place both sides agree on keeps that exact state
+    /// and one they disagree on carries *both* possibilities forward
+    /// rather than collapsing to a single absorbing answer.
+    fn join(self, other: FieldState) -> FieldState {
+        FieldState(self.0 | other.0)
+    }
+
+    /// At least one path reaching here left this place holding nothing.
+    fn may_be_empty(self) -> bool {
+        self.0 & FieldState::EMPTY.0 != 0
+    }
+
+    /// At least one path reaching here left this frame owning what this
+    /// place holds -- so overwriting it here would lose an obligation,
+    /// and any exit past it that never discharges it leaks.
+    fn may_own(self) -> bool {
+        self.0 & FieldState::OWNED.0 != 0
+    }
+
+    /// At least one path reaching here left this place holding a merely
+    /// observing view -- so consuming it would give away something the
+    /// caller still owns.
+    fn may_observe(self) -> bool {
+        self.0 & FieldState::OBSERVED.0 != 0
+    }
+
+    /// *Every* path reaching here left this place holding something --
+    /// what a read requires. Says nothing about who owns it.
+    fn definitely_present(self) -> bool {
+        !self.may_be_empty()
+    }
+
+    /// *Every* path reaching here left this frame owning what this place
+    /// holds -- what a transfer, destruction or decomposition requires.
+    fn definitely_owned(self) -> bool {
+        self == FieldState::OWNED
+    }
+
+    /// *Every* path reaching here left this place holding nothing.
+    fn definitely_empty(self) -> bool {
+        self == FieldState::EMPTY
+    }
 }
 
-/// The pairwise lattice meet two reachable predecessors' own
-/// [`FieldState`] for the identical structural place join to: agreement
-/// keeps that state, disagreement (including either side already being
-/// the absorbing [`FieldState::Maybe`]) always joins to `Maybe` -- never
-/// silently favors one side over the other, matching `LocationState`'s
-/// own identical three-state shape (this one just has no separate
-/// origin/role payload to carry along).
-fn merge_field(a: FieldState, b: FieldState) -> FieldState {
-    match (a, b) {
-        (FieldState::Full, FieldState::Full) => FieldState::Full,
-        (FieldState::Empty, FieldState::Empty) => FieldState::Empty,
-        _ => FieldState::Maybe,
+/// Spelled out rather than derived: a bare `FieldState(3)` in a failing
+/// assertion says nothing about which of the two axes disagreed.
+impl std::fmt::Debug for FieldState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.may_be_empty() {
+            parts.push("Empty");
+        }
+        if self.may_own() {
+            parts.push("Owned");
+        }
+        if self.may_observe() {
+            parts.push("Observed");
+        }
+        if parts.is_empty() {
+            // Unreachable for any state this pass builds: every state
+            // originates from one of the three constants and join only
+            // ever adds bits. Printed rather than panicked so a `Debug`
+            // in a failing assertion can never itself panic.
+            return f.write_str("FieldState(none)");
+        }
+        f.write_str(&parts.join("|"))
     }
+}
+
+/// The lattice join of two reachable predecessors' own [`FieldState`]
+/// for the identical structural place -- set union, never silently
+/// favoring one side over the other.
+fn merge_field(a: FieldState, b: FieldState) -> FieldState {
+    a.join(b)
 }
 
 /// Every structural place fact one program point holds, keyed by the
 /// exact [`Place`] (`rfcs/0012`). A key absent here is *not* a missing
-/// answer: it is the initial, untouched [`FieldState::Full`], which is
+/// answer: it is the initial, untouched [`FieldState::OWNED`], which is
 /// exactly what a freshly constructed aggregate's own fields all start
 /// as. Facts are always read back through [`resolve_place_state`]/
-/// [`place_is_whole`], never a bare `get`, so an ancestor's own state
-/// always dominates its descendants' and a consumed descendant always
-/// makes its ancestors partial.
+/// [`place_is_whole`]/[`place_may_observe`], never a bare `get`, so an
+/// ancestor's own state always dominates its descendants' and a
+/// consumed descendant always makes its ancestors partial.
 type PlaceFacts = HashMap<Place<ValueId>, FieldState>;
 
 /// This place's own effective state within one structural ownership
 /// lattice (`rfcs/0012`): the *shortest* ancestor prefix (including
-/// itself) recorded as anything other than `Full`, or `Full` when no
-/// prefix was ever touched at all.
+/// itself) recorded as anything other than plain `OWNED`, or `OWNED`
+/// when no prefix was ever touched at all.
 ///
 /// This is what makes moving or dropping a parent consume its entire
 /// descendant subtree, whether or not each descendant ever got a key of
 /// its own -- a child read after its parent was transferred or dropped
 /// is rejected by exactly the same check a child read after its *own*
-/// transfer is. Walks a bounded prefix chain in a fixed order, so no
-/// `HashMap` iteration order can affect the answer.
+/// transfer is. It is equally what makes observation transitive: a
+/// field reached through a slot holding a merely-observing view resolves
+/// to `OBSERVED` without ever needing a key of its own, so no projection
+/// can walk *down* out of an observation into ownership. Walks a bounded
+/// prefix chain in a fixed order, so no `HashMap` iteration order can
+/// affect the answer.
 fn resolve_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
     for len in 0..=place.projections.len() {
         let prefix = Place {
@@ -6358,29 +6489,58 @@ fn resolve_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState
             projections: place.projections[..len].to_vec(),
         };
         match facts.get(&prefix) {
-            Some(FieldState::Full) | None => {}
+            None => {}
+            Some(state) if state.definitely_owned() => {}
             Some(state) => return *state,
         }
     }
-    FieldState::Full
+    FieldState::OWNED
 }
 
 /// `true` iff `place` itself *and* every place reachable through it
-/// still hold their own values -- what a *whole-value* use requires
-/// (`rfcs/0012`): observed, transferred, returned, raised, or consumed
-/// into an aggregate. A parent with a moved-out child fails this while
-/// still passing [`resolve_place_state`], which is precisely the
-/// difference between "you may not use this as a value" and "you may
+/// definitely still hold their own values -- what a *whole-value* use
+/// requires (`rfcs/0012`): observed, transferred, returned, raised, or
+/// consumed into an aggregate. A parent with a moved-out child fails
+/// this while still passing [`resolve_place_state`], which is precisely
+/// the difference between "you may not use this as a value" and "you may
 /// still reach an unaffected sibling through it, reinitialize an empty
-/// child, or structurally drop what remains". A boolean `any`, so
-/// `facts`' own iteration order cannot affect the answer.
+/// child, or structurally drop what remains".
+///
+/// Presence only: whether the frame *owns* what is there is the separate
+/// axis [`place_may_observe`] answers, so an aggregate holding an
+/// observing view is still structurally whole (reading it is legal) and
+/// is still refused as a transfer, by that check rather than this one. A
+/// boolean `any`, so `facts`' own iteration order cannot affect the
+/// answer.
 fn place_is_whole(facts: &PlaceFacts, place: &Place<ValueId>) -> bool {
-    if resolve_place_state(facts, place) != FieldState::Full {
+    if !resolve_place_state(facts, place).definitely_present() {
         return false;
     }
-    !facts
+    !facts.iter().any(|(key, state)| {
+        key != place && place.is_ancestor_of(key) && !state.definitely_present()
+    })
+}
+
+/// `true` iff `place`, or anything recorded beneath it, may be a merely
+/// *observing* view of a value this frame does not own (`rfcs/0011`,
+/// `rfcs/0012`).
+///
+/// Both halves are load-bearing. Resolving `place` itself walks its
+/// ancestors, so a field reached through an observed slot is an
+/// observation. Scanning strict descendants catches the other
+/// direction: an aggregate this frame owns whose *one field* is an
+/// observing view is not something the frame may hand away wholesale,
+/// and looking only at the root would launder exactly that field.
+///
+/// A boolean `any` over a bounded key set, so `facts`' own iteration
+/// order cannot affect the answer.
+fn place_may_observe(facts: &PlaceFacts, place: &Place<ValueId>) -> bool {
+    if resolve_place_state(facts, place).may_observe() {
+        return true;
+    }
+    facts
         .iter()
-        .any(|(key, state)| key != place && place.is_ancestor_of(key) && *state != FieldState::Full)
+        .any(|(key, state)| key != place && place.is_ancestor_of(key) && state.may_observe())
 }
 
 /// Records `place`'s own new leaf state, first clearing every strictly
@@ -6405,6 +6565,9 @@ enum OwnershipViolation {
     UseAfterMove(ValueId),
     /// A `StorePlace` targeting a place that is not definitely empty.
     OverwriteLive(ValueId),
+    /// A `Store` (either mode) writing a slot that may still hold a
+    /// value *this frame owns*, which the write would silently discard.
+    OverwriteOwnedSlot(ValueId),
     /// A place used as a *whole* value while one of its own affine
     /// descendants is already consumed.
     PartialWhole(ValueId),
@@ -6440,8 +6603,9 @@ enum OwnershipViolation {
 /// predecessor contributes nothing to a join, and is never mistaken for
 /// a *computed* predecessor that has definitively proven a place
 /// consumed. A join takes the union of both sides' keys -- so a place
-/// touched on only one predecessor still joins to `Maybe` against the
-/// other's implicit `Full` -- which is what makes the result
+/// touched on only one predecessor still joins against the other side's
+/// own implicit `OWNED`, keeping both possibilities -- which is what
+/// makes the result
 /// independent of predecessor discovery order, block vector order and
 /// `HashMap` order alike.
 #[allow(clippy::too_many_arguments)]
@@ -6566,14 +6730,27 @@ fn verify_structural_places(
     let is_affine =
         |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
 
-    // Ownership is the second axis. A value this frame merely *observes*
-    // is available -- readable, passable to another observing parameter
-    // -- and is never this frame's to give away, destroy, take apart or
-    // overwrite. A slot and the loads of it are one place here, exactly
-    // as they are everywhere else in this pass.
-    let observed = observed_values(function, &is_affine);
-    let is_observed =
-        |v: ValueId| -> bool { observed.contains(&v) || observed.contains(&origin(v)) };
+    // Ownership is the second axis, and it lives in the lattice itself
+    // (see [`FieldState`]) rather than in a set beside it. The one part
+    // of it that is genuinely path-*insensitive* is seeded here: an
+    // ordinary (non-`take`) affine parameter is a call-scoped
+    // observation of something the caller still owns, for its whole
+    // life, from the entry onwards. Everything else -- what a slot
+    // currently holds, what a projection out of it inherits -- is a
+    // fact about the path, and is carried by [`PlaceFacts`].
+    //
+    // Kept as its own map, rather than folded straight into
+    // `entry_facts`, because an *unreachable* block is still walked for
+    // shape checking from a fact set nothing proved; starting it from
+    // this much (and no more) keeps a parameter observed there too,
+    // without inventing the rest of the entry state for a block no path
+    // reaches.
+    let mut param_facts = PlaceFacts::new();
+    for param in &function.params {
+        if !param.take && is_affine(param.value) {
+            param_facts.insert(Place::root(param.value), FieldState::OBSERVED);
+        }
+    }
 
     // Every value whose *only* use anywhere in this function is as a
     // `Drop` operand (`rfcs/0012`). A structural destruction of one
@@ -6671,10 +6848,32 @@ fn verify_structural_places(
                 // -- and treating the allocation itself as ownership
                 // made an `Invoke`'s result slot look owned on the
                 // failure edge that never wrote it.
-                let state = if matches!(kind, ValueKind::VariantPayload { .. } | ValueKind::Alloc) {
-                    FieldState::Empty
+                let default = if matches!(kind, ValueKind::VariantPayload { .. } | ValueKind::Alloc)
+                {
+                    FieldState::EMPTY
                 } else {
-                    FieldState::Full
+                    FieldState::OWNED
+                };
+                // Ownership never launders *out* of an observation
+                // (`rfcs/0011`, `rfcs/0012`). A value derived from a
+                // place this frame merely observes is itself an
+                // observation, whatever instruction derived it and
+                // however many projections deep it sits -- so the role
+                // is read off the source place's own current state
+                // here, at the definition, rather than trusted to a
+                // function-global set that could never take a slot's
+                // role back once the slot was legally refilled.
+                //
+                // Read *before* the result's own key is written, so a
+                // (malformed) instruction naming its own result as its
+                // source reads the incoming state rather than one this
+                // very line just invented.
+                let inherited = observation_source(kind, &origin, &canonical)
+                    .is_some_and(|source| resolve_place_state(&facts, &source).may_observe());
+                let state = if inherited {
+                    FieldState::OBSERVED
+                } else {
+                    default
                 };
                 set_place_state(&mut facts, &Place::root(*result), state);
             }
@@ -6688,11 +6887,13 @@ fn verify_structural_places(
                     // Moving a field out of an observation takes
                     // ownership the caller never handed over. Reading
                     // one is fine, and is the point.
-                    if *mode == crate::nir::OwnershipMode::Transfer && is_observed(place.root) {
+                    if *mode == crate::nir::OwnershipMode::Transfer
+                        && place_may_observe(&facts, &place)
+                    {
                         violations.push(OwnershipViolation::ObserverTransfer(*result));
                         continue;
                     }
-                    if resolve_place_state(&facts, &place) != FieldState::Full {
+                    if !resolve_place_state(&facts, &place).definitely_present() {
                         violations.push(OwnershipViolation::UseAfterMove(*result));
                         continue;
                     }
@@ -6707,7 +6908,7 @@ fn verify_structural_places(
                         continue;
                     }
                     if *mode == crate::nir::OwnershipMode::Transfer {
-                        set_place_state(&mut facts, &place, FieldState::Empty);
+                        set_place_state(&mut facts, &place, FieldState::EMPTY);
                     }
                 }
                 // Taking a variant apart into one specific case, on
@@ -6728,11 +6929,26 @@ fn verify_structural_places(
                     let shell = Place::root(origin(*value));
                     // Taking an observed variant apart claims payload
                     // positions the caller still owns.
-                    if is_observed(*value) {
+                    if place_may_observe(&facts, &shell) {
                         violations.push(OwnershipViolation::ObserverTransfer(*value));
+                        // The decomposition is refused, but nothing
+                        // downstream of it may look like an owner
+                        // either: each extraction it named stays an
+                        // observation, so a later drop of one is
+                        // reported as the observer transfer it is
+                        // rather than accepted outright.
+                        for (_, owner) in taken {
+                            if is_affine(*owner) && origin(*owner) == *owner {
+                                set_place_state(
+                                    &mut facts,
+                                    &Place::root(*owner),
+                                    FieldState::OBSERVED,
+                                );
+                            }
+                        }
                         continue;
                     }
-                    if resolve_place_state(&facts, &shell) != FieldState::Full {
+                    if !resolve_place_state(&facts, &shell).definitely_owned() {
                         violations.push(OwnershipViolation::DoubleCleanup(*value));
                         continue;
                     }
@@ -6780,13 +6996,13 @@ fn verify_structural_places(
                         violations.push(OwnershipViolation::IncompleteDecomposition(*value));
                         continue;
                     }
-                    set_place_state(&mut facts, &shell, FieldState::Empty);
+                    set_place_state(&mut facts, &shell, FieldState::EMPTY);
                     // Each claimed payload is this frame's own from
-                    // here: seeded `Full` so a later consumption of it
+                    // here: seeded `OWNED` so a later consumption of it
                     // is checked against a real state, never a default.
                     for (_, owner) in taken {
                         if is_affine(*owner) && origin(*owner) == *owner {
-                            set_place_state(&mut facts, &Place::root(*owner), FieldState::Full);
+                            set_place_state(&mut facts, &Place::root(*owner), FieldState::OWNED);
                         }
                     }
                 }
@@ -6795,27 +7011,26 @@ fn verify_structural_places(
                     // Writing through an observer overwrites storage
                     // the caller still owns, leaking whatever was
                     // there.
-                    if is_observed(place.root) {
+                    if place_may_observe(&facts, &place) {
                         violations.push(OwnershipViolation::ObserverTransfer(*value));
                         continue;
                     }
-                    if resolve_place_state(&facts, &place) != FieldState::Empty {
+                    if !resolve_place_state(&facts, &place).definitely_empty() {
                         violations.push(OwnershipViolation::OverwriteLive(*value));
                         continue;
                     }
                     // Storing a nested affine value creates exactly the
                     // descendant obligations that value itself carries:
-                    // the place becomes `Full` and every stale deeper
+                    // the place becomes `OWNED` and every stale deeper
                     // fact recorded before it was emptied is cleared, so
                     // an ancestor emptied only by this child's own move
                     // becomes complete again.
-                    set_place_state(&mut facts, &place, FieldState::Full);
+                    set_place_state(&mut facts, &place, FieldState::OWNED);
                     consume_root(
                         &mut facts,
                         &mut violations,
                         &is_affine,
                         &origin,
-                        &is_observed,
                         *value,
                         true,
                         *value,
@@ -6834,49 +7049,85 @@ fn verify_structural_places(
                         &mut violations,
                         &is_affine,
                         &origin,
-                        &is_observed,
                         *value,
                         false,
                         *value,
                     );
                 }
-                Instruction::Store { slot, value, mode } => match mode {
-                    crate::nir::OwnershipMode::Transfer => {
-                        consume_root(
-                            &mut facts,
-                            &mut violations,
-                            &is_affine,
-                            &origin,
-                            &is_observed,
-                            *value,
-                            true,
-                            *value,
-                        );
-                        if is_affine(*slot) {
-                            set_place_state(
+                Instruction::Store { slot, value, mode } => {
+                    let destination = Place::root(origin(*slot));
+                    // A store *replaces* whatever the slot holds, and
+                    // nothing else discharges the old occupant. So if
+                    // this frame may still own what is there, this write
+                    // is precisely the point that obligation would
+                    // vanish -- and it is refused here, by this pass's
+                    // own reconstruction of the slot's state, rather
+                    // than left to the source-level checker that this
+                    // NIR may never have passed through at all.
+                    //
+                    // Both modes, deliberately. A transferring store
+                    // losing the previous owner is the obvious case; an
+                    // *observing* store over a live owner loses it every
+                    // bit as completely, and the fact that the incoming
+                    // value is only a view makes no difference to what
+                    // was overwritten.
+                    //
+                    // Checked over *all* reachable paths, not locally:
+                    // `may_own` is true for a slot filled on only one
+                    // predecessor, and a `MaybeOwned` join (owner on one
+                    // path, observer on another) is conservatively
+                    // refused too rather than assumed harmless.
+                    if is_affine(*slot) && resolve_place_state(&facts, &destination).may_own() {
+                        violations.push(OwnershipViolation::OverwriteOwnedSlot(*slot));
+                        continue;
+                    }
+                    match mode {
+                        crate::nir::OwnershipMode::Transfer => {
+                            consume_root(
                                 &mut facts,
-                                &Place::root(origin(*slot)),
-                                FieldState::Full,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                *value,
+                                true,
+                                *value,
                             );
+                            if is_affine(*slot) {
+                                set_place_state(&mut facts, &destination, FieldState::OWNED);
+                            }
+                        }
+                        crate::nir::OwnershipMode::Observe => {
+                            observe_root(
+                                &facts,
+                                &mut violations,
+                                &is_affine,
+                                &origin,
+                                *value,
+                                *value,
+                            );
+                            // The slot now holds an observing view. It
+                            // owns nothing -- the owner it aliases still
+                            // owes the cleanup -- but it is *there*, and
+                            // reading it back is legal. An `Alloc` alone
+                            // leaves the slot empty, so without this the
+                            // very next `Load` of it would look like a
+                            // use after move.
+                            //
+                            // `OBSERVED` unconditionally, never a role
+                            // copied from `value`: the interpreter runs
+                            // every `store.observe` through
+                            // `to_observer_if_resource`, so the slot is
+                            // a merely-observing window even when the
+                            // stored value is currently an owner. Taking
+                            // the role from the source instead is
+                            // exactly how an owner got laundered back
+                            // out of a `Load` of this slot.
+                            if is_affine(*slot) {
+                                set_place_state(&mut facts, &destination, FieldState::OBSERVED);
+                            }
                         }
                     }
-                    crate::nir::OwnershipMode::Observe => {
-                        observe_root(&facts, &mut violations, &is_affine, &origin, *value, *value);
-                        // The slot now holds an observing alias. It owns
-                        // nothing -- the owner it aliases still owes the
-                        // cleanup -- but it is *there*, and reading it
-                        // back is legal. An `Alloc` alone leaves the slot
-                        // empty, so without this the very next `Load` of
-                        // it would look like a use after move.
-                        if is_affine(*slot) {
-                            set_place_state(
-                                &mut facts,
-                                &Place::root(origin(*slot)),
-                                FieldState::Full,
-                            );
-                        }
-                    }
-                },
+                }
                 Instruction::Value { result, kind, .. } => match kind {
                     ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
                         consume_root(
@@ -6884,7 +7135,6 @@ fn verify_structural_places(
                             &mut violations,
                             &is_affine,
                             &origin,
-                            &is_observed,
                             *source,
                             true,
                             *result,
@@ -6897,7 +7147,6 @@ fn verify_structural_places(
                                 &mut violations,
                                 &is_affine,
                                 &origin,
-                                &is_observed,
                                 *field,
                                 true,
                                 *result,
@@ -6911,7 +7160,6 @@ fn verify_structural_places(
                                 &mut violations,
                                 &is_affine,
                                 &origin,
-                                &is_observed,
                                 *field,
                                 true,
                                 *result,
@@ -6927,7 +7175,6 @@ fn verify_structural_places(
                                     &mut violations,
                                     &is_affine,
                                     &origin,
-                                    &is_observed,
                                     *arg,
                                     true,
                                     *result,
@@ -6960,7 +7207,7 @@ fn verify_structural_places(
                         // because the ancestor's own state dominates.
                         let place = Place::root(origin(*base))
                             .field(*record, crate::place::FieldId(*field as u32));
-                        if resolve_place_state(&facts, &place) != FieldState::Full {
+                        if !resolve_place_state(&facts, &place).definitely_present() {
                             violations.push(OwnershipViolation::UseAfterMove(*result));
                         }
                     }
@@ -6976,7 +7223,6 @@ fn verify_structural_places(
                     &mut violations,
                     &is_affine,
                     &origin,
-                    &is_observed,
                     *value,
                     true,
                     *value,
@@ -6988,13 +7234,18 @@ fn verify_structural_places(
                     &mut violations,
                     &is_affine,
                     &origin,
-                    &is_observed,
                     *value,
                     true,
                     *value,
                 );
             }
-            Terminator::Invoke { callee, args, .. } => {
+            Terminator::Invoke {
+                callee,
+                args,
+                ok_slot,
+                err_targets,
+                ..
+            } => {
                 let take = known_functions.get(callee).map(|f| f.take.as_slice());
                 for (i, arg) in args.iter().enumerate() {
                     if consumes_arg(take, args.len(), i) {
@@ -7003,13 +7254,34 @@ fn verify_structural_places(
                             &mut violations,
                             &is_affine,
                             &origin,
-                            &is_observed,
                             *arg,
                             true,
                             *arg,
                         );
                     } else {
                         observe_root(&facts, &mut violations, &is_affine, &origin, *arg, *arg);
+                    }
+                }
+                // An `Invoke` writes ownership into `ok_slot` on its
+                // success edge and into each error target's own slot on
+                // that failure edge, and those writes discard whatever
+                // the slot already held -- exactly as a `Store` does,
+                // and with exactly the same consequence if what it held
+                // was still this frame's own owner.
+                //
+                // Reported here, at the terminator, rather than on the
+                // edge in `in_state_for_places`: the edge is a pure
+                // join with no violation channel, and the question is
+                // about the state *this block* leaves behind, which is
+                // precisely what is in scope here. Every slot the
+                // invoke may write is checked, not just the success
+                // one, since a failure edge overwrites its own slot on
+                // the identical terms.
+                for slot in std::iter::once(*ok_slot).chain(err_targets.iter().map(|t| t.slot)) {
+                    if is_affine(slot)
+                        && resolve_place_state(&facts, &Place::root(origin(slot))).may_own()
+                    {
+                        violations.push(OwnershipViolation::OverwriteOwnedSlot(slot));
                     }
                 }
             }
@@ -7026,20 +7298,22 @@ fn verify_structural_places(
         .expect("presence already checked above");
     // Every root an instruction creates starts *absent*: nothing has
     // created it yet on any path through the entry. Without this the
-    // absence of a key reads as `Full`, so a value built on one arm of
+    // absence of a key reads as `OWNED`, so a value built on one arm of
     // a branch is indistinguishable at the join from one that was never
     // created on the other arm at all -- and a bypass path silently
     // excuses a real leak, or is itself blamed for a value it never
-    // received. Parameters are deliberately not seeded: a `take`
-    // parameter really is live from the entry.
-    let mut entry_facts = PlaceFacts::new();
+    // received. A `take` parameter is deliberately not seeded here: it
+    // really is live and owned from the entry, which the absent-key
+    // default already says. An ordinary parameter *is* seeded, as
+    // `OBSERVED` -- see `param_facts` above.
+    let mut entry_facts = param_facts.clone();
     for block in &function.blocks {
         for instruction in &block.instructions {
             if let Instruction::Value { result, .. } = instruction
                 && is_affine(*result)
                 && origin(*result) == *result
             {
-                entry_facts.insert(Place::root(*result), FieldState::Empty);
+                entry_facts.insert(Place::root(*result), FieldState::EMPTY);
             }
         }
         // An `Invoke`'s own result slots are absent until the edge that
@@ -7052,7 +7326,7 @@ fn verify_structural_places(
         {
             for slot in std::iter::once(*ok_slot).chain(err_targets.iter().map(|t| t.slot)) {
                 if is_affine(slot) && origin(slot) == slot {
-                    entry_facts.insert(Place::root(slot), FieldState::Empty);
+                    entry_facts.insert(Place::root(slot), FieldState::EMPTY);
                 }
             }
         }
@@ -7077,15 +7351,29 @@ fn verify_structural_places(
     // always explored in the same order. A block is re-enqueued only
     // when one of its own predecessors' out-states actually changed.
     //
-    // Termination, with no pass limit of any kind: every transfer
-    // either records a fixed state for a place or -- when its own guard
-    // fails on a worse in-state -- records nothing and leaves the joined
-    // state standing. So a worse in-state can only ever produce an
-    // equal-or-worse out-state, which makes the transfer monotone in
-    // the order `Full`/`Empty` below the absorbing `Maybe`. The set of
-    // tracked places is bounded by the places the instructions actually
-    // name, and each one's state can rise at most twice, so the
-    // iteration reaches a fixed point.
+    // Termination, with no pass limit of any kind.
+    //
+    // The set of tracked places is bounded by the places the
+    // instructions actually name, and each one's state is drawn from
+    // the finite seven-value `FieldState` lattice, so there are
+    // finitely many out-states a block can have at all.
+    //
+    // What rules out oscillating between them is that every *guarded*
+    // write preserves state when its guard fails: a consumption, a
+    // store, a reinitialization or a decomposition that is refused
+    // records nothing and leaves the joined state standing. A guard
+    // fails on a strictly larger in-state and keeps failing as the
+    // in-state grows further, so once a place stops being written it
+    // only ever accumulates possibilities from its predecessors, which
+    // is set union and therefore monotone. The one write that is not
+    // guarded this way is a definition's own seed, and it depends on a
+    // single question -- may this definition's *source* place be
+    // observed -- whose answer likewise only ever moves from `no` to
+    // `yes` as the in-state grows.
+    //
+    // `a_loop_alternating_store_modes_converges_and_rejects` and
+    // `the_analysis_converges_on_randomly_generated_loops` exercise
+    // this directly: each would hang rather than fail if it were wrong.
     let mut worklist: VecDeque<BlockId> = function
         .blocks
         .iter()
@@ -7166,9 +7454,14 @@ fn verify_structural_places(
             }
         } else {
             // An unreachable block is walked purely so its own
-            // instructions are still shape-checked; it starts from
-            // nothing, and its facts never reach a reachable block.
-            PlaceFacts::new()
+            // instructions are still shape-checked; its facts never
+            // reach a reachable block. It starts from the parameter
+            // roles and nothing else: those hold on every path, this
+            // one included, so consuming an observed parameter is
+            // still caught here -- while none of the rest of the entry
+            // state, which no path actually delivers to this block, is
+            // invented for it.
+            param_facts.clone()
         };
         let (exit_facts, violations) = transfer(block, &in_state);
         for violation in violations {
@@ -7206,6 +7499,12 @@ fn verify_structural_places(
                     v,
                     "reinitializes a structural place that is not definitely empty on every path \
                      reaching it",
+                ),
+                OwnershipViolation::OverwriteOwnedSlot(v) => (
+                    codes::STORE_OVER_OWNED_SLOT,
+                    v,
+                    "is written while it may still hold a value this function owns on a path \
+                     reaching it, which would discard that value's own cleanup obligation",
                 ),
                 OwnershipViolation::PartialWhole(v) => (
                     codes::PARTIAL_PLACE_USED_AS_WHOLE,
@@ -7305,13 +7604,11 @@ fn verify_structural_places(
 /// consumed on this path is duplicate structural cleanup, reported
 /// against `reporter` -- the instruction result, where there is one, so
 /// the diagnostic names the operation rather than its operand.
-#[allow(clippy::too_many_arguments)]
 fn consume_root(
     facts: &mut PlaceFacts,
     violations: &mut Vec<OwnershipViolation>,
     is_affine: &impl Fn(ValueId) -> bool,
     origin: &impl Fn(ValueId) -> ValueId,
-    is_observed: &impl Fn(ValueId) -> bool,
     value: ValueId,
     require_whole: bool,
     reporter: ValueId,
@@ -7319,14 +7616,22 @@ fn consume_root(
     if !is_affine(value) {
         return;
     }
+    let place = Place::root(origin(value));
     // Consuming is giving away, and an observer has nothing to give:
-    // whatever this reaches, the caller still owns it.
-    if is_observed(value) {
+    // whatever this reaches, the caller still owns it. Asked of the
+    // place rather than of a global set, so a slot that once held a
+    // view and was legally refilled with a real owner is consumable
+    // again, while one that still holds a view -- or holds an owner on
+    // one path and a view on another -- is not.
+    if place_may_observe(facts, &place) {
         violations.push(OwnershipViolation::ObserverTransfer(reporter));
         return;
     }
-    let place = Place::root(origin(value));
-    if resolve_place_state(facts, &place) != FieldState::Full {
+    // Whatever is left is an availability question: the observation
+    // axis is already ruled out above, so anything short of definite
+    // ownership here means at least one path reaching this point holds
+    // nothing to consume.
+    if !resolve_place_state(facts, &place).definitely_owned() {
         violations.push(OwnershipViolation::DoubleCleanup(reporter));
         return;
     }
@@ -7334,12 +7639,18 @@ fn consume_root(
         violations.push(OwnershipViolation::PartialWhole(reporter));
         return;
     }
-    set_place_state(facts, &place, FieldState::Empty);
+    set_place_state(facts, &place, FieldState::EMPTY);
 }
 
 /// Observes `value`'s own whole root place without consuming it -- still
 /// requires it to be intact, since a partially moved aggregate has no
 /// whole value left to observe (`rfcs/0012`).
+///
+/// Deliberately asks only about *presence*: observing something this
+/// frame merely observes in turn is exactly what an ordinary parameter
+/// is for, so an already-observed place passes here. Only the consuming
+/// direction ([`consume_root`]) cares which side of the ownership axis
+/// the place sits on.
 fn observe_root(
     facts: &PlaceFacts,
     violations: &mut Vec<OwnershipViolation>,
@@ -7352,94 +7663,64 @@ fn observe_root(
         return;
     }
     let place = Place::root(origin(value));
-    if resolve_place_state(facts, &place) != FieldState::Full {
+    if !resolve_place_state(facts, &place).definitely_present() {
         violations.push(OwnershipViolation::UseAfterMove(reporter));
     } else if !place_is_whole(facts, &place) {
         violations.push(OwnershipViolation::PartialWhole(reporter));
     }
 }
 
-/// Every value in this function that is an *observation* rather than an
-/// owner (`rfcs/0011`, `rfcs/0012`) -- a call-scoped view of something
-/// the caller still owns.
+/// The structural place a value-producing instruction *derives* its
+/// result from, for the purpose of carrying observation forward
+/// (`rfcs/0011`, `rfcs/0012`) -- or `None` when the result is a genuinely
+/// new value that observes nothing.
 ///
 /// Ownership is a second axis alongside availability, and this is the
 /// half availability cannot express: a field of an observed aggregate is
 /// perfectly *there*, and reading it is exactly what observation is for,
 /// but nothing reached through it may be transferred, destroyed,
-/// decomposed or reinitialized.
+/// decomposed or reinitialized. Every projection out of an observation
+/// is an observation in turn, and no step ever moves the other way along
+/// this axis -- which is exactly the laundering this closes.
 ///
-/// It is a property of the value rather than of the path -- an ordinary
-/// (non-`take`) affine parameter is observed for its whole life -- so
-/// this is a least fixed point over definitions and uses, and a join
-/// can never lose it. Every projection out of an observation is an
-/// observation in turn: reading a field, extracting a payload, loading
-/// a slot an observing alias was stored into. No step ever moves the
-/// other way along this axis, which is exactly the laundering it
-/// closes.
-fn observed_values(function: &Function, is_affine: &impl Fn(ValueId) -> bool) -> HashSet<ValueId> {
-    let mut observed: HashSet<ValueId> = function
-        .params
-        .iter()
-        .filter(|param| !param.take && is_affine(param.value))
-        .map(|param| param.value)
-        .collect();
-    // Definitions may appear in any block order, so this runs to a
-    // fixed point rather than in one pass. The set only ever grows and
-    // is bounded by the values this function defines.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                match instruction {
-                    Instruction::Value { result, kind, .. } => {
-                        let source = match kind {
-                            ValueKind::PlaceRead { place, .. } => Some(place.root),
-                            ValueKind::RecordField { base, .. } => Some(*base),
-                            ValueKind::VariantPayload { base, .. } => Some(*base),
-                            ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
-                                Some(*source)
-                            }
-                            ValueKind::Load(slot) => Some(*slot),
-                            _ => None,
-                        };
-                        if let Some(source) = source
-                            && observed.contains(&source)
-                            && observed.insert(*result)
-                        {
-                            changed = true;
-                        }
-                    }
-                    // Whatever a slot was last given, it can give back.
-                    Instruction::Store { slot, value, .. } => {
-                        if observed.contains(value) && observed.insert(*slot) {
-                            changed = true;
-                        }
-                    }
-                    Instruction::StorePlace { place, value } => {
-                        if observed.contains(value) && observed.insert(place.root) {
-                            changed = true;
-                        }
-                    }
-                    // The decomposition itself is rejected below; the
-                    // fact still propagates so nothing downstream of it
-                    // looks like an owner either.
-                    Instruction::DecomposeVariant { value, taken, .. } => {
-                        if observed.contains(value) {
-                            for (_, owner) in taken {
-                                if observed.insert(*owner) {
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                    Instruction::Drop { .. } => {}
-                }
-            }
+/// This deliberately answers a question about *one* instruction against
+/// the facts holding where it appears, rather than computing a
+/// function-global set of "observing values". A slot is mutable: it may
+/// hold an observing view, be emptied, and then legally be given a real
+/// owner. A global monotone set can express the first of those and can
+/// never take it back, so it must either keep the slot observed forever
+/// (rejecting the legal refill) or never record it at all (laundering
+/// the observation). The path-sensitive [`PlaceFacts`] lattice has no
+/// such choice to make.
+///
+/// A `Load` is deliberately absent: its result already *shares* the
+/// slot's own place identity through `origin`, so it reads the slot's
+/// current role directly and needs no separate rule.
+fn observation_source(
+    kind: &ValueKind,
+    origin: &impl Fn(ValueId) -> ValueId,
+    canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
+) -> Option<Place<ValueId>> {
+    match kind {
+        ValueKind::PlaceRead { place, .. } => Some(canonical(place)),
+        ValueKind::RecordField {
+            base,
+            record,
+            field,
+        } => Some(Place::root(origin(*base)).field(*record, crate::place::FieldId(*field as u32))),
+        // A payload read reaches *through* the shell, so it observes
+        // whatever the shell is. Which payload position it names does
+        // not matter here: the shell's own role dominates every one of
+        // them.
+        ValueKind::VariantPayload { base, .. } => Some(Place::root(origin(*base))),
+        ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+            Some(Place::root(origin(*source)))
         }
+        // A construction, a call's returned value and a constant are all
+        // genuinely new: they observe nothing, and their operands are
+        // separately required to be transferable.
+        _ => None,
     }
-    observed
 }
 
 /// Every root this function itself owns and must therefore have fully
@@ -7619,26 +7900,28 @@ fn extracted_payloads(function: &Function) -> HashMap<(ValueId, usize, usize), V
 /// NIR alone rather than trusted from it.
 /// The most precise state `facts` records for `place` (`rfcs/0012`).
 ///
-/// An ancestor that is `Empty` is gone, and takes everything reachable
-/// through it, so nothing under it is ever owed. Otherwise the place's
-/// own recorded fact is the most precise answer there is: a join can
-/// leave a parent `Maybe` -- live on one predecessor, absent or consumed
-/// on another -- while a child is recorded `Empty` on every predecessor
+/// An ancestor that owns nothing -- destroyed, moved out, or itself only
+/// an observing view -- takes everything reachable through it with it,
+/// so nothing under it is ever owed. Otherwise the place's own recorded
+/// fact is the most precise answer there is: a join can leave a parent
+/// `Owned|Empty` -- live on one predecessor, absent or consumed on
+/// another -- while a child is recorded `Empty` on every predecessor
 /// that had it at all, and reading the child through the parent would
 /// demand cleanup for something already cleaned everywhere.
 ///
 /// This is deliberately *not* `resolve_place_state`, which answers the
-/// stricter question a *use* asks: there a non-`Full` ancestor makes
-/// every descendant unusable, which is exactly right for reading or
-/// moving, and too coarse for deciding what is still owed.
+/// stricter question a *use* asks: there any ancestor that is not
+/// plainly owned makes every descendant unusable, which is exactly right
+/// for reading or moving, and too coarse for deciding what is still
+/// owed.
 fn precise_place_state(facts: &PlaceFacts, place: &Place<ValueId>) -> FieldState {
     for len in 0..place.projections.len() {
         let prefix = Place {
             root: place.root,
             projections: place.projections[..len].to_vec(),
         };
-        if facts.get(&prefix) == Some(&FieldState::Empty) {
-            return FieldState::Empty;
+        if facts.get(&prefix).is_some_and(|state| !state.may_own()) {
+            return FieldState::EMPTY;
         }
     }
     match facts.get(place) {
@@ -7659,12 +7942,14 @@ fn remaining_obligations(
     if depth >= MAX_GENERIC_DEPTH {
         return;
     }
-    // `Empty` is the only state that owes nothing: every path reaching
-    // here either never created this place or already consumed it.
-    // `Maybe` means at least one path still holds it, and that path
-    // leaks -- treating disagreement as "nothing owed" is exactly how a
-    // value live on one predecessor and consumed on another escaped.
-    if precise_place_state(facts, place) == FieldState::Empty {
+    // Owing nothing means no path reaching here left this frame owning
+    // this place: it was never created, or already consumed, or it only
+    // ever held an observing view of something the caller owns. Any
+    // remaining `Owned` bit means at least one path still holds it, and
+    // that path leaks -- treating disagreement as "nothing owed" is
+    // exactly how a value live on one predecessor and consumed on
+    // another escaped.
+    if !precise_place_state(facts, place).may_own() {
         return;
     }
     if !is_affine_in(ty, agg) {
@@ -7708,9 +7993,10 @@ fn remaining_obligations(
                 crate::place::CaseId(case as u32),
                 crate::place::FieldId(index as u32),
             );
-            if precise_place_state(facts, &payload_place) == FieldState::Empty {
-                // Already transferred out on this path: whoever took it
-                // owns it now, and owes its cleanup in its own right.
+            if !precise_place_state(facts, &payload_place).may_own() {
+                // Already transferred out on this path (or never owned
+                // here at all): whoever took it owns it now, and owes
+                // its cleanup in its own right.
                 continue;
             }
             // Still held by the shell. What it owes in turn is answered
@@ -7824,7 +8110,8 @@ impl VariantCaseContext<'_> {
 
 /// The pairwise join of two reachable predecessors' own place facts --
 /// over the *union* of both sides' keys, so a place touched on only one
-/// of them still joins to `Maybe` against the other's implicit `Full`.
+/// of them still joins against the other's own implicit `OWNED`,
+/// keeping both possibilities rather than collapsing them.
 /// Collected through a `BTreeSet`, so the result never depends on
 /// either map's own iteration order.
 fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
@@ -7832,7 +8119,7 @@ fn merge_place_facts(a: &PlaceFacts, b: &PlaceFacts) -> PlaceFacts {
     keys.into_iter()
         .map(|key| {
             // Each side's most precise recorded state, never a bare
-            // `unwrap_or(Full)`: a side that never recorded this exact
+            // `unwrap_or(OWNED)`: a side that never recorded this exact
             // place may still have recorded its parent, and a child of
             // a place that is absent or already consumed is absent or
             // consumed too. Reading it as `Full` claimed the child was
@@ -7928,7 +8215,7 @@ fn in_state_for_places(
         let facts = match generated {
             Some(slot) => {
                 let mut initialized = facts.clone();
-                set_place_state(&mut initialized, &Place::root(*slot), FieldState::Full);
+                set_place_state(&mut initialized, &Place::root(*slot), FieldState::OWNED);
                 initialized
             }
             None => facts.clone(),
@@ -8235,10 +8522,42 @@ mod tests {
 
     // -- `merge_field` lattice laws (`rfcs/0012`) --------------------
 
+    /// Every state the lattice can reach: the three concrete ones and
+    /// every join of them. Exhaustive, so the laws below are proven over
+    /// the whole domain rather than a chosen sample of it.
+    fn all_field_states() -> Vec<FieldState> {
+        let atoms = [FieldState::EMPTY, FieldState::OWNED, FieldState::OBSERVED];
+        let mut states = Vec::new();
+        for mask in 1u8..8 {
+            let mut state: Option<FieldState> = None;
+            for (bit, atom) in atoms.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    state = Some(match state {
+                        None => *atom,
+                        Some(previous) => previous.join(*atom),
+                    });
+                }
+            }
+            states.push(state.expect("mask is non-zero, so at least one atom was joined"));
+        }
+        states
+    }
+
+    #[test]
+    fn the_lattice_has_exactly_seven_distinct_states() {
+        let states = all_field_states();
+        let distinct: HashSet<FieldState> = states.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            7,
+            "three independent possibilities must give seven non-empty joins, got {states:?}"
+        );
+    }
+
     #[test]
     fn merge_field_is_commutative() {
-        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
-            for b in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+        for a in all_field_states() {
+            for b in all_field_states() {
                 assert_eq!(
                     merge_field(a, b),
                     merge_field(b, a),
@@ -8250,7 +8569,7 @@ mod tests {
 
     #[test]
     fn merge_field_is_idempotent() {
-        for a in [FieldState::Full, FieldState::Empty, FieldState::Maybe] {
+        for a in all_field_states() {
             assert_eq!(
                 merge_field(a, a),
                 a,
@@ -8261,13 +8580,13 @@ mod tests {
 
     #[test]
     fn merge_field_is_associative() {
-        let states = [FieldState::Full, FieldState::Empty, FieldState::Maybe];
-        for a in states {
-            for b in states {
-                for c in states {
+        let states = all_field_states();
+        for a in &states {
+            for b in &states {
+                for c in &states {
                     assert_eq!(
-                        merge_field(merge_field(a, b), c),
-                        merge_field(a, merge_field(b, c)),
+                        merge_field(merge_field(*a, *b), *c),
+                        merge_field(*a, merge_field(*b, *c)),
                         "(a merge b) merge c != a merge (b merge c) for {a:?}, {b:?}, {c:?}"
                     );
                 }
@@ -8275,20 +8594,72 @@ mod tests {
         }
     }
 
+    /// A join never loses a possibility: whatever either side admitted,
+    /// the result still admits. This is what makes the fixpoint
+    /// monotone, and it is the property a hand-written merge table
+    /// silently broke by collapsing disagreement onto one absorbing
+    /// state.
     #[test]
-    fn merge_field_disagreement_is_the_absorbing_maybe_state() {
-        assert_eq!(
-            merge_field(FieldState::Full, FieldState::Empty),
-            FieldState::Maybe
+    fn merge_field_never_discards_a_possibility() {
+        for a in all_field_states() {
+            for b in all_field_states() {
+                let merged = merge_field(a, b);
+                for side in [a, b] {
+                    assert!(
+                        !(side.may_be_empty() && !merged.may_be_empty())
+                            && !(side.may_own() && !merged.may_own())
+                            && !(side.may_observe() && !merged.may_observe()),
+                        "merge_field({a:?}, {b:?}) = {merged:?} lost a possibility of {side:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The four cases the join must keep apart -- the distinction a
+    /// single absorbing "maybe" cannot express, and the reason a store
+    /// over a joined slot can be judged at all.
+    #[test]
+    fn the_join_distinguishes_empty_owner_observer_and_disagreement() {
+        let owner_or_empty = merge_field(FieldState::OWNED, FieldState::EMPTY);
+        let owner_or_observer = merge_field(FieldState::OWNED, FieldState::OBSERVED);
+        let observer_or_empty = merge_field(FieldState::OBSERVED, FieldState::EMPTY);
+
+        assert!(
+            FieldState::EMPTY.definitely_empty() && !FieldState::EMPTY.may_own(),
+            "an empty slot owns nothing and may be written"
         );
-        assert_eq!(
-            merge_field(FieldState::Maybe, FieldState::Full),
-            FieldState::Maybe
+        assert!(
+            FieldState::OWNED.definitely_owned() && FieldState::OWNED.definitely_present(),
+            "an owned slot is present and consumable"
         );
-        assert_eq!(
-            merge_field(FieldState::Empty, FieldState::Maybe),
-            FieldState::Maybe
+        assert!(
+            FieldState::OBSERVED.definitely_present()
+                && !FieldState::OBSERVED.may_own()
+                && FieldState::OBSERVED.may_observe(),
+            "an observing view is present, owns nothing, and is never consumable"
         );
+
+        // Owner on one path, nothing on another: not readable, and not
+        // overwritable either.
+        assert!(!owner_or_empty.definitely_present());
+        assert!(owner_or_empty.may_own());
+
+        // Owner on one path, an observing view on another: definitely
+        // *there*, so reading it is fine -- and definitely not
+        // consumable, and not overwritable, because one path would lose
+        // a real owner.
+        assert!(owner_or_observer.definitely_present());
+        assert!(!owner_or_observer.definitely_owned());
+        assert!(owner_or_observer.may_own());
+        assert!(owner_or_observer.may_observe());
+
+        // A view on one path and nothing on another owns nothing at
+        // all, so overwriting it loses nothing: precision a single
+        // absorbing state would have thrown away, turning a legal
+        // program into a false positive.
+        assert!(!observer_or_empty.may_own());
+        assert!(!observer_or_empty.definitely_present());
     }
 
     #[test]
@@ -16094,6 +16465,7 @@ mod structural_ownership {
                             | codes::DECOMPOSITION_CLAIM_MISMATCH
                             | codes::UNCLAIMED_PAYLOAD_OWNERSHIP
                             | codes::OBSERVER_CANNOT_TRANSFER
+                            | codes::STORE_OVER_OWNED_SLOT
                     )
                 })
                 .collect();
@@ -16895,7 +17267,8 @@ mod structural_ownership {
 
     /// `f(cond) { if cond { move session.input; drop it } ; read
     /// session.input }` -- empty on exactly one predecessor, so the
-    /// join is the absorbing `Maybe` and the later read is rejected.
+    /// join admits both `Empty` and `Owned`, so it is not definitely
+    /// present and the later read is rejected.
     fn field_empty_on_one_predecessor(fx: &Fixture) -> Vec<BasicBlock> {
         vec![
             BasicBlock {
@@ -17102,7 +17475,7 @@ mod structural_ownership {
                             value: ValueId(4),
                         },
                     ],
-                    // Back edge: the field is `Full` again, so a second
+                    // Back edge: the field is `OWNED` again, so a second
                     // iteration may move it again.
                     terminator: Terminator::Branch(BlockId(1)),
                 },
@@ -17176,9 +17549,9 @@ mod structural_ownership {
         let parent = Place::root(ValueId(0));
         let child = parent.field(SESSION, FieldId(0));
         let grandchild = child.field(FILE, FieldId(0));
-        set_place_state(&mut facts, &parent, FieldState::Empty);
-        assert_eq!(resolve_place_state(&facts, &child), FieldState::Empty);
-        assert_eq!(resolve_place_state(&facts, &grandchild), FieldState::Empty);
+        set_place_state(&mut facts, &parent, FieldState::EMPTY);
+        assert_eq!(resolve_place_state(&facts, &child), FieldState::EMPTY);
+        assert_eq!(resolve_place_state(&facts, &grandchild), FieldState::EMPTY);
     }
 
     #[test]
@@ -17187,8 +17560,8 @@ mod structural_ownership {
         let parent = Place::root(ValueId(0));
         let child = parent.field(SESSION, FieldId(0));
         let sibling = parent.field(SESSION, FieldId(1));
-        set_place_state(&mut facts, &child, FieldState::Empty);
-        assert_eq!(resolve_place_state(&facts, &parent), FieldState::Full);
+        set_place_state(&mut facts, &child, FieldState::EMPTY);
+        assert_eq!(resolve_place_state(&facts, &parent), FieldState::OWNED);
         assert!(!place_is_whole(&facts, &parent));
         assert!(place_is_whole(&facts, &sibling));
     }
@@ -17198,8 +17571,8 @@ mod structural_ownership {
         let mut facts = PlaceFacts::new();
         let parent = Place::root(ValueId(0));
         let child = parent.field(SESSION, FieldId(0));
-        set_place_state(&mut facts, &child, FieldState::Empty);
-        set_place_state(&mut facts, &parent, FieldState::Full);
+        set_place_state(&mut facts, &child, FieldState::EMPTY);
+        set_place_state(&mut facts, &parent, FieldState::OWNED);
         assert!(
             place_is_whole(&facts, &parent),
             "restoring a parent must retire every stale descendant fact"
@@ -17211,15 +17584,16 @@ mod structural_ownership {
         let parent = Place::root(ValueId(0));
         let child = parent.field(SESSION, FieldId(0));
         let mut a = PlaceFacts::new();
-        a.insert(child.clone(), FieldState::Empty);
+        a.insert(child.clone(), FieldState::EMPTY);
         let b = PlaceFacts::new();
         let left = merge_place_facts(&a, &b);
         let right = merge_place_facts(&b, &a);
         assert_eq!(left, right, "the join must be commutative");
         assert_eq!(
             left.get(&child),
-            Some(&FieldState::Maybe),
-            "a key present on only one side must join to the absorbing state"
+            Some(&FieldState::EMPTY.join(FieldState::OWNED)),
+            "a key present on only one side must join against the other side's own implicit \
+             `OWNED`, keeping both possibilities"
         );
     }
 
@@ -18440,7 +18814,7 @@ mod structural_ownership {
 
         #[test]
         fn a_block_waiting_for_one_predecessor_joins_only_the_ones_that_landed() {
-            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::EMPTY)]);
             // bb2's back edge from bb1 has not been processed yet; bb0 has.
             let incoming =
                 HashMap::from([(BlockId(2), vec![(BlockId(0), None), (BlockId(1), None)])]);
@@ -18461,7 +18835,7 @@ mod structural_ownership {
 
         #[test]
         fn an_unreachable_predecessors_computed_out_state_is_never_joined() {
-            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::Empty)]);
+            let consumed = PlaceFacts::from([(Place::root(ValueId(0)), FieldState::EMPTY)]);
             let incoming = HashMap::from([(BlockId(2), vec![(BlockId(1), None)])]);
             // bb1 has an out-state, but nothing reaches it from the entry.
             let reachable = HashSet::from([BlockId(0), BlockId(2)]);
@@ -20362,7 +20736,7 @@ mod structural_ownership {
         use crate::nir::InvokeErrTarget;
 
         /// `func raiser() -> Box[File] raises Holder`.
-        fn raiser(fx: &mut Fixture) -> Function {
+        pub(super) fn raiser(fx: &mut Fixture) -> Function {
             let name = fx.interner.intern("raiser");
             Function {
                 id: RAISER,
@@ -21511,6 +21885,1312 @@ mod structural_ownership {
             assert!(
                 structural_codes(&mut fx, f).contains(&codes::MISSING_STRUCTURAL_CLEANUP),
                 "the arm that filled the slot leaks it at the shared exit"
+            );
+        }
+    }
+
+    // == Blocker 1: a store must never discard the slot's own owner ====
+    //
+    // `Store` had no notion of what its destination already held: the
+    // transferring arm consumed the incoming value and set the slot
+    // `Full` unconditionally, so a second `store.transfer` into a slot
+    // that already owned a value silently dropped the first one's
+    // cleanup obligation on the floor. The whole-slot analogue of
+    // `StorePlace`'s own `PLACE_OVERWRITE_OF_LIVE_FIELD`, which had
+    // always checked exactly this for a *projected* place.
+
+    fn alloc_of(result: u32, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::Alloc,
+        }
+    }
+
+    fn load_of(result: u32, ty: Ty, slot: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::Load(ValueId(slot)),
+        }
+    }
+
+    fn store_of(slot: u32, value: u32, mode: OwnershipMode) -> Instruction {
+        Instruction::Store {
+            slot: ValueId(slot),
+            value: ValueId(value),
+            mode,
+        }
+    }
+
+    /// `%descriptor = 0` then `%result = File(%descriptor)` -- a fresh,
+    /// nominally-`resource` value.
+    fn new_file(fx: &Fixture, descriptor: u32, result: u32) -> Vec<Instruction> {
+        vec![
+            int(descriptor, 0),
+            Instruction::Value {
+                result: ValueId(result),
+                ty: fx.file.clone(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(descriptor)]),
+            },
+        ]
+    }
+
+    /// `%result = Box[File](%inner)` -- transitively affine, never
+    /// nominally a `resource`, so it is this pass's own obligation
+    /// rather than `verify_resource_ownership`'s.
+    fn new_box(fx: &Fixture, inner: u32, result: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: fx.box_file.clone(),
+            kind: ValueKind::RecordCreate(BOXY, vec![fx.file.clone()], vec![ValueId(inner)]),
+        }
+    }
+
+    /// `%result = Box[Box[File]](%inner)` -- one legal way to transfer a
+    /// whole `Box[File]` out of the slot that held it.
+    fn new_outer_box(fx: &Fixture, inner: u32, result: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::Applied(BOXY, vec![fx.box_file.clone()]),
+            kind: ValueKind::RecordCreate(BOXY, vec![fx.box_file.clone()], vec![ValueId(inner)]),
+        }
+    }
+
+    fn call_observe(result: u32, arg: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Call(OBSERVE, Vec::new(), vec![ValueId(arg)], Vec::new()),
+        }
+    }
+
+    /// `sink(take File)` -- a genuinely consuming call argument.
+    fn call_sink(result: u32, arg: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::Unit,
+            kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(arg)], Vec::new()),
+        }
+    }
+
+    /// One straight-line `bb0` returning `%result`.
+    fn single_block(instructions: Vec<Instruction>, result: u32) -> Vec<BasicBlock> {
+        vec![BasicBlock {
+            id: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(ValueId(result))),
+        }]
+    }
+
+    /// A fresh `Box[File]` in `%value`, built from a `File` in
+    /// `%value - 1` whose own descriptor is `%value - 2`.
+    fn boxed_file(fx: &Fixture, value: u32) -> Vec<Instruction> {
+        let mut out = new_file(fx, value - 2, value - 1);
+        out.push(new_box(fx, value - 1, value));
+        out
+    }
+
+    fn bool_param() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(2),
+            ty: Ty::Bool,
+            take: false,
+        }]
+    }
+
+    #[test]
+    fn a_second_transferring_store_into_a_still_owning_slot_is_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        instructions.extend(boxed_file(&fx, 6));
+        instructions.push(store_of(0, 6, OwnershipMode::Transfer));
+        instructions.push(load_of(7, fx.box_file.clone(), 0));
+        instructions.push(drop_of(7));
+        instructions.push(int(8, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 8)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "the second store discards the first Box[File]'s own cleanup obligation and must be \
+             rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_store_after_the_first_value_was_loaded_and_destroyed_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        // The slot is emptied by destroying what it held, so the next
+        // store loses nothing.
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(drop_of(4));
+        instructions.extend(boxed_file(&fx, 7));
+        instructions.push(store_of(0, 7, OwnershipMode::Transfer));
+        instructions.push(load_of(8, fx.box_file.clone(), 0));
+        instructions.push(drop_of(8));
+        instructions.push(int(9, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+        );
+        assert!(
+            codes.is_empty(),
+            "emptying the slot first makes the second store legal, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_store_after_the_first_value_was_transferred_out_is_accepted() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        // Moved out into a new owner, which is itself destroyed: the
+        // slot owns nothing by the time the second store runs.
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(new_outer_box(&fx, 4, 5));
+        instructions.push(drop_of(5));
+        instructions.extend(boxed_file(&fx, 8));
+        instructions.push(store_of(0, 8, OwnershipMode::Transfer));
+        instructions.push(load_of(9, fx.box_file.clone(), 0));
+        instructions.push(drop_of(9));
+        instructions.push(int(10, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 10)),
+        );
+        assert!(
+            codes.is_empty(),
+            "transferring the first value out makes the second store legal, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_store_over_a_slot_that_still_owns_a_value_is_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Transfer));
+        // An *observing* write loses the owner underneath it every bit
+        // as completely as a transferring one: the mode describes the
+        // incoming value, not what was overwritten.
+        instructions.extend(boxed_file(&fx, 6));
+        instructions.push(store_of(0, 6, OwnershipMode::Observe));
+        instructions.push(drop_of(6));
+        instructions.push(int(7, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 7)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "an observing store must not silently discard the owner the slot still held, got \
+             {codes:?}"
+        );
+    }
+
+    #[test]
+    fn overwriting_a_slot_that_only_holds_an_observing_view_loses_no_owner() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        // The slot is given a *view* of `%2`; `%2` itself stays this
+        // frame's owner and is destroyed at the end.
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.push(call_observe(4, 3));
+        // Overwriting a view discards nothing, so a second observing
+        // store is legal.
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(5, fx.file.clone(), 0));
+        instructions.push(call_observe(6, 5));
+        instructions.push(drop_of(2));
+        instructions.push(int(8, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 8)),
+        );
+        assert!(
+            codes.is_empty(),
+            "an observing view owns nothing, so overwriting it is legal and loses nothing, got \
+             {codes:?}"
+        );
+    }
+
+    /// `bb0` branches; only one arm fills the slot; the join block
+    /// stores into it. On the filling path that store discards a real
+    /// owner, and a join must not average that away.
+    fn slot_filled_on_one_branch(fx: &Fixture, fill_then: bool) -> Vec<BasicBlock> {
+        let mut fill = boxed_file(fx, 5);
+        fill.push(store_of(0, 5, OwnershipMode::Transfer));
+        let (fill_arm, bypass_arm) = if fill_then {
+            (BlockId(1), BlockId(2))
+        } else {
+            (BlockId(2), BlockId(1))
+        };
+        let mut after = boxed_file(fx, 8);
+        after.push(store_of(0, 8, OwnershipMode::Transfer));
+        after.push(load_of(9, fx.box_file.clone(), 0));
+        after.push(drop_of(9));
+        after.push(int(10, 0));
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: vec![alloc_of(0, fx.box_file.clone())],
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(2),
+                    then_block: fill_arm,
+                    else_block: bypass_arm,
+                },
+            },
+            BasicBlock {
+                id: fill_arm,
+                instructions: fill,
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: bypass_arm,
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: after,
+                terminator: Terminator::Return(Some(ValueId(10))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_slot_filled_on_only_one_branch_may_not_be_overwritten_after_the_join() {
+        let mut fx = fixture();
+        let blocks = slot_filled_on_one_branch(&fx, true);
+        let codes = structural_codes(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "the join must carry the filling branch's own owner forward, not average it away, \
+             got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_slot_empty_on_every_branch_may_be_stored_into_after_the_join() {
+        let mut fx = fixture();
+        let mut after = boxed_file(&fx, 6);
+        after.push(store_of(0, 6, OwnershipMode::Transfer));
+        after.push(load_of(7, fx.box_file.clone(), 0));
+        after.push(drop_of(7));
+        after.push(int(8, 0));
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: vec![alloc_of(0, fx.box_file.clone())],
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(2),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: after,
+                terminator: Terminator::Return(Some(ValueId(8))),
+            },
+        ];
+        let codes = all_codes(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+        assert!(
+            codes.is_empty(),
+            "a slot no path ever filled may be stored into freely, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn the_overwrite_diagnosis_is_identical_under_rotated_and_reversed_blocks() {
+        let mut fx = fixture();
+        let straight_blocks = slot_filled_on_one_branch(&fx, true);
+        let swapped_blocks = slot_filled_on_one_branch(&fx, false);
+        let straight = rendered(&mut fx, under_test(bool_param(), Ty::I64, straight_blocks));
+        let swapped = rendered(&mut fx, under_test(bool_param(), Ty::I64, swapped_blocks));
+        assert!(
+            !straight.is_empty(),
+            "the shared expectation must not be vacuously empty"
+        );
+        assert_eq!(
+            straight, swapped,
+            "swapping which vector position each arm occupies must not change the diagnosis"
+        );
+        let mut reversed_blocks = slot_filled_on_one_branch(&fx, true);
+        reversed_blocks.reverse();
+        let reversed = rendered(&mut fx, under_test(bool_param(), Ty::I64, reversed_blocks));
+        assert_eq!(
+            straight, reversed,
+            "reversing `function.blocks` must not change the diagnosis"
+        );
+    }
+
+    #[test]
+    fn a_second_store_into_a_nominally_resource_slot_is_rejected_too() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Transfer));
+        instructions.extend(new_file(&fx, 3, 4));
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.push(load_of(5, fx.file.clone(), 0));
+        instructions.push(drop_of(5));
+        instructions.push(int(6, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 6)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "a declared `resource` slot is checked by the NIR verifier itself, not left to \
+             `resourceck`'s source-level U0010, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_store_into_a_transitively_affine_variant_slot_is_rejected() {
+        let mut fx = fixture();
+        // `Holder` is a variant whose `Full` case carries an `Envelope`,
+        // itself an ordinary record with a `File` field: affine only
+        // transitively, and never a nominal `resource`.
+        let held = |descriptor: u32, file: u32, envelope: u32, holder: u32| -> Vec<Instruction> {
+            let mut out = new_file(&fx, descriptor, file);
+            out.push(Instruction::Value {
+                result: ValueId(envelope),
+                ty: fx.envelope.clone(),
+                kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(file)]),
+            });
+            out.push(Instruction::Value {
+                result: ValueId(holder),
+                ty: fx.holder.clone(),
+                kind: ValueKind::VariantCreate {
+                    variant: HOLDER,
+                    case: 0,
+                    type_args: Vec::new(),
+                    payload: vec![ValueId(envelope)],
+                },
+            });
+            out
+        };
+        let mut instructions = vec![alloc_of(0, fx.holder.clone())];
+        instructions.extend(held(1, 2, 3, 4));
+        instructions.push(store_of(0, 4, OwnershipMode::Transfer));
+        instructions.extend(held(5, 6, 7, 8));
+        instructions.push(store_of(0, 8, OwnershipMode::Transfer));
+        instructions.push(load_of(9, fx.holder.clone(), 0));
+        instructions.push(drop_of(9));
+        instructions.push(int(10, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 10)),
+        );
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "a transitively affine variant slot owns real resources and must be checked too, \
+             got {codes:?}"
+        );
+    }
+
+    // == Blocker 2: `store.observe` may never launder an owner ==========
+    //
+    // The old model asked a *function-global* question -- "is this value
+    // an observation anywhere?" -- and answered it with a monotone
+    // `HashSet`. A `store.observe` only marked the slot observed when
+    // the value it stored already was, so storing a genuine *owner*
+    // through an observing store left the slot looking owned, and the
+    // very next `Load` handed back owning access to something the
+    // interpreter had already downgraded with
+    // `to_observer_if_resource`. Patching that single rule was never
+    // enough: a slot is mutable, so it can hold a view, be emptied, and
+    // then legally receive a real owner, and a global monotone set can
+    // only ever be wrong in one direction or the other. The role now
+    // lives in the path-sensitive lattice instead.
+
+    /// `%0` is a slot given an observing view of the owner `%2`, which
+    /// this frame keeps and destroys itself. `tail` is whatever the test
+    /// then does with a `Load` of that slot, which is always `%3`.
+    fn observed_slot(fx: &Fixture, tail: Vec<Instruction>) -> Vec<BasicBlock> {
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.extend(tail);
+        instructions.push(drop_of(2));
+        instructions.push(int(9, 0));
+        single_block(instructions, 9)
+    }
+
+    #[test]
+    fn a_load_of_an_observing_slot_may_be_read() {
+        let mut fx = fixture();
+        let blocks = observed_slot(&fx, vec![call_observe(4, 3)]);
+        let codes = all_codes(&mut fx, under_test(Vec::new(), Ty::I64, blocks));
+        assert!(
+            codes.is_empty(),
+            "reading through an observing view is exactly what observation is for, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_load_of_an_observing_slot_may_not_be_destroyed() {
+        let mut fx = fixture();
+        let blocks = observed_slot(&fx, vec![drop_of(3)]);
+        let codes = structural_codes(&mut fx, under_test(Vec::new(), Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "destroying what an observing store put in the slot destroys a value this frame \
+             never owned, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_load_of_an_observing_slot_may_be_passed_to_an_observing_parameter() {
+        let mut fx = fixture();
+        let blocks = observed_slot(&fx, vec![call_observe(4, 3)]);
+        let codes = all_codes(&mut fx, under_test(Vec::new(), Ty::I64, blocks));
+        assert!(
+            codes.is_empty(),
+            "an observing argument takes nothing, so an observed value is a legal one, got \
+             {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_load_of_an_observing_slot_may_not_be_passed_to_a_take_parameter() {
+        let mut fx = fixture();
+        let blocks = observed_slot(&fx, vec![call_sink(4, 3)]);
+        let codes = structural_codes(&mut fx, under_test(Vec::new(), Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a `take` parameter takes ownership the caller never handed over, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_reached_through_an_observing_slot_stays_an_observation() {
+        let mut fx = fixture();
+        // `Envelope` is an ordinary record with one `File` field. The
+        // slot observes a whole `Envelope`; the field read through it
+        // must not come back out as an owner.
+        let mut instructions = vec![alloc_of(0, fx.envelope.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(2)]),
+        });
+        instructions.push(store_of(0, 3, OwnershipMode::Observe));
+        instructions.push(load_of(4, fx.envelope.clone(), 0));
+        instructions.push(Instruction::Value {
+            result: ValueId(5),
+            ty: fx.file.clone(),
+            kind: ValueKind::RecordField {
+                base: ValueId(4),
+                record: ENVELOPE,
+                field: 0,
+            },
+        });
+        instructions.push(drop_of(5));
+        instructions.push(drop_of(3));
+        instructions.push(int(6, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 6)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a field projected out of an observing slot is an observation in turn, and \
+             destroying it is destroying the caller's own value, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_variant_payload_reached_through_an_observing_slot_stays_an_observation() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.holder.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(2)]),
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: fx.holder.clone(),
+            kind: ValueKind::VariantCreate {
+                variant: HOLDER,
+                case: 0,
+                type_args: Vec::new(),
+                payload: vec![ValueId(3)],
+            },
+        });
+        instructions.push(store_of(0, 4, OwnershipMode::Observe));
+        instructions.push(load_of(5, fx.holder.clone(), 0));
+        instructions.push(Instruction::Value {
+            result: ValueId(6),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::VariantPayload {
+                base: ValueId(5),
+                variant: HOLDER,
+                case: 0,
+                index: 0,
+            },
+        });
+        instructions.push(drop_of(6));
+        instructions.push(drop_of(4));
+        instructions.push(int(7, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 7)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a payload reached through an observing slot is an observation in turn, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_once_held_a_view_may_later_legally_own_a_value() {
+        let mut fx = fixture();
+        // The exact shape a global monotone "observed values" set could
+        // never express: the slot holds a view, is read through, and is
+        // then given a real owner it really does have to destroy. A
+        // sticky observation would reject the drop below as an observer
+        // transfer -- a false positive on a perfectly legal program.
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.push(call_observe(4, 3));
+        // The view's referent is destroyed through its own owner, and
+        // the slot -- which owns nothing -- is then given a real one.
+        instructions.push(drop_of(2));
+        instructions.extend(new_file(&fx, 5, 6));
+        instructions.push(store_of(0, 6, OwnershipMode::Transfer));
+        instructions.push(load_of(7, fx.file.clone(), 0));
+        instructions.push(drop_of(7));
+        instructions.push(int(8, 0));
+        let codes = all_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 8)),
+        );
+        assert!(
+            codes.is_empty(),
+            "an observation is a fact about a path, not a life sentence on a slot, got {codes:?}"
+        );
+    }
+
+    /// `bb0` branches: one arm gives the slot a real owner, the other an
+    /// observing view of a value the frame keeps. Both arms join at
+    /// `bb3`, which loads the slot and then does `tail` with it.
+    fn owner_observer_join(fx: &Fixture, tail: Vec<Instruction>) -> Vec<BasicBlock> {
+        let mut owning_arm = new_file(fx, 3, 4);
+        owning_arm.push(store_of(0, 4, OwnershipMode::Transfer));
+        let observing_arm = vec![store_of(0, 1, OwnershipMode::Observe)];
+        let mut join = vec![load_of(5, fx.file.clone(), 0)];
+        join.extend(tail);
+        join.push(int(6, 0));
+        vec![
+            BasicBlock {
+                id: BlockId(0),
+                // `%1` is a `File` this frame owns for the whole
+                // function and destroys on neither arm -- the observing
+                // arm only lends a view of it.
+                instructions: {
+                    let mut entry = vec![alloc_of(0, fx.file.clone())];
+                    entry.extend(new_file(fx, 7, 1));
+                    entry
+                },
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(2),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: owning_arm,
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: observing_arm,
+                terminator: Terminator::Branch(BlockId(3)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: join,
+                terminator: Terminator::Return(Some(ValueId(6))),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_join_of_an_owner_and_an_observer_may_still_be_read() {
+        let mut fx = fixture();
+        let blocks = owner_observer_join(&fx, vec![call_observe(8, 5)]);
+        let codes = structural_codes(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+        // Nothing at all: both paths definitely left *something* in the
+        // slot, so the read is legal, and an observing read is never an
+        // observer transfer. A single absorbing "maybe" state could not
+        // have told this apart from an owner joined with an empty slot,
+        // and would have rejected it as a use after move.
+        assert!(
+            codes.is_empty(),
+            "reading a slot that holds an owner on one path and a view on the other is legal, \
+             got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_join_of_an_owner_and_an_observer_may_not_be_consumed() {
+        let mut fx = fixture();
+        let blocks = owner_observer_join(&fx, vec![drop_of(5)]);
+        let codes = structural_codes(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+        assert_eq!(
+            codes,
+            vec![codes::OBSERVER_CANNOT_TRANSFER],
+            "one path reaching here holds only a view, so this destruction is not this frame's \
+             to perform -- and that is the *only* thing wrong with it"
+        );
+    }
+
+    #[test]
+    fn an_observing_store_of_a_transitively_affine_record_does_not_launder_it() {
+        let mut fx = fixture();
+        // `Envelope` is affine only *transitively*: never a nominal
+        // `resource`, so `verify_resource_ownership`'s own lattice never
+        // sees it at all and this pass is the only thing standing
+        // between it and a laundered owner. This is the exact program
+        // from the blocker report.
+        let mut instructions = vec![alloc_of(0, fx.envelope.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(2)]),
+        });
+        instructions.push(store_of(0, 3, OwnershipMode::Observe));
+        instructions.push(load_of(4, fx.envelope.clone(), 0));
+        instructions.push(drop_of(4));
+        instructions.push(drop_of(3));
+        instructions.push(int(5, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "the verifier must reject the same first drop the interpreter refuses, rather than \
+             accepting both drops, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_store_of_a_transitively_affine_variant_does_not_launder_it() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.holder.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(Instruction::Value {
+            result: ValueId(3),
+            ty: fx.envelope.clone(),
+            kind: ValueKind::RecordCreate(ENVELOPE, Vec::new(), vec![ValueId(2)]),
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: fx.holder.clone(),
+            kind: ValueKind::VariantCreate {
+                variant: HOLDER,
+                case: 0,
+                type_args: Vec::new(),
+                payload: vec![ValueId(3)],
+            },
+        });
+        instructions.push(store_of(0, 4, OwnershipMode::Observe));
+        instructions.push(load_of(5, fx.holder.clone(), 0));
+        instructions.push(drop_of(5));
+        instructions.push(drop_of(4));
+        instructions.push(int(6, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 6)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a transitively affine variant is laundered by exactly the same route, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn an_observing_store_of_a_generic_aggregate_does_not_launder_it() {
+        let mut fx = fixture();
+        // `Box[File]`: affine only because of its *instantiation*, which
+        // is precisely the case a nominal check cannot see.
+        let mut instructions = vec![alloc_of(0, fx.box_file.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(store_of(0, 3, OwnershipMode::Observe));
+        instructions.push(load_of(4, fx.box_file.clone(), 0));
+        instructions.push(drop_of(4));
+        instructions.push(drop_of(3));
+        instructions.push(int(5, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a generic aggregate observed into a slot is not laundered into an owner, got \
+             {codes:?}"
+        );
+    }
+
+    #[test]
+    fn the_laundering_diagnosis_is_identical_under_permuted_blocks() {
+        let mut fx = fixture();
+        let straight_blocks = owner_observer_join(&fx, vec![drop_of(5)]);
+        let straight = rendered(&mut fx, under_test(bool_param(), Ty::I64, straight_blocks));
+        assert!(
+            !straight.is_empty(),
+            "the shared expectation must not be vacuously empty"
+        );
+        // Every rotation of the non-entry blocks: `bb0` must stay first
+        // only because it is `BlockId(0)`, never because of where it
+        // sits in the vector.
+        for rotation in 1..4usize {
+            let mut blocks = owner_observer_join(&fx, vec![drop_of(5)]);
+            blocks.rotate_left(rotation);
+            let permuted = rendered(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+            assert_eq!(
+                straight, permuted,
+                "rotating `function.blocks` by {rotation} changed the diagnosis"
+            );
+        }
+        let mut reversed = owner_observer_join(&fx, vec![drop_of(5)]);
+        reversed.reverse();
+        let reversed = rendered(&mut fx, under_test(bool_param(), Ty::I64, reversed));
+        assert_eq!(
+            straight, reversed,
+            "reversing `function.blocks` changed the diagnosis"
+        );
+    }
+
+    // == equivalent paths, found by adversarial review =================
+    //
+    // Fixing `Store` alone would have left the identical defect standing
+    // on every *other* instruction that writes a whole slot, and would
+    // have said nothing about whether the new lattice still converges on
+    // a loop. These are the probes that hunt for those.
+
+    /// Every diagnostic the verifier reports for `function`, with an
+    /// extra callee linked in alongside the usual helpers -- unfiltered,
+    /// so a code no existing allowlist mentions is still visible.
+    fn codes_linking(fx: &mut Fixture, function: Function, extra: Function) -> Vec<&'static str> {
+        let helpers = helpers(fx);
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let mut functions = vec![function, extra];
+        functions.extend(helpers);
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: fx.records.clone(),
+            variants: fx.variants.clone(),
+        };
+        let mut codes: Vec<&'static str> =
+            verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                .into_iter()
+                .map(|d| d.code)
+                .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    /// An `Invoke` writes its callee's result into `ok_slot` on the
+    /// success edge, and a raised value into each error target's own
+    /// slot on that failure edge. Both discard whatever the slot already
+    /// held, on exactly the terms a `Store` does -- so a slot that still
+    /// owns a value must be refused here too.
+    ///
+    /// This was found by review rather than by the blocker report: the
+    /// `Store` fix alone left it reporting nothing at all.
+    #[test]
+    fn an_invoke_whose_result_slot_still_owns_a_value_is_rejected() {
+        let mut fx = fixture();
+        let raiser = invoke_slots::raiser(&mut fx);
+        let mut entry = vec![
+            alloc_of(0, fx.box_file.clone()),
+            alloc_of(10, fx.holder.clone()),
+        ];
+        entry.extend(boxed_file(&fx, 3));
+        entry.push(store_of(0, 3, OwnershipMode::Transfer));
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: entry,
+                terminator: Terminator::Invoke {
+                    callee: RAISER,
+                    type_args: Vec::new(),
+                    args: Vec::new(),
+                    evidence: Vec::new(),
+                    // Already owns the `Box[File]` stored above: the
+                    // success edge would overwrite it and leak it.
+                    ok_slot: ValueId(0),
+                    ok_target: BlockId(1),
+                    err_targets: vec![crate::nir::InvokeErrTarget {
+                        variant: HOLDER,
+                        slot: ValueId(10),
+                        target: BlockId(2),
+                    }],
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: vec![load_of(4, fx.box_file.clone(), 0), drop_of(4), int(5, 0)],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![
+                    drop_of(10),
+                    load_of(6, fx.box_file.clone(), 0),
+                    drop_of(6),
+                    int(7, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(7))),
+            },
+        ];
+        let codes = codes_linking(&mut fx, under_test(Vec::new(), Ty::I64, blocks), raiser);
+        assert!(
+            codes.contains(&codes::STORE_OVER_OWNED_SLOT),
+            "an invoke's own result slot discards whatever it held, so it is checked on the same \
+             terms as a store, got {codes:?}"
+        );
+    }
+
+    /// The lattice gained an atom, so the fixed point has more states to
+    /// climb through. A loop whose body alternates the two store modes
+    /// on one slot is the shape most likely to oscillate rather than
+    /// converge -- this test simply completing is the assertion that it
+    /// does not, and the codes pin down what it settles on.
+    #[test]
+    fn a_loop_alternating_store_modes_converges_and_rejects() {
+        let mut fx = fixture();
+        let mut entry = vec![alloc_of(0, fx.file.clone())];
+        entry.extend(new_file(&fx, 1, 2));
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: entry,
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: vec![store_of(0, 2, OwnershipMode::Observe)],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![store_of(0, 2, OwnershipMode::Transfer), int(3, 0)],
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(9),
+                    then_block: BlockId(1),
+                    else_block: BlockId(3),
+                },
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![int(4, 0)],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            },
+        ];
+        let params = vec![Param {
+            value: ValueId(9),
+            ty: Ty::Bool,
+            take: false,
+        }];
+        let codes = structural_codes(&mut fx, under_test(params, Ty::I64, blocks));
+        assert_eq!(
+            codes,
+            vec![codes::STORE_OVER_OWNED_SLOT, codes::STORE_OVER_OWNED_SLOT],
+            "on the second iteration each store finds the slot possibly owning, and the analysis \
+             settles there rather than oscillating"
+        );
+    }
+
+    /// The legal counterpart, and the false positive to watch for: a
+    /// loop that fills the slot and drains it again every iteration.
+    /// The back edge carries an emptied slot, so every iteration's store
+    /// is as legal as the first.
+    #[test]
+    fn a_loop_that_fills_and_drains_its_slot_each_iteration_is_accepted() {
+        let mut fx = fixture();
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: vec![alloc_of(0, fx.box_file.clone())],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: {
+                    let mut body = boxed_file(&fx, 3);
+                    body.push(store_of(0, 3, OwnershipMode::Transfer));
+                    body.push(load_of(4, fx.box_file.clone(), 0));
+                    body.push(drop_of(4));
+                    body
+                },
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(9),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            },
+            BasicBlock {
+                id: BlockId(2),
+                instructions: vec![int(5, 0)],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            },
+        ];
+        let params = vec![Param {
+            value: ValueId(9),
+            ty: Ty::Bool,
+            take: false,
+        }];
+        let codes = all_codes(&mut fx, under_test(params, Ty::I64, blocks));
+        assert!(
+            codes.is_empty(),
+            "a slot emptied before the back edge is as free on the second iteration as on the \
+             first, got {codes:?}"
+        );
+    }
+
+    /// Returning a value this frame only observes hands the caller an
+    /// owner it never had.
+    #[test]
+    fn returning_an_observed_parameter_is_rejected() {
+        let mut fx = fixture();
+        let params = vec![Param {
+            value: ValueId(0),
+            ty: fx.box_file.clone(),
+            take: false,
+        }];
+        let blocks = vec![BasicBlock {
+            id: BlockId(0),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Some(ValueId(0))),
+        }];
+        let return_ty = fx.box_file.clone();
+        let codes = structural_codes(&mut fx, under_test(params, return_ty, blocks));
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "an ordinary parameter is the caller's, and returning it gives away what was never \
+             this frame's, got {codes:?}"
+        );
+    }
+
+    /// Reinitializing a field reached through an observing slot
+    /// overwrites -- and leaks -- storage the caller still owns.
+    #[test]
+    fn a_store_place_through_an_observing_slot_is_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.session.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.extend(new_file(&fx, 3, 4));
+        instructions.push(Instruction::Value {
+            result: ValueId(5),
+            ty: fx.session.clone(),
+            kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(2), ValueId(4)]),
+        });
+        instructions.push(store_of(0, 5, OwnershipMode::Observe));
+        instructions.push(load_of(6, fx.session.clone(), 0));
+        instructions.extend(new_file(&fx, 7, 8));
+        instructions.push(Instruction::StorePlace {
+            place: Place::root(ValueId(6)).field(SESSION, FieldId(0)),
+            value: ValueId(8),
+        });
+        instructions.push(drop_of(5));
+        instructions.push(int(9, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 9)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "writing through an observation overwrites the caller's own storage, got {codes:?}"
+        );
+    }
+
+    /// `move` is a transfer like any other, so moving out of an
+    /// observing slot claims ownership the caller never handed over.
+    #[test]
+    fn a_move_out_of_an_observing_slot_is_rejected() {
+        let mut fx = fixture();
+        let mut instructions = vec![alloc_of(0, fx.file.clone())];
+        instructions.extend(new_file(&fx, 1, 2));
+        instructions.push(store_of(0, 2, OwnershipMode::Observe));
+        instructions.push(load_of(3, fx.file.clone(), 0));
+        instructions.push(Instruction::Value {
+            result: ValueId(4),
+            ty: fx.file.clone(),
+            kind: ValueKind::Move { source: ValueId(3) },
+        });
+        instructions.push(drop_of(4));
+        instructions.push(drop_of(2));
+        instructions.push(int(5, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 5)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "a `move` names the transfer explicitly, and an observation has nothing to transfer, \
+             got {codes:?}"
+        );
+    }
+
+    /// Observation survives an arbitrary number of projections, not just
+    /// the first: `Box[Box[File]]` observed into a slot, then projected
+    /// twice, must still be an observation at the bottom.
+    #[test]
+    fn observation_survives_a_doubly_nested_projection() {
+        let mut fx = fixture();
+        let outer = Ty::Applied(BOXY, vec![fx.box_file.clone()]);
+        let mut instructions = vec![alloc_of(0, outer.clone())];
+        instructions.extend(boxed_file(&fx, 3));
+        instructions.push(new_outer_box(&fx, 3, 4));
+        instructions.push(store_of(0, 4, OwnershipMode::Observe));
+        instructions.push(load_of(5, outer, 0));
+        instructions.push(Instruction::Value {
+            result: ValueId(6),
+            ty: fx.box_file.clone(),
+            kind: ValueKind::RecordField {
+                base: ValueId(5),
+                record: BOXY,
+                field: 0,
+            },
+        });
+        instructions.push(Instruction::Value {
+            result: ValueId(7),
+            ty: fx.file.clone(),
+            kind: ValueKind::RecordField {
+                base: ValueId(6),
+                record: BOXY,
+                field: 0,
+            },
+        });
+        instructions.push(drop_of(7));
+        instructions.push(drop_of(4));
+        instructions.push(int(8, 0));
+        let codes = structural_codes(
+            &mut fx,
+            under_test(Vec::new(), Ty::I64, single_block(instructions, 8)),
+        );
+        assert!(
+            codes.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+            "no number of projections walks down out of an observation into ownership, got \
+             {codes:?}"
+        );
+    }
+
+    /// A slot owning on one path and observing on another, abandoned at
+    /// the exit. The owning path leaks, and the join must not discharge
+    /// that obligation just because a sibling path owed nothing --
+    /// exactly the "a path cancels a sibling's obligation" failure this
+    /// lattice exists to prevent.
+    #[test]
+    fn a_slot_owning_on_only_one_path_still_leaks_at_a_shared_exit() {
+        let mut fx = fixture();
+        let mut owning = boxed_file(&fx, 5);
+        owning.push(store_of(0, 5, OwnershipMode::Transfer));
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: {
+                    let mut entry = vec![alloc_of(0, fx.box_file.clone())];
+                    entry.extend(boxed_file(&fx, 8));
+                    entry
+                },
+                terminator: Terminator::CondBranch {
+                    condition: ValueId(2),
+                    then_block: BlockId(1),
+                    else_block: BlockId(3),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: owning,
+                terminator: Terminator::Branch(BlockId(4)),
+            },
+            BasicBlock {
+                id: BlockId(3),
+                instructions: vec![store_of(0, 8, OwnershipMode::Observe)],
+                terminator: Terminator::Branch(BlockId(4)),
+            },
+            BasicBlock {
+                id: BlockId(4),
+                // `%8` is destroyed, but the slot itself is abandoned.
+                instructions: vec![drop_of(8), int(9, 0)],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            },
+        ];
+        let codes = structural_codes(&mut fx, under_test(bool_param(), Ty::I64, blocks));
+        assert!(
+            codes.contains(&codes::MISSING_STRUCTURAL_CLEANUP),
+            "the observing path owes nothing, but the owning path still leaks, and a join that \
+             read `Owned|Observed` as `Empty` would have lost it, got {codes:?}"
+        );
+    }
+
+    /// The lattice gained a third atom, so the fixed point has more
+    /// states to climb through and more ways to get the ordering wrong.
+    /// A hand-picked loop proves one shape converges; this sweeps four
+    /// hundred randomly assembled ones, each verified five times.
+    ///
+    /// Two properties are checked at once, and both matter more than
+    /// which diagnostics come out:
+    ///
+    /// - it *terminates*. A lattice that oscillated would hang here
+    ///   rather than fail, which is a visible failure all the same.
+    /// - it is *deterministic*, and independent of the order
+    ///   `function.blocks` happens to be in -- the property every
+    ///   `HashMap` and `HashSet` inside these analyses has to preserve.
+    ///
+    /// Deliberately a fixed-seed generator rather than a real fuzzer:
+    /// the corpus is identical on every machine and every run, so a
+    /// failure is reproducible from the seed alone.
+    #[test]
+    fn the_analysis_converges_on_randomly_generated_loops() {
+        // xorshift64*, inlined: no dependency, and identical everywhere.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || -> u64 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            state
+        };
+
+        for case in 0..400u32 {
+            let mut fx = fixture();
+            // Three blocks wired into a loop, plus an exit: the
+            // smallest shape with a back edge, a join, and two
+            // predecessors disagreeing.
+            let mut bodies: Vec<Vec<Instruction>> = vec![Vec::new(), Vec::new(), Vec::new()];
+            let mut next_value = 20u32;
+            for body in bodies.iter_mut() {
+                let count = (next() % 4) as usize;
+                for _ in 0..count {
+                    let choice = next() % 6;
+                    match choice {
+                        0 => body.push(store_of(0, 2, OwnershipMode::Transfer)),
+                        1 => body.push(store_of(0, 2, OwnershipMode::Observe)),
+                        2 => {
+                            body.push(load_of(next_value, fx.file.clone(), 0));
+                            next_value += 1;
+                        }
+                        3 => {
+                            // Destroy whatever the previous load read;
+                            // with no previous load this names a value
+                            // that does not exist, which is itself a
+                            // shape the verifier has to survive.
+                            body.push(drop_of(next_value.saturating_sub(1)));
+                        }
+                        4 => {
+                            let descriptor = next_value;
+                            let file = next_value + 1;
+                            body.extend(new_file(&fx, descriptor, file));
+                            next_value += 2;
+                        }
+                        _ => body.push(drop_of(2)),
+                    }
+                }
+            }
+
+            let mut entry = vec![alloc_of(0, fx.file.clone())];
+            entry.extend(new_file(&fx, 1, 2));
+            entry.extend(bodies[0].clone());
+            let blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: entry,
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: bodies[1].clone(),
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(9),
+                        then_block: BlockId(2),
+                        else_block: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: bodies[2].clone(),
+                    // The back edge.
+                    terminator: Terminator::Branch(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![int(8, 0)],
+                    terminator: Terminator::Return(Some(ValueId(8))),
+                },
+            ];
+            let params = vec![Param {
+                value: ValueId(9),
+                ty: Ty::Bool,
+                take: false,
+            }];
+
+            // Reaching this line at all is the termination assertion.
+            let straight =
+                structural_codes(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            let again =
+                structural_codes(&mut fx, under_test(params.clone(), Ty::I64, blocks.clone()));
+            assert_eq!(
+                straight, again,
+                "case {case}: two runs of the identical module disagreed"
+            );
+
+            // The entry block is `BlockId(0)`, never "whichever block is
+            // first in the vector", so every rotation must agree.
+            for rotation in 1..blocks.len() {
+                let mut rotated = blocks.clone();
+                rotated.rotate_left(rotation);
+                let permuted =
+                    structural_codes(&mut fx, under_test(params.clone(), Ty::I64, rotated));
+                assert_eq!(
+                    straight, permuted,
+                    "case {case}: rotating `function.blocks` by {rotation} changed the result"
+                );
+            }
+            let mut reversed = blocks;
+            reversed.reverse();
+            let reversed = structural_codes(&mut fx, under_test(params, Ty::I64, reversed));
+            assert_eq!(
+                straight, reversed,
+                "case {case}: reversing `function.blocks` changed the result"
             );
         }
     }

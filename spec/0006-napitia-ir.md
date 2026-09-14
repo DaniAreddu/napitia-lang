@@ -144,9 +144,20 @@ dataflow shape `V0082` already uses, canonicalized through the same
 `Load`-origin unification the whole-value pass already needs for a
 `mutable` local reloaded more than once:
 
-- a place's effective state is its *shortest* non-full ancestor prefix,
-  so moving or dropping a parent consumes its entire descendant subtree
-  and a child used afterwards is `V0087`;
+A place's state is the *set* of concrete states it may be in at that
+point, drawn from `Empty` (holds nothing), `Owned` (holds a value this
+frame owns) and `Observed` (holds a merely-observing view of a value the
+caller owns). A join is set union, so it is associative, commutative and
+idempotent by construction, and it keeps the two axes — *is anything
+there* and *does this frame own it* — independently precise: `Owned`
+joined with `Observed` is definitely present (readable) and definitely
+not consumable, while `Owned` joined with `Empty` is neither.
+
+- a place's effective state is its *shortest* ancestor prefix that is
+  not plainly `Owned`, so moving or dropping a parent consumes its
+  entire descendant subtree and a child used afterwards is `V0087` —
+  and, on the same mechanism, observation is transitive: nothing
+  projected out of an observed place is ever an owner;
 - a whole-value use additionally requires no strict descendant to be
   consumed, so a partially moved parent used as a value is `V0090`
   while remaining usable for an unaffected sibling, a reinitialized
@@ -154,7 +165,21 @@ dataflow shape `V0082` already uses, canonicalized through the same
 - a reinitializing store into a place not definitely empty is `V0088`,
   a whole-value destruction or transfer of something already consumed
   is `V0092`, and a transitively affine value still owning affine
-  descendants at a reachable exit is `V0091`.
+  descendants at a reachable exit is `V0091`;
+- writing a whole *slot* that may still hold a value this frame owns is
+  `V0100` — `store.transfer` and `store.observe` alike (the mode
+  describes the incoming value, not what the write discards), and an
+  `Invoke`'s own `ok_slot` and error-target slots, which overwrite on
+  identical terms. This is the whole-slot counterpart of `V0088` and is
+  answered by the verifier's own reconstruction of the slot's state,
+  never delegated to source-level checking;
+- transferring, destroying, decomposing or reinitializing anything
+  reachable only through an observation is `V0099`. A `store.observe`
+  always leaves the slot `Observed`, whatever the stored value's own
+  role, matching the interpreter's unconditional `to_observer_if_
+  resource`; a slot whose contents are later legally retired may
+  receive a real owner again, since the role is a fact about the path
+  and not about the slot for the rest of its life.
 
 Ownership facts come from `take` parameters, `Move`, `DeferCapture`,
 `PlaceRead`, `StorePlace`, `Store`, `RecordCreate`, `VariantCreate`,

@@ -410,6 +410,26 @@ ownership over the whole place **tree**, not merely per exact key:
   transitively affine value this function owns that still has remaining
   owned affine descendants at a reachable exit is `V0091` (missing
   structural cleanup).
+- Writing a whole *slot* that may still hold a value this function owns
+  is `V0100` (store over an owned slot) -- the whole-slot counterpart of
+  `V0088`. It covers `store.transfer`, `store.observe` (the mode
+  describes the incoming value, not what the write discards) and an
+  `Invoke`'s own result and error-target slots, all of which overwrite
+  whatever the slot held on identical terms.
+
+A place's state is the *set* of concrete states it may be in at that
+point -- `Empty`, `Owned`, or `Observed` (a merely-observing view of
+something the caller owns) -- and a join is set union. Ownership is
+therefore a second axis carried by the same lattice rather than a
+separate function-global set, which is what lets a mutable slot hold a
+view, be retired, and later legally receive a real owner: the role is a
+fact about the path, not a permanent property of the slot. `Owned`
+joined with `Observed` stays readable and stays unconsumable, a
+distinction a single absorbing "maybe" cannot express. A
+`store.observe` always leaves its slot `Observed` regardless of the
+stored value's own role, matching the interpreter's unconditional
+`to_observer_if_resource`, and no projection ever walks *down* out of an
+observation into ownership (`V0099`).
 
 Ownership facts are contributed by every path that actually moves one --
 `take` parameters, `Move`, `DeferCapture`, `PlaceRead`, `StorePlace`,

@@ -6807,6 +6807,10 @@ fn verify_structural_places(
         }
     }
     let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
+    // Structural provenance for every affine value, built once per
+    // function: which places each one could actually name, rather than
+    // the root its id happens to canonicalize to.
+    let argument_provenance = CallArgumentProvenance::new(function, &load_origin);
     let canonical = |place: &Place<ValueId>| -> Place<ValueId> {
         Place {
             root: origin(place.root),
@@ -7333,7 +7337,7 @@ fn verify_structural_places(
                             take,
                             &consumes_arg,
                             &is_affine,
-                            &origin,
+                            &argument_provenance,
                         ) {
                             violations.push(OwnershipViolation::MixedCallAlias(*result));
                             continue;
@@ -7426,7 +7430,7 @@ fn verify_structural_places(
                     take,
                     &consumes_arg,
                     &is_affine,
-                    &origin,
+                    &argument_provenance,
                 );
                 if mixed && let Some(first) = args.first() {
                     violations.push(OwnershipViolation::MixedCallAlias(*first));
@@ -7815,7 +7819,7 @@ fn call_mixes_observation_and_transfer(
     take: Option<&[bool]>,
     consumes_arg: &impl Fn(Option<&[bool]>, usize, usize) -> bool,
     is_affine: &impl Fn(ValueId) -> bool,
-    origin: &impl Fn(ValueId) -> ValueId,
+    provenance: &CallArgumentProvenance,
 ) -> bool {
     let mut observed: Vec<Place<ValueId>> = Vec::new();
     let mut taken: Vec<Place<ValueId>> = Vec::new();
@@ -7823,11 +7827,11 @@ fn call_mixes_observation_and_transfer(
         if !is_affine(*arg) {
             continue;
         }
-        let place = Place::root(origin(*arg));
+        let places = provenance.places_of(*arg);
         if consumes_arg(take, args.len(), index) {
-            taken.push(place);
+            taken.extend(places);
         } else {
-            observed.push(place);
+            observed.extend(places);
         }
     }
     taken.iter().any(|taken_place| {
@@ -7835,6 +7839,152 @@ fn call_mixes_observation_and_transfer(
             taken_place.is_ancestor_of(observed_place) || observed_place.is_ancestor_of(taken_place)
         })
     })
+}
+
+/// Every structural place each affine value in one function could name,
+/// reconstructed from NIR alone (`rfcs/0011`, `rfcs/0012`).
+///
+/// Reducing an argument to `Place::root(origin(argument))` is not
+/// enough, and was the gap this exists to close. `origin` canonicalizes
+/// only a `Load` back to its slot, so every other way of reaching a
+/// resource collapsed to an unrelated root and stopped overlapping with
+/// anything: a `PlaceRead` of `session.input`, a `RecordField` off an
+/// observed aggregate, a `VariantPayload`, and anything reached through
+/// a slot an observing store had written. A call could then hand the
+/// same resource to an observing and a `take` parameter through two
+/// different spellings and look disjoint.
+///
+/// A value's places are the union of everywhere it could have come
+/// from, so a projection carries its base's places extended by the
+/// projection, and a slot carries both itself and whatever was stored
+/// into it. Freshly produced values -- constructions, call results, an
+/// untouched `Alloc` -- name nothing that existed before, which is a
+/// fact rather than a gap.
+struct CallArgumentProvenance {
+    /// What each value-producing instruction is, so a value's own
+    /// provenance can be resolved from its definition.
+    definitions: HashMap<ValueId, ValueKind>,
+    /// Every value written into each slot, in instruction order. Both
+    /// store modes: a slot genuinely names whatever was put in it, and
+    /// an observing store is precisely how an alias of someone else's
+    /// resource gets into one.
+    stored_into: HashMap<ValueId, Vec<ValueId>>,
+    load_origin: HashMap<ValueId, ValueId>,
+}
+
+impl CallArgumentProvenance {
+    fn new(function: &Function, load_origin: &HashMap<ValueId, ValueId>) -> Self {
+        let mut definitions = HashMap::new();
+        let mut stored_into: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Value { result, kind, .. } => {
+                        definitions.insert(*result, kind.clone());
+                    }
+                    Instruction::Store { slot, value, .. } => {
+                        stored_into.entry(*slot).or_default().push(*value);
+                    }
+                    Instruction::StorePlace { place, value } => {
+                        stored_into.entry(place.root).or_default().push(*value);
+                    }
+                    Instruction::Drop { .. } | Instruction::DecomposeVariant { .. } => {}
+                }
+            }
+        }
+        Self {
+            definitions,
+            stored_into,
+            load_origin: load_origin.clone(),
+        }
+    }
+
+    fn canonical(&self, place: &Place<ValueId>) -> Place<ValueId> {
+        Place {
+            root: self
+                .load_origin
+                .get(&place.root)
+                .copied()
+                .unwrap_or(place.root),
+            projections: place.projections.clone(),
+        }
+    }
+
+    /// Every place `value` could name. Never empty for a value this
+    /// walk cannot follow: the fallback is the value's own root, which
+    /// keeps an unmodelled shape conservative rather than disjoint from
+    /// everything.
+    fn places_of(&self, value: ValueId) -> Vec<Place<ValueId>> {
+        let mut out = Vec::new();
+        let mut visiting = HashSet::new();
+        self.collect(value, &mut out, &mut visiting, 0);
+        out
+    }
+
+    fn collect(
+        &self,
+        value: ValueId,
+        out: &mut Vec<Place<ValueId>>,
+        visiting: &mut HashSet<ValueId>,
+        depth: usize,
+    ) {
+        // Two guards, for two different shapes. `visiting` stops a
+        // slot written from a load of itself from recursing forever;
+        // `depth` bounds a long projection chain in hand-built NIR.
+        if depth >= MAX_GENERIC_DEPTH || !visiting.insert(value) {
+            return;
+        }
+        // The value's own identity, always and first. In NIR a value is
+        // a single SSA name, so passing one twice really is passing one
+        // resource twice however it was produced -- unlike source-level
+        // HIR, where two occurrences of a construction build two
+        // resources. Anything further below only *adds* the places it
+        // additionally reaches.
+        out.push(Place::root(value));
+        match self.definitions.get(&value) {
+            Some(ValueKind::Load(slot)) => {
+                self.collect(*slot, out, visiting, depth + 1);
+            }
+            Some(ValueKind::PlaceRead { place, .. }) => {
+                out.push(self.canonical(place));
+            }
+            Some(ValueKind::RecordField {
+                base,
+                record,
+                field,
+            }) => {
+                // The named field of every place the base could name.
+                let mut bases = Vec::new();
+                self.collect(*base, &mut bases, visiting, depth + 1);
+                for base_place in bases {
+                    out.push(base_place.field(*record, crate::place::FieldId(*field as u32)));
+                }
+            }
+            // A payload read reaches through the shell, so it names
+            // whatever the shell names. Which position it picks does not
+            // separate it from the shell for aliasing purposes.
+            Some(
+                ValueKind::VariantPayload { base, .. }
+                | ValueKind::Move { source: base }
+                | ValueKind::DeferCapture { source: base },
+            ) => {
+                self.collect(*base, out, visiting, depth + 1);
+            }
+            // A construction or a call result reaches no place that
+            // existed before it; its own root, pushed above, is the
+            // whole of what it names.
+            _ => {}
+        }
+        // Whatever was written into this value as a slot is also
+        // something it can name -- which is how a resource observed
+        // into a slot stays connected to the owner it aliases.
+        if let Some(sources) = self.stored_into.get(&value) {
+            for source in sources {
+                self.collect(*source, out, visiting, depth + 1);
+            }
+        }
+        visiting.remove(&value);
+    }
 }
 
 fn consume_root(

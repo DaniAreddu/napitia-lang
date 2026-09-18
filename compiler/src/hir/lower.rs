@@ -2676,6 +2676,200 @@ mod tests {
     use crate::parser::Parser;
     use crate::source::SourceMap;
 
+    /// `rfcs/0013` -- observation lowering: stable identities, a
+    /// lexically scoped alias, and no state shared between sibling
+    /// scopes that happen to spell their alias the same way.
+    mod observations {
+        use super::lower;
+        use crate::hir::{HirBlock, HirExpr, HirObserve, HirStmt};
+
+        fn statements(text: &str) -> Vec<HirStmt> {
+            let (hir, diags) = lower(text);
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+            hir.functions[0].body.statements.clone()
+        }
+
+        /// Every observation statement anywhere in `block`, outermost
+        /// first.
+        fn collect(block: &HirBlock, out: &mut Vec<HirObserve>) {
+            for stmt in &block.statements {
+                if let HirStmt::Observe(o) = stmt {
+                    out.push(o.clone());
+                    collect(&o.body, out);
+                }
+            }
+        }
+
+        fn observations_of(text: &str) -> Vec<HirObserve> {
+            let (hir, diags) = lower(text);
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+            let mut out = Vec::new();
+            for f in &hir.functions {
+                collect(&f.body, &mut out);
+            }
+            out
+        }
+
+        #[test]
+        fn a_local_source_lowers_to_a_resolved_local_reference() {
+            let statements = statements(
+                "func f(file: i64) -> i64 { observe file as view { } return 0 }",
+            );
+            let HirStmt::Observe(o) = &statements[0] else {
+                panic!("expected an observation")
+            };
+            assert!(matches!(o.source, HirExpr::Local { .. }));
+        }
+
+        #[test]
+        fn a_nested_field_source_lowers_to_a_field_chain() {
+            let statements = statements(
+                "record Inner { count: i64 }\n\
+                 record Outer { inner: Inner }\n\
+                 func f(outer: Outer) -> i64 { observe outer.inner.count as view { } return 0 }",
+            );
+            let HirStmt::Observe(o) = &statements[0] else {
+                panic!("expected an observation")
+            };
+            let HirExpr::Field { base, .. } = &o.source else {
+                panic!("expected a field chain")
+            };
+            assert!(matches!(base.as_ref(), HirExpr::Field { .. }));
+        }
+
+        #[test]
+        fn every_observation_gets_its_own_stable_identity() {
+            let observations = observations_of(
+                "func f(a: i64) -> i64 {\n\
+                   observe a as view { }\n\
+                   observe a as view { }\n\
+                   return 0\n\
+                 }",
+            );
+            assert_eq!(observations.len(), 2);
+            assert_ne!(observations[0].id, observations[1].id);
+        }
+
+        #[test]
+        fn two_sibling_scopes_spelling_one_alias_name_mint_distinct_locals() {
+            let observations = observations_of(
+                "func f(a: i64) -> i64 {\n\
+                   observe a as view { }\n\
+                   observe a as view { }\n\
+                   return 0\n\
+                 }",
+            );
+            assert_ne!(
+                observations[0].alias, observations[1].alias,
+                "sibling scopes must not share an alias identity"
+            );
+            assert_eq!(observations[0].alias_name, observations[1].alias_name);
+        }
+
+        #[test]
+        fn a_nested_observation_is_lowered_inside_its_parents_body() {
+            let observations = observations_of(
+                "func f(a: i64) -> i64 { observe a as outer { observe outer as inner { } } return 0 }",
+            );
+            assert_eq!(observations.len(), 2);
+            assert_ne!(observations[0].id, observations[1].id);
+            // The inner observation's own source resolves to the outer
+            // alias's local, never to a fresh one or to the outer
+            // source's.
+            let HirExpr::Local { local, .. } = &observations[1].source else {
+                panic!("expected the inner source to resolve to the outer alias")
+            };
+            assert_eq!(*local, observations[0].alias);
+        }
+
+        #[test]
+        fn the_alias_shadows_an_outer_binding_only_inside_the_block() {
+            let (hir, diags) = lower(
+                "func f(a: i64) -> i64 {\n\
+                   value view = 1;\n\
+                   observe a as view { }\n\
+                   return view\n\
+                 }",
+            );
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+            let mut observations = Vec::new();
+            collect(&hir.functions[0].body, &mut observations);
+            let HirStmt::Binding(binding) = &hir.functions[0].body.statements[0] else {
+                panic!("expected a binding")
+            };
+            let Some(HirExpr::Return {
+                value: Some(returned),
+                ..
+            }) = hir.functions[0].body.tail.as_deref()
+            else {
+                panic!("expected a returning tail")
+            };
+            let HirExpr::Local { local, .. } = returned.as_ref() else {
+                panic!("expected a local return operand")
+            };
+            assert_eq!(
+                *local, binding.local,
+                "after the block, the name must resolve back to the outer binding"
+            );
+            assert_ne!(*local, observations[0].alias);
+        }
+
+        #[test]
+        fn using_the_alias_after_its_block_says_why_the_name_is_gone() {
+            let (_, diags) = lower(
+                "func f(a: i64) -> i64 { observe a as view { } return view }",
+            );
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            assert_eq!(diags[0].code, "R0034");
+        }
+
+        #[test]
+        fn a_name_that_was_never_an_alias_keeps_the_ordinary_diagnostic() {
+            let (_, diags) = lower("func f() -> i64 { return missing }");
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            assert_eq!(diags[0].code, "R0002");
+        }
+
+        #[test]
+        fn an_alias_name_in_one_function_says_nothing_about_another() {
+            // The alias map is per function: a name that was an alias
+            // in `f` must still report the ordinary "cannot find" in
+            // `g`, not a misleading out-of-scope explanation.
+            let (_, diags) = lower(
+                "func f(a: i64) -> i64 { observe a as view { } return 0 }\n\
+                 func g() -> i64 { return view }",
+            );
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            assert_eq!(diags[0].code, "R0002");
+        }
+
+        #[test]
+        fn a_use_before_the_observation_is_not_reported_as_out_of_scope() {
+            let (_, diags) = lower(
+                "func f(a: i64) -> i64 { value n = view; observe a as view { } return n }",
+            );
+            assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
+            assert_eq!(diags[0].code, "R0002");
+        }
+
+        #[test]
+        fn the_source_resolves_before_the_alias_scope_opens() {
+            // `observe view as view` observes whatever `view` already
+            // named, never its own not-yet-existing alias.
+            let (hir, diags) = lower(
+                "func f(view: i64) -> i64 { observe view as view { } return 0 }",
+            );
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+            let mut observations = Vec::new();
+            collect(&hir.functions[0].body, &mut observations);
+            let HirExpr::Local { local, .. } = &observations[0].source else {
+                panic!("expected a local source")
+            };
+            assert_eq!(*local, hir.functions[0].params[0].local);
+            assert_ne!(*local, observations[0].alias);
+        }
+    }
+
     fn lower(text: &str) -> (HirModule, Vec<Diagnostic>) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);

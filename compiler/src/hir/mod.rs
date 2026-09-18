@@ -50,6 +50,20 @@ pub struct ExprId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PatternId(pub(crate) u32);
 
+/// Identifies one `observe <place> as <name> { ... }` statement
+/// (`rfcs/0013`) for the lifetime of one compilation session.
+///
+/// Its own id space, distinct from [`ExprId`]: an observation is a
+/// statement, never an expression, and the identity has to survive all
+/// the way into NIR (`nir::instruction::ValueKind::ObservePlace`, and
+/// the matching `Instruction::EndObserve`) where no HIR expression id
+/// means anything any more. Deliberately not derived from a span or a
+/// name: two sibling observation scopes that spell their alias the same
+/// way, or a macro-free but structurally duplicated statement, must
+/// still be two distinct observations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObservationId(pub(crate) u32);
+
 /// Identifies one declaration-local generic type parameter (the `T` in
 /// `func identity[T](value: T) -> T`) for the lifetime of one
 /// compilation session -- distinct from every other identity newtype
@@ -415,6 +429,35 @@ pub enum HirStmt {
         body: HirBlock,
         span: Span,
     },
+    /// `observe <place> as <name> { ... }` (`rfcs/0013`).
+    Observe(HirObserve),
+}
+
+/// One resolved `observe` statement (`rfcs/0013`): a stable identity,
+/// the observed place expression, the alias's own freshly-minted local,
+/// and the lexical block the observation is active for.
+#[derive(Debug, Clone)]
+pub struct HirObserve {
+    pub id: ObservationId,
+    /// The observed place, already resolved the same way any other
+    /// expression is -- a [`HirExpr::Local`], or a [`HirExpr::Field`]
+    /// chain rooted in one. An unresolvable name leaves a
+    /// [`HirExpr::Error`] here, exactly as anywhere else, and every
+    /// later stage skips the observation rather than inventing a place
+    /// for it.
+    pub source: HirExpr,
+    /// The alias's own fresh local, defined in a scope that contains
+    /// only `body` -- never reachable before the statement or after the
+    /// block, and never shared with a sibling scope that happens to
+    /// spell its own alias the same way.
+    pub alias: LocalId,
+    pub alias_name: Symbol,
+    pub alias_span: Span,
+    pub body: HirBlock,
+    /// The `observe` keyword's own span -- see
+    /// [`crate::syntax::ast::ObserveStmt::keyword_span`].
+    pub keyword_span: Span,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

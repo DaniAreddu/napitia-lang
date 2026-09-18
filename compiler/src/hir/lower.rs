@@ -97,6 +97,12 @@ mod codes {
     /// transfers ownership, and silently treating it as an ordinary
     /// observation is unsound.
     pub const TAKE_IN_PROTOCOL_METHOD: &str = "R0033";
+    /// A name that resolves to nothing, but which *was* an observation
+    /// alias earlier in this same function (`rfcs/0013`) -- the alias
+    /// exists only inside its own `observe` block, so a use after that
+    /// block closed is reported with the reason rather than as the
+    /// generic `R0002` for a name that was never declared at all.
+    pub const OBSERVATION_ALIAS_OUT_OF_SCOPE: &str = "R0034";
 }
 
 /// Which kind of item a name in the type namespace refers to -- needed
@@ -121,6 +127,11 @@ pub struct IdCursor {
     pub next_expr_id: u32,
     pub next_pattern_id: u32,
     pub next_type_param_id: u32,
+    /// Where this module's own fresh [`crate::hir::ObservationId`]s
+    /// start counting from (`rfcs/0013`) -- threaded across modules
+    /// exactly like every other id space here, so two modules of one
+    /// project never mint the same observation identity.
+    pub next_observation_id: u32,
 }
 
 /// One item made visible to a module via `import`, already resolved to
@@ -255,6 +266,8 @@ pub fn lower_module_with_imports(
         next_expr_id: ids.next_expr_id,
         next_pattern_id: ids.next_pattern_id,
         next_type_param_id: ids.next_type_param_id,
+        next_observation_id: ids.next_observation_id,
+        observation_alias_names: HashMap::new(),
     };
     let hir = lowering.run_with_imports(module, imports);
     let cursor = IdCursor {
@@ -263,6 +276,7 @@ pub fn lower_module_with_imports(
         next_expr_id: lowering.next_expr_id,
         next_pattern_id: lowering.next_pattern_id,
         next_type_param_id: lowering.next_type_param_id,
+        next_observation_id: lowering.next_observation_id,
     };
     (hir, cursor, lowering.diagnostics)
 }
@@ -333,6 +347,16 @@ struct Lowering<'a> {
     next_expr_id: u32,
     next_pattern_id: u32,
     next_type_param_id: u32,
+    next_observation_id: u32,
+    /// Every observation alias name this function has already opened
+    /// and closed a scope for, with the `observe` statement that
+    /// introduced it (`rfcs/0013`) -- consulted only when a name fails
+    /// to resolve, so a use *after* the block closed says why the name
+    /// is gone (`R0034`) rather than reporting the generic "cannot
+    /// find" of a name that was never declared at all. Reset per
+    /// function: an alias in one function says nothing about a name in
+    /// another.
+    observation_alias_names: HashMap<Symbol, Span>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1069,6 +1093,12 @@ impl<'a> Lowering<'a> {
         id
     }
 
+    fn fresh_observation_id(&mut self) -> crate::hir::ObservationId {
+        let id = crate::hir::ObservationId(self.next_observation_id);
+        self.next_observation_id += 1;
+        id
+    }
+
     fn fresh_local(&mut self) -> LocalId {
         let id = LocalId(self.next_local_id);
         self.next_local_id += 1;
@@ -1249,6 +1279,10 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower_function(&mut self, id: ItemId, f: &ast::FunctionDecl) -> HirFunction {
+        // An observation alias is a fact about one function body only
+        // (`rfcs/0013`): a name that was an alias in some *other*
+        // function must still report the ordinary "cannot find" here.
+        self.observation_alias_names.clear();
         let type_params = self.lower_type_params(&f.type_params);
         let mut scopes = Scopes::new();
         let params = self.lower_params(&f.params, &mut scopes);
@@ -1538,6 +1572,72 @@ impl<'a> Lowering<'a> {
                 let body = self.lower_block(&l.body, scopes);
                 HirStmt::Loop { body, span: l.span }
             }
+            // `observe <place> as <alias> { ... }` (`rfcs/0013`). The
+            // source is resolved *before* the alias scope is pushed, so
+            // `observe view as view { }` observes whatever `view`
+            // already named rather than its own not-yet-existing alias.
+            ast::Stmt::Observe(o) => {
+                let source = self.lower_expr(&o.source, scopes);
+                let id = self.fresh_observation_id();
+                // One dedicated scope holding only the alias, wrapped
+                // around the body's own scope: the alias is visible
+                // throughout the block (including in nested blocks) and
+                // nowhere else, and shadows an outer binding of the
+                // same name exactly like any other nested binding.
+                scopes.push();
+                let alias = self.fresh_local();
+                scopes.define(o.alias.symbol, alias);
+                let body = self.lower_block(&o.body, scopes);
+                scopes.pop();
+                // Recorded only once the scope has actually closed, so
+                // a use *inside* the block never consults it.
+                self.observation_alias_names
+                    .insert(o.alias.symbol, o.alias.span);
+                HirStmt::Observe(crate::hir::HirObserve {
+                    id,
+                    source,
+                    alias,
+                    alias_name: o.alias.symbol,
+                    alias_span: o.alias.span,
+                    body,
+                    keyword_span: o.keyword_span,
+                    span: o.span,
+                })
+            }
+        }
+    }
+
+    /// The diagnostic for a name that resolved to nothing (`rfcs/0013`):
+    /// `R0034` when this same function already closed an observation
+    /// scope that bound exactly this name, and the ordinary `R0002`
+    /// otherwise. Never guesses: the alias map is only ever written
+    /// after a scope actually closed, so a name that merely *will* be
+    /// an alias later in the function still reports `R0002`.
+    fn unresolved_name_diagnostic(&self, ident: ast::Ident) -> Diagnostic {
+        let text = self.interner.resolve(ident.symbol);
+        match self.observation_alias_names.get(&ident.symbol) {
+            Some(&declared) => Diagnostic::error(
+                codes::OBSERVATION_ALIAS_OUT_OF_SCOPE,
+                self.source,
+                ident.span,
+                format!(
+                    "`{text}` is an observation alias and cannot be used outside its own \
+                     `observe` block"
+                ),
+            )
+            .with_primary_label("observation alias used out of scope")
+            .with_label(declared, "the observation alias was introduced here")
+            .with_help(
+                "an observation carries no ownership and cannot outlive its block; move the use \
+                 inside the `observe` block, or observe the place again",
+            ),
+            None => Diagnostic::error(
+                codes::UNRESOLVED_NAME,
+                self.source,
+                ident.span,
+                format!("cannot find `{text}` in this scope"),
+            )
+            .with_primary_label("not found"),
         }
     }
 
@@ -1950,16 +2050,8 @@ impl<'a> Lowering<'a> {
         if self.protocol_names.contains_key(&ident.symbol) {
             return self.protocol_not_a_value(ident, ident.span);
         }
-        let text = self.interner.resolve(ident.symbol);
-        self.diagnostics.push(
-            Diagnostic::error(
-                codes::UNRESOLVED_NAME,
-                self.source,
-                ident.span,
-                format!("cannot find `{text}` in this scope"),
-            )
-            .with_primary_label("not found"),
-        );
+        let diagnostic = self.unresolved_name_diagnostic(ident);
+        self.diagnostics.push(diagnostic);
         HirExpr::Error {
             id: self.fresh_expr_id(),
             span: ident.span,
@@ -3248,7 +3340,9 @@ mod tests {
             next_expr_id: 0,
             next_pattern_id: 0,
             type_param_scope: HashMap::new(),
+            observation_alias_names: HashMap::new(),
             next_type_param_id: 0,
+            next_observation_id: 0,
         };
         let depth = crate::limits::MAX_PATTERN_DEPTH + 50;
         let mut pattern = ast::Pattern::Wildcard {
@@ -3320,7 +3414,9 @@ mod tests {
             next_expr_id: 0,
             next_pattern_id: 0,
             type_param_scope: HashMap::new(),
+            observation_alias_names: HashMap::new(),
             next_type_param_id: 0,
+            next_observation_id: 0,
         };
         let raises = vec![ast::Ident {
             symbol: variant_sym,

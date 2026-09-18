@@ -436,7 +436,292 @@ fn deeply_nested_pattern_terminates_diagnostically_at_every_stage() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Expressions nested far past the parser's own nesting bound, one
+/// shape per grammar recursion, generated here rather than committed as
+/// giant fixture files.
+///
+/// Each of these used to abort the process with a native stack overflow
+/// -- no diagnostic, no error code, nothing on stderr -- because every
+/// stage after the parser walks the expression tree on the call stack.
+/// The exit code is asserted exactly: a stack overflow on Windows exits
+/// with a status code too (`0xC0000409`), so "not a signal" is not
+/// enough to tell the two apart, while "exit 1 and a P0001 on stderr"
+/// is.
+///
+/// The size of stderr is asserted as well. A refused expression resumes
+/// mid-construct, so every surplus token can produce its own follow-on
+/// syntax error; on a chain this long that is tens of thousands of
+/// diagnostics, each re-rendering the same tens-of-kilobytes source
+/// line, which is slow enough to be indistinguishable from a hang.
+#[test]
+fn deeply_nested_expressions_terminate_diagnostically_at_every_stage() {
+    let depth = 20_000;
+    let cases = [
+        (
+            "parentheses",
+            format!(
+                "func main() -> i64 {{ return {}1{}; }}\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            ),
+        ),
+        (
+            "blocks",
+            format!(
+                "func main() -> i64 {{ return {}1{}; }}\n",
+                "{".repeat(depth),
+                "}".repeat(depth)
+            ),
+        ),
+        (
+            "unary operators",
+            format!("func main() -> i64 {{ return {}1; }}\n", "-".repeat(depth)),
+        ),
+        (
+            "a binary fold",
+            format!(
+                "func main() -> i64 {{ return 1{}; }}\n",
+                " + 1".repeat(depth)
+            ),
+        ),
+        (
+            "a postfix fold",
+            format!(
+                "func g() -> i64 {{ return 0; }}\nfunc main() -> i64 {{ return g{}; }}\n",
+                "()".repeat(depth)
+            ),
+        ),
+        (
+            "an assignment chain",
+            format!(
+                "func main() -> i64 {{ mutable a = 0; a {}= 1; return a; }}\n",
+                "= a ".repeat(depth)
+            ),
+        ),
+        (
+            "an else-if chain",
+            format!(
+                "func main() -> i64 {{ if false {{ return 0; }}{} else {{ return 1; }} }}\n",
+                " else if false { return 0; }".repeat(depth)
+            ),
+        ),
+    ];
+
+    for (index, (what, source)) in cases.iter().enumerate() {
+        let path = std::env::temp_dir().join(format!(
+            "napitia_deep_expr_{}_{index}.npt",
+            std::process::id()
+        ));
+        std::fs::write(&path, source).expect("failed to write the temp fixture");
+        let path_str = path.to_string_lossy().into_owned();
+
+        for cmd in ["check", "ir", "run"] {
+            let output = napitia(&[cmd, &path_str]);
+            let err = stderr(&output);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "`{cmd}` on {what} nested {depth} deep did not exit with a diagnostic status: {err}"
+            );
+            assert!(
+                err.contains("P0001") && err.contains("nested too deeply"),
+                "`{cmd}` on {what} did not report the depth diagnostic: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+                "`{cmd}` on {what} panicked instead of reporting a diagnostic: {err}"
+            );
+            assert!(
+                err.len() < 1_000_000,
+                "`{cmd}` on {what} produced {} bytes of diagnostics for one defect",
+                err.len()
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// One Napitia call frame is one native interpreter frame, so recursion
+/// used to be bounded by whatever stack the platform handed the main
+/// thread -- roughly 25 frames in a debug build on Windows -- and
+/// exceeding it aborted the process: no diagnostic, no usable exit code,
+/// nothing on stderr, while `check` and `ir` on the very same file
+/// succeeded. Both halves of the repair are asserted here, because
+/// either alone still fails: enough stack to make ordinary recursion
+/// work, and a depth budget so a recursion that never unwinds ends in an
+/// ordinary runtime error rather than further out on the same cliff.
+#[test]
+fn recursion_runs_to_a_real_depth_and_then_reports_rather_than_aborting() {
+    let program = |depth: i64| {
+        format!(
+            "func down(n: i64) -> i64 {{\n\
+             \x20   if n <= 0 {{ return 0; }}\n\
+             \x20   return down(n - 1) + 1;\n\
+             }}\n\
+             func main() -> i64 {{ return down({depth}); }}\n"
+        )
+    };
+    let path = std::env::temp_dir().join(format!("napitia_recursion_{}.npt", std::process::id()));
+
+    // Deep enough that the platform's own default main-thread stack
+    // could not have carried it.
+    std::fs::write(&path, program(400)).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+    let deep = napitia(&["run", &path_str]);
+    assert!(
+        deep.status.success(),
+        "400 frames of ordinary recursion should run: {}",
+        stderr(&deep)
+    );
+    assert_eq!(stdout(&deep).trim(), "400");
+
+    // Past the budget: a runtime error, not an abort.
+    std::fs::write(&path, program(100_000)).expect("failed to write the temp fixture");
+    let over = napitia(&["run", &path_str]);
+    assert_eq!(
+        over.status.code(),
+        Some(1),
+        "a recursion past the budget did not exit with a runtime-error status: {}",
+        stderr(&over)
+    );
+    let err = stderr(&over);
+    assert!(
+        err.contains("call depth exceeded"),
+        "expected the call-depth diagnostic, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+        "the depth budget panicked instead of reporting: {err}"
+    );
+
+    // A recursion that never terminates at all ends the same way, rather
+    // than running until something outside the program stops it.
+    let endless = "func forever(n: i64) -> i64 { return forever(n + 1); }\n\
+                   func main() -> i64 { return forever(0); }\n";
+    std::fs::write(&path, endless).expect("failed to write the temp fixture");
+    let looped = napitia(&["run", &path_str]);
+    assert_eq!(
+        looped.status.code(),
+        Some(1),
+        "an unterminated recursion did not exit with a runtime-error status: {}",
+        stderr(&looped)
+    );
+    assert!(stderr(&looped).contains("call depth exceeded"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `check`, `ir` and `run` must agree about what they accept. A type
+/// nested this deep compiled cleanly and then aborted the process at
+/// run time, which is the sharpest possible form of that disagreement:
+/// two stages said yes and the third did not say anything at all.
+#[test]
+fn a_deeply_nested_generic_value_runs_as_cleanly_as_it_checks() {
+    let depth = 60;
+    let mut source = String::from("resource File { descriptor: i64 }\nrecord Box[T] { item: T }\n");
+    source.push_str("func w0() -> File { return File { descriptor: 1 }; }\n");
+    let mut ty = String::from("File");
+    for level in 1..=depth {
+        source.push_str(&format!(
+            "func w{level}() -> Box[{ty}] {{ return Box[{ty}] {{ item: w{} }}; }}\n",
+            format_args!("{}()", level - 1)
+        ));
+        ty = format!("Box[{ty}]");
+    }
+    source.push_str(&format!(
+        "func main() -> i64 {{\n    value b = w{depth}();\n    return 0;\n}}\n"
+    ));
+
+    let path = std::env::temp_dir().join(format!("napitia_deep_value_{}.npt", std::process::id()));
+    std::fs::write(&path, &source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            output.status.success(),
+            "`{cmd}` failed on a value nested {depth} levels deep: {}",
+            stderr(&output)
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // -- Generics (`rfcs/0008`) ---------------------------------------------
+
+/// A generic body writes its own constructions symbolically
+/// (`record.create @Box[Box[T]]`), and the value it builds must carry
+/// the instantiation actually running, not the parameter. Keeping the
+/// parameter made the value's declared field types resolve to
+/// `Ty::Param` while the value stored there was concrete, so this
+/// program checked and lowered cleanly and was then refused at run time
+/// for a shape disagreement it does not have.
+#[test]
+fn a_generic_body_constructing_a_nested_generic_runs_as_cleanly_as_it_checks() {
+    let source = "record Box[T] { item: T }\n\
+                  variant Pair[T] { Both(Box[T]), Neither }\n\
+                  func depth[T](x: Box[T]) -> i64 {\n\
+                  \x20   value nested = Box[Box[T]] { item: x };\n\
+                  \x20   value tagged = Pair[Box[T]].Both(nested);\n\
+                  \x20   return match tagged { Both(_) => 1, Neither => 0 };\n\
+                  }\n\
+                  func main() -> i64 { return depth[i64](Box[i64] { item: 7 }); }\n";
+    let path =
+        std::env::temp_dir().join(format!("napitia_generic_frame_{}.npt", std::process::id()));
+    std::fs::write(&path, source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            output.status.success(),
+            "`{cmd}` failed: {}",
+            stderr(&output)
+        );
+    }
+    let ran = napitia(&["run", &path_str]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "1");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A generic function whose own type argument grows on every call names
+/// an instantiation that never converges. It must end in the depth
+/// diagnostic that actually describes it, not in a shape error about a
+/// disagreement the program does not have.
+#[test]
+fn an_endlessly_growing_instantiation_reports_its_depth() {
+    let source = "record Box[T] { item: T }\n\
+                  func f[T](x: Box[T]) -> i64 { return g[Box[T]](Box[Box[T]] { item: x }); }\n\
+                  func g[T](x: Box[T]) -> i64 { return f[T](x); }\n\
+                  func main() -> i64 { return f[i64](Box[i64] { item: 1 }); }\n";
+    let path =
+        std::env::temp_dir().join(format!("napitia_generic_grow_{}.npt", std::process::id()));
+    std::fs::write(&path, source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    let ran = napitia(&["run", &path_str]);
+    assert_eq!(
+        ran.status.code(),
+        Some(1),
+        "an unbounded instantiation did not exit with a runtime-error status: {}",
+        stderr(&ran)
+    );
+    let err = stderr(&ran);
+    assert!(
+        err.contains("nested more deeply"),
+        "expected the nesting-depth diagnostic, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+        "an unbounded instantiation panicked instead of reporting: {err}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
 
 #[test]
 fn generic_identity_check_ir_and_run_all_succeed() {
@@ -891,6 +1176,41 @@ fn resource_handle_cleanup_example_runs_end_to_end() {
     assert_resource_example_runs("resource_handle_cleanup.npt", "4");
 }
 
+#[test]
+fn resource_nested_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_nested.npt", "3");
+}
+
+#[test]
+fn resource_field_move_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_move.npt", "20");
+}
+
+#[test]
+fn resource_partial_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_drop.npt", "0");
+}
+
+#[test]
+fn resource_field_reinitialize_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_reinitialize.npt", "5");
+}
+
+/// Assigning a place to itself, as a whole binding and as one
+/// structural field. The right-hand side moves the value out and the
+/// assignment puts the same value straight back, so nothing is
+/// discarded -- and every stage has to agree, since an overwrite check
+/// that looked only at the destination would call it a leak.
+#[test]
+fn resource_self_assignment_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_self_assignment.npt", "7");
+}
+
+#[test]
+fn resource_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_payload.npt", "8");
+}
+
 /// Each invalid resource example is rejected at `check` with its own
 /// exact code, and every stage that runs it agrees, with no leaked
 /// internal (`Ixxxx`/`Vxxxx`) diagnostic and no panic.
@@ -916,6 +1236,15 @@ fn assert_resource_example_rejected(name: &str, code: &str) {
             !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
             "`{cmd}` panicked instead of reporting a diagnostic for {name}: {err}"
         );
+        // The same invalid program must produce byte-identical output
+        // across two independent runs: no `HashMap` iteration order may
+        // reach a user-visible diagnostic (`rfcs/0012`).
+        let again = napitia(&[cmd, &path]);
+        assert_eq!(
+            err,
+            stderr(&again),
+            "`{cmd}`'s own diagnostics for {name} are not deterministic across repeated runs"
+        );
     }
 }
 
@@ -937,4 +1266,421 @@ fn resource_invalid_escape_example_is_u0005_at_every_stage() {
 #[test]
 fn resource_invalid_generic_take_example_is_t0065_at_every_stage() {
     assert_resource_example_rejected("resource_invalid_generic_take.npt", "T0065");
+}
+
+#[test]
+fn resource_invalid_parent_after_partial_move_example_is_u0014_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_parent_after_partial_move.npt", "U0014");
+}
+
+#[test]
+fn resource_invalid_live_field_overwrite_example_is_u0010_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_live_field_overwrite.npt", "U0010");
+}
+
+#[test]
+fn resource_invalid_field_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_field_double_drop.npt", "U0003");
+}
+
+// -- Alpha 0.1.8 structural ownership repairs (`rfcs/0012`) -------------
+//
+// Every example below is one of the blockers the first Alpha 0.1.8
+// review rejected the milestone for, exercised end to end through the
+// real binary: `check` accepts it, `ir` produces deterministic NIR with
+// no leaked verifier code, and `run` produces the value that proves each
+// affine identity was transferred or destroyed exactly once.
+
+#[test]
+fn resource_wildcard_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_payload.npt", "1");
+}
+
+#[test]
+fn resource_wildcard_partial_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_wildcard_partial_payload.npt", "11");
+}
+
+#[test]
+fn resource_mixed_nesting_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_mixed_nesting.npt", "82");
+}
+
+#[test]
+fn resource_generic_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_aggregate.npt", "69");
+}
+
+#[test]
+fn resource_generic_variant_payload_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_variant_payload.npt", "5");
+}
+
+#[test]
+fn resource_defer_field_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_defer_field.npt", "2");
+}
+
+#[test]
+fn resource_field_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_field_drop.npt", "2");
+}
+
+#[test]
+fn resource_structural_exits_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_exits.npt", "5");
+}
+
+#[test]
+fn resource_invalid_local_double_drop_example_is_u0003_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_local_double_drop.npt", "U0003");
+}
+
+/// One call handing the same resource to an observing and a `take`
+/// parameter. The taken parameter may destroy it anywhere in the body
+/// while the observation stays readable, and no signature says which
+/// order the body uses -- so every stage refuses the pairing.
+///
+/// Reported as `U0015` at every stage because the pipeline stops at the
+/// first one that refuses; the NIR verifier's own independent answer
+/// (`V0101`) is exercised on hand-built NIR, which never passes through
+/// the source checker at all.
+#[test]
+fn resource_invalid_mixed_observe_take_example_is_u0015_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_mixed_observe_take.npt", "U0015");
+}
+
+/// The same alias with the observing argument spelled as an `if`.
+///
+/// The compound spelling is what makes it a distinct regression: an
+/// argument that is neither a bare local nor a field chain has no single
+/// place, and reading that as "names nothing" let this reach the
+/// interpreter as a stale handle after both earlier stages had accepted
+/// it.
+#[test]
+fn resource_invalid_compound_mixed_alias_example_is_u0015_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_compound_mixed_alias.npt", "U0015");
+}
+
+#[test]
+fn resource_invalid_defer_parent_drop_example_is_u0004_at_every_stage() {
+    assert_resource_example_rejected("resource_invalid_defer_parent_drop.npt", "U0004");
+}
+
+/// The field-level double drop reports the *field* as double-dropped,
+/// not merely the generic whole-local diagnostic a local extracted out
+/// of that field first would produce -- the two examples exist side by
+/// side precisely so a regression collapsing one into the other is
+/// visible.
+#[test]
+fn the_field_and_local_double_drop_examples_name_their_own_target() {
+    let field = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_field_double_drop.npt"),
+    ]));
+    assert!(
+        field.contains("drop session.input;"),
+        "the field double drop must be reported against the field itself: {field}"
+    );
+    let local = stderr(&napitia(&[
+        "check",
+        &example("resource_invalid_local_double_drop.npt"),
+    ]));
+    assert!(
+        local.contains("drop input;"),
+        "the local double drop must be reported against the local: {local}"
+    );
+}
+
+#[test]
+fn resource_structural_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_structural_drop.npt", "0");
+}
+
+/// `drop` still refuses a value that owns nothing at all -- extending it
+/// to every transitively affine value must not quietly turn it into a
+/// no-op accepted on any expression.
+#[test]
+fn dropping_a_value_that_owns_no_resource_is_still_t0061() {
+    let output = napitia(&["check", &fixture("drop_non_affine_invalid.npt")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("error[T0061]"),
+        "expected T0061: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn resource_partial_sibling_access_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_partial_sibling_access.npt", "13");
+}
+
+/// The advice `U0014` gives must actually work: a partially moved
+/// aggregate stays usable for an unaffected field (affine or not), and
+/// only using it as a *whole* value is rejected. A regression that
+/// widened the whole-value rule back over ordinary field reads would
+/// make the diagnostic's own suggestion impossible to follow.
+#[test]
+fn a_partially_moved_parent_still_permits_what_u0014_suggests() {
+    let ok = napitia(&["check", &example("resource_partial_sibling_access.npt")]);
+    assert!(
+        ok.status.success(),
+        "reading an unaffected field of a partially moved parent must stay legal: {}",
+        stderr(&ok)
+    );
+    let rejected = napitia(&[
+        "check",
+        &example("resource_invalid_parent_after_partial_move.npt"),
+    ]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stderr(&rejected).contains("error[U0014]"));
+}
+
+// -- Alpha 0.1.8 generic runtime ownership (`rfcs/0008`, `rfcs/0012`) ---
+//
+// A runtime aggregate carries its own concrete type arguments, so
+// destroying one asks what *this instantiation* owns rather than what
+// its declaration's symbolic parameter owns. Both examples destroy
+// generic aggregates as a whole, which is the shape that reaches the
+// runtime's own structural drop -- and the shape under which a
+// discarded type argument leaks silently.
+
+#[test]
+fn resource_generic_whole_drop_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_whole_drop.npt", "14");
+}
+
+#[test]
+fn resource_generic_nested_ownership_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_generic_nested_ownership.npt", "0");
+}
+
+/// Textual NIR carries each construction's own concrete type arguments,
+/// which is what the interpreter reads them back from -- a regression
+/// dropping them from the printed form would mean they were dropped
+/// from the instruction too.
+#[test]
+fn textual_nir_shows_a_generic_constructions_type_arguments() {
+    let output = napitia(&["ir", &example("resource_generic_whole_drop.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("record.create @Box") && text.contains("[File"),
+        "expected a generic record construction to print its type arguments: {text}"
+    );
+    assert!(
+        text.contains("variant.create @Maybe") && text.contains("[File"),
+        "expected a generic variant construction to print its type arguments: {text}"
+    );
+}
+
+/// A malformed program whose parser recovery produces a self-referential
+/// layout must terminate. `typeck::cycles` rejects it as an infinite
+/// layout, but checking never stops at the first error, so `resourceck`
+/// still walks the same HIR -- and its own place decomposition has to
+/// bound the infinite place tree that layout describes rather than
+/// descending it forever.
+#[test]
+fn a_recovered_self_referential_layout_terminates_instead_of_hanging() {
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &fixture("cyclic_recovery_hang_invalid.npt")]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{cmd}` should reject the recovered cyclic layout"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("error["),
+            "`{cmd}` should report a diagnostic: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{cmd}` panicked: {err}"
+        );
+    }
+}
+
+// -- Alpha 0.1.8 path-sensitive variant ownership (`rfcs/0012`) ---------
+//
+// Variant ownership is per *path*: one branch may destroy the whole
+// value while a disjoint branch takes it apart and owns the payload, and
+// neither may suppress or discharge the other's obligations.
+
+#[test]
+fn resource_branch_local_variant_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_branch_local_variant.npt", "36");
+}
+
+#[test]
+fn resource_variant_decomposition_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_variant_decomposition.npt", "134");
+}
+
+// Observation is transitive: an ordinary parameter is a call-scoped view
+// of a value the caller still owns, and so is every field reached
+// through it.
+
+#[test]
+fn resource_observed_aggregate_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observed_aggregate.npt", "31");
+}
+
+/// Moving a field out of an observed aggregate is refused by `check`
+/// itself -- not by the verifier after `check` already accepted it.
+#[test]
+fn resource_invalid_observed_field_move_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observed_field_move.npt", "U0005");
+}
+
+/// Textual NIR shows the decomposition explicitly, on the arm's own
+/// path -- the ownership event a function-global consumption scan used
+/// to stand in for.
+#[test]
+fn textual_nir_shows_variant_decomposition_on_the_claiming_path() {
+    let output = napitia(&["ir", &example("resource_branch_local_variant.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("decompose "),
+        "expected an explicit decomposition in textual NIR: {text}"
+    );
+    // The branch that drops the whole value must not decompose it.
+    assert!(
+        text.contains("drop "),
+        "expected the sibling branch's whole-value drop: {text}"
+    );
+}
+
+// -- Cross-stage ownership agreement (`rfcs/0011`, `rfcs/0012`) -------
+//
+// The three stages each reconstruct ownership independently -- the
+// source checker from HIR, `nir::verify` from NIR alone, the interpreter
+// from runtime values -- and that independence is the point: each is a
+// backstop for the others rather than a restatement. What it must never
+// become is disagreement. A program the source checker accepts must not
+// then be rejected downstream for ownership, and the internal `Vxxxx`
+// family must never reach a user who wrote a program `check` accepted.
+
+/// Every `.npt` example, so a newly added one is swept in automatically
+/// rather than needing to be listed here.
+fn every_example() -> Vec<String> {
+    let dir = format!("{}/../examples", env!("CARGO_MANIFEST_DIR"));
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the examples directory must exist")
+        .map(|entry| entry.expect("a readable directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".npt"))
+        .collect();
+    // Sorted so a failure names the same example run to run.
+    names.sort();
+    assert!(
+        names.len() > 20,
+        "the sweep must actually be finding the examples, found {}",
+        names.len()
+    );
+    names
+}
+
+/// A source `check` accepted must never be rejected by `ir` afterwards,
+/// and `ir` must never leak an internal diagnostic.
+///
+/// `ir` is where `nir::verify` runs, so this is the exact seam an
+/// over-strict NIR ownership rule would break: a false positive there
+/// shows up as a program that checks cleanly and then fails to compile,
+/// blaming the user for a defect in the verifier.
+#[test]
+fn no_example_that_checks_cleanly_is_rejected_by_ir() {
+    for name in every_example() {
+        let path = example(&name);
+        if !napitia(&["check", &path]).status.success() {
+            continue;
+        }
+        let ired = napitia(&["ir", &path]);
+        let err = stderr(&ired);
+        assert!(
+            ired.status.success(),
+            "`{name}` passes `check` but `ir` rejected it: {err}"
+        );
+        assert!(
+            !err.contains("V0") && !err.contains("I0"),
+            "`ir` leaked an internal diagnostic for `{name}`, which `check` had accepted: {err}"
+        );
+    }
+}
+
+/// The same seam one stage further on: a source `check` accepted must
+/// never have the *interpreter* reject it for ownership, and must never
+/// see an internal `Vxxxx`/`Ixxxx` code either.
+///
+/// `run` may still legitimately fail -- a `main` that raises is a real
+/// program outcome, not a defect -- so this asserts what must never
+/// happen rather than demanding success: no ownership rejection, no
+/// internal diagnostic, no panic.
+#[test]
+fn no_example_that_checks_cleanly_is_rejected_by_run_for_ownership() {
+    // The vocabulary the ownership backstops use when they refuse
+    // something. Any of these reaching a user whose program `check`
+    // accepted means the stages disagree.
+    let ownership_refusals = [
+        "undestroyed resource",
+        "merely-observing resource handle",
+        "already dropped",
+        "stale resource handle",
+        "still owns an undestroyed resource",
+        "same resource identity",
+    ];
+    for name in every_example() {
+        let path = example(&name);
+        if !napitia(&["check", &path]).status.success() {
+            continue;
+        }
+        let output = napitia(&["run", &path]);
+        let err = stderr(&output);
+        assert!(
+            !err.contains("V0") && !err.contains("I0"),
+            "`run` leaked an internal diagnostic for `{name}`, which `check` had accepted: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`run` panicked on `{name}`, which `check` had accepted: {err}"
+        );
+        for refusal in ownership_refusals {
+            assert!(
+                !err.contains(refusal),
+                "`run` refused `{name}` for ownership ({refusal}), but `check` had accepted it: \
+                 {err}"
+            );
+        }
+    }
+}
+
+/// Whatever a stage decides, it must decide the same way twice, at every
+/// stage, for every example -- the property every `HashMap`/`HashSet` in
+/// the ownership analyses has to preserve.
+#[test]
+fn every_example_produces_identical_output_at_every_stage_across_two_runs() {
+    for name in every_example() {
+        let path = example(&name);
+        for cmd in ["check", "ir", "run"] {
+            let first = napitia(&[cmd, &path]);
+            let second = napitia(&[cmd, &path]);
+            assert_eq!(
+                first.status.code(),
+                second.status.code(),
+                "`{cmd}` on `{name}` was not deterministic in its exit code"
+            );
+            assert_eq!(
+                stderr(&first),
+                stderr(&second),
+                "`{cmd}` on `{name}` was not deterministic on stderr"
+            );
+            assert_eq!(
+                stdout(&first),
+                stdout(&second),
+                "`{cmd}` on `{name}` was not deterministic on stdout"
+            );
+        }
+    }
 }

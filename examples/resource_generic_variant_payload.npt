@@ -1,0 +1,37 @@
+// A generic variant whose payload is affine at this instantiation
+// (`rfcs/0008`, `rfcs/0012`): the payload is owned, and an arm that
+// ignores it destroys it rather than leaking it.
+resource File {
+    descriptor: i64,
+}
+
+variant Maybe[T] {
+    Some(T),
+    None,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func unwrap(take maybe: Maybe[File]) -> i64 {
+    return match maybe {
+        Some(file) => sink(file),
+        None => 0,
+    };
+}
+
+func discard(take maybe: Maybe[File]) -> i64 {
+    return match maybe {
+        Some(_) => -1,
+        None => 0,
+    };
+}
+
+func main() -> i64 {
+    value kept = unwrap(Maybe[File].Some(File { descriptor: 6 }));
+    value dropped = discard(Maybe[File].Some(File { descriptor: 9 }));
+    return kept + dropped;
+}

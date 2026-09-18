@@ -704,3 +704,74 @@ fn resource_nir_is_deterministic_under_reversed_import_order() {
         "NIR must not depend on import declaration order"
     );
 }
+
+/// Structural ownership across a module boundary (`rfcs/0012`): an
+/// imported resource-containing aggregate has exactly one of its own
+/// fields transferred out, the rest is structurally destroyed, a
+/// postfix `?` fires while the aggregate is already partially moved,
+/// and an imported variant carrying an affine record has that payload
+/// ignored by `_` in the arm that matched. Every affine identity is
+/// transferred or destroyed exactly once, across the boundary.
+#[test]
+fn a_cross_module_structural_transfer_compiles_and_runs() {
+    let dir = project("resource_structural_cross_module");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ir = napitia(&["ir", &dir]);
+    assert!(ir.status.success(), "ir failed: {}", stderr(&ir));
+    assert!(
+        !stdout(&ir).contains("V0"),
+        "cross-module structural NIR leaked a verifier diagnostic: {}",
+        stdout(&ir)
+    );
+
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "4");
+}
+
+/// The same project with every `import` line reversed produces
+/// *byte-identical* NIR and the identical result: nothing about
+/// structural ownership -- alias identity included -- may depend on the
+/// order imports happen to be discovered in.
+#[test]
+fn reversing_the_imports_of_a_cross_module_structural_project_changes_nothing() {
+    let forward = project("resource_structural_cross_module");
+    let reversed = project("resource_structural_cross_module_reordered");
+
+    let a = napitia(&["ir", &forward]);
+    let b = napitia(&["ir", &reversed]);
+    assert!(a.status.success(), "ir failed: {}", stderr(&a));
+    assert!(b.status.success(), "ir failed: {}", stderr(&b));
+    assert_eq!(
+        stdout(&a),
+        stdout(&b),
+        "reversed imports produced different NIR"
+    );
+
+    let ran_a = napitia(&["run", &forward]);
+    let ran_b = napitia(&["run", &reversed]);
+    assert_eq!(stdout(&ran_a).trim(), "4");
+    assert_eq!(stdout(&ran_b).trim(), "4");
+}
+
+/// Repeated `ir` runs of the same structural project are byte-identical
+/// too -- no `HashMap` iteration order may reach the printed output.
+#[test]
+fn a_cross_module_structural_projects_own_nir_is_deterministic() {
+    let dir = project("resource_structural_cross_module");
+    let first = napitia(&["ir", &dir]);
+    let second = napitia(&["ir", &dir]);
+    assert_eq!(
+        stdout(&first),
+        stdout(&second),
+        "the same project produced different NIR across two runs"
+    );
+}

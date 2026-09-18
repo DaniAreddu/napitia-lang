@@ -1,0 +1,26 @@
+// Rejected: one call hands the same resource to an observing parameter
+// and to a `take` parameter (`rfcs/0011`, `rfcs/0012`).
+//
+// The taken parameter owns the file for the whole call and may destroy
+// it at any point in the body; the observing parameter stays readable
+// for exactly as long. Nothing sequences those against each other, and
+// nothing in `consume`'s signature tells the caller which order its
+// body uses -- so the pairing is refused at the call rather than
+// reasoned about per body.
+//
+// Every stage refuses it on its own terms: `U0015` at the source level,
+// `V0101` in the NIR verifier, and a boundary refusal in the
+// interpreter, none of them relying on another's verdict.
+resource File {
+    descriptor: i64,
+}
+
+func consume(file: File, take owner: File) -> i64 {
+    drop owner;
+    return file.descriptor;
+}
+
+func main() -> i64 {
+    value file = File { descriptor: 42 };
+    return consume(file, file);
+}

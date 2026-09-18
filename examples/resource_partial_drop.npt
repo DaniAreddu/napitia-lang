@@ -1,0 +1,24 @@
+// Explicitly dropping one field, then dropping the remaining partial
+// parent (`rfcs/0012`): the parent's own structural drop destroys only
+// the fields still actually owned.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    value input = session.input;
+    drop input;
+    // `session` is now partially moved (`input` is gone); dropping it
+    // structurally destroys only the still-owned `output`.
+    drop session;
+    return 0;
+}

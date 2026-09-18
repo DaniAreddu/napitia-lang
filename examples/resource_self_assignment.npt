@@ -1,0 +1,33 @@
+// Assigning a place to itself (`rfcs/0012`). Both shapes are no-ops
+// rather than leaks: the right-hand side moves the value out, leaving
+// the place empty, and the assignment immediately puts the very same
+// value back. Nothing is discarded, so nothing is leaked, and the
+// checker, the NIR verifier and the interpreter all have to agree on
+// that -- an overwrite check that looked at the destination without
+// noticing where the incoming value came from would reject it.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func consume(take session: Session) -> i64 {
+    value total = session.input.descriptor + session.output.descriptor;
+    drop session;
+    return total;
+}
+
+func main() -> i64 {
+    mutable session = Session {
+        input: File { descriptor: 3 },
+        output: File { descriptor: 4 },
+    };
+    // A whole binding assigned to itself.
+    session = session;
+    // And one structural field assigned to itself.
+    session.input = session.input;
+    return consume(session);
+}

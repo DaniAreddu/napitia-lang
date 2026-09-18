@@ -1,4 +1,4 @@
-//! The [`Scanner`]: turns source text into a stream of tokens.
+//! The `Scanner`: turns source text into a stream of tokens.
 
 use super::token::{IntBase, Token, TokenKind, keyword_kind};
 use crate::diagnostics::Diagnostic;

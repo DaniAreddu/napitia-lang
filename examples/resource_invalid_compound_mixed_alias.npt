@@ -1,0 +1,36 @@
+// Rejected: a call hands the same resource to an observing parameter
+// and to a `take` parameter, with the observing argument spelled as a
+// compound expression (`rfcs/0011`, `rfcs/0012`).
+//
+// An `if` produces one of its branches' values, so this argument names
+// whatever those branches name -- here, the very `file` the second
+// argument transfers away. The callee owns it for the whole call and may
+// destroy it at any point, while the observing parameter stays readable
+// for exactly as long, and nothing sequences the two.
+//
+// The compound spelling is the point. A checker that asks only "is this
+// argument a bare local or a field chain" answers "neither" here, and
+// reading that as "then it names nothing" is what let this through:
+// `check` and `ir` accepted it and the interpreter failed on a stale
+// handle. The places an argument may name are the union of its
+// branches'.
+resource File {
+    descriptor: i64,
+}
+
+func mixed(file: File, take owner: File) -> i64 {
+    drop owner;
+    return file.descriptor;
+}
+
+func run(cond: bool) -> i64 {
+    value file = File { descriptor: 42 };
+    return mixed(
+        if cond { file } else { file },
+        file
+    );
+}
+
+func main() -> i64 {
+    return run(true);
+}

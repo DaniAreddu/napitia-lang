@@ -53,9 +53,130 @@ pub use state::ResourceState;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::hir::{ExprId, HirModule, ItemId, LocalId};
+use crate::hir::{ExprId, HirModule, ItemId, LocalId, TypeParamId};
 use crate::symbol::Interner;
 use crate::types::Ty;
+
+/// `typeck`'s own transitive-affinity metadata (`rfcs/0012`), bundled
+/// into one reference so [`check_module`]/`flow::FlowChecker::new`
+/// don't each need four more separate parameters for it. Every field
+/// mirrors the identically-named [`crate::typeck::TypeckResult`] field
+/// it is built from directly -- see each one's own doc comment there.
+pub struct AffineContext<'a> {
+    pub aggregate_field_types: &'a HashMap<ItemId, Vec<Ty>>,
+    pub declared_resources: &'a HashSet<ItemId>,
+    pub item_type_params: &'a HashMap<ItemId, Vec<TypeParamId>>,
+    pub field_projections: &'a HashMap<ExprId, (ItemId, usize)>,
+}
+
+/// `true` iff `item` (a record, resource, or variant) is transitively
+/// affine (`rfcs/0012`): a declared `resource` itself, or reachably
+/// containing one -- the same query `typeck::Checker::is_affine` already
+/// computes at declaration time, recomputed here directly from
+/// [`AffineContext`]'s own exported structural data rather than
+/// threading `typeck`'s own boolean answer through as a third
+/// representation of the same fact. Memoized, and guarded against a
+/// genuinely cyclic declaration (already independently rejected as an
+/// infinite-size layout by `typeck::cycles`) the same way: a cycle
+/// back-edge contributes `false` to *that one* occurrence's own
+/// disjunction without ever being cached as the type's own final answer.
+fn is_affine_item(
+    item: ItemId,
+    affine: &AffineContext<'_>,
+    visiting: &mut HashSet<ItemId>,
+    memo: &mut HashMap<ItemId, bool>,
+) -> bool {
+    if let Some(&cached) = memo.get(&item) {
+        return cached;
+    }
+    if affine.declared_resources.contains(&item) {
+        memo.insert(item, true);
+        return true;
+    }
+    if !visiting.insert(item) {
+        return false;
+    }
+    let result = affine
+        .aggregate_field_types
+        .get(&item)
+        .into_iter()
+        .flatten()
+        .any(|ty| is_affine_ty(ty, affine, visiting, memo));
+    visiting.remove(&item);
+    memo.insert(item, result);
+    result
+}
+
+fn is_affine_ty(
+    ty: &Ty,
+    affine: &AffineContext<'_>,
+    visiting: &mut HashSet<ItemId>,
+    memo: &mut HashMap<ItemId, bool>,
+) -> bool {
+    match ty {
+        Ty::Named(item, _) => is_affine_item(*item, affine, visiting, memo),
+        Ty::Applied(item, args) => {
+            if affine.declared_resources.contains(item) {
+                return true;
+            }
+            if !visiting.insert(*item) {
+                return false;
+            }
+            // Missing or arity-disagreeing generic metadata is never an
+            // *empty* substitution (`rfcs/0008`): an unsubstituted
+            // `Ty::Param` answers `false` below, which would let a
+            // genuinely affine instantiation be treated as an ordinary,
+            // freely-copyable value with no ownership to track at all.
+            // Fail closed -- answer *affine*, so every ownership
+            // obligation is still demanded -- exactly as
+            // `flow::FlowChecker::is_affine` and `nir::lower`'s own copy
+            // of this query do.
+            let type_params = affine.item_type_params.get(item);
+            let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
+                visiting.remove(item);
+                return true;
+            };
+            let subst: HashMap<TypeParamId, Ty> = type_params
+                .iter()
+                .copied()
+                .zip(args.iter().cloned())
+                .collect();
+            let result = affine
+                .aggregate_field_types
+                .get(item)
+                .into_iter()
+                .flatten()
+                .any(|fty| {
+                    is_affine_ty(
+                        &crate::types::substitute(fty, &subst),
+                        affine,
+                        visiting,
+                        memo,
+                    )
+                });
+            visiting.remove(item);
+            result
+        }
+        _ => false,
+    }
+}
+
+/// The full transitive-affinity set (`rfcs/0012`) over every record and
+/// variant [`AffineContext::aggregate_field_types`] knows about --
+/// mirrors `typeck::Checker`'s own identical declaration-time query
+/// exactly, so `resourceck` never disagrees with `typeck` about which
+/// plain (non-generic) `Ty::Named` is affine. `flow::FlowChecker::
+/// is_affine`'s own fast path for `Ty::Named` trusts this set completely
+/// rather than recomputing it per function.
+fn compute_affine_items(affine: &AffineContext<'_>) -> HashSet<ItemId> {
+    let mut memo = HashMap::new();
+    affine
+        .aggregate_field_types
+        .keys()
+        .copied()
+        .filter(|&item| is_affine_item(item, affine, &mut HashSet::new(), &mut memo))
+        .collect()
+}
 
 /// Checks every function and extend-method body in `hir` for affine
 /// ownership violations (`rfcs/0011`), returning the authoritative,
@@ -72,13 +193,19 @@ pub fn check_module(
     local_types: &HashMap<LocalId, Ty>,
     expr_types: &HashMap<ExprId, Ty>,
     interner: &Interner,
+    affine: &AffineContext<'_>,
 ) -> ResourceCheckResult {
-    let affine_items: HashSet<ItemId> = hir
-        .records
-        .iter()
-        .filter(|r| r.affine)
-        .map(|r| r.id)
-        .collect();
+    let affine_items = compute_affine_items(affine);
+    // Every declared variant's own `ItemId` (`rfcs/0012`) -- a variant's
+    // own payload is never individually addressable outside a pattern
+    // match (there is no `.field` syntax for it, unlike a record), so an
+    // affine variant-typed place is always tracked as one opaque
+    // whole-value unit rather than decomposed field-by-field the way a
+    // record's own declared fields are: which case is actually live is
+    // not knowable statically, so `FlowChecker::structural_drop_targets`
+    // must never treat `aggregate_field_types`'s own flattened per-case
+    // payload list as if it were one case's own named field vector.
+    let variant_items: HashSet<ItemId> = hir.variants.iter().map(|v| v.id).collect();
     let mut take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
     for f in &hir.functions {
         take_flags.insert(f.id, f.params.iter().map(|p| p.take).collect());
@@ -98,7 +225,9 @@ pub fn check_module(
             local_types,
             expr_types,
             &affine_items,
+            &variant_items,
             &take_flags,
+            affine,
             f.source,
             interner,
             &mut diagnostics,
@@ -115,7 +244,9 @@ pub fn check_module(
                 local_types,
                 expr_types,
                 &affine_items,
+                &variant_items,
                 &take_flags,
+                affine,
                 m.source,
                 interner,
                 &mut diagnostics,
@@ -175,6 +306,12 @@ mod tests {
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &interner,
+            &AffineContext {
+                aggregate_field_types: &typeck_result.aggregate_field_types,
+                declared_resources: &typeck_result.declared_resources,
+                item_type_params: &typeck_result.item_type_params,
+                field_projections: &typeck_result.field_projections,
+            },
         )
         .diagnostics
     }
@@ -218,6 +355,12 @@ mod tests {
             &typeck_result.local_types,
             &typeck_result.expr_types,
             &interner,
+            &AffineContext {
+                aggregate_field_types: &typeck_result.aggregate_field_types,
+                declared_resources: &typeck_result.declared_resources,
+                item_type_params: &typeck_result.item_type_params,
+                field_projections: &typeck_result.field_projections,
+            },
         );
         assert!(
             result.diagnostics.is_empty(),
@@ -1622,5 +1765,440 @@ mod tests {
              }",
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    // -- compound arguments carry the places they forward --------------
+    //
+    // An `if`/`match`/block argument produces one of its branches'
+    // values, so the places it may name are the union of theirs.
+    // Answering "no place" for it -- which is what a bare
+    // `resolve_place` does -- reads as "aliases nothing", and that let
+    // the same resource reach an observing and a `take` parameter with
+    // nothing noticing.
+
+    const COMPOUND_PRELUDE: &str = "resource File { descriptor: i64 } \
+         resource Session { input: File, output: File } \
+         variant Choice { Left(i64), Right(i64) } \
+         func mixed(file: File, take owner: File) -> i64 { \
+             drop owner; \
+             return file.descriptor; \
+         } \
+         func mixed_rev(take owner: File, file: File) -> i64 { \
+             value d = file.descriptor; \
+             drop owner; \
+             return d; \
+         } \
+         func obs2(a: File, b: File) -> i64 { return a.descriptor + b.descriptor } ";
+
+    fn check_compound(body: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        check(&format!("{COMPOUND_PRELUDE}{body}"))
+    }
+
+    #[test]
+    fn an_if_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed(if cond { file } else { file }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "an `if` forwards its branches' places: {diags:?}"
+        );
+    }
+
+    /// The same call with the parameters swapped. Both spellings must
+    /// name the same fault rather than one tripping a move rule.
+    #[test]
+    fn an_if_argument_is_rejected_in_either_parameter_order() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed_rev(file, if cond { file } else { file }); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "argument order must not decide the answer: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 value c = if cond { Choice.Left(1) } else { Choice.Right(2) }; \
+                 return mixed(match c { Left(n) => { file } Right(n) => { file } }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "every arm's value is a place this argument may name: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_argument_forwarding_a_taken_resource_is_rejected() {
+        let diags = check_compound(
+            "func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return mixed({ file }, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "a block's value is its tail's value: {diags:?}"
+        );
+    }
+
+    /// Only *one* branch overlaps. The union is what catches it -- an
+    /// analysis that took a single representative branch would accept
+    /// this half the time depending which it picked.
+    #[test]
+    fn an_if_argument_overlapping_on_only_one_branch_is_rejected() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(if cond { s.input } else { s.output }, s.input); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "one overlapping branch is enough: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_if_argument_naming_a_disjoint_sibling_is_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value n = mixed(if cond { s.output } else { s.output }, s.input); \
+                 value rest = s.output; \
+                 drop rest; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "disjoint sibling fields never alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_compound_observations_of_one_resource_are_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 value n = obs2(if cond { file } else { file }, file); \
+                 drop file; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "neither observation can end the resource: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_compound_argument_naming_a_distinct_resource_is_accepted() {
+        let diags = check_compound(
+            "func f(cond: bool) -> i64 { \
+                 value kept = File { descriptor: 1 }; \
+                 value given = File { descriptor: 2 }; \
+                 value n = mixed(if cond { kept } else { kept }, given); \
+                 drop kept; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "distinct resources never alias: {diags:?}"
+        );
+    }
+    // -- one resource may not be observed and taken by one call --------
+    //
+    // The `take` parameter owns what it was given for the whole call
+    // and may destroy it at any point in the body, while the observing
+    // parameter stays readable for exactly as long. Nothing orders
+    // those, and no signature the caller can see says which the callee
+    // does -- so the pairing is refused at the call, not reasoned about
+    // per body.
+
+    #[test]
+    fn observing_and_taking_one_resource_in_one_call_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(file: File, take owner: File) -> i64 { \
+                 drop owner; \
+                 return file.descriptor; \
+             } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return consume(file, file); \
+             }",
+        );
+        assert_eq!(codes_of(&diags), vec!["U0015"], "unexpected: {diags:?}");
+    }
+
+    /// The same call with the parameters swapped. This order used to
+    /// trip `U0001` on the later read purely because the transfer
+    /// happened to come first; the fault is the pairing, so both orders
+    /// must name the same one.
+    #[test]
+    fn taking_and_observing_one_resource_in_one_call_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func consume(take owner: File, file: File) -> i64 { \
+                 value d = file.descriptor; \
+                 drop owner; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 42 }; \
+                 return consume(file, file); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "both argument orders must report the alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_a_parent_while_taking_its_field_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(observed: Session, take owner: File) -> i64 { \
+                 drop owner; \
+                 return observed.output.descriptor; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(s, s.input); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "taking a field of an observed parent is the same alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn taking_a_parent_while_observing_its_field_is_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(observed: File, take owner: Session) -> i64 { \
+                 value d = observed.descriptor; \
+                 drop owner; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 return mixed(s.input, s); \
+             }",
+        );
+        assert!(
+            codes_of(&diags).contains(&"U0015"),
+            "containment in the other direction is the same alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_resource_twice_in_one_call_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func both(a: File, b: File) -> i64 { return a.descriptor + b.descriptor } \
+             func f() -> i64 { \
+                 value file = File { descriptor: 1 }; \
+                 value n = both(file, file); \
+                 drop file; \
+                 return n; \
+             }",
+        );
+        assert!(
+            diags.is_empty(),
+            "neither observation can end the resource: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_resource_while_taking_a_different_one_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func mixed(a: File, take b: File) -> i64 { \
+                 value d = a.descriptor; \
+                 drop b; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 value kept = File { descriptor: 1 }; \
+                 value given = File { descriptor: 2 }; \
+                 value n = mixed(kept, given); \
+                 drop kept; \
+                 return n; \
+             }",
+        );
+        assert!(
+            diags.is_empty(),
+            "distinct resources never alias: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn observing_one_sibling_field_while_taking_another_is_accepted() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             resource Session { input: File, output: File } \
+             func mixed(a: File, take b: File) -> i64 { \
+                 value d = a.descriptor; \
+                 drop b; \
+                 return d; \
+             } \
+             func f() -> i64 { \
+                 mutable s = Session { \
+                     input: File { descriptor: 1 }, \
+                     output: File { descriptor: 2 }, \
+                 }; \
+                 value n = mixed(s.output, s.input); \
+                 value rest = s.output; \
+                 drop rest; \
+                 return n; \
+             }",
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "disjoint sibling fields are not an alias: {diags:?}"
+        );
+    }
+
+    /// Two `take` arguments reaching one identity were already rejected
+    /// by the move rules; adding the observe/take check must not have
+    /// replaced that answer with its own.
+    #[test]
+    fn taking_one_resource_twice_in_one_call_is_still_rejected() {
+        let diags = check(
+            "resource File { descriptor: i64 } \
+             func both(take a: File, take b: File) -> unit { drop a; drop b; } \
+             func f() { \
+                 value file = File { descriptor: 1 }; \
+                 both(file, file); \
+             }",
+        );
+        assert!(
+            !diags.is_empty(),
+            "one identity may not be transferred twice: {diags:?}"
+        );
+        assert!(
+            !codes_of(&diags).contains(&"U0015"),
+            "two transfers are not an observe/take alias: {diags:?}"
+        );
+    }
+}
+
+/// Missing-metadata fail-closed behavior (`rfcs/0008`, `rfcs/0012`):
+/// this stage's own affinity query must never answer "not affine" just
+/// because a generic declaration's own type-parameter list is absent or
+/// disagrees with the arguments a use supplies. Answering `false` there
+/// would let a genuinely affine instantiation be treated as an
+/// ordinary, freely-copyable value with no ownership tracked at all --
+/// the one direction that leaks rather than over-demands.
+#[cfg(test)]
+mod missing_metadata {
+    use super::*;
+
+    const BOXY: ItemId = ItemId(70);
+    const FILE: ItemId = ItemId(71);
+
+    /// The four owned tables an [`AffineContext`] borrows, kept alive
+    /// by the caller for exactly as long as the borrow it hands out.
+    struct Tables {
+        fields: HashMap<ItemId, Vec<Ty>>,
+        resources: HashSet<ItemId>,
+        params: HashMap<ItemId, Vec<TypeParamId>>,
+        projections: HashMap<ExprId, (ItemId, usize)>,
+    }
+
+    fn context(type_params: Option<Vec<TypeParamId>>) -> Tables {
+        let param = TypeParamId(0);
+        let name = crate::symbol::Symbol(0);
+        let mut fields = HashMap::new();
+        fields.insert(BOXY, vec![Ty::Param(param, name)]);
+        fields.insert(FILE, vec![Ty::I64]);
+        let mut resources = HashSet::new();
+        resources.insert(FILE);
+        let mut params = HashMap::new();
+        if let Some(declared) = type_params {
+            params.insert(BOXY, declared);
+        }
+        params.insert(FILE, Vec::new());
+        Tables {
+            fields,
+            resources,
+            params,
+            projections: HashMap::new(),
+        }
+    }
+
+    fn affine_with(type_params: Option<Vec<TypeParamId>>, args: Vec<Ty>) -> bool {
+        let tables = context(type_params);
+        let affine = AffineContext {
+            aggregate_field_types: &tables.fields,
+            declared_resources: &tables.resources,
+            item_type_params: &tables.params,
+            field_projections: &tables.projections,
+        };
+        is_affine_ty(
+            &Ty::Applied(BOXY, args),
+            &affine,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_well_formed_generic_instantiation_answers_from_its_substituted_field() {
+        let file = Ty::Named(FILE, crate::symbol::Symbol(0));
+        assert!(
+            affine_with(Some(vec![TypeParamId(0)]), vec![file]),
+            "`Box[File]` must be affine"
+        );
+        assert!(
+            !affine_with(Some(vec![TypeParamId(0)]), vec![Ty::I64]),
+            "`Box[i64]` must not be affine"
+        );
+    }
+
+    #[test]
+    fn a_missing_type_parameter_list_fails_closed_to_affine() {
+        assert!(
+            affine_with(None, vec![Ty::I64]),
+            "missing generic metadata must never be answered as an empty substitution"
+        );
+    }
+
+    #[test]
+    fn an_arity_disagreement_fails_closed_to_affine() {
+        assert!(
+            affine_with(Some(vec![TypeParamId(0)]), vec![Ty::I64, Ty::I64]),
+            "an arity disagreement must never be answered as a partial substitution"
+        );
     }
 }

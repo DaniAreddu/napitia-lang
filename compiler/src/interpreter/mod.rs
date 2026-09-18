@@ -959,9 +959,7 @@ impl<'a> Interpreter<'a> {
             Some(_) => Err(invalid(
                 "an observation ended while an observation opened inside it is still active",
             )),
-            None => Err(invalid(
-                "an observation ended that this frame never began",
-            )),
+            None => Err(invalid("an observation ended that this frame never began")),
         }
     }
 

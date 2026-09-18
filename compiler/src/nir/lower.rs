@@ -847,8 +847,7 @@ struct Lowering<'a> {
     /// exactly the same exiting-node id `cleanup_edges` uses, and
     /// already innermost-first. Replayed by `emit_checked_cleanup`,
     /// immediately before that same edge's ownership cleanup.
-    observation_exits:
-        &'a BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
+    observation_exits: &'a BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1437,7 +1436,8 @@ impl<'a> Lowering<'a> {
                 place,
             },
         );
-        fb.local_bindings.insert(o.alias, LocalBinding::Direct(view));
+        fb.local_bindings
+            .insert(o.alias, LocalBinding::Direct(view));
         self.lower_scoped_block_void(fb, &o.body)?;
         if !fb.current_terminated() {
             fb.push_instruction(crate::nir::Instruction::EndObserve { observation: o.id });

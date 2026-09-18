@@ -48,8 +48,11 @@ mod flow;
 mod plan;
 mod state;
 
-pub use plan::{CheckedDeferPlan, CleanupAction, ConsumeInfo, ResourceCheckResult};
-pub use state::ResourceState;
+pub use plan::{
+    CheckedDeferPlan, CheckedObservation, CleanupAction, ConsumeInfo, ObservationExit,
+    ResourceCheckResult,
+};
+pub use state::{PlaceStatus, ResourceState};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -220,6 +223,8 @@ pub fn check_module(
     let mut cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>> = BTreeMap::new();
     let mut consume_sites: BTreeMap<ExprId, ConsumeInfo> = BTreeMap::new();
     let mut defer_plans: BTreeMap<ExprId, CheckedDeferPlan> = BTreeMap::new();
+    let mut observations: BTreeMap<crate::hir::ObservationId, CheckedObservation> = BTreeMap::new();
+    let mut observation_exits: BTreeMap<ExprId, Vec<ObservationExit>> = BTreeMap::new();
     for f in &hir.functions {
         let mut checker = flow::FlowChecker::new(
             local_types,
@@ -233,10 +238,12 @@ pub fn check_module(
             &mut diagnostics,
         );
         checker.check_function(f);
-        let (edges, consumes, defers) = checker.into_plan();
-        cleanup_edges.extend(edges);
-        consume_sites.extend(consumes);
-        defer_plans.extend(defers);
+        let plan = checker.into_plan();
+        cleanup_edges.extend(plan.cleanup_edges);
+        consume_sites.extend(plan.consume_sites);
+        defer_plans.extend(plan.defer_plans);
+        observations.extend(plan.observations);
+        observation_exits.extend(plan.observation_exits);
     }
     for e in &hir.extends {
         for m in &e.methods {
@@ -252,10 +259,12 @@ pub fn check_module(
                 &mut diagnostics,
             );
             checker.check_function(m);
-            let (edges, consumes, defers) = checker.into_plan();
-            cleanup_edges.extend(edges);
-            consume_sites.extend(consumes);
-            defer_plans.extend(defers);
+            let plan = checker.into_plan();
+            cleanup_edges.extend(plan.cleanup_edges);
+            consume_sites.extend(plan.consume_sites);
+            defer_plans.extend(plan.defer_plans);
+            observations.extend(plan.observations);
+            observation_exits.extend(plan.observation_exits);
         }
     }
     ResourceCheckResult {
@@ -263,6 +272,8 @@ pub fn check_module(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
     }
 }
 

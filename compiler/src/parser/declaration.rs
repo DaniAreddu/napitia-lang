@@ -4,9 +4,9 @@ use super::{Parser, recovery};
 use crate::lexer::TokenKind;
 use crate::source::Span;
 use crate::syntax::ast::{
-    Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt, Param,
-    Path, ProtocolDecl, ProtocolMember, RecordDecl, ResourceDecl, Stmt, Type, UsesClause,
-    VariantDecl, WhileStmt,
+    Block, Case, Expr, ExtendDecl, Field, FunctionDecl, Ident, ImportDecl, Item, LoopStmt,
+    ObserveStmt, Param, Path, ProtocolDecl, ProtocolMember, RecordDecl, ResourceDecl, Stmt, Type,
+    UsesClause, VariantDecl, WhileStmt,
 };
 
 /// Whether `expr`'s surface syntax already ends in a `}` (`if`/`match`/
@@ -599,6 +599,7 @@ impl<'a> Parser<'a> {
             TokenKind::Drop => StmtOrTail::Stmt(self.parse_drop_stmt()),
             TokenKind::While => StmtOrTail::Stmt(Stmt::While(self.parse_while_stmt())),
             TokenKind::Loop => StmtOrTail::Stmt(Stmt::Loop(self.parse_loop_stmt())),
+            TokenKind::Observe => self.parse_observe_stmt(),
             _ => {
                 let expr = self.parse_expression();
                 if self.eat(&TokenKind::Semi) {
@@ -673,6 +674,84 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `observe <place> as <alias> { ... }` (`rfcs/0013`).
+    ///
+    /// Always consumes the leading `observe` before anything else can
+    /// fail, so every path out of here has made forward progress --
+    /// the block loop's own "did this attempt consume anything" guard
+    /// can never spin on this statement, however malformed the rest of
+    /// it is. A missing `as` or alias name is reported and then
+    /// *recovered past* rather than abandoned, so `observe file view {
+    /// ... }` still parses its block (and reports exactly one
+    /// diagnostic) instead of resynchronizing through it.
+    fn parse_observe_stmt(&mut self) -> StmtOrTail {
+        let start = self.current_span();
+        self.advance(); // 'observe'
+        let Some(source) = self.parse_place_expr() else {
+            // Nothing usable was named at all: there is no statement to
+            // build, and the block loop resynchronizes from here.
+            return StmtOrTail::Recover;
+        };
+        self.expect(&TokenKind::As, "`as`");
+        let alias = self
+            .expect_ident("an observation alias name")
+            .unwrap_or_else(|| {
+                let span = self.current_span();
+                Ident {
+                    symbol: self.placeholder_symbol(),
+                    span,
+                }
+            });
+        let body = self.parse_block();
+        StmtOrTail::Stmt(Stmt::Observe(ObserveStmt {
+            span: start.join(body.span),
+            keyword_span: start,
+            source,
+            alias,
+            body,
+        }))
+    }
+
+    /// An observation source: `a`, `a.b`, `a.b.c` -- an identifier
+    /// followed by zero or more `.field` steps, and nothing else
+    /// (`rfcs/0013`). Deliberately not `parse_expression`: `as` is the
+    /// cast operator, so a general expression would consume `as <alias>`
+    /// as a cast to a type named after the alias, and the observation's
+    /// own `as` would never be seen here at all.
+    ///
+    /// Claims the same nesting budget `parse_postfix` does, once per
+    /// `.field` step: each step wraps the accumulated tree in one more
+    /// boxed node, so a chain long enough to exhaust the native stack
+    /// during the tree's own recursive `Drop` is refused here rather
+    /// than built (`P0001`).
+    fn parse_place_expr(&mut self) -> Option<Expr> {
+        let mut expr = Expr::Ident(self.expect_ident("a place to observe")?);
+        let mut claimed = 0usize;
+        let result = loop {
+            if !self.check(&TokenKind::Dot) {
+                break Some(expr);
+            }
+            if !self.enter_expression(self.current_span()) {
+                break Some(expr);
+            }
+            claimed += 1;
+            self.advance(); // '.'
+            let Some(name) = self.expect_ident("a field name") else {
+                break Some(expr);
+            };
+            let span = expr.span().join(name.span);
+            expr = Expr::Field {
+                base: Box::new(expr),
+                name,
+                span,
+            };
+        };
+        for _ in 0..claimed {
+            self.leave_expression();
+        }
+        result
+    }
+
     fn parse_while_stmt(&mut self) -> WhileStmt {
         let start = self.current_span();
         self.advance(); // 'while'
@@ -711,7 +790,88 @@ enum StmtOrTail {
 #[cfg(test)]
 mod tests {
     use super::super::tests::parse;
-    use crate::syntax::ast::{Item, Stmt};
+    use crate::syntax::ast::{Expr, Item, Stmt};
+
+    /// The statements of the first declared function in `text`.
+    fn statements(text: &str) -> Vec<Stmt> {
+        let (module, diags) = parse(text);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Function(f) = &module.items[0] else {
+            panic!("expected function")
+        };
+        f.body.statements.clone()
+    }
+
+    fn observe_of(text: &str) -> crate::syntax::ast::ObserveStmt {
+        let statements = statements(text);
+        let Some(Stmt::Observe(observe)) = statements.into_iter().next() else {
+            panic!("expected an observe statement")
+        };
+        observe
+    }
+
+    #[test]
+    fn parses_an_observation_of_a_bare_local() {
+        let observe = observe_of("func f(x: i64) -> i64 { observe file as view { } return 0 }");
+        assert!(matches!(observe.source, Expr::Ident(_)));
+        assert!(observe.body.statements.is_empty());
+        assert!(observe.keyword_span.start < observe.span.end);
+    }
+
+    #[test]
+    fn parses_an_observation_of_a_nested_field_place() {
+        let observe =
+            observe_of("func f(x: i64) -> i64 { observe a.b.c as view { } return 0 }");
+        let Expr::Field { base, .. } = &observe.source else {
+            panic!("expected a field chain")
+        };
+        assert!(matches!(base.as_ref(), Expr::Field { .. }));
+    }
+
+    #[test]
+    fn an_observation_needs_no_trailing_semicolon() {
+        // Brace-terminated, exactly like `while`/`loop`: the statement
+        // after it parses on its own terms (`rfcs/0013`).
+        let statements = statements("func f() -> i64 { observe a as view { } return 0 }");
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(statements[0], Stmt::Observe(_)));
+    }
+
+    #[test]
+    fn an_observation_body_is_an_ordinary_block() {
+        let observe = observe_of(
+            "func f() -> i64 { observe a as view { value x = 1; drop a; } return 0 }",
+        );
+        assert_eq!(observe.body.statements.len(), 2);
+    }
+
+    #[test]
+    fn nested_observations_parse_as_nested_statements() {
+        let outer = observe_of("func f() -> i64 { observe a as v { observe v as w { } } return 0 }");
+        assert_eq!(outer.body.statements.len(), 1);
+        assert!(matches!(outer.body.statements[0], Stmt::Observe(_)));
+    }
+
+    #[test]
+    fn an_observation_parses_inside_a_loop_body() {
+        let statements = statements("func f() -> i64 { loop { observe a as v { break; } } }");
+        let Stmt::Loop(l) = &statements[0] else {
+            panic!("expected loop")
+        };
+        assert!(matches!(l.body.statements[0], Stmt::Observe(_)));
+    }
+
+    #[test]
+    fn an_observation_source_is_never_parsed_as_a_cast() {
+        // `x as T` is the cast operator; an observation's own source
+        // must stop before `as` or the alias name would be swallowed
+        // into a cast to a type named after it (`rfcs/0013`).
+        let observe = observe_of("func f() -> i64 { observe file as view { } return 0 }");
+        assert!(
+            matches!(observe.source, Expr::Ident(_)),
+            "the source must be the bare place, not a cast"
+        );
+    }
 
     #[test]
     fn parses_function_with_params_and_return_type() {

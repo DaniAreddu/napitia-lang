@@ -182,6 +182,38 @@ impl ResourceTable {
 
     /// Opens a lease over `observed` (`rfcs/0013`), nested inside
     /// `parent` when one is already active in the same frame.
+    /// How many leases have already been taken, recorded before a frame
+    /// runs so its own can be told from every other frame's
+    /// (`rfcs/0013`). Lease identities are handed out in increasing
+    /// order and the table never shrinks, so "opened by this frame" is
+    /// exactly "at or past this mark".
+    fn lease_mark(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Ends every lease opened at or after `mark` that is still open,
+    /// innermost first (`rfcs/0013`) -- the epilogue of a frame that
+    /// ended in an error.
+    ///
+    /// Infallible on purpose: this runs while an error is already
+    /// propagating, so there is no second failure it could usefully
+    /// report and nothing it may mask. It touches only leases, never a
+    /// resource's generation or status: unwinding an observation
+    /// releases a claim, it does not destroy anything.
+    fn abandon_leases_from(&mut self, mark: usize) {
+        // `active` is in ascending identity order, so the innermost
+        // lease this frame still holds is always the last one.
+        while let Some(id) = self.active.last().copied() {
+            if (id.0 as usize) < mark {
+                break;
+            }
+            self.active.pop();
+            if let Some(lease) = self.leases.get_mut(id.0 as usize) {
+                lease.status = LeaseStatus::Ended;
+            }
+        }
+    }
+
     /// The identity the next lease will take, without taking it
     /// (`rfcs/0013`).
     ///
@@ -3190,7 +3222,21 @@ impl<'a> Interpreter<'a> {
             )));
         }
         self.call_depth.set(self.call_depth.get() + 1);
+        // Every observation this frame opens is its own to close. A
+        // frame that ends in `Err` -- from anywhere, including deep
+        // inside a helper this function never sees -- has abandoned its
+        // own lease stack wherever it stood, so the epilogue closes
+        // what the frame itself opened (`rfcs/0013`).
+        //
+        // Without it, any error after an `ObservePlace` left that lease
+        // `Active` forever, and the *caller* -- which legitimately owns
+        // the observed resources -- was refused every ownership
+        // operation on them for the rest of the run.
+        let mark = self.resources.borrow().lease_mark();
         let outcome = self.call_function_in_frame(function, type_args, args, evidence);
+        if outcome.is_err() {
+            self.resources.borrow_mut().abandon_leases_from(mark);
+        }
         self.call_depth.set(self.call_depth.get() - 1);
         outcome
     }

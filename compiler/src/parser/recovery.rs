@@ -32,6 +32,7 @@ pub(super) fn is_stmt_start(kind: &TokenKind) -> bool {
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::Loop
+                | TokenKind::Observe
                 | TokenKind::Match
                 | TokenKind::Return
                 | TokenKind::Break
@@ -172,5 +173,14 @@ mod tests {
         assert!(is_stmt_start(&TokenKind::Value));
         assert!(is_stmt_start(&TokenKind::Return));
         assert!(!is_stmt_start(&TokenKind::Plus));
+    }
+
+    #[test]
+    fn stmt_start_includes_observe() {
+        // `rfcs/0013`: a malformed statement is resynchronized past by
+        // scanning for the next statement's own leading token, so an
+        // `observe` that follows one must be recognized as a fresh
+        // start rather than skipped over as unrelated filler.
+        assert!(is_stmt_start(&TokenKind::Observe));
     }
 }

@@ -702,7 +702,19 @@ impl<'a> Parser<'a> {
                     span,
                 }
             });
+        // An observation body is a nested block every later stage
+        // descends into once per level (`hir::lower`, `typeck`,
+        // `resourceck::flow`, `nir::lower`, and Rust's own recursive
+        // `Drop` for the boxed tree), so the nesting is claimed against
+        // the same budget every other tree-deepening construct claims:
+        // a chain deep enough to exhaust the native stack is refused
+        // here, at the only place a syntax tree is built from source,
+        // rather than built and then walked.
+        if !self.enter_expression(start) {
+            return StmtOrTail::Recover;
+        }
         let body = self.parse_block();
+        self.leave_expression();
         StmtOrTail::Stmt(Stmt::Observe(ObserveStmt {
             span: start.join(body.span),
             keyword_span: start,
@@ -871,6 +883,181 @@ mod tests {
             matches!(observe.source, Expr::Ident(_)),
             "the source must be the bare place, not a cast"
         );
+    }
+
+    /// `rfcs/0013`: every malformed observation must produce a
+    /// deterministic diagnostic *and* leave the parser strictly further
+    /// along than it started. Each case here is written as a whole file
+    /// so the block loop's own progress guard is genuinely exercised --
+    /// a recovery path that failed to consume anything would hang the
+    /// test rather than fail it, which is exactly the failure mode
+    /// these are here to rule out.
+    mod observation_recovery {
+        use super::super::super::tests::parse;
+        use crate::diagnostics::Diagnostic;
+
+        fn diagnostics(text: &str) -> Vec<Diagnostic> {
+            parse(text).1
+        }
+
+        fn rejected(text: &str) {
+            let diags = diagnostics(text);
+            assert!(
+                !diags.is_empty(),
+                "expected at least one diagnostic for: {text}"
+            );
+            // Parsing the identical input twice must produce identical
+            // diagnostics: nothing about recovery may depend on state
+            // carried between runs.
+            let again = diagnostics(text);
+            assert_eq!(
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+                again.iter().map(|d| &d.message).collect::<Vec<_>>(),
+                "recovery is not deterministic for: {text}"
+            );
+        }
+
+        #[test]
+        fn a_bare_observe_keyword_is_a_diagnostic_not_a_hang() {
+            rejected("func f() -> i64 { observe }");
+        }
+
+        #[test]
+        fn an_observe_at_end_of_input_is_a_diagnostic_not_a_hang() {
+            rejected("func f() -> i64 { observe");
+        }
+
+        #[test]
+        fn a_missing_as_keyword_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file view { } return 0 }");
+        }
+
+        #[test]
+        fn a_missing_alias_name_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file as { } return 0 }");
+        }
+
+        #[test]
+        fn a_non_identifier_alias_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file as 42 { } return 0 }");
+        }
+
+        #[test]
+        fn a_missing_block_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file as view return 0 }");
+        }
+
+        #[test]
+        fn an_unterminated_block_is_a_diagnostic_not_a_hang() {
+            rejected("func f() -> i64 { observe file as view {");
+        }
+
+        #[test]
+        fn a_malformed_statement_inside_the_block_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file as view { value = 1; } return 0 }");
+        }
+
+        #[test]
+        fn a_bare_identifier_tail_inside_the_block_is_an_ordinary_block() {
+            // The body really is an ordinary block, so a trailing
+            // expression in it is a tail, not a syntax error.
+            let (_, diags) = parse("func f() -> i64 { observe file as view { thing } return 0 }");
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        }
+
+        #[test]
+        fn a_trailing_dot_in_the_place_is_a_diagnostic() {
+            rejected("func f() -> i64 { observe file. as view { } return 0 }");
+        }
+
+        #[test]
+        fn nested_malformed_observations_each_recover() {
+            rejected(
+                "func f() -> i64 { observe a as { observe b as { } } observe c as { } return 0 }",
+            );
+        }
+
+        #[test]
+        fn a_malformed_observation_inside_a_loop_recovers() {
+            rejected("func f() -> i64 { loop { observe a as { } } }");
+        }
+
+        #[test]
+        fn a_malformed_observation_inside_a_handler_recovers() {
+            rejected(
+                "func f() -> i64 { handle g() { success v => { observe a as { } 0 }, failure _ => 0 } }",
+            );
+        }
+
+        #[test]
+        fn a_well_formed_item_after_a_malformed_observation_still_parses() {
+            let (module, diags) = parse(
+                "func broken() -> i64 { observe as { } return 0 }\n\
+                 func fine() -> i64 { return 1 }",
+            );
+            assert!(!diags.is_empty());
+            assert_eq!(
+                module.items.len(),
+                2,
+                "recovery must not swallow the next item"
+            );
+        }
+
+        #[test]
+        fn a_deeply_nested_observation_chain_is_a_diagnostic_not_a_stack_overflow() {
+            // Each level adds one `.field` to the observed place, which
+            // is exactly the shape that wraps the accumulated tree in
+            // one more boxed node per iteration -- the one a loop-based
+            // fold would leave unbounded if it did not claim the same
+            // nesting budget the postfix parser does.
+            let depth = 4_000;
+            let mut place = String::from("a");
+            for _ in 0..depth {
+                place.push_str(".b");
+            }
+            let text = format!("func f() -> i64 {{ observe {place} as view {{ }} return 0 }}");
+            let diags = diagnostics(&text);
+            assert!(
+                diags.iter().any(|d| d.code == "P0001"),
+                "a place chain past the depth limit must be refused, not built"
+            );
+        }
+
+        #[test]
+        fn deeply_nested_observation_blocks_are_a_diagnostic_not_a_stack_overflow() {
+            // Runs on an ordinary 2 MiB test thread, deliberately: the
+            // bound has to hold on the *smallest* stack the parser is
+            // ever driven on, not only on the large one `cli::run`
+            // gives itself.
+            let depth = 2_000;
+            let mut text = String::from("func f() -> i64 { ");
+            for _ in 0..depth {
+                text.push_str("observe a as v { ");
+            }
+            for _ in 0..depth {
+                text.push('}');
+            }
+            text.push_str(" return 0 }");
+            let diags = diagnostics(&text);
+            assert!(
+                diags.iter().any(|d| d.code == "P0001"),
+                "an observation chain past the depth limit must be refused, not built"
+            );
+        }
+
+        #[test]
+        fn an_observation_chain_just_under_the_depth_limit_still_parses() {
+            let mut text = String::from("func f() -> i64 { ");
+            for _ in 0..32 {
+                text.push_str("observe a as v { ");
+            }
+            for _ in 0..32 {
+                text.push('}');
+            }
+            text.push_str(" return 0 }");
+            let diags = diagnostics(&text);
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        }
     }
 
     #[test]

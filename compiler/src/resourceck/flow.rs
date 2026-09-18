@@ -1391,6 +1391,31 @@ impl<'a> FlowChecker<'a> {
     /// `T0070`/`T0072`). No observation is registered for it at all --
     /// the body is still walked for its own independent diagnostics,
     /// but nothing downstream ever sees a half-built observation.
+    /// Walks one observation body (`rfcs/0013`), on every path that
+    /// walks one at all -- accepted or rejected.
+    ///
+    /// The body's own tail value is *discarded*: the statement produces
+    /// no value and nothing above it consumes one, exactly like a bare
+    /// statement-expression. So a freshly constructed resource there is
+    /// never bound, returned, dropped or transferred to a `take`
+    /// parameter, and nothing would ever destroy it -- the identical
+    /// leak `RESOURCE_TEMPORARY_LEAK` already covers everywhere else,
+    /// caught here rather than left for `nir::verify` to report as a
+    /// leak with no source to point at.
+    ///
+    /// A diverging tail never actually produces a value at this point
+    /// at all, so it is not this check's concern, matching
+    /// [`Self::reject_leaked_temporary`]'s own rule for every other
+    /// transparent position.
+    fn check_observation_body(&mut self, body: &HirBlock) {
+        self.check_block(body);
+        if let Some(tail) = &body.tail
+            && !self.diverges(tail.id())
+        {
+            self.reject_leaked_temporary(tail);
+        }
+    }
+
     fn check_observe(&mut self, o: &HirObserve) {
         let place = if self.is_affine_expr(o.source.id()) {
             self.resolve_place(&o.source)
@@ -1399,7 +1424,7 @@ impl<'a> FlowChecker<'a> {
         };
         let Some(place) = place else {
             self.check_expr(&o.source);
-            self.check_block(&o.body);
+            self.check_observation_body(&o.body);
             return;
         };
         // A use-after-move/use-after-drop of the source is exactly the
@@ -1407,7 +1432,7 @@ impl<'a> FlowChecker<'a> {
         // grain, so it reports through exactly the same path.
         self.check_place_read(&place, &o.source);
         let Some(ty) = self.place_ty(&place) else {
-            self.check_block(&o.body);
+            self.check_observation_body(&o.body);
             return;
         };
         match self.place_status(&place) {
@@ -1436,14 +1461,14 @@ impl<'a> FlowChecker<'a> {
                     ),
                     "partially moved aggregate observed as a whole",
                 );
-                self.check_block(&o.body);
+                self.check_observation_body(&o.body);
                 return;
             }
             // Already diagnosed by `check_place_read` just above, or an
             // `Error` place whose own root cause was reported earlier --
             // no second diagnostic about the same thing either way.
             PlaceStatus::Moved | PlaceStatus::Dropped | PlaceStatus::Error => {
-                self.check_block(&o.body);
+                self.check_observation_body(&o.body);
                 return;
             }
         }
@@ -1465,7 +1490,7 @@ impl<'a> FlowChecker<'a> {
             alias: o.alias,
             alias_name: o.alias_name,
         });
-        self.check_block(&o.body);
+        self.check_observation_body(&o.body);
         // A block is left exactly once, however it is left: an early
         // `return`/`raise`/`?`/`break`/`continue` inside it already
         // recorded its own end edge (see

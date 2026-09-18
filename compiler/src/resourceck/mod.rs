@@ -969,6 +969,34 @@ mod tests {
         }
 
         #[test]
+        fn a_resource_temporary_discarded_by_the_body_is_rejected_here() {
+            // The body's own tail value is discarded, exactly like a
+            // bare statement-expression's is -- so a freshly
+            // constructed resource there is never bound, returned,
+            // dropped or transferred, and nothing would ever destroy
+            // it. Caught at `check`, not left for the verifier to
+            // report as a leak with no source to point at.
+            rejected_with(
+                "func make() -> File { return File { descriptor: 1 }; }\n\
+                 func f(take file: File) -> i64 {\n\
+                   observe file as view { make() }\n\
+                   return sink(file);\n\
+                 }",
+                "U0011",
+            );
+        }
+
+        #[test]
+        fn an_ordinary_value_tail_in_the_body_is_still_fine() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as view { inspect(view) }\n\
+                   return sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
         fn a_reversed_declaration_order_checks_identically() {
             // The place's identity is structural, not positional: the
             // same program with its two resource fields declared the

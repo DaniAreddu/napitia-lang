@@ -3020,8 +3020,19 @@ impl<'a> Interpreter<'a> {
                     // Instead the identities that really cross the
                     // boundary are named explicitly, and the commit
                     // happens only once nothing fallible is left.
+                    // The result is a typed destination like any other:
+                    // a value that disagrees with the signature it is
+                    // leaving through is refused before it moves, so a
+                    // hand-built body cannot hand its caller a
+                    // `Session` where the signature promises a `File`.
+                    // Checked against the *instantiated* return type, so
+                    // a generic function's own `T` is compared where it
+                    // is actually resolved.
+                    let value = get(&values, id)?;
+                    let declared = crate::types::substitute(&function.return_type, &frame_subst);
+                    self.validate_argument(&value, &declared)?;
                     let mut plan = StorePlan::default();
-                    let returned = self.plan_transfer(&get(&values, id)?, &mut plan, 0)?;
+                    let returned = self.plan_transfer(&value, &mut plan, 0)?;
                     if let Some(leaked) =
                         self.leaked_resource(&values, &observing_params, &plan.reachable)
                     {
@@ -13424,5 +13435,298 @@ mod runtime_construction_validation {
         interpreter
             .call_function(&none, &[], Vec::new(), Vec::new())
             .expect("a well-formed `Maybe[i64]::None` is still constructible");
+    }
+}
+
+/// Every typed boundary refuses a value that disagrees with the type its
+/// destination declares, and refuses it without changing anything
+/// (`rfcs/0008`, `rfcs/0011`, `rfcs/0012`).
+///
+/// Construction was the boundary that was reported, but it was never the
+/// only one: a value enters a typed destination on a `Store`, through a
+/// `StorePlace`, as a call or `take` argument, as a function's own
+/// result, and when a deferred call is captured and later run. Each of
+/// these is checked here directly against the interpreter, because
+/// defence in depth is only real if the stage below the verifier refuses
+/// the same thing on its own.
+#[cfg(test)]
+mod typed_boundaries {
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Function, Instruction, Param, RecordLayout, Terminator};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(190);
+    const SESSION: ItemId = ItemId(191);
+    const CALLER: ItemId = ItemId(192);
+    const CALLEE: ItemId = ItemId(193);
+
+    fn name() -> Symbol {
+        Symbol(0)
+    }
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, name())
+    }
+
+    fn session_ty() -> Ty {
+        Ty::Named(SESSION, name())
+    }
+
+    fn module() -> Module {
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), file_ty())],
+                        affine: true,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn int(result: u32, value: u128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value)),
+        }
+    }
+
+    /// `%konst` then a valid `File` in `%result`.
+    fn make_file(konst: u32, result: u32) -> Vec<Instruction> {
+        vec![
+            int(konst, 1),
+            Instruction::Value {
+                result: ValueId(result),
+                ty: file_ty(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(konst)]),
+            },
+        ]
+    }
+
+    fn function(instructions: Vec<Instruction>, terminator: Terminator, ret: Ty) -> Function {
+        Function {
+            id: CALLER,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: ret,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator,
+            }],
+        }
+    }
+
+    /// Runs `function` and asserts it is refused with nothing destroyed
+    /// and no resource left half-moved.
+    fn refuse(function: &Function, args: Vec<Value>, what: &str) -> String {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(function, &[], args, Vec::new())
+            .map(|_| ())
+            .expect_err(what);
+        let table = interpreter.resources.borrow();
+        assert!(
+            table
+                .records
+                .iter()
+                .all(|record| record.status == ResourceStatus::Alive),
+            "{what}: a refused operation destroys nothing"
+        );
+        assert!(
+            table
+                .records
+                .iter()
+                .flat_map(|record| record.fields.iter())
+                .all(|field| !matches!(field, Value::Moved | Value::Dropped)),
+            "{what}: a refused operation moves no field out of anything"
+        );
+        format!("{error:?}")
+    }
+
+    /// A `Store` into a slot whose declared type is `File`, handed a
+    /// well-formed `Session`.
+    #[test]
+    fn a_store_refuses_a_value_of_the_wrong_declared_type() {
+        let mut body = make_file(0, 1);
+        body.push(Instruction::Value {
+            result: ValueId(2),
+            ty: session_ty(),
+            kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(1)]),
+        });
+        // The slot declares `File`; the value is a `Session`.
+        body.push(Instruction::Value {
+            result: ValueId(3),
+            ty: file_ty(),
+            kind: ValueKind::Alloc,
+        });
+        body.push(Instruction::Store {
+            slot: ValueId(3),
+            value: ValueId(2),
+            mode: OwnershipMode::Transfer,
+        });
+        let function = function(body, Terminator::Return(None), Ty::Unit);
+        refuse(
+            &function,
+            Vec::new(),
+            "a `Session` stored into a slot that declares `File`",
+        );
+    }
+
+    /// The same, for an observing store: a view of the wrong type is
+    /// still the wrong type.
+    #[test]
+    fn an_observing_store_refuses_a_value_of_the_wrong_declared_type() {
+        let mut body = make_file(0, 1);
+        body.push(Instruction::Value {
+            result: ValueId(2),
+            ty: session_ty(),
+            kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(1)]),
+        });
+        body.push(Instruction::Value {
+            result: ValueId(3),
+            ty: file_ty(),
+            kind: ValueKind::Alloc,
+        });
+        body.push(Instruction::Store {
+            slot: ValueId(3),
+            value: ValueId(2),
+            mode: OwnershipMode::Observe,
+        });
+        let function = function(body, Terminator::Return(None), Ty::Unit);
+        refuse(
+            &function,
+            Vec::new(),
+            "a `Session` observed into a slot that declares `File`",
+        );
+    }
+
+    /// A function whose declared result is `File`, returning a `Session`.
+    #[test]
+    fn a_return_refuses_a_value_of_the_wrong_declared_type() {
+        let mut body = make_file(0, 1);
+        body.push(Instruction::Value {
+            result: ValueId(2),
+            ty: session_ty(),
+            kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(1)]),
+        });
+        let function = function(body, Terminator::Return(Some(ValueId(2))), file_ty());
+        refuse(
+            &function,
+            Vec::new(),
+            "a `Session` returned where `File` is declared",
+        );
+    }
+
+    /// A `take` argument of the wrong declared type, at the call
+    /// boundary rather than inside the callee.
+    #[test]
+    fn a_take_argument_of_the_wrong_declared_type_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(file)]);
+        let callee = Function {
+            id: CALLEE,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: file_ty(),
+                take: true,
+            }],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let before = interpreter.resources.borrow().records[session.id.0 as usize].generation;
+        let error = interpreter
+            .call_function(&callee, &[], vec![Value::Resource(session)], Vec::new())
+            .map(|_| ())
+            .expect_err("a `Session` is not a `File`");
+        assert!(
+            format!("{error:?}").contains("different") || format!("{error:?}").contains("disagree"),
+            "the rejection names the disagreement, got {error:?}"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[session.id.0 as usize].generation,
+            before,
+            "a refused argument never moved"
+        );
+    }
+
+    /// The well-formed spellings of each of the above still work, so the
+    /// boundary checks are a restriction on malformed values rather than
+    /// on the operations themselves.
+    #[test]
+    fn the_well_formed_spellings_still_succeed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+
+        // Store of a `File` into a slot that declares `File`.
+        let mut body = make_file(0, 1);
+        body.push(Instruction::Value {
+            result: ValueId(2),
+            ty: file_ty(),
+            kind: ValueKind::Alloc,
+        });
+        body.push(Instruction::Store {
+            slot: ValueId(2),
+            value: ValueId(1),
+            mode: OwnershipMode::Transfer,
+        });
+        body.push(Instruction::Value {
+            result: ValueId(3),
+            ty: file_ty(),
+            kind: ValueKind::Load(ValueId(2)),
+        });
+        body.push(Instruction::Drop { value: ValueId(3) });
+        let stores = function(body, Terminator::Return(None), Ty::Unit);
+        interpreter
+            .call_function(&stores, &[], Vec::new(), Vec::new())
+            .expect("a `File` really may be stored into a slot that declares `File`");
+
+        // Return of a `File` where `File` is declared.
+        let returns = function(
+            make_file(0, 1),
+            Terminator::Return(Some(ValueId(1))),
+            file_ty(),
+        );
+        interpreter
+            .call_function(&returns, &[], Vec::new(), Vec::new())
+            .expect("a `File` really may be returned where `File` is declared");
     }
 }

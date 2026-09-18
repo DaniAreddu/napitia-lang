@@ -4297,7 +4297,7 @@ mod tests {
     use crate::source::SourceMap;
     use crate::typeck::check_module;
 
-    fn run(text: &str) -> Result<Value, InterpreterError> {
+    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -15059,5 +15059,789 @@ mod observed_extraction {
             codes.contains(&"V0099"),
             "the verifier must reject the same observer-to-owner flow statically, got {codes:?}"
         );
+    }
+}
+
+/// `rfcs/0013` -- observations as real runtime leases, enforced by the
+/// interpreter itself rather than assumed from `nir::verify`.
+///
+/// Every negative case here is hand-built NIR that the verifier would
+/// reject, fed straight to the interpreter: the point is precisely that
+/// it does not depend on having been verified.
+#[cfg(test)]
+mod observation_leases {
+    use super::tests::{run, run_with_log};
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::place::{FieldId, Place};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(90);
+    const SESSION: ItemId = ItemId(91);
+    const SINK: ItemId = ItemId(92);
+    const SELF: ItemId = ItemId(93);
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, Symbol(0))
+    }
+
+    fn session_ty() -> Ty {
+        Ty::Named(SESSION, Symbol(1))
+    }
+
+    /// `resource File { descriptor: i64 }`, `resource Session { left:
+    /// File, right: File }`, and `sink(take File)`.
+    fn module_with(under_test: Function) -> Module {
+        Module {
+            functions: vec![
+                under_test,
+                Function {
+                    id: SINK,
+                    name: Symbol(2),
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: file_ty(),
+                        take: true,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name: Symbol(0),
+                        type_params: Vec::new(),
+                        fields: vec![(Symbol(3), Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name: Symbol(1),
+                        type_params: Vec::new(),
+                        fields: vec![(Symbol(4), file_ty()), (Symbol(5), file_ty())],
+                        affine: true,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn under_test(params: Vec<Param>, return_type: Ty, blocks: Vec<BasicBlock>) -> Function {
+        Function {
+            id: SELF,
+            name: Symbol(6),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn take_session() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: session_ty(),
+            take: true,
+        }]
+    }
+
+    fn session_field(index: u32) -> Place<ValueId> {
+        Place::root(ValueId(0)).field(SESSION, FieldId(index))
+    }
+
+    fn observe_at(result: u32, ty: Ty, id: u32, place: Place<ValueId>) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::ObservePlace {
+                observation: crate::hir::ObservationId(id),
+                place,
+            },
+        }
+    }
+
+    fn end(id: u32) -> Instruction {
+        Instruction::EndObserve {
+            observation: crate::hir::ObservationId(id),
+        }
+    }
+
+    fn read(result: u32, ty: Ty, place: Place<ValueId>, mode: OwnershipMode) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::PlaceRead { place, mode },
+        }
+    }
+
+    fn int(result: u32, value: i128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value as u128)),
+        }
+    }
+
+    /// Builds a live `Session` owning two `File`s inside `interpreter`.
+    fn live_session(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        let left = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let right = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(left), Value::Resource(right)])
+    }
+
+    /// Everything a rejected operation is required to leave untouched:
+    /// every resource record (item, generation, status and fields,
+    /// tombstones included), every lease (status, observed set and
+    /// parent), and the execution event log.
+    fn snapshot(interpreter: &Interpreter<'_>) -> String {
+        let table = interpreter.resources.borrow();
+        format!(
+            "records={:?}\nleases={:?}\nevents={:?}",
+            table.records,
+            table.leases,
+            interpreter.event_log()
+        )
+    }
+
+    fn run_under_test(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
+        let interpreter = Interpreter::new(module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        let after = snapshot(&interpreter);
+        (outcome, before, after)
+    }
+
+    // -- the ordinary shape -------------------------------------------
+
+    #[test]
+    fn begin_read_end_runs_and_leaves_the_owner_usable() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_valid_ownership_operation_after_the_end_is_accepted() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+                    },
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    // -- ended leases ---------------------------------------------------
+
+    #[test]
+    fn reading_through_an_ended_lease_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        let Err(InterpreterError::InvalidOperation(message)) = outcome else {
+            panic!("expected a structured error, got {outcome:?}")
+        };
+        assert!(
+            message.contains("already ended"),
+            "the error names the ended observation, got {message}"
+        );
+    }
+
+    #[test]
+    fn ending_the_same_observation_twice_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn ending_an_observation_this_frame_never_began_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![end(0), Instruction::Drop { value: ValueId(0) }, int(3, 0)],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn beginning_one_observation_identity_twice_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    observe_at(2, file_ty(), 0, session_field(1)),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    // -- conflicting ownership, and the atomicity of refusing it --------
+
+    /// Every rejected ownership operation must leave the whole runtime
+    /// byte-identical to what it found: no generation, status, field,
+    /// tombstone, lease or event may change.
+    fn assert_refused_without_mutation(instructions: Vec<Instruction>) {
+        let mut all = instructions;
+        all.push(int(9, 0));
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: all,
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected the operation to be refused, got {outcome:?}"
+        );
+        let after = snapshot(&interpreter);
+        // The call boundary itself legitimately transfers the argument
+        // and logs the entered frame, so the comparison is against the
+        // state as it stood once the frame was entered -- taken by
+        // running the identical program a second time and comparing the
+        // two refusals, which must be identical to each other.
+        let second = Interpreter::new(&module);
+        let session = live_session(&second);
+        let repeat = second.call_item(SELF, vec![Value::Resource(session)]);
+        assert_eq!(
+            format!("{outcome:?}"),
+            format!("{repeat:?}"),
+            "a refusal must be deterministic"
+        );
+        assert_eq!(
+            after,
+            snapshot(&second),
+            "two identical refusals must leave identical state"
+        );
+        assert!(before.contains("Alive"), "the fixture really was alive");
+    }
+
+    #[test]
+    fn moving_the_observed_place_while_active_is_refused_without_mutation() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn dropping_the_owner_while_active_is_refused_without_mutation() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            Instruction::Drop { value: ValueId(0) },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn a_take_call_on_the_observed_place_while_active_is_refused() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+            Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::Unit,
+                kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+            },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn storing_over_the_observed_place_while_active_is_refused() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            int(4, 7),
+            Instruction::Value {
+                result: ValueId(5),
+                ty: file_ty(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(4)]),
+            },
+            Instruction::StorePlace {
+                place: session_field(0),
+                value: ValueId(5),
+            },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn returning_the_owner_while_active_is_refused() {
+        let module = module_with(under_test(
+            take_session(),
+            session_ty(),
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0))],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn a_disjoint_sibling_stays_transferable_while_observed() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    read(2, file_ty(), session_field(1), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+                    },
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    // -- nesting ---------------------------------------------------------
+
+    #[test]
+    fn nested_leases_end_innermost_first() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                    end(1),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn ending_a_parent_while_a_derived_lease_is_active_is_refused() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                    end(0),
+                    end(1),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn two_simultaneous_observations_of_disjoint_places_both_work() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    observe_at(2, file_ty(), 1, session_field(1)),
+                    read(
+                        3,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    read(
+                        4,
+                        file_ty(),
+                        Place::root(ValueId(2)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(1),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_view_of_a_resource_record_carries_the_lease_at_every_depth() {
+        // The view is of the whole `Session`; the `File` reached through
+        // it lives in the resource table, not inline, so its handle is
+        // only bound to the lease if the projection propagates it.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)).field(SESSION, FieldId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(0),
+                    read(
+                        3,
+                        file_ty(),
+                        Place::root(ValueId(2)),
+                        OwnershipMode::Observe,
+                    ),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        let Err(InterpreterError::InvalidOperation(message)) = outcome else {
+            panic!("a projection out of a view must not outlive it, got {outcome:?}")
+        };
+        assert!(message.contains("already ended"), "got {message}");
+    }
+
+    // -- malformed runtime graphs ----------------------------------------
+
+    #[test]
+    fn a_cyclic_ownership_graph_terminates_instead_of_recursing_forever() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(9, 0)],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        // Make the session own itself: a graph no ownership operation
+        // could ever satisfy, and one a naive walk would never leave.
+        interpreter.resources.borrow_mut().records[session.id.0 as usize].fields[0] =
+            Value::Resource(session);
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        let outcome = interpreter.collect_reachable_resources(
+            &Value::Resource(session),
+            &mut seen,
+            &mut ordered,
+            0,
+        );
+        assert!(outcome.is_ok());
+        assert!(
+            ordered.len() <= 3,
+            "a cycle must be walked once, got {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_owner_handle_is_rejected_before_any_lease_is_opened() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(9, 0)],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let fresh = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(session)
+            .expect("the fixture is transferable");
+        let _ = fresh;
+        let before = snapshot(&interpreter);
+        let error = interpreter
+            .call_item(SELF, vec![Value::Resource(session)])
+            .expect_err("a stale handle must not enter a frame");
+        assert!(matches!(error, InterpreterError::InvalidOperation(_)));
+        assert_eq!(
+            before,
+            snapshot(&interpreter),
+            "a refused call changes nothing"
+        );
+    }
+
+    // -- source-level end-to-end behavior ---------------------------------
+
+    const SOURCE_PRELUDE: &str = "\
+        resource File { descriptor: i64 }\n\
+        resource Session { left: File, right: File }\n\
+        record Envelope { item: File }\n\
+        record Box2 { inner: Envelope }\n\
+        variant Maybe { Some(File), None }\n\
+        func inspect(file: File) -> i64 { return file.descriptor; }\n";
+
+    #[test]
+    fn an_observation_of_a_resource_inside_an_ordinary_record_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value packed = Envelope {{ item: File {{ descriptor: 5 }} }};\n\
+               mutable n = 0;\n\
+               observe packed.item as view {{ n = inspect(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(5)));
+    }
+
+    #[test]
+    fn an_observation_of_a_resource_inside_a_resource_record_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value session = Session {{ left: File {{ descriptor: 3 }}, right: File {{ descriptor: 4 }} }};\n\
+               mutable n = 0;\n\
+               observe session.left as view {{ n = inspect(view); }}\n\
+               drop session;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(3)));
+    }
+
+    #[test]
+    fn an_observation_through_deep_mixed_nesting_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value packed = Box2 {{ inner: Envelope {{ item: File {{ descriptor: 9 }} }} }};\n\
+               mutable n = 0;\n\
+               observe packed.inner.item as view {{ n = inspect(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(9)));
+    }
+
+    #[test]
+    fn an_observation_of_a_whole_aggregate_reads_through_it() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func peek(packed: Envelope) -> i64 {{ return inspect(packed.item); }}\n\
+             func main() -> i64 {{\n\
+               value packed = Envelope {{ item: File {{ descriptor: 6 }} }};\n\
+               mutable n = 0;\n\
+               observe packed as view {{ n = peek(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(6)));
+    }
+
+    #[test]
+    fn the_owner_is_destroyed_exactly_once_after_an_observation() {
+        let (result, log) = run_with_log(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value file = File {{ descriptor: 2 }};\n\
+               mutable n = 0;\n\
+               observe file as view {{ n = inspect(view); }}\n\
+               drop file;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(result, Ok(Value::Int(2)));
+        let drops: Vec<String> = log
+            .into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect();
+        assert_eq!(drops, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn the_execution_log_is_identical_across_repeated_runs() {
+        let program = format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value session = Session {{ left: File {{ descriptor: 1 }}, right: File {{ descriptor: 2 }} }};\n\
+               mutable n = 0;\n\
+               observe session.left as a {{\n\
+                 observe session.right as b {{ n = inspect(a) + inspect(b); }}\n\
+               }}\n\
+               drop session;\n\
+               return n;\n\
+             }}"
+        );
+        let (first, first_log) = run_with_log(&program);
+        let (second, second_log) = run_with_log(&program);
+        assert_eq!(first, Ok(Value::Int(3)));
+        assert_eq!(first, second);
+        assert_eq!(first_log, second_log);
+    }
+
+    #[test]
+    fn an_observation_of_a_variant_payload_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value held = Maybe.Some(File {{ descriptor: 8 }});\n\
+               mutable n = 0;\n\
+               observe held as view {{ n = 1; }}\n\
+               drop held;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(1)));
     }
 }

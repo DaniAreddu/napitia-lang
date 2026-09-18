@@ -1320,6 +1320,11 @@ impl<'a> FlowChecker<'a> {
             // than by the outer `return`'s id (which only a *direct*,
             // non-compound return value would ever be looked up by).
             if kind == ConsumeKind::Return && !self.diverges(tail.id()) {
+                // The same leaf is where this `return`'s own
+                // observation ends land too (`rfcs/0013`), for exactly
+                // the same reason: `nir::lower` replays this leaf's own
+                // id, never the outer `return`'s.
+                self.record_observation_exit(tail.id(), 0);
                 self.record_exit(tail.id(), 0);
             }
         }
@@ -3312,6 +3317,7 @@ impl<'a> FlowChecker<'a> {
                     let return_leaf_recorded =
                         kind == ConsumeKind::Return && self.is_affine_expr(match_id);
                     if return_leaf_recorded && !diverges {
+                        self.record_observation_exit(e.id(), 0);
                         self.record_exit(e.id(), 0);
                     }
                     (e.id(), diverges, return_leaf_recorded)
@@ -3401,6 +3407,7 @@ impl<'a> FlowChecker<'a> {
                     let return_leaf_recorded =
                         kind == ConsumeKind::Return && self.is_affine_expr(handle_id);
                     if return_leaf_recorded && !diverges {
+                        self.record_observation_exit(e.id(), 0);
                         self.record_exit(e.id(), 0);
                     }
                     (e.id(), diverges, return_leaf_recorded)

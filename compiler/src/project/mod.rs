@@ -247,6 +247,12 @@ pub fn compile_project(
         &typeck_result.local_types,
         &typeck_result.expr_types,
         interner,
+        &crate::resourceck::AffineContext {
+            aggregate_field_types: &typeck_result.aggregate_field_types,
+            declared_resources: &typeck_result.declared_resources,
+            item_type_params: &typeck_result.item_type_params,
+            field_projections: &typeck_result.field_projections,
+        },
     );
     if !resourceck_result.diagnostics.is_empty() {
         return Err(resourceck_result.diagnostics);

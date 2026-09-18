@@ -1,0 +1,29 @@
+// A `defer` may never capture an observation alias (`rfcs/0013`).
+//
+// A deferred action runs at its *enclosing scope's* exit, which is
+// strictly later than the end of the observation block it was written
+// in. By the time `inspect` actually ran, `view` would name nothing.
+//
+// Rejected however the capture is written -- directly, through a field,
+// or through any compound expression -- because the question is asked
+// of every place the deferred expression reaches.
+resource File {
+    descriptor: i64
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func watch(take file: File) -> i64 {
+    observe file as view {
+        defer inspect(view);
+    }
+
+    drop file;
+    return 0;
+}
+
+func main() -> i64 {
+    return watch(File { descriptor: 3 });
+}

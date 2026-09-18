@@ -75,6 +75,8 @@ pub fn lower_module(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -89,6 +91,8 @@ pub fn lower_module(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
         interner,
         source,
         ModulePathMode::SingleFile,
@@ -116,6 +120,8 @@ pub fn lower_module_with_paths(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
@@ -131,6 +137,8 @@ pub fn lower_module_with_paths(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
         interner,
         source,
         ModulePathMode::Project(module_path_of),
@@ -149,6 +157,8 @@ fn lower_module_impl(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
     module_path_mode: ModulePathMode<'_>,
@@ -402,6 +412,8 @@ fn lower_module_impl(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -818,6 +830,25 @@ struct Lowering<'a> {
     /// (`rfcs/0011`), keyed by that exact call expression's own
     /// `ExprId` -- see `resourceck::CheckedDeferPlan`.
     defer_plans: &'a BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    /// `resourceck`'s own checked observations (`rfcs/0013`), by stable
+    /// identity -- the canonical observed place, the alias, the
+    /// resolved type and the body scope. Lowering builds every
+    /// `observe.place` from this and nothing else: it never re-resolves
+    /// which place an `observe` statement names, whether that place was
+    /// legal to observe, or where the scope ends.
+    ///
+    /// An observation absent here is one the checker rejected. Lowering
+    /// only ever runs on a module whose resource check produced no
+    /// diagnostics, so reaching a rejected observation is a genuine
+    /// internal inconsistency between the two stages and is reported as
+    /// one -- never silently lowered as if it had been accepted.
+    observations: &'a BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    /// Every exit edge's own observation ends (`rfcs/0013`), keyed by
+    /// exactly the same exiting-node id `cleanup_edges` uses, and
+    /// already innermost-first. Replayed by `emit_checked_cleanup`,
+    /// immediately before that same edge's ownership cleanup.
+    observation_exits:
+        &'a BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1352,7 +1383,66 @@ impl<'a> Lowering<'a> {
                 condition, body, ..
             } => self.lower_while(fb, condition, body),
             HirStmt::Loop { body, .. } => self.lower_loop(fb, body),
+            HirStmt::Observe(o) => self.lower_observe(fb, o),
         }
+    }
+
+    /// `observe <place> as <alias> { .. }` (`rfcs/0013`).
+    ///
+    /// Built entirely from `resourceck`'s own [`crate::resourceck::
+    /// CheckedObservation`]: the canonical place, the alias and the
+    /// resolved type all come from there, and the NIR place is then
+    /// independently re-resolved from that checked HIR place through
+    /// the same `resolve_nir_place` every other structural instruction
+    /// uses -- so a disagreement between the two stages is reported as
+    /// an internal error rather than lowered as if neither had noticed.
+    ///
+    /// The scope's own *normal* end is emitted here, structurally,
+    /// after the body block's own cleanup; every early exit already
+    /// emitted its own end through `emit_observation_ends` and left the
+    /// block terminated, which is exactly why this is guarded on the
+    /// block still being open.
+    fn lower_observe(&mut self, fb: &mut FnBuilder, o: &crate::hir::HirObserve) -> LowerResult<()> {
+        let Some(checked) = self.observations.get(&o.id) else {
+            return Err(self.internal_error(&format!(
+                "observation {:?} reached lowering with no checked record from resourceck",
+                o.id
+            )));
+        };
+        if checked.lexical_scope != o.body.id {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked scope disagrees with its own body block",
+                o.id
+            )));
+        }
+        if checked.alias != o.alias {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked alias disagrees with its own statement",
+                o.id
+            )));
+        }
+        let source = checked.source.clone();
+        let checked_ty = checked.ty.clone();
+        let (place, ty) = self.resolve_nir_place(fb, &source)?;
+        if ty != checked_ty {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked type disagrees with its own resolved place type",
+                o.id
+            )));
+        }
+        let view = fb.push_value(
+            ty,
+            ValueKind::ObservePlace {
+                observation: o.id,
+                place,
+            },
+        );
+        fb.local_bindings.insert(o.alias, LocalBinding::Direct(view));
+        self.lower_scoped_block_void(fb, &o.body)?;
+        if !fb.current_terminated() {
+            fb.push_instruction(crate::nir::Instruction::EndObserve { observation: o.id });
+        }
+        Ok(())
     }
 
     /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
@@ -1799,7 +1889,45 @@ impl<'a> Lowering<'a> {
     /// plan for an exit lowering still reached, a structural mismatch
     /// between the two stages -- reported as an internal error, never
     /// silently treated as "nothing to clean up".
+    /// Replays every observation `exit_id` has to end (`rfcs/0013`), in
+    /// `resourceck`'s own already-innermost-first order.
+    ///
+    /// Emitted *before* the ownership cleanup on the same edge, because
+    /// that cleanup is exactly the destruction an active observation
+    /// exists to forbid -- the verifier and the interpreter each reject
+    /// the other order independently, so getting it wrong here is a
+    /// rejected program rather than a silently unsound one.
+    ///
+    /// Every entry is cross-checked against the plan it came from: an
+    /// entry filed under the wrong exit, or naming an observation that
+    /// was never accepted, means the two stages disagree and is an
+    /// internal error rather than something to replay anyway.
+    fn emit_observation_ends(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        let Some(ends) = self.observation_exits.get(&exit_id) else {
+            return Ok(());
+        };
+        for end in ends {
+            if end.exit != exit_id {
+                return Err(self.internal_error(&format!(
+                    "a checked observation end filed under exit {exit_id:?} names exit {:?}",
+                    end.exit
+                )));
+            }
+            if !self.observations.contains_key(&end.observation) {
+                return Err(self.internal_error(&format!(
+                    "exit {exit_id:?} ends observation {:?}, which has no checked record",
+                    end.observation
+                )));
+            }
+            fb.push_instruction(crate::nir::Instruction::EndObserve {
+                observation: end.observation,
+            });
+        }
+        Ok(())
+    }
+
     fn emit_checked_cleanup(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        self.emit_observation_ends(fb, exit_id)?;
         let Some(actions) = self.cleanup_edges.get(&exit_id).cloned() else {
             return Err(self.internal_error(&format!(
                 "exit {exit_id:?} is reachable but resourceck recorded no checked cleanup plan for it"

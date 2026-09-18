@@ -3440,11 +3440,35 @@ impl<'a> Interpreter<'a> {
                 // fresh owning handles thrown away along with the failed
                 // result -- and an identity appearing in two different
                 // fields looked live to each of them in turn.
+                // Every value is checked against the type its *own*
+                // declaration resolves to, before any of them is planned
+                // (`rfcs/0008`, `rfcs/0011`). Counting them is not
+                // enough: a `File` whose one declared field is
+                // `descriptor: i64` used to be constructible out of a
+                // live resource handle, because nothing ever compared
+                // the value with the position it was filling.
+                let declared = self.record_field_types(*item, &type_args)?;
+                if declared.len() != field_ids.len() {
+                    return Err(invalid(
+                        "a runtime construction supplies a field count its declaration does not \
+                         declare",
+                    ));
+                }
+                let supplied = field_ids
+                    .iter()
+                    .map(|id| get(values, id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (value, field_ty) in supplied.iter().zip(declared.iter()) {
+                    let mut seen = HashSet::new();
+                    self.validate_value_against_ty(value, Some(field_ty), &mut seen, 0)?;
+                }
+                // Only now does anything move. Every field is planned
+                // into one shared plan before any of them moves
+                // (`rfcs/0012`).
                 let mut plan = StorePlan::default();
                 let mut fields = Vec::with_capacity(field_ids.len());
-                for id in field_ids {
-                    let value = get(values, id)?;
-                    fields.push(self.plan_transfer(&value, &mut plan, 0)?);
+                for value in &supplied {
+                    fields.push(self.plan_transfer(value, &mut plan, 0)?);
                 }
                 self.commit_transfer(&plan);
                 // A `resource` gets its own unique runtime identity
@@ -3504,11 +3528,30 @@ impl<'a> Interpreter<'a> {
                 // One plan across the whole payload, for the identical
                 // reason `RecordCreate` uses one across the whole field
                 // list.
+                // The active case's own declared payload, substituted,
+                // and checked before anything moves -- for the same
+                // reason `RecordCreate` checks its fields. Resolving it
+                // is also what rejects a case index this variant never
+                // declared.
+                let declared = self.case_payload_types(*variant, &type_args, *case)?;
+                if declared.len() != payload.len() {
+                    return Err(invalid(
+                        "a runtime construction supplies a payload count its active case does not \
+                         declare",
+                    ));
+                }
+                let supplied = payload
+                    .iter()
+                    .map(|id| get(values, id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (value, slot_ty) in supplied.iter().zip(declared.iter()) {
+                    let mut seen = HashSet::new();
+                    self.validate_value_against_ty(value, Some(slot_ty), &mut seen, 0)?;
+                }
                 let mut plan = StorePlan::default();
                 let mut values_out = Vec::with_capacity(payload.len());
-                for id in payload {
-                    let value = get(values, id)?;
-                    values_out.push(self.plan_transfer(&value, &mut plan, 0)?);
+                for value in &supplied {
+                    values_out.push(self.plan_transfer(value, &mut plan, 0)?);
                 }
                 self.commit_transfer(&plan);
                 Ok(Value::Variant {
@@ -12767,5 +12810,619 @@ mod observed_projection_atomicity {
             before,
             "neither attempt mutated anything"
         );
+    }
+}
+
+/// Runtime construction validates every value against the type its
+/// declaration actually resolves to (`rfcs/0008`, `rfcs/0011`,
+/// `rfcs/0012`).
+///
+/// `RecordCreate` and `VariantCreate` used to reach transfer planning
+/// having checked only how *many* values they were handed. A hand-built
+/// module could therefore construct a `File` whose one declared field is
+/// `descriptor: i64` out of a live resource handle: the interpreter
+/// answered `Ok`, transferred ownership into the malformed aggregate,
+/// and left a resource owned by a position that declares a primitive.
+///
+/// The verifier remains the first line of defence. These tests drive the
+/// interpreter directly, because defence in depth is only real if the
+/// stage below refuses the same thing on its own.
+#[cfg(test)]
+mod runtime_construction_validation {
+    use super::*;
+    use crate::nir::{
+        BasicBlock, BlockId, CaseLayout, Function, Instruction, Param, RecordLayout, Terminator,
+        VariantLayout,
+    };
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(180);
+    const SESSION: ItemId = ItemId(181);
+    const BOXY: ItemId = ItemId(182);
+    const PAIR: ItemId = ItemId(183);
+    const MAYBE: ItemId = ItemId(184);
+    const CALLER: ItemId = ItemId(185);
+
+    fn name() -> Symbol {
+        Symbol(0)
+    }
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, name())
+    }
+
+    fn module() -> Module {
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), file_ty())],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name: name(),
+                        type_params: vec![(param, name())],
+                        fields: vec![(name(), Ty::Param(param, name()))],
+                        affine: false,
+                    },
+                ),
+                (
+                    PAIR,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::I64), (name(), Ty::Bool)],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name: name(),
+                    type_params: vec![(param, name())],
+                    cases: vec![
+                        CaseLayout {
+                            name: name(),
+                            payload: vec![Ty::Param(param, name())],
+                        },
+                        CaseLayout {
+                            name: name(),
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// A function whose single `take` parameter is `param_ty`, whose body
+    /// is exactly one construction of `kind`, and which returns it.
+    fn constructing(param_ty: Ty, result_ty: Ty, kind: ValueKind) -> Function {
+        Function {
+            id: CALLER,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: param_ty,
+                take: true,
+            }],
+            return_type: result_ty.clone(),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(1),
+                    ty: result_ty,
+                    kind,
+                }],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        }
+    }
+
+    /// The same shape, but taking no parameter at all: the construction's
+    /// inputs are constants the body makes for itself.
+    fn constructing_from_consts(
+        consts: Vec<Instruction>,
+        result_ty: Ty,
+        kind: ValueKind,
+        result: u32,
+    ) -> Function {
+        let mut instructions = consts;
+        instructions.push(Instruction::Value {
+            result: ValueId(result),
+            ty: result_ty.clone(),
+            kind,
+        });
+        Function {
+            id: CALLER,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type: result_ty,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(result))),
+            }],
+        }
+    }
+
+    fn int(result: u32, value: u128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value)),
+        }
+    }
+
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(descriptor)])
+    }
+
+    /// Everything a rejected construction must leave exactly as it was.
+    #[derive(Debug, PartialEq)]
+    struct Snapshot {
+        records: usize,
+        fields: Vec<Vec<Value>>,
+        generations: Vec<u64>,
+        statuses: Vec<ResourceStatus>,
+        events: Vec<String>,
+    }
+
+    fn snapshot(interpreter: &Interpreter<'_>) -> Snapshot {
+        let table = interpreter.resources.borrow();
+        Snapshot {
+            records: table.records.len(),
+            fields: table.records.iter().map(|r| r.fields.clone()).collect(),
+            generations: table.records.iter().map(|r| r.generation).collect(),
+            statuses: table.records.iter().map(|r| r.status.clone()).collect(),
+            events: interpreter.event_log(),
+        }
+    }
+
+    /// Runs `function` with `args` and asserts it is refused without
+    /// changing a single observable fact.
+    /// Runs a parameterless `function` whose body ends in one malformed
+    /// construction, and asserts both that it is refused and that the
+    /// refusal left the resources its own earlier instructions legitimately
+    /// created exactly as they were.
+    ///
+    /// Deliberately parameterless: binding a `take` parameter is itself a
+    /// real ownership transfer, so a function that received one would
+    /// legitimately show an advanced generation before the construction
+    /// under test ever ran, and the snapshot could no longer attribute a
+    /// change to the rejection.
+    fn refused(function: Function, expected_resources: usize, what: &str) -> String {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(&function, &[], Vec::new(), Vec::new())
+            .map(|_| ())
+            .err()
+            .unwrap_or_else(|| panic!("{what}: the interpreter accepted a malformed construction"));
+        let after = snapshot(&interpreter);
+        assert_eq!(
+            after.records, expected_resources,
+            "{what}: a rejected construction creates no new runtime resource"
+        );
+        assert!(
+            after.generations.iter().all(|generation| *generation == 0),
+            "{what}: a rejected construction advances no generation, got {:?}",
+            after.generations
+        );
+        assert!(
+            after
+                .statuses
+                .iter()
+                .all(|status| *status == ResourceStatus::Alive),
+            "{what}: a rejected construction destroys nothing"
+        );
+        assert!(
+            after
+                .fields
+                .iter()
+                .flatten()
+                .all(|field| !matches!(field, Value::Moved | Value::Dropped)),
+            "{what}: a rejected construction moves no field out of anything"
+        );
+        format!("{error:?}")
+    }
+
+    /// Builds a valid `File` in `%result`, from a constant in
+    /// `%result - 1`, as a prefix every "now feed it somewhere illegal"
+    /// test shares.
+    fn valid_file(descriptor: u128, konst: u32, result: u32) -> Vec<Instruction> {
+        vec![
+            int(konst, descriptor),
+            Instruction::Value {
+                result: ValueId(result),
+                ty: file_ty(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(konst)]),
+            },
+        ]
+    }
+
+    /// The reported defect: a live resource handed to a field whose
+    /// declared type is `i64`.
+    #[test]
+    fn a_resource_cannot_fill_a_field_declared_as_a_primitive() {
+        let function = constructing_from_consts(
+            valid_file(3, 0, 1),
+            file_ty(),
+            ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(1)]),
+            2,
+        );
+        let error = refused(function, 1, "a resource in an `i64` field");
+        assert!(
+            error.contains("different kind") || error.contains("owns nothing"),
+            "the rejection names the disagreement, got {error}"
+        );
+    }
+
+    /// The mirror image: a primitive where a resource is declared.
+    #[test]
+    fn a_primitive_cannot_fill_a_field_declared_as_a_resource() {
+        let function = constructing_from_consts(
+            vec![int(0, 5)],
+            Ty::Named(SESSION, name()),
+            ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(0)]),
+            1,
+        );
+        refused(function, 0, "an `i64` in a `File` field");
+    }
+
+    /// A resource of the wrong declaration, where the field's own
+    /// resource type is a different one entirely.
+    #[test]
+    fn a_resource_of_the_wrong_declaration_cannot_fill_a_resource_field() {
+        // `%2` is a valid `File`; `%3` is a valid `Session` owning it.
+        // `Session`'s own field is declared `File`, so handing it that
+        // `Session` is a resource of an entirely different declaration.
+        let mut body = valid_file(1, 0, 1);
+        body.push(Instruction::Value {
+            result: ValueId(2),
+            ty: Ty::Named(SESSION, name()),
+            kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(1)]),
+        });
+        let function = constructing_from_consts(
+            body,
+            Ty::Named(SESSION, name()),
+            ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(2)]),
+            3,
+        );
+        // The inner `File` legitimately moved into the `Session` before
+        // the malformed construction ran, so this one asserts the
+        // rejection directly rather than through the shared helper.
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let error = interpreter
+            .call_function(&function, &[], Vec::new(), Vec::new())
+            .map(|_| ())
+            .expect_err("a `Session` is not a `File`, however alike their shapes are");
+        assert!(
+            format!("{error:?}").contains("different"),
+            "the rejection names the disagreement, got {error:?}"
+        );
+        let after = snapshot(&interpreter);
+        assert_eq!(
+            after.records, 2,
+            "the two legitimate resources exist; the malformed one was never created"
+        );
+        assert!(
+            after
+                .statuses
+                .iter()
+                .all(|status| *status == ResourceStatus::Alive),
+            "and neither of them was destroyed"
+        );
+        assert_eq!(
+            after.generations[1], 0,
+            "the `Session` never moved: the construction that would have taken it was refused"
+        );
+    }
+
+    /// Too few values for the declaration's own field list.
+    #[test]
+    fn a_record_cannot_be_built_with_the_wrong_arity() {
+        let function = constructing_from_consts(
+            vec![int(0, 1)],
+            Ty::Named(PAIR, name()),
+            ValueKind::RecordCreate(PAIR, Vec::new(), vec![ValueId(0)]),
+            1,
+        );
+        refused(function, 0, "a two-field record built from one value");
+    }
+
+    /// A value of the wrong kind in the *second* field, so the first one
+    /// has already been checked when the disagreement is found.
+    #[test]
+    fn a_later_field_of_the_wrong_kind_is_still_refused() {
+        let function = constructing_from_consts(
+            vec![int(0, 1), int(1, 2)],
+            Ty::Named(PAIR, name()),
+            ValueKind::RecordCreate(PAIR, Vec::new(), vec![ValueId(0), ValueId(1)]),
+            2,
+        );
+        refused(function, 0, "an `i64` where `bool` is declared");
+    }
+
+    /// A payload handed to a case that declares none.
+    #[test]
+    fn a_payload_cannot_be_given_to_a_payload_less_case() {
+        let function = constructing_from_consts(
+            vec![int(0, 1)],
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 1,
+                type_args: vec![Ty::I64],
+                payload: vec![ValueId(0)],
+            },
+            1,
+        );
+        refused(function, 0, "a payload on a payload-less case");
+    }
+
+    /// A case that declares a payload, built without one.
+    #[test]
+    fn a_required_payload_cannot_be_omitted() {
+        let function = constructing_from_consts(
+            Vec::new(),
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 0,
+                type_args: vec![Ty::I64],
+                payload: Vec::new(),
+            },
+            0,
+        );
+        refused(function, 0, "a missing required payload");
+    }
+
+    /// A payload of the wrong type for the case's own substitution.
+    #[test]
+    fn a_payload_of_the_wrong_type_is_refused() {
+        let function = constructing_from_consts(
+            valid_file(4, 0, 1),
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 0,
+                type_args: vec![Ty::I64],
+                payload: vec![ValueId(1)],
+            },
+            2,
+        );
+        refused(function, 1, "a resource payload where `i64` is substituted");
+    }
+
+    /// A case index the declaration does not have.
+    #[test]
+    fn an_unknown_variant_case_is_refused() {
+        let function = constructing_from_consts(
+            Vec::new(),
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 7,
+                type_args: vec![Ty::I64],
+                payload: Vec::new(),
+            },
+            0,
+        );
+        refused(function, 0, "a case the variant does not declare");
+    }
+
+    /// The generic field, filled correctly: `Box[File]` really may hold a
+    /// `File`, and the construction must still succeed.
+    #[test]
+    fn a_generic_field_accepts_its_own_substitution() {
+        let function = constructing_from_consts(
+            valid_file(1, 0, 1),
+            Ty::Applied(BOXY, vec![file_ty()]),
+            ValueKind::RecordCreate(BOXY, vec![file_ty()], vec![ValueId(1)]),
+            2,
+        );
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        interpreter
+            .call_function(&function, &[], Vec::new(), Vec::new())
+            .expect("`Box[File]` really does accept a `File`");
+    }
+
+    /// The same generic field, filled with something its substitution
+    /// does not permit.
+    #[test]
+    fn a_generic_field_refuses_the_wrong_substitution() {
+        let function = constructing_from_consts(
+            valid_file(2, 0, 1),
+            Ty::Applied(BOXY, vec![Ty::I64]),
+            ValueKind::RecordCreate(BOXY, vec![Ty::I64], vec![ValueId(1)]),
+            2,
+        );
+        refused(function, 1, "a `File` in a `Box[i64]`");
+    }
+
+    /// A malformed aggregate nested one level down: the outer counts are
+    /// right, and only the inner field disagrees.
+    #[test]
+    fn a_nested_malformed_aggregate_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        // A `Box[File]` whose slot actually holds an `i64`, handed to a
+        // position that declares `Box[File]`.
+        let malformed = Value::Record {
+            item: BOXY,
+            type_args: vec![file_ty()],
+            fields: vec![Value::Int(0)],
+        };
+        let function = constructing(
+            Ty::Applied(BOXY, vec![file_ty()]),
+            Ty::Applied(BOXY, vec![Ty::Applied(BOXY, vec![file_ty()])]),
+            ValueKind::RecordCreate(
+                BOXY,
+                vec![Ty::Applied(BOXY, vec![file_ty()])],
+                vec![ValueId(0)],
+            ),
+        );
+        let before = snapshot(&interpreter);
+        interpreter
+            .call_function(&function, &[], vec![malformed], Vec::new())
+            .map(|_| ())
+            .expect_err("the inner disagreement is still a disagreement");
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "and the outer construction changed nothing"
+        );
+    }
+
+    /// A hand-built value that reaches the same resource identity twice
+    /// must be refused rather than transferred twice.
+    #[test]
+    fn a_duplicated_identity_in_one_construction_is_refused() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = new_file(&interpreter, 1);
+        let function = Function {
+            id: CALLER,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: true,
+                },
+                Param {
+                    value: ValueId(1),
+                    ty: file_ty(),
+                    take: true,
+                },
+            ],
+            return_type: Ty::Named(SESSION, name()),
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::Named(SESSION, name()),
+                    kind: ValueKind::RecordCreate(SESSION, Vec::new(), vec![ValueId(0)]),
+                }],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        };
+        let result = interpreter.call_function(
+            &function,
+            &[],
+            vec![Value::Resource(file), Value::Resource(file)],
+            Vec::new(),
+        );
+        assert!(
+            result.is_err(),
+            "one identity bound twice is a duplicate, not two resources"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records.len(),
+            1,
+            "and the refusal created no new resource"
+        );
+    }
+
+    /// The whole point of the exercise: a well-formed construction still
+    /// succeeds, for a record, a resource and a variant alike.
+    #[test]
+    fn well_formed_constructions_still_succeed() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+
+        // A plain record.
+        let pair = constructing_from_consts(
+            vec![
+                int(0, 1),
+                Instruction::Value {
+                    result: ValueId(1),
+                    ty: Ty::Bool,
+                    kind: ValueKind::Const(Const::Bool(true)),
+                },
+            ],
+            Ty::Named(PAIR, name()),
+            ValueKind::RecordCreate(PAIR, Vec::new(), vec![ValueId(0), ValueId(1)]),
+            2,
+        );
+        interpreter
+            .call_function(&pair, &[], Vec::new(), Vec::new())
+            .expect("a well-formed `Pair` is still constructible");
+
+        // A resource.
+        let file = constructing_from_consts(
+            vec![int(0, 9)],
+            file_ty(),
+            ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
+            1,
+        );
+        interpreter
+            .call_function(&file, &[], Vec::new(), Vec::new())
+            .expect("a well-formed `File` is still constructible");
+
+        // A variant, both cases.
+        let some = constructing_from_consts(
+            vec![int(0, 3)],
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 0,
+                type_args: vec![Ty::I64],
+                payload: vec![ValueId(0)],
+            },
+            1,
+        );
+        interpreter
+            .call_function(&some, &[], Vec::new(), Vec::new())
+            .expect("a well-formed `Maybe[i64]::Some` is still constructible");
+        let none = constructing_from_consts(
+            Vec::new(),
+            Ty::Applied(MAYBE, vec![Ty::I64]),
+            ValueKind::VariantCreate {
+                variant: MAYBE,
+                case: 1,
+                type_args: vec![Ty::I64],
+                payload: Vec::new(),
+            },
+            0,
+        );
+        interpreter
+            .call_function(&none, &[], Vec::new(), Vec::new())
+            .expect("a well-formed `Maybe[i64]::None` is still constructible");
     }
 }

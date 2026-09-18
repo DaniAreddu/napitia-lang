@@ -331,6 +331,543 @@ mod tests {
         diagnostics.iter().map(|d| d.code).collect()
     }
 
+    /// `rfcs/0013` -- lexically scoped observations, at the grain the
+    /// resource checker actually decides them: which places are frozen,
+    /// which are untouched, where every scope ends, and what an alias
+    /// may never be used for.
+    mod observations {
+        use super::{check, check_result, check_result_rejecting};
+
+        const PRELUDE: &str = "\
+            resource File { descriptor: i64 }\n\
+            resource Session { left: File, right: File }\n\
+            record Holder { item: File, count: i64 }\n\
+            variant Maybe { Some(File), None }\n\
+            func inspect(file: File) -> i64 { return file.descriptor; }\n\
+            func peek(session: Session) -> i64 { return inspect(session.left); }\n\
+            func sink(take file: File) -> i64 { drop file; return 1; }\n\
+            func swallow(take session: Session) -> i64 { drop session; return 1; }\n\
+            func hold(take holder: Holder) -> i64 { drop holder; return 1; }\n";
+
+        fn codes(text: &str) -> Vec<String> {
+            check(&format!("{PRELUDE}{text}"))
+                .iter()
+                .map(|d| d.code.to_string())
+                .collect()
+        }
+
+        fn accepted(text: &str) {
+            let codes = codes(text);
+            assert!(codes.is_empty(), "unexpected diagnostics: {codes:?}");
+        }
+
+        fn rejected_with(text: &str, code: &str) {
+            let codes = codes(text);
+            assert_eq!(codes, vec![code], "unexpected diagnostics: {codes:?}");
+        }
+
+        // -- straight line, nesting, repetition -----------------------
+
+        #[test]
+        fn a_straight_line_scope_releases_its_owner() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn nested_scopes_release_from_the_inside_out() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as outer { observe outer as inner { n = inspect(inner); } }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn repeated_sequential_observations_of_one_place_are_legal() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as a { n = inspect(a); }\n\
+                   observe file as b { n = n + inspect(b); }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn overlapping_observations_are_all_legal_because_all_are_read_only() {
+            accepted(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session as whole {\n\
+                     observe session.left as part { n = inspect(part) + peek(whole); }\n\
+                   }\n\
+                   return n + swallow(session);\n\
+                 }",
+            );
+        }
+
+        // -- overlap ---------------------------------------------------
+
+        #[test]
+        fn a_disjoint_sibling_field_stays_movable() {
+            accepted(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session.left as view {\n\
+                     n = inspect(view) + sink(session.right);\n\
+                   }\n\
+                   drop session.left;\n\
+                   return n;\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn a_disjoint_sibling_may_itself_be_observed() {
+            accepted(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session.left as a {\n\
+                     observe session.right as b { n = inspect(a) + inspect(b); }\n\
+                   }\n\
+                   return n + swallow(session);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn moving_the_exact_observed_place_is_rejected() {
+            rejected_with(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session.left as view { n = sink(session.left); }\n\
+                   return n;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn moving_an_ancestor_of_the_observed_place_is_rejected() {
+            rejected_with(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session.left as view { n = swallow(session); }\n\
+                   return n;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn dropping_an_ancestor_of_the_observed_place_is_rejected() {
+            rejected_with(
+                "func f(take session: Session) -> i64 {\n\
+                   observe session.left as view { drop session; }\n\
+                   return 0;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn moving_a_descendant_of_the_observed_place_is_rejected() {
+            rejected_with(
+                "func f(take holder: Holder) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe holder as view { n = sink(holder.item); }\n\
+                   return n;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn overwriting_an_observed_place_is_rejected() {
+            rejected_with(
+                "func f(take session: Session, take other: File) -> i64 {\n\
+                   observe session.left as view { session.left = other; }\n\
+                   return 0;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn decomposing_an_observed_variant_is_rejected() {
+            rejected_with(
+                "func f(take maybe: Maybe) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe maybe as view {\n\
+                     n = match maybe { Some(file) => sink(file), None => 0 };\n\
+                   }\n\
+                   return n;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn one_conflicting_operation_reports_exactly_one_diagnostic() {
+            // A nested aggregate has several affine descendants; the
+            // rejection must name the operation once, not once per
+            // field reachable through it.
+            let codes = codes(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session as view { n = swallow(session); }\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(codes, vec!["U0017"]);
+        }
+
+        #[test]
+        fn a_non_affine_field_of_an_observed_aggregate_is_still_readable() {
+            accepted(
+                "func f(take holder: Holder) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe holder as view { n = holder.count + inspect(view.item); }\n\
+                   return n + hold(holder);\n\
+                 }",
+            );
+        }
+
+        // -- the alias -------------------------------------------------
+
+        #[test]
+        fn passing_the_alias_to_an_ordinary_parameter_is_legal() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn passing_the_alias_to_a_take_parameter_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = sink(view); }\n\
+                   return n;\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn dropping_the_alias_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as view { drop view; }\n\
+                   return sink(file);\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn returning_the_alias_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> File {\n\
+                   observe file as view { return view; }\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn a_field_reached_through_the_alias_is_equally_unownable() {
+            rejected_with(
+                "func f(take session: Session) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe session as view { n = sink(view.left); }\n\
+                   return n;\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn storing_the_alias_into_an_aggregate_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as view {\n\
+                     value boxed = Holder { item: view, count: 1 };\n\
+                     drop boxed;\n\
+                   }\n\
+                   return sink(file);\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn a_defer_capturing_the_alias_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as view { defer inspect(view); }\n\
+                   return sink(file);\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn a_defer_capturing_the_alias_through_a_field_is_rejected() {
+            rejected_with(
+                "func f(take session: Session) -> i64 {\n\
+                   observe session as view { defer inspect(view.left); }\n\
+                   return swallow(session);\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn a_defer_that_does_not_mention_the_alias_stays_legal() {
+            accepted(
+                "func f(take file: File, other: File) -> i64 {\n\
+                   observe file as view {\n\
+                     defer inspect(other);\n\
+                     value n = inspect(view);\n\
+                   }\n\
+                   return sink(file);\n\
+                 }",
+            );
+        }
+
+        // -- exits ------------------------------------------------------
+
+        #[test]
+        fn a_return_inside_the_scope_ends_it_exactly_once() {
+            let result = check_result(&format!(
+                "{PRELUDE}func f(take file: File) -> i64 {{\n\
+                   observe file as view {{ return inspect(view); }}\n\
+                 }}"
+            ));
+            assert!(result.diagnostics.is_empty());
+            assert_eq!(result.observations.len(), 1);
+            let ends: usize = result.observation_exits.values().map(|v| v.len()).sum();
+            assert_eq!(ends, 1, "exactly one recorded end edge for one `return`");
+        }
+
+        #[test]
+        fn break_ends_only_the_observations_opened_inside_the_loop() {
+            let result = check_result(&format!(
+                "{PRELUDE}func f(take file: File) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe file as outer {{\n\
+                     loop {{\n\
+                       observe outer as inner {{ n = inspect(inner); break; }}\n\
+                     }}\n\
+                   }}\n\
+                   return n + sink(file);\n\
+                 }}"
+            ));
+            assert!(
+                result.diagnostics.is_empty(),
+                "unexpected diagnostics: {:?}",
+                result.diagnostics
+            );
+            // The `break` leaves only the inner scope: the outer one is
+            // still active after the loop and must not be ended here.
+            let ends: Vec<usize> = result
+                .observation_exits
+                .values()
+                .map(|entry| entry.len())
+                .collect();
+            assert_eq!(ends, vec![1]);
+        }
+
+        #[test]
+        fn a_continue_inside_the_scope_ends_it() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   while n < 3 {\n\
+                     observe file as view { n = n + inspect(view); continue; }\n\
+                   }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn an_observation_in_one_branch_does_not_leak_into_its_sibling() {
+            // The `then` branch opens a scope over `file`; the `else`
+            // branch moves `file` away. If the observation leaked past
+            // its own branch, the sibling's move would be rejected --
+            // and if it leaked past the join, the drop after it would
+            // be too.
+            accepted(
+                "func f(take file: File, flag: bool) -> i64 {\n\
+                   mutable n = 0;\n\
+                   if flag {\n\
+                     observe file as view { n = inspect(view); }\n\
+                     n = n + sink(file);\n\
+                   } else {\n\
+                     n = sink(file);\n\
+                   }\n\
+                   return n;\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn an_observation_in_one_branch_does_not_freeze_the_join() {
+            accepted(
+                "func f(take file: File, flag: bool) -> i64 {\n\
+                   mutable n = 0;\n\
+                   if flag {\n\
+                     observe file as view { n = inspect(view); }\n\
+                   } else {\n\
+                     n = 1;\n\
+                   }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn the_owner_is_usable_again_after_the_scope_ends() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn a_loop_carried_observation_is_opened_and_closed_each_iteration() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   while n < 3 { observe file as view { n = n + inspect(view); } }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        // -- sources ----------------------------------------------------
+
+        #[test]
+        fn observing_an_already_moved_place_reports_the_move_not_the_observation() {
+            let codes = codes(
+                "func f(take file: File) -> i64 {\n\
+                   value n = sink(file);\n\
+                   observe file as view { }\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(codes, vec!["U0001"]);
+        }
+
+        #[test]
+        fn observing_a_partially_moved_aggregate_as_a_whole_is_rejected() {
+            let codes = codes(
+                "func f(take session: Session) -> i64 {\n\
+                   value n = sink(session.left);\n\
+                   observe session as view { }\n\
+                   drop session;\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(codes, vec!["U0014"]);
+        }
+
+        #[test]
+        fn observing_an_ordinary_parameters_own_observation_is_legal() {
+            accepted(
+                "func f(file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   return n;\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn an_observation_of_an_observation_still_cannot_be_owned() {
+            rejected_with(
+                "func f(file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = sink(view); }\n\
+                   return n;\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn a_reversed_declaration_order_checks_identically() {
+            // The place's identity is structural, not positional: the
+            // same program with its two resource fields declared the
+            // other way round must be accepted on exactly the same
+            // terms.
+            let forward = check(&format!(
+                "{PRELUDE}func f(take session: Session) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe session.right as view {{ n = inspect(view) + sink(session.left); }}\n\
+                   drop session.right;\n\
+                   return n;\n\
+                 }}"
+            ));
+            assert!(forward.is_empty(), "unexpected diagnostics: {forward:?}");
+        }
+
+        #[test]
+        fn a_checked_observation_records_its_exact_place_and_scope() {
+            let result = check_result(&format!(
+                "{PRELUDE}func f(take session: Session) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe session.left as view {{ n = inspect(view); }}\n\
+                   return n + swallow(session);\n\
+                 }}"
+            ));
+            assert!(result.diagnostics.is_empty());
+            assert_eq!(result.observations.len(), 1);
+            let observation = result.observations.values().next().expect("one recorded");
+            assert_eq!(
+                observation.source.projections.len(),
+                1,
+                "the recorded place must be the field itself, never its root"
+            );
+        }
+
+        #[test]
+        fn a_rejected_observation_records_no_checked_metadata_at_all() {
+            let result = check_result_rejecting(&format!(
+                "{PRELUDE}func f(take session: Session) -> i64 {{\n\
+                   value n = sink(session.left);\n\
+                   observe session as view {{ }}\n\
+                   drop session;\n\
+                   return n;\n\
+                 }}"
+            ));
+            assert!(!result.diagnostics.is_empty());
+            assert!(
+                result.observations.is_empty(),
+                "a rejected observation must not reach lowering as if it had been accepted"
+            );
+        }
+    }
+
     /// Like [`check`], but returns the whole [`ResourceCheckResult`]
     /// rather than only its diagnostics -- for tests that need to
     /// directly inspect `consume_sites`/`defer_plans` themselves,
@@ -379,6 +916,49 @@ mod tests {
             result.diagnostics
         );
         result
+    }
+
+    /// Like [`check_result`], but for a program this stage is *expected*
+    /// to reject -- so a test can assert what a rejected program leaves
+    /// behind (which must be nothing a later stage could mistake for an
+    /// accepted decision).
+    fn check_result_rejecting(text: &str) -> ResourceCheckResult {
+        let mut map = SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(map.get(id).content(), id, &mut interner);
+        assert!(
+            lex_diags.is_empty(),
+            "unexpected lexer diagnostics: {lex_diags:?}"
+        );
+        let (module, parse_diags) = Parser::new(tokens, id, &mut interner).parse_module();
+        assert!(
+            parse_diags.is_empty(),
+            "unexpected parser diagnostics: {parse_diags:?}"
+        );
+        let (hir, resolve_diags) = lower_module(&module, id, &interner);
+        assert!(
+            resolve_diags.is_empty(),
+            "unexpected resolve diagnostics: {resolve_diags:?}"
+        );
+        let typeck_result = typeck::check_module(&hir, id, &interner, typeck::EntryMain::ByName);
+        assert!(
+            typeck_result.diagnostics.is_empty(),
+            "unexpected typeck diagnostics: {:?}",
+            typeck_result.diagnostics
+        );
+        check_module(
+            &hir,
+            &typeck_result.local_types,
+            &typeck_result.expr_types,
+            &interner,
+            &AffineContext {
+                aggregate_field_types: &typeck_result.aggregate_field_types,
+                declared_resources: &typeck_result.declared_resources,
+                item_type_params: &typeck_result.item_type_params,
+                field_projections: &typeck_result.field_projections,
+            },
+        )
     }
 
     #[test]

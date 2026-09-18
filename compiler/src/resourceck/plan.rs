@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{ExprId, ItemId, LocalId};
+use crate::hir::{ExprId, ItemId, LocalId, ObservationId};
 use crate::place::Place;
+use crate::source::Span;
 use crate::types::Ty;
 
 /// Whether one specific expression's own value, at the exact syntactic
@@ -90,6 +91,48 @@ pub enum CleanupAction {
     Defer(ExprId),
 }
 
+/// One accepted `observe <place> as <alias> { .. }` statement, exactly
+/// as `super::flow` checked it (`rfcs/0013`) -- `nir::lower` builds its
+/// `observe.place`/`end.observe` instructions from this and nothing
+/// else, rather than re-deriving the place, the alias or the scope from
+/// the statement's own syntax a second time.
+///
+/// Recorded only for an observation that actually passed every check.
+/// A rejected one contributes no entry at all, which is what stops a
+/// malformed observation from reaching lowering as apparently-valid
+/// metadata.
+#[derive(Debug, Clone)]
+pub struct CheckedObservation {
+    pub id: ObservationId,
+    /// The exact canonical place observed (`rfcs/0012`'s shared
+    /// representation) -- `session`, or `session.input`, never merely
+    /// its root.
+    pub source: Place<LocalId>,
+    pub alias: LocalId,
+    /// The observed place's own resolved type, which is also the
+    /// alias's type and the `observe.place` instruction's own result
+    /// type.
+    pub ty: Ty,
+    /// The lexical scope this observation is active for: its body
+    /// block's own stable [`ExprId`].
+    pub lexical_scope: ExprId,
+    /// The `observe` keyword's own span, for a diagnostic that needs to
+    /// point at where an observation began.
+    pub begin: Span,
+}
+
+/// One observation's own end on one specific exit edge (`rfcs/0013`).
+///
+/// `exit` always equals the [`ResourceCheckResult::observation_exits`]
+/// key this entry is stored under; carrying it redundantly here is
+/// deliberate, so `nir::lower` can cross-check the two and reject a
+/// plan that disagrees with itself rather than replaying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationExit {
+    pub observation: ObservationId,
+    pub exit: ExprId,
+}
+
 /// The resource checker's complete, authoritative analysis of one HIR
 /// module (`rfcs/0011`). `nir::lower` treats `cleanup_edges` as the
 /// single source of truth for every resource cleanup decision it makes:
@@ -125,4 +168,20 @@ pub struct ResourceCheckResult {
     /// that exact call expression's own [`ExprId`] -- see
     /// [`CheckedDeferPlan`].
     pub defer_plans: BTreeMap<ExprId, CheckedDeferPlan>,
+    /// Every *accepted* observation this module declares, by stable
+    /// identity (`rfcs/0013`) -- see [`CheckedObservation`].
+    pub observations: BTreeMap<ObservationId, CheckedObservation>,
+    /// Every exit edge that must end one or more observations, keyed by
+    /// the stable [`ExprId`] of whatever HIR node *is* that exit --
+    /// exactly the same keying `cleanup_edges` uses, so `nir::lower`
+    /// looks both up at the same point with the same id.
+    ///
+    /// Each list is **innermost first**: the observation opened last is
+    /// ended first, which is the only order that keeps a nested
+    /// observation from outliving the one it was opened inside. An
+    /// absent key means that exit ends no observation at all -- never
+    /// "unknown": an exit that is reachable but ends nothing simply has
+    /// no entry, exactly like an exit with nothing to clean up records
+    /// an empty `cleanup_edges` list.
+    pub observation_exits: BTreeMap<ExprId, Vec<ObservationExit>>,
 }

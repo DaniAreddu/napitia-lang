@@ -1,4 +1,6 @@
-//! The affine resource state machine (`rfcs/0011`).
+//! The affine resource state machine (`rfcs/0011`, `rfcs/0013`).
+
+use crate::hir::ObservationId;
 
 /// One resource-typed local binding's own current ownership state,
 /// tracked per [`crate::hir::LocalId`] by `super::flow`.
@@ -44,4 +46,45 @@ impl ResourceState {
             ResourceState::Error
         }
     }
+}
+
+/// One structural place's own *complete* current status at a point in
+/// the walk (`rfcs/0013`): [`ResourceState`]'s own recorded transition,
+/// plus the two facts that are never recorded as a transition at all --
+/// whether the place is partially moved (derived structurally from its
+/// own descendants, `rfcs/0012`), and which observations are currently
+/// holding it.
+///
+/// Deliberately a *query* result rather than a second state map:
+/// `Observed` is not something a place is put into and later taken out
+/// of, it is a fact about the lexically enclosing observation scopes at
+/// this exact point, and `PartiallyMoved` is a fact about descendants.
+/// Recording either as a stored `ResourceState` would make both
+/// path-insensitive and would need a second, separately-fallible
+/// "put it back" transition on every exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceStatus {
+    /// Owned, live, whole, and held by no observation: every ownership
+    /// operation is available.
+    Available,
+    /// Owned and live, but one or more affine descendants have already
+    /// been moved or dropped out of it (`rfcs/0012`). Usable for an
+    /// unaffected sibling, a reinitialization, or structural cleanup --
+    /// never as one whole value.
+    PartiallyMoved,
+    /// Ownership transferred elsewhere.
+    Moved,
+    /// Registered with a `defer` that has not yet run.
+    DropScheduled,
+    /// Destroyed.
+    Dropped,
+    /// Held by at least one currently-active observation whose own
+    /// place overlaps this one (`rfcs/0013`) -- innermost last, in the
+    /// exact order the scopes were opened, so a diagnostic naming "the
+    /// observation holding this" always names the same one for the same
+    /// program. Reading stays legal; every ownership operation does not,
+    /// until every listed observation has ended.
+    Observed(Vec<ObservationId>),
+    /// See [`ResourceState::Error`].
+    Error,
 }

@@ -36,7 +36,49 @@ Options:
 /// opposed to a compilation error reported through diagnostics (`1`).
 const USAGE_ERROR: u8 = 2;
 
+/// Exit code a panic leaves behind, matching what the process would
+/// have exited with had the panic unwound out of `main` itself. The
+/// panic hook has already printed the message by the time this is
+/// used; re-panicking here would only print a second, less useful one.
+const PANIC_EXIT: u8 = 101;
+
+/// The stack the compiler and interpreter actually run on.
+///
+/// Every stage recurses on the native stack, and the interpreter
+/// recurses once per Napitia call frame, so the binding constraint on
+/// what this compiler can accept is whatever stack the platform
+/// happens to hand the main thread -- 1 MiB on Windows, which a debug
+/// build exhausts after roughly 25 interpreted frames. That is not a
+/// limit worth having, and it fails in the worst possible way: the
+/// process aborts, with no diagnostic, no exit code anything can act
+/// on and nothing on stderr.
+///
+/// Sizing it here makes the limit this compiler's own choice instead,
+/// and the one that actually applies is
+/// `crate::limits::MAX_CALL_DEPTH`, which reports an ordinary runtime
+/// error. This is provisioned to outlast that budget with room to
+/// spare: 512 frames of a debug build measure well under a quarter of
+/// it. It is a *reservation*, not an allocation -- pages are committed
+/// as they are touched, so an ordinary compile pays for none of it.
+const WORKER_STACK_BYTES: usize = 128 * 1024 * 1024;
+
+/// Runs the CLI on a thread whose stack this compiler sizes itself
+/// ([`WORKER_STACK_BYTES`]), falling back to the caller's own thread if
+/// one cannot be spawned -- a smaller stack is still better than
+/// refusing to run at all.
 pub fn run(args: Vec<String>) -> ExitCode {
+    let fallback = args.clone();
+    match std::thread::Builder::new()
+        .name("napitia".to_string())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || dispatch(args))
+    {
+        Ok(worker) => worker.join().unwrap_or(ExitCode::from(PANIC_EXIT)),
+        Err(_) => dispatch(fallback),
+    }
+}
+
+fn dispatch(args: Vec<String>) -> ExitCode {
     let mut args = args.into_iter().skip(1);
 
     match args.next().as_deref() {

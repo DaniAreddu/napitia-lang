@@ -1,7 +1,7 @@
 //! The affine resource state machine (`rfcs/0011`).
 
 /// One resource-typed local binding's own current ownership state,
-/// tracked per [`crate::hir::LocalId`] by [`super::flow`].
+/// tracked per [`crate::hir::LocalId`] by `super::flow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceState {
     /// Owned, live: safe to read, move, drop, or observe.

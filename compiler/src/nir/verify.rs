@@ -7398,23 +7398,23 @@ fn consumed_places(
             ValueKind::PlaceRead {
                 place,
                 mode: crate::nir::OwnershipMode::Transfer,
-            } => out.push((canonical(place), *result, "moved out of")),
+            } => out.push((canonical(place), *result, "moves out of")),
             ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
                 if is_affine(*source) {
-                    out.push((root(*source), *result, "moved out of"));
+                    out.push((root(*source), *result, "moves out of"));
                 }
             }
             ValueKind::RecordCreate(_, _, fields) => {
                 for field in fields {
                     if is_affine(*field) {
-                        out.push((root(*field), *result, "consumed into an aggregate by"));
+                        out.push((root(*field), *result, "consumes into an aggregate"));
                     }
                 }
             }
             ValueKind::VariantCreate { payload, .. } => {
                 for field in payload {
                     if is_affine(*field) {
-                        out.push((root(*field), *result, "consumed into an aggregate by"));
+                        out.push((root(*field), *result, "consumes into an aggregate"));
                     }
                 }
             }
@@ -7422,7 +7422,7 @@ fn consumed_places(
                 let take = known_functions.get(callee).map(|f| f.take.as_slice());
                 for (index, arg) in args.iter().enumerate() {
                     if is_affine(*arg) && argument_transfers(take, args.len(), index) {
-                        out.push((root(*arg), *result, "passed to a `take` parameter by"));
+                        out.push((root(*arg), *result, "passes to a `take` parameter"));
                     }
                 }
             }
@@ -7430,27 +7430,27 @@ fn consumed_places(
         },
         Instruction::Store { slot, value, mode } => {
             if *mode == crate::nir::OwnershipMode::Transfer && is_affine(*value) {
-                out.push((root(*value), *value, "moved out of"));
+                out.push((root(*value), *value, "moves out of"));
             }
             // The write itself discards whatever the slot held, in
             // either mode -- the mode describes the incoming value, not
             // what the store overwrites.
             if is_affine(*slot) {
-                out.push((Place::root(*slot), *slot, "overwritten by"));
+                out.push((Place::root(*slot), *slot, "overwrites"));
             }
         }
         Instruction::Drop { value } => {
             if is_affine(*value) {
-                out.push((root(*value), *value, "dropped by"));
+                out.push((root(*value), *value, "drops"));
             }
         }
         Instruction::DecomposeVariant { value, .. } => {
-            out.push((root(*value), *value, "decomposed by"));
+            out.push((root(*value), *value, "decomposes"));
         }
         Instruction::StorePlace { place, value } => {
-            out.push((canonical(place), *value, "reinitialized by"));
+            out.push((canonical(place), *value, "reinitializes"));
             if is_affine(*value) {
-                out.push((root(*value), *value, "moved out of"));
+                out.push((root(*value), *value, "moves out of"));
             }
         }
         Instruction::EndObserve { .. } => {}
@@ -7538,8 +7538,8 @@ fn observation_transfer(
                     index,
                     codes::OWNERSHIP_WHILE_OBSERVED,
                     format!(
-                        "function `{function_name}`: %{} names a place {what} it while \
-                         observation @obs{} is still holding it",
+                        "function `{function_name}`: %{} {what} a place observation @obs{} is \
+                         still holding",
                         reporter.0, id.0
                     ),
                 );
@@ -7618,7 +7618,7 @@ fn observation_transfer(
                 terminator_consumes.push((
                     Place::root(origin(*scrutinee)),
                     *scrutinee,
-                    "decomposed by",
+                    "decomposes",
                 ));
             }
         }
@@ -7629,7 +7629,7 @@ fn observation_transfer(
                     terminator_consumes.push((
                         Place::root(origin(*arg)),
                         *arg,
-                        "passed to a `take` parameter by",
+                        "passes to a `take` parameter",
                     ));
                 }
             }
@@ -7646,8 +7646,8 @@ fn observation_transfer(
                 after_all,
                 codes::OWNERSHIP_WHILE_OBSERVED,
                 format!(
-                    "function `{function_name}`: %{} names a place {what} it while observation \
-                     @obs{} is still holding it",
+                    "function `{function_name}`: %{} {what} a place observation @obs{} is still \
+                     holding",
                     reporter.0, id.0
                 ),
             );

@@ -542,6 +542,113 @@ fn deeply_nested_expressions_terminate_diagnostically_at_every_stage() {
     }
 }
 
+/// One Napitia call frame is one native interpreter frame, so recursion
+/// used to be bounded by whatever stack the platform handed the main
+/// thread -- roughly 25 frames in a debug build on Windows -- and
+/// exceeding it aborted the process: no diagnostic, no usable exit code,
+/// nothing on stderr, while `check` and `ir` on the very same file
+/// succeeded. Both halves of the repair are asserted here, because
+/// either alone still fails: enough stack to make ordinary recursion
+/// work, and a depth budget so a recursion that never unwinds ends in an
+/// ordinary runtime error rather than further out on the same cliff.
+#[test]
+fn recursion_runs_to_a_real_depth_and_then_reports_rather_than_aborting() {
+    let program = |depth: i64| {
+        format!(
+            "func down(n: i64) -> i64 {{\n\
+             \x20   if n <= 0 {{ return 0; }}\n\
+             \x20   return down(n - 1) + 1;\n\
+             }}\n\
+             func main() -> i64 {{ return down({depth}); }}\n"
+        )
+    };
+    let path = std::env::temp_dir().join(format!("napitia_recursion_{}.npt", std::process::id()));
+
+    // Deep enough that the platform's own default main-thread stack
+    // could not have carried it.
+    std::fs::write(&path, program(400)).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+    let deep = napitia(&["run", &path_str]);
+    assert!(
+        deep.status.success(),
+        "400 frames of ordinary recursion should run: {}",
+        stderr(&deep)
+    );
+    assert_eq!(stdout(&deep).trim(), "400");
+
+    // Past the budget: a runtime error, not an abort.
+    std::fs::write(&path, program(100_000)).expect("failed to write the temp fixture");
+    let over = napitia(&["run", &path_str]);
+    assert_eq!(
+        over.status.code(),
+        Some(1),
+        "a recursion past the budget did not exit with a runtime-error status: {}",
+        stderr(&over)
+    );
+    let err = stderr(&over);
+    assert!(
+        err.contains("call depth exceeded"),
+        "expected the call-depth diagnostic, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+        "the depth budget panicked instead of reporting: {err}"
+    );
+
+    // A recursion that never terminates at all ends the same way, rather
+    // than running until something outside the program stops it.
+    let endless = "func forever(n: i64) -> i64 { return forever(n + 1); }\n\
+                   func main() -> i64 { return forever(0); }\n";
+    std::fs::write(&path, endless).expect("failed to write the temp fixture");
+    let looped = napitia(&["run", &path_str]);
+    assert_eq!(
+        looped.status.code(),
+        Some(1),
+        "an unterminated recursion did not exit with a runtime-error status: {}",
+        stderr(&looped)
+    );
+    assert!(stderr(&looped).contains("call depth exceeded"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `check`, `ir` and `run` must agree about what they accept. A type
+/// nested this deep compiled cleanly and then aborted the process at
+/// run time, which is the sharpest possible form of that disagreement:
+/// two stages said yes and the third did not say anything at all.
+#[test]
+fn a_deeply_nested_generic_value_runs_as_cleanly_as_it_checks() {
+    let depth = 60;
+    let mut source = String::from("resource File { descriptor: i64 }\nrecord Box[T] { item: T }\n");
+    source.push_str("func w0() -> File { return File { descriptor: 1 }; }\n");
+    let mut ty = String::from("File");
+    for level in 1..=depth {
+        source.push_str(&format!(
+            "func w{level}() -> Box[{ty}] {{ return Box[{ty}] {{ item: w{} }}; }}\n",
+            format_args!("{}()", level - 1)
+        ));
+        ty = format!("Box[{ty}]");
+    }
+    source.push_str(&format!(
+        "func main() -> i64 {{\n    value b = w{depth}();\n    return 0;\n}}\n"
+    ));
+
+    let path = std::env::temp_dir().join(format!("napitia_deep_value_{}.npt", std::process::id()));
+    std::fs::write(&path, &source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir", "run"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            output.status.success(),
+            "`{cmd}` failed on a value nested {depth} levels deep: {}",
+            stderr(&output)
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // -- Generics (`rfcs/0008`) ---------------------------------------------
 
 #[test]

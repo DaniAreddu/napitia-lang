@@ -3455,6 +3455,29 @@ impl<'a> Interpreter<'a> {
                 }
             }
 
+            // A frame may never leave with an observation still open
+            // (`rfcs/0013`). Nothing would ever end that lease, so
+            // every resource it holds would stay frozen for the rest of
+            // the run -- and the *caller*, which legitimately owns
+            // those resources, would be refused every ownership
+            // operation on them from here on.
+            //
+            // Checked before any exit does anything fallible or
+            // committing, so a frame refused for this reason has
+            // transferred nothing and changed no state. Deliberately a
+            // refusal rather than an implicit end: silently closing the
+            // scope here would accept exactly the NIR `V0107` exists to
+            // reject.
+            if matches!(
+                block.terminator,
+                Terminator::Return(_) | Terminator::Raise { .. }
+            ) && let Some((_, lease)) = active_leases.last()
+            {
+                return Err(invalid(format!(
+                    "function exited with observation {} still active",
+                    lease.0
+                )));
+            }
             match &block.terminator {
                 Terminator::Return(Some(id)) => {
                     // A returned resource transfers ownership back to
@@ -15228,6 +15251,28 @@ mod observation_leases {
         )
     }
 
+    /// An *ordinary* (non-`take`) session parameter: the frame observes
+    /// it and owes it nothing, so a test can isolate a defect that is
+    /// not about ownership at all.
+    fn observing_session() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: session_ty(),
+            take: false,
+        }]
+    }
+
+    /// Like [`run_under_test`], but the session is handed in as an
+    /// observation rather than transferred.
+    fn run_observing(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
+        let interpreter = Interpreter::new(module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        let after = snapshot(&interpreter);
+        (outcome, before, after)
+    }
+
     fn run_under_test(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
         let interpreter = Interpreter::new(module);
         let session = live_session(&interpreter);
@@ -15486,6 +15531,114 @@ mod observation_leases {
             },
             end(0),
         ]);
+    }
+
+    #[test]
+    fn a_frame_that_exits_with_an_active_lease_is_refused() {
+        // Nothing about the returned value is wrong here -- it is an
+        // ordinary `i64`. What is wrong is the frame itself: it ends
+        // with an observation still open, so nothing would ever end
+        // that lease, and every resource it holds would stay frozen for
+        // the rest of the run.
+        //
+        // The session is an *ordinary* parameter here, so this frame
+        // owes it no destruction and leaks nothing: the only thing
+        // wrong is the open lease, which is exactly what has to be
+        // caught.
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0)), int(2, 0)],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "a frame must not exit with an observation still open, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_returns_no_value_with_an_active_lease_is_refused() {
+        let mut function = under_test(
+            observing_session(),
+            Ty::Unit,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0))],
+                terminator: Terminator::Return(None),
+            }],
+        );
+        function.return_type = Ty::Unit;
+        let module = module_with(function);
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_raises_with_an_active_lease_is_refused() {
+        let mut function = under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(0)),
+                    },
+                ],
+                terminator: Terminator::Raise { value: ValueId(2) },
+            }],
+        );
+        function.raises = vec![FILE];
+        let module = module_with(function);
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_lease_left_open_by_a_refused_frame_never_freezes_a_later_one() {
+        // Defence in depth for the same thing from the other side: once
+        // the frame has been refused, nothing of its own lease may
+        // survive to reject an unrelated later operation.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let first = live_session(&interpreter);
+        assert_eq!(
+            interpreter.call_item(SELF, vec![Value::Resource(first)]),
+            Ok(Value::Int(0))
+        );
+        let second = live_session(&interpreter);
+        assert_eq!(
+            interpreter.call_item(SELF, vec![Value::Resource(second)]),
+            Ok(Value::Int(0)),
+            "a second call must not be frozen by the first call's own ended lease"
+        );
     }
 
     #[test]

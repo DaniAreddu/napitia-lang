@@ -4702,6 +4702,41 @@ mod tests {
         }
 
         #[test]
+        fn a_source_that_resolves_to_something_other_than_a_place_is_rejected() {
+            // The grammar only admits an identifier chain, but an
+            // identifier can still resolve to something that is not a
+            // place at all -- here a payload-less variant case, which
+            // is a complete value with no storage behind it.
+            assert_eq!(
+                codes(
+                    "variant Choice { A, B }\n\
+                     func probe() -> i64 {\n\
+                       observe A as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0069"]
+            );
+        }
+
+        #[test]
+        fn a_function_named_as_a_source_keeps_its_own_earlier_diagnostic() {
+            // `helper` is not a value at all in this milestone, which is
+            // the real root cause -- reported once, by the rule that
+            // owns it, rather than also as a second "not a place".
+            assert_eq!(
+                codes(
+                    "func helper(file: File) -> i64 { return file.descriptor; }\n\
+                     func probe() -> i64 {\n\
+                       observe helper as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0010"]
+            );
+        }
+
+        #[test]
         fn observing_a_non_affine_record_is_rejected() {
             assert_eq!(
                 codes(

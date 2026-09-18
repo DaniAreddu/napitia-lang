@@ -651,6 +651,78 @@ fn a_deeply_nested_generic_value_runs_as_cleanly_as_it_checks() {
 
 // -- Generics (`rfcs/0008`) ---------------------------------------------
 
+/// A generic body writes its own constructions symbolically
+/// (`record.create @Box[Box[T]]`), and the value it builds must carry
+/// the instantiation actually running, not the parameter. Keeping the
+/// parameter made the value's declared field types resolve to
+/// `Ty::Param` while the value stored there was concrete, so this
+/// program checked and lowered cleanly and was then refused at run time
+/// for a shape disagreement it does not have.
+#[test]
+fn a_generic_body_constructing_a_nested_generic_runs_as_cleanly_as_it_checks() {
+    let source = "record Box[T] { item: T }\n\
+                  variant Pair[T] { Both(Box[T]), Neither }\n\
+                  func depth[T](x: Box[T]) -> i64 {\n\
+                  \x20   value nested = Box[Box[T]] { item: x };\n\
+                  \x20   value tagged = Pair[Box[T]].Both(nested);\n\
+                  \x20   return match tagged { Both(_) => 1, Neither => 0 };\n\
+                  }\n\
+                  func main() -> i64 { return depth[i64](Box[i64] { item: 7 }); }\n";
+    let path =
+        std::env::temp_dir().join(format!("napitia_generic_frame_{}.npt", std::process::id()));
+    std::fs::write(&path, source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    for cmd in ["check", "ir"] {
+        let output = napitia(&[cmd, &path_str]);
+        assert!(
+            output.status.success(),
+            "`{cmd}` failed: {}",
+            stderr(&output)
+        );
+    }
+    let ran = napitia(&["run", &path_str]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "1");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A generic function whose own type argument grows on every call names
+/// an instantiation that never converges. It must end in the depth
+/// diagnostic that actually describes it, not in a shape error about a
+/// disagreement the program does not have.
+#[test]
+fn an_endlessly_growing_instantiation_reports_its_depth() {
+    let source = "record Box[T] { item: T }\n\
+                  func f[T](x: Box[T]) -> i64 { return g[Box[T]](Box[Box[T]] { item: x }); }\n\
+                  func g[T](x: Box[T]) -> i64 { return f[T](x); }\n\
+                  func main() -> i64 { return f[i64](Box[i64] { item: 1 }); }\n";
+    let path =
+        std::env::temp_dir().join(format!("napitia_generic_grow_{}.npt", std::process::id()));
+    std::fs::write(&path, source).expect("failed to write the temp fixture");
+    let path_str = path.to_string_lossy().into_owned();
+
+    let ran = napitia(&["run", &path_str]);
+    assert_eq!(
+        ran.status.code(),
+        Some(1),
+        "an unbounded instantiation did not exit with a runtime-error status: {}",
+        stderr(&ran)
+    );
+    let err = stderr(&ran);
+    assert!(
+        err.contains("nested more deeply"),
+        "expected the nesting-depth diagnostic, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+        "an unbounded instantiation panicked instead of reporting: {err}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn generic_identity_check_ir_and_run_all_succeed() {
     let path = fixture("generic_identity.npt");

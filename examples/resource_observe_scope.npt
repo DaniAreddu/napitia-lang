@@ -1,0 +1,46 @@
+// `observe <place> as <name> { ... }` (`rfcs/0013`): a lexically
+// scoped, read-only view of a place another binding still owns.
+//
+// `file` is owned by `read` for the whole function. Inside the block,
+// `view` names the same `File` without owning it -- so it can be handed
+// to an ordinary (observing) parameter, and `file` itself is frozen
+// against every ownership operation until the block ends. The instant
+// it does, `file` is an ordinary owner again and `drop file` is fine.
+resource File {
+    descriptor: i64
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func read(take file: File) -> i64 {
+    mutable result = 0;
+
+    observe file as view {
+        result = inspect(view);
+    }
+
+    drop file;
+    return result;
+}
+
+// The owner keeps owning, so two sequential observations of the same
+// place are ordinary: each one ends where its own block does.
+func read_twice(take file: File) -> i64 {
+    mutable total = 0;
+
+    observe file as first {
+        total = inspect(first);
+    }
+    observe file as second {
+        total = total + inspect(second);
+    }
+
+    drop file;
+    return total;
+}
+
+func main() -> i64 {
+    return read(File { descriptor: 7 }) + read_twice(File { descriptor: 5 });
+}

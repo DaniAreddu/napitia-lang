@@ -84,6 +84,14 @@ pub enum TokenKind {
     Resource,
     Take,
     Drop,
+    /// `observe <place> as <name> { ... }` (`rfcs/0013`): opens a
+    /// lexically scoped, read-only observation of an affine place.
+    /// Reserved as its own keyword rather than a contextual one, for
+    /// the same reason every other statement keyword here is -- a
+    /// statement's own leading token decides which production runs,
+    /// and a contextual keyword would make that decision depend on
+    /// what follows it.
+    Observe,
 
     // Operators and punctuation.
     Plus,
@@ -190,6 +198,7 @@ pub fn keyword_kind(text: &str) -> Option<TokenKind> {
         "resource" => TokenKind::Resource,
         "take" => TokenKind::Take,
         "drop" => TokenKind::Drop,
+        "observe" => TokenKind::Observe,
         _ => return None,
     })
 }
@@ -205,7 +214,7 @@ mod tests {
             "loop", "break", "continue", "true", "false", "record", "variant", "match", "protocol",
             "extend", "with", "import", "module", "public", "private", "uses", "raises", "raise",
             "handle", "success", "failure", "as", "is", "unsafe", "async", "await", "region",
-            "defer", "resource", "take", "drop",
+            "defer", "resource", "take", "drop", "observe",
         ];
         for kw in keywords {
             assert!(keyword_kind(kw).is_some(), "{kw} should be a keyword");
@@ -213,8 +222,17 @@ mod tests {
     }
 
     #[test]
+    fn observe_is_its_own_keyword_distinct_from_every_other() {
+        // `rfcs/0013`: `observe` begins a statement, so it must scan as
+        // its own token rather than as an identifier that a later stage
+        // re-interprets by spelling.
+        assert_eq!(keyword_kind("observe"), Some(TokenKind::Observe));
+        assert_ne!(keyword_kind("observe"), keyword_kind("as"));
+    }
+
+    #[test]
     fn ordinary_identifiers_are_not_keywords() {
-        for ident in ["value1", "myFunc", "Record", "func2"] {
+        for ident in ["value1", "myFunc", "Record", "func2", "observer", "observed"] {
             assert!(
                 keyword_kind(ident).is_none(),
                 "{ident} should not be a keyword"

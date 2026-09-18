@@ -2712,9 +2712,8 @@ mod tests {
 
         #[test]
         fn a_local_source_lowers_to_a_resolved_local_reference() {
-            let statements = statements(
-                "func f(file: i64) -> i64 { observe file as view { } return 0 }",
-            );
+            let statements =
+                statements("func f(file: i64) -> i64 { observe file as view { } return 0 }");
             let HirStmt::Observe(o) = &statements[0] else {
                 panic!("expected an observation")
             };
@@ -2816,9 +2815,7 @@ mod tests {
 
         #[test]
         fn using_the_alias_after_its_block_says_why_the_name_is_gone() {
-            let (_, diags) = lower(
-                "func f(a: i64) -> i64 { observe a as view { } return view }",
-            );
+            let (_, diags) = lower("func f(a: i64) -> i64 { observe a as view { } return view }");
             assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
             assert_eq!(diags[0].code, "R0034");
         }
@@ -2845,9 +2842,8 @@ mod tests {
 
         #[test]
         fn a_use_before_the_observation_is_not_reported_as_out_of_scope() {
-            let (_, diags) = lower(
-                "func f(a: i64) -> i64 { value n = view; observe a as view { } return n }",
-            );
+            let (_, diags) =
+                lower("func f(a: i64) -> i64 { value n = view; observe a as view { } return n }");
             assert_eq!(diags.len(), 1, "unexpected diagnostics: {diags:?}");
             assert_eq!(diags[0].code, "R0002");
         }
@@ -2856,9 +2852,8 @@ mod tests {
         fn the_source_resolves_before_the_alias_scope_opens() {
             // `observe view as view` observes whatever `view` already
             // named, never its own not-yet-existing alias.
-            let (hir, diags) = lower(
-                "func f(view: i64) -> i64 { observe view as view { } return 0 }",
-            );
+            let (hir, diags) =
+                lower("func f(view: i64) -> i64 { observe view as view { } return 0 }");
             assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
             let mut observations = Vec::new();
             collect(&hir.functions[0].body, &mut observations);

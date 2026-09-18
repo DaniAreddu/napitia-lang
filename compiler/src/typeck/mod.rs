@@ -1533,9 +1533,7 @@ impl<'a> Checker<'a> {
                     "an observation source must be a local or a field of one",
                 )
                 .with_primary_label("not an addressable place")
-                .with_help(
-                    "bind the value to a `value` first, then observe that binding",
-                ),
+                .with_help("bind the value to a `value` first, then observe that binding"),
             );
             return Ty::Error;
         }
@@ -1570,9 +1568,7 @@ impl<'a> Checker<'a> {
                     ),
                 )
                 .with_primary_label("owns no resource")
-                .with_help(
-                    "an ordinary value is freely copyable and has no ownership to suspend",
-                ),
+                .with_help("an ordinary value is freely copyable and has no ownership to suspend"),
             );
             return Ty::Error;
         }
@@ -4633,10 +4629,12 @@ mod tests {
         /// point is supplied here so no case has to spend its own
         /// signature satisfying `EntryMain`.
         fn codes(text: &str) -> Vec<String> {
-            check(&format!("{RESOURCE}{text}\nfunc main() -> i64 {{ return 0; }}"))
-                .into_iter()
-                .map(|d| d.code.to_string())
-                .collect()
+            check(&format!(
+                "{RESOURCE}{text}\nfunc main() -> i64 {{ return 0; }}"
+            ))
+            .into_iter()
+            .map(|d| d.code.to_string())
+            .collect()
         }
 
         #[test]

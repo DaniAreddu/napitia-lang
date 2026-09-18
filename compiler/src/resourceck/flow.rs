@@ -920,6 +920,11 @@ impl<'a> FlowChecker<'a> {
     fn field_name_and_span(expr: &HirExpr) -> (Option<Symbol>, Span) {
         match expr {
             HirExpr::Field { name, span, .. } => (Some(*name), *span),
+            // A place can be a bare local too, not only a field access
+            // (`rfcs/0013`: an observation source is either). Naming it
+            // is what stops "`this field` was already dropped" from
+            // being reported about something that is plainly a local.
+            HirExpr::Local { name, span, .. } => (Some(*name), *span),
             other => (None, other.span()),
         }
     }

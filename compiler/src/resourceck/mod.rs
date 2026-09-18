@@ -779,6 +779,48 @@ mod tests {
         }
 
         #[test]
+        fn observing_a_dropped_owner_names_the_owner() {
+            let diagnostics = check(&format!(
+                "{PRELUDE}func f(take file: File) -> i64 {{\n\
+                   drop file;\n\
+                   observe file as view {{ }}\n\
+                   return 0;\n\
+                 }}"
+            ));
+            assert_eq!(diagnostics.len(), 1, "unexpected: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, "U0002");
+            assert!(
+                diagnostics[0].message.contains("`file`"),
+                "a bare local source must be named, not called \"this field\": {}",
+                diagnostics[0].message
+            );
+        }
+
+        #[test]
+        fn returning_the_owner_while_observed_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> File {\n\
+                   observe file as view {\n\
+                     value n = inspect(view);\n\
+                     return file;\n\
+                   }\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn raising_the_owner_while_observed_is_rejected() {
+            rejected_with(
+                "variant Wrap { W(File) }\n\
+                 func f(take file: File) -> i64 raises Wrap {\n\
+                   observe file as view { raise Wrap.W(file); }\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
         fn observing_a_partially_moved_aggregate_as_a_whole_is_rejected() {
             let codes = codes(
                 "func f(take session: Session) -> i64 {\n\

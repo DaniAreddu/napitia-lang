@@ -5678,6 +5678,176 @@ mod tests {
         crate::nir::verify_module(&module, id, &interner, &crate::hir::ItemRegistry::default())
     }
 
+    /// `rfcs/0013` -- what lowering actually emits for an observation,
+    /// as opposed to what the checker decided about it: the boundaries
+    /// themselves, their order, and their position relative to the
+    /// ownership cleanup on the same edge.
+    mod observations {
+        use super::{lower, lower_and_verify};
+        use crate::nir::{Function, Instruction, ValueKind};
+
+        const PRELUDE: &str = "\
+            resource File { descriptor: i64 }\n\
+            resource Session { left: File, right: File }\n\
+            variant Failed { Bad }\n\
+            func inspect(file: File) -> i64 { return file.descriptor; }\n\
+            func gate(flag: bool) -> i64 raises Failed {\n\
+              if flag { raise Failed.Bad; }\n\
+              return 1;\n\
+            }\n";
+
+        /// The one function in a fixture that actually observes
+        /// something. Selected by what it contains rather than by name:
+        /// a symbol is interned per compilation, so comparing against a
+        /// fresh interner's own id would compare two unrelated numbers.
+        fn observing_function(text: &str) -> Function {
+            lower(&format!("{PRELUDE}{text}"))
+                .functions
+                .into_iter()
+                .find(|f| {
+                    f.blocks.iter().any(|b| {
+                        b.instructions.iter().any(|i| {
+                            matches!(
+                                i,
+                                Instruction::Value {
+                                    kind: ValueKind::ObservePlace { .. },
+                                    ..
+                                }
+                            )
+                        })
+                    })
+                })
+                .expect("no function in the fixture observes anything")
+        }
+
+        /// Every observation instruction in one block, in order, as a
+        /// compact readable trace: `begin N`, `end N`, `drop`.
+        fn trace(f: &Function, block: usize) -> Vec<String> {
+            f.blocks[block]
+                .instructions
+                .iter()
+                .filter_map(|instruction| match instruction {
+                    Instruction::Value {
+                        kind: ValueKind::ObservePlace { observation, .. },
+                        ..
+                    } => Some(format!("begin {}", observation.0)),
+                    Instruction::EndObserve { observation } => {
+                        Some(format!("end {}", observation.0))
+                    }
+                    Instruction::Drop { .. } => Some("drop".to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_straight_line_scope_ends_before_the_owners_own_cleanup() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(trace(&f, 0), vec!["begin 0", "end 0", "drop"]);
+        }
+
+        #[test]
+        fn nested_scopes_end_innermost_first_on_a_return() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as outer {\n\
+                     observe outer as inner { return inspect(inner); }\n\
+                   }\n\
+                 }",
+            );
+            assert_eq!(
+                trace(&f, 0),
+                vec!["begin 0", "begin 1", "end 1", "end 0", "drop"],
+                "the inner scope must end first, and both before the drop"
+            );
+        }
+
+        #[test]
+        fn both_invoke_edges_end_every_active_scope_innermost_first() {
+            // The failure edge is the one a per-block (rather than
+            // per-edge) placement would silently skip.
+            let f = observing_function(
+                "func f(take file: File, flag: bool) -> i64 raises Failed {\n\
+                   mutable n = 0;\n\
+                   observe file as outer {\n\
+                     observe outer as inner { n = inspect(inner) + gate(flag)?; }\n\
+                   }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            let success = trace(&f, 1);
+            let failure = trace(&f, 2);
+            assert_eq!(success, vec!["end 1", "end 0", "drop"]);
+            assert_eq!(failure, vec!["end 1", "end 0", "drop"]);
+        }
+
+        #[test]
+        fn a_scope_left_by_break_ends_only_what_the_loop_encloses() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as outer {\n\
+                     loop {\n\
+                       observe outer as inner { n = inspect(inner); break; }\n\
+                     }\n\
+                   }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            let all: Vec<String> = (0..f.blocks.len()).flat_map(|b| trace(&f, b)).collect();
+            assert_eq!(all.iter().filter(|e| *e == "begin 0").count(), 1, "{all:?}");
+            assert_eq!(
+                all.iter().filter(|e| *e == "end 0").count(),
+                1,
+                "the outer scope is left exactly once, after the loop: {all:?}"
+            );
+            assert_eq!(
+                all.iter().filter(|e| *e == "end 1").count(),
+                1,
+                "the `break` ends only the scope the loop encloses: {all:?}"
+            );
+        }
+
+        #[test]
+        fn every_lowered_observation_shape_verifies_cleanly() {
+            let diagnostics = lower_and_verify(&format!(
+                "{PRELUDE}\
+                 func straight(take file: File) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe file as view {{ n = inspect(view); }}\n\
+                   drop file;\n\
+                   return n;\n\
+                 }}\n\
+                 func siblings(take session: Session) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe session.left as view {{ n = inspect(view) + inspect(session.right); }}\n\
+                   drop session;\n\
+                   return n;\n\
+                 }}\n\
+                 func propagating(take file: File, flag: bool) -> i64 raises Failed {{\n\
+                   mutable n = 0;\n\
+                   observe file as view {{ n = inspect(view) + gate(flag)?; }}\n\
+                   drop file;\n\
+                   return n;\n\
+                 }}\n\
+                 func main() -> i64 {{ return 0; }}"
+            ));
+            assert!(
+                diagnostics.is_empty(),
+                "lowered observations must verify with no diagnostics: {diagnostics:?}"
+            );
+        }
+    }
+
     fn drop_count(f: &Function) -> usize {
         f.blocks
             .iter()

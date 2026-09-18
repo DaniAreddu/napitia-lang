@@ -26,17 +26,28 @@ impl<'a> Parser<'a> {
         expr
     }
 
+    /// Assignment is right-associative, so `a = a = a = ...` recurses
+    /// here rather than folding in a loop. The operand's own
+    /// `parse_unary` budget is already given back by the time this
+    /// recursion happens, so this claims the nesting level for itself --
+    /// without it a chain of assignments nests without ever holding more
+    /// than one level of budget at a time.
     fn parse_assignment(&mut self) -> Expr {
         let left = self.parse_range();
         if let Some(op) = assign_op(self.current()) {
+            let span = self.current_span();
+            if !self.enter_expression(span) {
+                return left;
+            }
             self.advance();
             let value = self.parse_assignment();
-            let span = left.span().join(value.span());
+            self.leave_expression();
+            let joined = left.span().join(value.span());
             return Expr::Assign {
                 target: Box::new(left),
                 op,
                 value: Box::new(value),
-                span,
+                span: joined,
             };
         }
         left
@@ -66,12 +77,24 @@ impl<'a> Parser<'a> {
     /// below `min_bp` stop the loop, and the recursive call for the
     /// right-hand side uses `bp + 1` so equal-precedence operators stay
     /// left-associative.
+    /// Left-associative operators are folded by this loop rather than by
+    /// recursion, so `1 + 1 + 1 + ...` costs one parser frame and builds
+    /// one `Binary` node per operator. The tree is what later stages --
+    /// and Rust's own recursive `Drop` -- walk, so the nesting budget is
+    /// claimed per *iteration* and only released once the whole fold is
+    /// done; releasing it each time round would let the loop nest
+    /// without bound while never exceeding the budget at any one moment.
     fn parse_binary(&mut self, min_bp: u8) -> Expr {
         let mut left = self.parse_unary();
+        let mut claimed = 0usize;
         while let Some((bp, op)) = infix_binding_power(self.current()) {
             if bp < min_bp {
                 break;
             }
+            if !self.enter_expression(self.current_span()) {
+                break;
+            }
+            claimed += 1;
             self.advance();
             let right = self.parse_binary(bp + 1);
             let span = left.span().join(right.span());
@@ -82,11 +105,38 @@ impl<'a> Parser<'a> {
                 span,
             };
         }
+        for _ in 0..claimed {
+            self.leave_expression();
+        }
         left
     }
 
+    /// The one point every expression nesting level passes through
+    /// exactly once (`parse_expression` -> `parse_assignment` ->
+    /// `parse_range` -> `parse_binary` -> here), which is why the
+    /// recursive half of the nesting budget is claimed here: a
+    /// parenthesis, a block, an `if`, a `match`, a call argument and a
+    /// unary operator all reach their operand through this function.
     fn parse_unary(&mut self) -> Expr {
         let start = self.current_span();
+        if !self.enter_expression(start) {
+            // Deliberately consumes nothing. The surplus tokens are
+            // still consumed -- by the enclosing levels' own ordinary
+            // recovery, and ultimately by the block and module loops,
+            // which both guarantee forward progress -- and doing it
+            // that way keeps the token stream synchronized with the
+            // grammar. Skipping ahead from here instead would resume in
+            // the middle of a construct (past an `if`'s own `{`, say)
+            // and desynchronize the rest of the file, which is a much
+            // worse answer than a truncated expression.
+            return Expr::Error { span: start };
+        }
+        let expr = self.parse_unary_inner(start);
+        self.leave_expression();
+        expr
+    }
+
+    fn parse_unary_inner(&mut self, start: crate::source::Span) -> Expr {
         let op = match self.current() {
             TokenKind::Minus => Some(UnaryOp::Neg),
             TokenKind::Bang => Some(UnaryOp::Not),
@@ -106,9 +156,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Postfix operators fold in a loop for the same reason binary ones
+    /// do, and claim the nesting budget on the same terms: `f(a)(b)(c)`,
+    /// `x.a.b.c` and `e????` each add one node per iteration, so the
+    /// budget is held for the whole chain rather than taken and returned
+    /// each time round.
     fn parse_postfix(&mut self) -> Expr {
         let mut expr = self.parse_primary();
+        let mut claimed = 0usize;
         loop {
+            if matches!(
+                self.current(),
+                TokenKind::LParen | TokenKind::Dot | TokenKind::As | TokenKind::Question
+            ) {
+                if !self.enter_expression(self.current_span()) {
+                    break;
+                }
+                claimed += 1;
+            }
             match self.current() {
                 TokenKind::LParen => {
                     self.advance();
@@ -156,6 +221,9 @@ impl<'a> Parser<'a> {
                 }
                 _ => break,
             }
+        }
+        for _ in 0..claimed {
+            self.leave_expression();
         }
         expr
     }
@@ -488,7 +556,21 @@ impl<'a> Parser<'a> {
         let then_branch = self.parse_block();
         let else_branch = if self.eat(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
-                Some(ElseBranch::If(Box::new(self.parse_if_expr())))
+                // `else if` is the one expression recursion that does
+                // not pass back through `parse_unary`, so it claims the
+                // nesting budget itself. Refusing leaves the `if` token
+                // unconsumed: the enclosing block simply parses it as
+                // the next statement, which re-enters at depth zero and
+                // so consumes the rest of the chain a bounded piece at
+                // a time instead of recursing through all of it at once.
+                let span = self.current_span();
+                if self.enter_expression(span) {
+                    let nested = self.parse_if_expr();
+                    self.leave_expression();
+                    Some(ElseBranch::If(Box::new(nested)))
+                } else {
+                    None
+                }
             } else {
                 Some(ElseBranch::Block(self.parse_block()))
             }
@@ -1076,5 +1158,134 @@ mod tests {
             panic!("expected a match expression")
         };
         assert!(matches!(*m.scrutinee, Expr::Ident(_)));
+    }
+
+    // -- Expression nesting depth (`MAX_EXPRESSION_DEPTH`) -------------
+    //
+    // Every stage after this one walks the expression tree on the
+    // native call stack, so an unbounded tree is a stack overflow --
+    // which is a process abort, not a diagnostic: no error code, no
+    // exit status a caller can act on, and nothing printed. These
+    // cover every shape that adds a level of nesting, because the two
+    // that fold in a *loop* rather than by recursion were exactly the
+    // ones an obvious "count the recursive descents" guard missed.
+
+    use super::super::MAX_EXPRESSION_DEPTH;
+
+    /// Builds `open` repeated `depth` times, then `1`, then `close`
+    /// repeated `depth` times, as the value of a binding -- a position
+    /// that claims no nesting of its own, so the tree's depth is exactly
+    /// `depth` plus the one level every expression costs.
+    fn nested(depth: usize, open: &str, close: &str) -> String {
+        format!(
+            "func f() -> i64 {{ value a = {}1{}; return a; }}",
+            open.repeat(depth),
+            close.repeat(depth)
+        )
+    }
+
+    /// The bound is a *limit*, not an off-by-one: an expression right up
+    /// against it still parses, with no diagnostic at all.
+    #[test]
+    fn an_expression_just_under_the_depth_limit_still_parses() {
+        // One level is claimed by the expression itself, so the deepest
+        // clean nest is one less than the bound.
+        let src = nested(MAX_EXPRESSION_DEPTH - 1, "(", ")");
+        let (module, diags) = parse(&src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(module.items.len(), 1);
+    }
+
+    /// Sibling expressions each get the full budget: the counter is
+    /// released on the way out, never leaked. Without this, a file with
+    /// many ordinary expressions would start rejecting them partway
+    /// through.
+    #[test]
+    fn the_depth_budget_is_released_between_sibling_expressions() {
+        let one = format!(
+            "value a{{i}} = {}1{};",
+            "(".repeat(MAX_EXPRESSION_DEPTH - 2),
+            ")".repeat(MAX_EXPRESSION_DEPTH - 2)
+        );
+        let mut src = String::from("func f() -> i64 { ");
+        for i in 0..20 {
+            src.push_str(&one.replace("{i}", &i.to_string()));
+            src.push(' ');
+        }
+        src.push_str("return 0; }");
+        let (_, diags) = parse(&src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// Each shape is a separate recursion in the grammar, and each one
+    /// separately exhausted the native stack before this bound existed:
+    /// parentheses and blocks recurse through `parse_primary`, `-`
+    /// through `parse_unary`, `+` folds in `parse_binary`'s loop, calls
+    /// and field access fold in `parse_postfix`'s loop, `=` recurses
+    /// right-associatively through `parse_assignment`, and `else if`
+    /// recurses through `parse_if_expr` without passing through any of
+    /// the others.
+    #[test]
+    fn every_nesting_shape_past_the_depth_limit_is_a_diagnostic_not_a_crash() {
+        let depth = MAX_EXPRESSION_DEPTH + 50;
+        let cases = [
+            ("parentheses", nested(depth, "(", ")")),
+            ("unary", nested(depth, "-", "")),
+            ("blocks", nested(depth, "{", "}")),
+            (
+                "binary fold",
+                format!("func f() -> i64 {{ return 1{}; }}", " + 1".repeat(depth)),
+            ),
+            (
+                "postfix fold",
+                format!("func f() -> i64 {{ return g{}; }}", "()".repeat(depth)),
+            ),
+            (
+                "assignment chain",
+                format!(
+                    "func f() -> i64 {{ mutable a = 0; a {}= 1; return a; }}",
+                    "= a ".repeat(depth)
+                ),
+            ),
+            (
+                "else if chain",
+                format!(
+                    "func f() -> i64 {{ if false {{ return 0; }}{} else {{ return 1; }} }}",
+                    " else if false { return 0; }".repeat(depth)
+                ),
+            ),
+        ];
+        for (what, src) in cases {
+            let (_, diags) = parse(&src);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.message.contains("nested too deeply")),
+                "{what}: expected a depth diagnostic, got {diags:?}"
+            );
+        }
+    }
+
+    /// One thing wrong with the file produces one diagnostic about it.
+    /// A chain this long resumes mid-construct at every level on the way
+    /// out, and reporting each of those consequences meant tens of
+    /// thousands of diagnostics over a source line tens of kilobytes
+    /// wide -- slow enough, once rendered, to be indistinguishable from
+    /// a hang.
+    #[test]
+    fn a_pathologically_deep_expression_does_not_produce_a_diagnostic_per_token() {
+        let src = nested(20_000, "(", ")");
+        let (_, diags) = parse(&src);
+        assert!(
+            diags.len() <= 4,
+            "expected a handful of diagnostics, got {}",
+            diags.len()
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("nested too deeply")),
+            "expected the depth diagnostic: {diags:?}"
+        );
     }
 }

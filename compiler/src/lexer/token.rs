@@ -232,7 +232,9 @@ mod tests {
 
     #[test]
     fn ordinary_identifiers_are_not_keywords() {
-        for ident in ["value1", "myFunc", "Record", "func2", "observer", "observed"] {
+        for ident in [
+            "value1", "myFunc", "Record", "func2", "observer", "observed",
+        ] {
             assert!(
                 keyword_kind(ident).is_none(),
                 "{ident} should not be a keyword"

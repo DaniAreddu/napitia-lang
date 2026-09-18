@@ -70,10 +70,8 @@ pub struct CheckOutput {
     /// See [`crate::resourceck::ResourceCheckResult::defer_plans`].
     pub defer_plans: std::collections::BTreeMap<hir::ExprId, crate::resourceck::CheckedDeferPlan>,
     /// See [`crate::resourceck::ResourceCheckResult::observations`].
-    pub observations: std::collections::BTreeMap<
-        hir::ObservationId,
-        crate::resourceck::CheckedObservation,
-    >,
+    pub observations:
+        std::collections::BTreeMap<hir::ObservationId, crate::resourceck::CheckedObservation>,
     /// See [`crate::resourceck::ResourceCheckResult::observation_exits`].
     pub observation_exits:
         std::collections::BTreeMap<hir::ExprId, Vec<crate::resourceck::ObservationExit>>,

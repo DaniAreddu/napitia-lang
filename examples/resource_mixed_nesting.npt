@@ -1,0 +1,46 @@
+// Alternating inline `record` and resource-table-backed `resource`
+// containers, four levels deep (`rfcs/0012`). Observing through the
+// chain leaves every ancestor exactly as it was; transferring through
+// it empties only the final field, and every intermediate container --
+// inline or resource-backed -- stays where it belongs.
+resource File {
+    descriptor: i64,
+}
+
+record Inner {
+    file: File,
+}
+
+resource Middle {
+    inner: Inner,
+}
+
+record Outer {
+    middle: Middle,
+    spare: File,
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func main() -> i64 {
+    value outer = Outer {
+        middle: Middle { inner: Inner { file: File { descriptor: 40 } } },
+        spare: File { descriptor: 2 },
+    };
+    // Observation through `record -> resource -> record -> resource`:
+    // reads the leaf without disturbing any container above it.
+    value observed = outer.middle.inner.file.descriptor;
+    // Transfer of the same leaf: only `outer.middle.inner.file` is
+    // emptied, and `outer.spare` -- a sibling two levels up -- is
+    // completely unaffected.
+    value file = outer.middle.inner.file;
+    value spare = outer.spare;
+    // Whatever remains of `outer` is structurally destroyed: the
+    // `Middle` resource's own outer identity, after its emptied child.
+    drop outer.middle;
+    return observed + sink(file) + sink(spare);
+}

@@ -60,6 +60,55 @@ pub struct ResourceHandle {
     id: ResourceId,
     generation: u64,
     role: RuntimeOwnershipRole,
+    /// The observation lease this handle was minted under (`rfcs/0013`),
+    /// or `None` for a handle that belongs to no explicit observation
+    /// scope at all (an owner, or an ordinary parameter's own
+    /// call-scoped observation).
+    ///
+    /// Carried on the handle rather than looked up from the resource,
+    /// because the same resource can legitimately be reached both
+    /// through an observation and directly by its owner at the same
+    /// time: what has ended is the *view*, not the resource. A read
+    /// through a handle whose lease has ended is a structured error;
+    /// the owner's own untagged handle keeps working.
+    lease: Option<RuntimeObservationId>,
+}
+
+/// One runtime observation lease's own identity within one
+/// [`Interpreter`]'s own lease table (`rfcs/0013`): a plain,
+/// monotonically-growing index, never a pointer address and never a
+/// `HashMap` key iterated for output, so nothing about a lease's
+/// identity or ordering depends on allocator or hashing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct RuntimeObservationId(u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseStatus {
+    Active,
+    Ended,
+}
+
+/// One lexically scoped observation, as a real runtime object
+/// (`rfcs/0013`).
+///
+/// The interpreter enforces observations itself and does not assume the
+/// module it is running passed `nir::verify`: an ended lease really
+/// stops working, a still-active lease really blocks every ownership
+/// operation on what it holds, and ending a lease a derived one is
+/// still nested inside is refused here too rather than left to the
+/// verifier's LIFO guarantee.
+#[derive(Debug, Clone)]
+struct RuntimeObservation {
+    id: RuntimeObservationId,
+    status: LeaseStatus,
+    /// Every resource identity reachable through the observed place at
+    /// the moment the lease was taken, in deterministic discovery
+    /// order (outermost first, then each field in declaration order).
+    observed: Vec<ResourceId>,
+    /// The lease this one was opened inside, if any -- what makes
+    /// "ending a parent while a child is still active" answerable here
+    /// rather than only statically.
+    parent: Option<RuntimeObservationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +142,12 @@ struct ResourceRecord {
 #[derive(Default)]
 struct ResourceTable {
     records: Vec<ResourceRecord>,
+    /// Every observation lease taken during this run, indexed by
+    /// [`RuntimeObservationId`] (`rfcs/0013`). Never shrinks: an ended
+    /// lease keeps its slot so a handle still tagged with it resolves
+    /// to something to *reject*, rather than silently going out of
+    /// bounds or -- worse -- colliding with a later lease's id.
+    leases: Vec<RuntimeObservation>,
 }
 
 impl ResourceTable {
@@ -108,10 +163,84 @@ impl ResourceTable {
             id,
             generation: 0,
             role: RuntimeOwnershipRole::Owner,
+            lease: None,
         }
     }
 
+    /// Opens a lease over `observed` (`rfcs/0013`), nested inside
+    /// `parent` when one is already active in the same frame.
+    fn begin_lease(
+        &mut self,
+        observed: Vec<ResourceId>,
+        parent: Option<RuntimeObservationId>,
+    ) -> RuntimeObservationId {
+        let id = RuntimeObservationId(self.leases.len() as u32);
+        self.leases.push(RuntimeObservation {
+            id,
+            status: LeaseStatus::Active,
+            observed,
+            parent,
+        });
+        id
+    }
+
+    fn lease(&self, id: RuntimeObservationId) -> Result<&RuntimeObservation, InterpreterError> {
+        self.leases
+            .get(id.0 as usize)
+            .ok_or_else(|| invalid("an observation handle does not refer to any known observation"))
+    }
+
+    /// Ends `id` exactly once (`rfcs/0013`).
+    ///
+    /// Refused when it was never opened, when it already ended, or
+    /// when a lease derived from it is still active -- the last one
+    /// being the runtime's own independent statement of the nesting
+    /// rule, so the interpreter does not depend on having been handed
+    /// verified NIR.
+    fn end_lease(&mut self, id: RuntimeObservationId) -> Result<(), InterpreterError> {
+        let lease = self.lease(id)?;
+        if lease.status == LeaseStatus::Ended {
+            return Err(invalid(
+                "an observation was ended more than once at run time",
+            ));
+        }
+        if self
+            .leases
+            .iter()
+            .any(|other| other.parent == Some(id) && other.status == LeaseStatus::Active)
+        {
+            return Err(invalid(
+                "cannot end an observation while an observation opened inside it is still active",
+            ));
+        }
+        self.leases[id.0 as usize].status = LeaseStatus::Ended;
+        Ok(())
+    }
+
+    /// The lowest-numbered still-active lease holding `resource`, if any
+    /// (`rfcs/0013`) -- a `Vec` scan in index order, so the answer never
+    /// depends on iteration order of anything hashed.
+    fn active_lease_holding(&self, resource: ResourceId) -> Option<RuntimeObservationId> {
+        self.leases
+            .iter()
+            .find(|lease| lease.status == LeaseStatus::Active && lease.observed.contains(&resource))
+            .map(|lease| lease.id)
+    }
+
     fn record(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
+        // A handle minted under an observation stops working the moment
+        // that observation ends (`rfcs/0013`) -- checked here, at the
+        // one place every read and every ownership operation resolves a
+        // handle, so no later caller can forget it. The owner's own
+        // untagged handle for the same resource is unaffected: what
+        // ended is the view, not the resource.
+        if let Some(lease) = handle.lease
+            && self.lease(lease)?.status == LeaseStatus::Ended
+        {
+            return Err(invalid(
+                "use of an observation after its own `observe` block already ended",
+            ));
+        }
         let record = self
             .records
             .get(handle.id.0 as usize)
@@ -155,6 +284,28 @@ impl ResourceTable {
             id: handle.id,
             generation: handle.generation,
             role: RuntimeOwnershipRole::Observer,
+            // Preserved, not cleared: downgrading an already-leased
+            // handle keeps it bound to the same observation
+            // (`rfcs/0013`).
+            lease: handle.lease,
+        })
+    }
+
+    /// Like [`Self::to_observer`], but binding the result to `lease`
+    /// (`rfcs/0013`) -- what every handle an `observe.place` view
+    /// carries is minted through, so ending that lease really does stop
+    /// all of them working at once.
+    fn to_leased_observer(
+        &self,
+        handle: ResourceHandle,
+        lease: RuntimeObservationId,
+    ) -> Result<ResourceHandle, InterpreterError> {
+        self.observe(handle)?;
+        Ok(ResourceHandle {
+            id: handle.id,
+            generation: handle.generation,
+            role: RuntimeOwnershipRole::Observer,
+            lease: Some(lease),
         })
     }
 
@@ -198,6 +349,7 @@ impl ResourceTable {
             id,
             generation: record.generation,
             role: RuntimeOwnershipRole::Owner,
+            lease: None,
         })
     }
 
@@ -245,7 +397,12 @@ impl ResourceTable {
         // and all -- so one projection through a generic aggregate
         // laundered an observation back into ownership.
         match handle.role {
-            RuntimeOwnershipRole::Observer => self.observing_view(field, 0),
+            // Reading through a *leased* observer binds what comes back
+            // to that same lease (`rfcs/0013`): the stored field's own
+            // handle belongs to the owner and carries no lease at all,
+            // so handing it back untouched would let one projection
+            // outlive the observation it was reached through.
+            RuntimeOwnershipRole::Observer => self.observing_view(field, handle.lease, 0),
             RuntimeOwnershipRole::Owner => Ok(field),
         }
     }
@@ -260,14 +417,22 @@ impl ResourceTable {
     /// held inline by the value that owns them. Nothing is mutated: the
     /// stored field keeps its owning handles, and only the copy handed
     /// back is downgraded.
-    fn observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+    fn observing_view(
+        &self,
+        value: Value,
+        lease: Option<RuntimeObservationId>,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
         match value {
-            Value::Resource(inner) => Ok(Value::Resource(self.to_observer(inner)?)),
+            Value::Resource(inner) => Ok(Value::Resource(match lease {
+                Some(lease) => self.to_leased_observer(inner, lease)?,
+                None => self.to_observer(inner)?,
+            })),
             Value::Record {
                 item,
                 type_args,
@@ -277,7 +442,7 @@ impl ResourceTable {
                 type_args,
                 fields: fields
                     .into_iter()
-                    .map(|field| self.observing_view(field, depth + 1))
+                    .map(|field| self.observing_view(field, lease, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Value::Variant {
@@ -291,7 +456,7 @@ impl ResourceTable {
                 case,
                 payload: payload
                     .into_iter()
-                    .map(|slot| self.observing_view(slot, depth + 1))
+                    .map(|slot| self.observing_view(slot, lease, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             other => Ok(other),
@@ -742,6 +907,64 @@ impl<'a> Interpreter<'a> {
     /// 8). `mode: Observe` never mutates anything at all (only ever
     /// clones); `mode: Transfer` leaves a [`Value::Moved`] tombstone
     /// behind at the exact field it removed.
+    /// `%v = observe.place @obsN <place>` (`rfcs/0013`).
+    ///
+    /// Strictly read-only in its first half: the place is walked
+    /// through `observe_projections`, which mutates nothing at any
+    /// depth, and every resource it reaches is collected in
+    /// deterministic discovery order. Only then is a lease opened, and
+    /// the view rebuilt around handles bound to it.
+    ///
+    /// A failure anywhere before the lease is opened therefore leaves
+    /// the lease table, the resource table and the frame's values
+    /// exactly as they were.
+    fn begin_observe(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        active_leases: &mut Vec<(crate::hir::ObservationId, RuntimeObservationId)>,
+        observation: crate::hir::ObservationId,
+        place: &Place<ValueId>,
+    ) -> Result<Value, InterpreterError> {
+        if active_leases.iter().any(|(id, _)| *id == observation) {
+            return Err(invalid(
+                "an observation began again while it was still active",
+            ));
+        }
+        let root_id = canonical_root(load_origin, place.root);
+        let root = get(values, &root_id)?;
+        let seen = self.observe_projections(&root, &place.projections)?;
+        let mut identities = HashSet::new();
+        let mut observed = Vec::new();
+        self.collect_reachable_resources(&seen, &mut identities, &mut observed, 0)?;
+        let parent = active_leases.last().map(|(_, lease)| *lease);
+        let lease = self.resources.borrow_mut().begin_lease(observed, parent);
+        active_leases.push((observation, lease));
+        self.to_leased_view(seen, lease, 0)
+    }
+
+    /// `end.observe @obsN` (`rfcs/0013`).
+    fn end_observe(
+        &self,
+        active_leases: &mut Vec<(crate::hir::ObservationId, RuntimeObservationId)>,
+        observation: crate::hir::ObservationId,
+    ) -> Result<(), InterpreterError> {
+        match active_leases.last() {
+            Some((id, lease)) if *id == observation => {
+                let lease = *lease;
+                self.resources.borrow_mut().end_lease(lease)?;
+                active_leases.pop();
+                Ok(())
+            }
+            Some(_) => Err(invalid(
+                "an observation ended while an observation opened inside it is still active",
+            )),
+            None => Err(invalid(
+                "an observation ended that this frame never began",
+            )),
+        }
+    }
+
     fn access_place(
         &self,
         values: &mut HashMap<ValueId, Value>,
@@ -779,6 +1002,14 @@ impl<'a> Interpreter<'a> {
                 self.to_observer_if_resource(seen)
             }
             OwnershipMode::Transfer => {
+                // Preflight, mutating nothing: what this move would
+                // take out must not be held by an active observation
+                // (`rfcs/0013`). Asked against a read-only view of the
+                // exact same place, so a refusal leaves the container,
+                // every generation and every field precisely as they
+                // were.
+                let seen = self.observe_projections(&root, &place.projections)?;
+                self.reject_leased_value(&seen, "moved out of its place")?;
                 let result = self.take_projections(root, &place.projections)?;
                 values.insert(place.root, result.container);
                 Ok(result.extracted)
@@ -1005,6 +1236,13 @@ impl<'a> Interpreter<'a> {
                 "a variant decomposition names a case other than the one actually live",
             ));
         }
+        // Taking a variant apart transfers every payload position it
+        // claims, so an observation holding any of them blocks the
+        // whole decomposition (`rfcs/0013`) -- checked before the shell
+        // is touched.
+        for slot in &payload {
+            self.reject_leased_value(slot, "decomposed out of its variant")?;
+        }
         // The shell's own shape first: every claim below is checked
         // against its declared payload types, so a shell that disagrees
         // with its declaration must be refused before any of that is
@@ -1112,6 +1350,123 @@ impl<'a> Interpreter<'a> {
         plan: &mut StorePlan,
         depth: usize,
     ) -> Result<Value, InterpreterError> {
+        let rebuilt = self.plan_transfer_inner(value, plan, depth)?;
+        // Asked once, at the top of the whole planned operation, over
+        // *every* identity the transfer would move -- including the
+        // ones nested inside a moved resource, which the recursion
+        // reaches only through `collect_owned_identities` and never
+        // individually (`rfcs/0013`). Still strictly inside phase A:
+        // nothing has been mutated yet, so a refusal here leaves every
+        // generation, status, field and event exactly as it found them.
+        if depth == 0 {
+            self.reject_leased_identities(&plan.reachable, "transferred")?;
+        }
+        Ok(rebuilt)
+    }
+
+    /// Refuses an ownership operation over any identity a still-active
+    /// observation is holding (`rfcs/0013`).
+    ///
+    /// Deterministic in its own right: the offending identity is the
+    /// lowest-numbered one, and the lease named is the lowest-numbered
+    /// active lease holding it, so the same refused operation reports a
+    /// byte-identical error every time.
+    fn reject_leased_identities(
+        &self,
+        identities: &HashSet<ResourceId>,
+        what: &str,
+    ) -> Result<(), InterpreterError> {
+        let mut ordered: Vec<ResourceId> = identities.iter().copied().collect();
+        ordered.sort_by_key(|id| id.0);
+        let table = self.resources.borrow();
+        for id in ordered {
+            if let Some(lease) = table.active_lease_holding(id) {
+                return Err(invalid(format!(
+                    "a resource cannot be {what} while observation {} is still holding it",
+                    lease.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::reject_leased_identities`] for a value rather than an
+    /// already-collected identity set: collects every resource the
+    /// value reaches, tolerating repeats (an ownership graph's own
+    /// duplicate/cycle rejection belongs to the operation being
+    /// planned, not to this question).
+    fn reject_leased_value(&self, value: &Value, what: &str) -> Result<(), InterpreterError> {
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        self.collect_reachable_resources(value, &mut seen, &mut ordered, 0)?;
+        self.reject_leased_identities(&seen, what)
+    }
+
+    /// Every resource identity reachable through `value`, in
+    /// deterministic discovery order: the value's own handles
+    /// outermost-first, then each resource's own stored fields in
+    /// declaration order (`rfcs/0013`).
+    ///
+    /// Unlike [`Self::collect_owned_identities`], a repeat is skipped
+    /// rather than refused: this answers "what does this reach", which
+    /// is a question with an answer even for a graph no ownership
+    /// operation would accept. Skipping repeats is also what bounds the
+    /// walk on a malformed cyclic graph, alongside the depth guard.
+    fn collect_reachable_resources(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        ordered: &mut Vec<ResourceId>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime ownership graph is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => {
+                if !seen.insert(handle.id) {
+                    return Ok(());
+                }
+                ordered.push(handle.id);
+                let fields = {
+                    let table = self.resources.borrow();
+                    // A stale or dropped handle has nothing to walk
+                    // into; whichever operation is being planned reports
+                    // that on its own terms.
+                    match table.record(*handle) {
+                        Ok(record) => record.fields.clone(),
+                        Err(_) => return Ok(()),
+                    }
+                };
+                for field in &fields {
+                    self.collect_reachable_resources(field, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.collect_reachable_resources(field, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.collect_reachable_resources(slot, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn plan_transfer_inner(
+        &self,
+        value: &Value,
+        plan: &mut StorePlan,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
@@ -1152,6 +1507,7 @@ impl<'a> Interpreter<'a> {
                     id: handle.id,
                     generation,
                     role: RuntimeOwnershipRole::Owner,
+                    lease: None,
                 }))
             }
             Value::Record {
@@ -1168,7 +1524,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = fields
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan, depth + 1))
+                    .map(|field| self.plan_transfer_inner(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Record {
                     item: *item,
@@ -1191,7 +1547,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = payload
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan, depth + 1))
+                    .map(|field| self.plan_transfer_inner(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *item,
@@ -2023,6 +2379,12 @@ impl<'a> Interpreter<'a> {
         // sitting where an `i64` is declared is refused rather than
         // walked past and left unreachable.
         self.validate_owned_graph(&value)?;
+        // Phase A1 -- observations, before the destruction order is
+        // even computed (`rfcs/0013`). Destroying something an
+        // observation is still holding is exactly what a lease exists
+        // to prevent, and refusing it here leaves every status,
+        // generation and event untouched.
+        self.reject_leased_value(&value, "dropped")?;
         let mut plan = Vec::new();
         let mut seen = HashSet::new();
         self.plan_drop(&value, &mut seen, &mut plan, 0)?;
@@ -2341,6 +2703,55 @@ impl<'a> Interpreter<'a> {
     ///
     /// Nothing is mutated: a new value is built, and the caller's own
     /// keeps its owning handles.
+    /// [`Self::to_observing_view`], but binding every handle it rebuilds
+    /// to `lease` (`rfcs/0013`) -- what an `observe.place` hands to its
+    /// own alias, so every handle the view carries, at any depth, stops
+    /// working the instant that exact observation ends.
+    fn to_leased_view(
+        &self,
+        value: Value,
+        lease: RuntimeObservationId,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => Ok(Value::Resource(
+                self.resources.borrow().to_leased_observer(handle, lease)?,
+            )),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|field| self.to_leased_view(field, lease, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|slot| self.to_leased_view(slot, lease, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            other => Ok(other),
+        }
+    }
+
     fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
@@ -2830,6 +3241,14 @@ impl<'a> Interpreter<'a> {
         for (id, bound, _) in bindings {
             values.insert(id, bound);
         }
+        // This frame's own currently-active observation leases
+        // (`rfcs/0013`), innermost last: the NIR identity paired with
+        // the runtime lease it opened. A stack, so `end.observe` can
+        // insist on being handed the innermost one at run time,
+        // independently of whatever the verifier already proved, and so
+        // a nested observation records the right `parent`. Per frame,
+        // never shared: an observation cannot span a call boundary.
+        let mut active_leases: Vec<(crate::hir::ObservationId, RuntimeObservationId)> = Vec::new();
 
         // The one place a call is recorded, and it means exactly one
         // thing: this callee's frame was successfully entered, with
@@ -2864,12 +3283,34 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, kind, .. } => {
-                        let value = if let ValueKind::PlaceRead { place, mode } = kind {
-                            self.access_place(&mut values, &load_origin, place, *mode)?
-                        } else {
-                            self.eval(kind, &values, &evidence, &frame_subst)?
+                        let value = match kind {
+                            ValueKind::PlaceRead { place, mode } => {
+                                self.access_place(&mut values, &load_origin, place, *mode)?
+                            }
+                            // Beginning an observation (`rfcs/0013`):
+                            // reads the place without disturbing it,
+                            // opens a lease over every resource it
+                            // reaches, and binds the resulting view --
+                            // recursively, at every depth -- to that
+                            // lease.
+                            ValueKind::ObservePlace { observation, place } => self.begin_observe(
+                                &mut values,
+                                &load_origin,
+                                &mut active_leases,
+                                *observation,
+                                place,
+                            )?,
+                            _ => self.eval(kind, &values, &evidence, &frame_subst)?,
                         };
                         values.insert(*result, value);
+                    }
+                    // Ending one (`rfcs/0013`). Refused unless it is
+                    // this frame's own innermost active observation:
+                    // ending out of order, ending twice, and ending one
+                    // that never began here are each rejected at run
+                    // time in their own right, not merely statically.
+                    crate::nir::Instruction::EndObserve { observation } => {
+                        self.end_observe(&mut active_leases, *observation)?;
                     }
                     // Ownership of one active case's payload position
                     // genuinely moves out of the shell here
@@ -3264,6 +3705,12 @@ impl<'a> Interpreter<'a> {
             // `&mut`) signature cannot do.
             ValueKind::PlaceRead { .. } => Err(invalid(
                 "ValueKind::PlaceRead must be evaluated by call_function directly, never through eval",
+            )),
+            // Same reason (`rfcs/0013`): beginning an observation needs
+            // the frame's own lease stack, which this method cannot
+            // reach.
+            ValueKind::ObservePlace { .. } => Err(invalid(
+                "ValueKind::ObservePlace must be evaluated by call_function directly, never through eval",
             )),
             ValueKind::Add(a, b) => arith(
                 get(values, a)?,
@@ -3899,6 +4346,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -3957,6 +4406,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -4259,6 +4710,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -4311,6 +4764,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )

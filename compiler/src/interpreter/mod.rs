@@ -12709,6 +12709,32 @@ mod observed_projection_atomicity {
         assert_all_observers(&boxed, "a `Box[Session]` read out of an observed resource");
     }
 
+    /// The variant spelling of the same read: a field holding a
+    /// `Maybe[Session]` must come back with its payload downgraded too,
+    /// not just a field holding a record.
+    #[test]
+    fn reading_a_variant_payload_through_an_observer_yields_no_owner() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (_session, holder) = build_variant(&interpreter);
+
+        let view = observer(&interpreter, holder);
+        let payload = interpreter
+            .resources
+            .borrow()
+            .observe_field(view, 0)
+            .expect("reading an observed resource's own field is always legal");
+
+        assert!(
+            matches!(payload, Value::Variant { .. }),
+            "the fixture really does store a variant in that field"
+        );
+        assert_all_observers(
+            &payload,
+            "a `Maybe[Session]` read out of an observed resource",
+        );
+    }
+
     /// The same, through the projection walker rather than one field
     /// read, and at every depth the walk can stop at.
     #[test]

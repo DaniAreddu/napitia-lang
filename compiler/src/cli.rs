@@ -63,7 +63,7 @@ const PANIC_EXIT: u8 = 101;
 const WORKER_STACK_BYTES: usize = 128 * 1024 * 1024;
 
 /// Runs the CLI on a thread whose stack this compiler sizes itself
-/// ([`WORKER_STACK_BYTES`]), falling back to the caller's own thread if
+/// (`WORKER_STACK_BYTES`), falling back to the caller's own thread if
 /// one cannot be spawned -- a smaller stack is still better than
 /// refusing to run at all.
 pub fn run(args: Vec<String>) -> ExitCode {

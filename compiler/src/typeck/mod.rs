@@ -1510,7 +1510,14 @@ impl<'a> Checker<'a> {
     /// skips it rather than finding no metadata for a local that
     /// nevertheless exists.
     fn check_observation_source(&mut self, o: &crate::hir::HirObserve, source_ty: &Ty) -> Ty {
-        let resolved = deep_resolve(&self.ctx, source_ty);
+        // Resolved *with* the numeric defaults already attached to any
+        // literal-derived variable. An integer literal's own binding is
+        // still a `Ty::Var` at this point, but one that can only ever
+        // end up `i64`, so answering "this type is not resolved"
+        // (`T0072`) for it would blame inference for what is plainly a
+        // non-affine source (`T0070`). A variable with *no* default is
+        // a different matter and is still reported as unresolved below.
+        let resolved = self.resolve_defaulted(&deep_resolve(&self.ctx, source_ty), 0);
         // An unresolvable name, or a source whose own type already
         // failed, has a diagnostic of its own already; a second one
         // about the same root cause would be noise.
@@ -4120,6 +4127,37 @@ impl<'a> Checker<'a> {
     ///   the same ambiguous text twice (`rfcs/0007`). Never the raw
     ///   `ItemId` alone, and never an import alias -- the registry only
     ///   ever returns an item's own true declared identity.
+    /// `ty` with every still-unresolved inference variable that already
+    /// carries a numeric default replaced by that default
+    /// (`rfcs/0013`).
+    ///
+    /// The same substitution `display_for_diagnostic` already applies
+    /// when rendering such a type, promoted to a real answer: a
+    /// variable created by an integer or float literal is only ever
+    /// going to become `i64`/`f64`, so a check that must decide
+    /// something about it now (is it affine?) may legitimately decide
+    /// from the default rather than refuse. A variable with no default
+    /// at all is genuinely undetermined and is left exactly as it is.
+    fn resolve_defaulted(&self, ty: &Ty, depth: usize) -> Ty {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return ty.clone();
+        }
+        match ty {
+            Ty::Var(var) => match self.ctx.kind_of(*var) {
+                Some(VarKind::Integer) => Ty::I64,
+                Some(VarKind::Float) => Ty::F64,
+                None => ty.clone(),
+            },
+            Ty::Applied(item, args) => Ty::Applied(
+                *item,
+                args.iter()
+                    .map(|a| self.resolve_defaulted(a, depth + 1))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     fn display_for_diagnostic(&self, ty: &Ty) -> String {
         self.display_for_diagnostic_at_depth(ty, 0)
     }
@@ -4580,6 +4618,184 @@ mod tests {
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
         check_module(&hir, id, &interner, EntryMain::ByName).diagnostics
+    }
+
+    /// `rfcs/0013` -- the observation source/alias rules.
+    mod observations {
+        use super::check;
+
+        const RESOURCE: &str = "resource File { descriptor: i64 }\n\
+                                record Holder { item: File }\n\
+                                record Plain { count: i64 }\n\
+                                func inspect(file: File) -> i64 { return file.descriptor; }\n";
+
+        /// `text` declares whatever functions the case needs; an entry
+        /// point is supplied here so no case has to spend its own
+        /// signature satisfying `EntryMain`.
+        fn codes(text: &str) -> Vec<String> {
+            check(&format!("{RESOURCE}{text}\nfunc main() -> i64 {{ return 0; }}"))
+                .into_iter()
+                .map(|d| d.code.to_string())
+                .collect()
+        }
+
+        #[test]
+        fn observing_an_affine_local_is_accepted() {
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe file as view { n = inspect(view); }\n\
+                       drop file;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn observing_a_nested_affine_field_is_accepted() {
+            assert!(
+                codes(
+                    "func probe(take holder: Holder) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe holder.item as view { n = inspect(view); }\n\
+                       drop holder;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn observing_a_primitive_binding_is_not_affine_not_unresolved() {
+            // An integer literal's own binding is still an inference
+            // variable when the observation is checked, but one with a
+            // numeric *default* already attached: it can only ever end
+            // up `i64`, which is emphatically not affine. Reporting
+            // `T0072` ("type is not resolved") for it blamed the
+            // inference machinery for what is plainly a non-affine
+            // source.
+            assert_eq!(
+                codes(
+                    "func probe() -> i64 {\n\
+                       value n = 1;\n\
+                       observe n as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn observing_an_explicitly_typed_primitive_is_not_affine() {
+            assert_eq!(
+                codes(
+                    "func probe(count: i64) -> i64 {\n\
+                       observe count as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn observing_a_non_affine_record_is_rejected() {
+            assert_eq!(
+                codes(
+                    "func probe(plain: Plain) -> i64 {\n\
+                       observe plain as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn observing_a_symbolic_generic_place_is_rejected_as_unresolved() {
+            // A generic body is checked once, symbolically: nothing here
+            // can decide whether `T` owns a resource, so this is refused
+            // for that reason rather than answered "not affine".
+            assert_eq!(
+                codes(
+                    "func peek[T](slot: T) -> i64 {\n\
+                       observe slot as view { }\n\
+                       return 0;\n\
+                     }\n\
+                     func other() -> i64 { return peek[i64](1); }"
+                ),
+                vec!["T0072"]
+            );
+        }
+
+        #[test]
+        fn assigning_to_an_observation_alias_is_its_own_diagnostic() {
+            assert_eq!(
+                codes(
+                    "func probe(take file: File, take other: File) -> i64 {\n\
+                       observe file as view { view = other; }\n\
+                       drop file;\n\
+                       drop other;\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0071"]
+            );
+        }
+
+        #[test]
+        fn the_alias_binds_the_observed_places_own_type() {
+            // `inspect` takes a `File`; if the alias bound anything else
+            // -- a wrapper, a distinct nominal type -- this would be an
+            // argument type mismatch instead of clean.
+            assert!(
+                codes(
+                    "func probe(take holder: Holder) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe holder.item as view { n = inspect(view); }\n\
+                       drop holder;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn two_sibling_scopes_may_reuse_one_alias_name() {
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe file as view { n = inspect(view); }\n\
+                       observe file as view { n = n + inspect(view); }\n\
+                       drop file;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn an_observation_body_that_always_returns_makes_the_rest_unreachable() {
+            // The body runs exactly once, unconditionally, so a `return`
+            // inside it really does end the function -- this would be a
+            // missing-return diagnostic otherwise.
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       observe file as view { return inspect(view); }\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
     }
 
     fn check_full(text: &str) -> TypeckResult {

@@ -35,7 +35,7 @@ use crate::types::{Ty, TyVar, is_integer};
 /// On failure, returns both sides fully resolved, for the caller to
 /// report. A variable is never bound to a type that (transitively,
 /// through the current substitution state) already contains that same
-/// variable -- see [`occurs`] -- so the substitution graph the *bound*
+/// variable -- see `occurs` -- so the substitution graph the *bound*
 /// side of a successful unification produces is always a forest, never
 /// a cycle. And because this top-level entry point checkpoints
 /// `ctx` first and restores it on any `Err`, a *failed* call to `unify`

@@ -762,7 +762,22 @@ impl<'a> Interpreter<'a> {
             // `outer.inner.file` must leave `outer` byte-for-byte as it
             // was, however many `record`/`resource` layers alternate on
             // the way there.
-            OwnershipMode::Observe => self.observe_projections(&root, &place.projections),
+            //
+            // The value handed back is an observing *view* of what the
+            // walk found, at every depth. `observe_field` downgrades
+            // only when the handle it reads through is already an
+            // observer -- correct for that helper, which also serves
+            // the traversal half of a genuine transfer, where an
+            // intermediate must stay owning for the final `take_field`
+            // to be legal at all. The opcode is where the answer is
+            // known: `Observe` means "read without disturbing this
+            // place's own current owner", and a read that is repeatable
+            // by definition cannot hand back an owner, or two repeats
+            // would be two owners of one resource.
+            OwnershipMode::Observe => {
+                let seen = self.observe_projections(&root, &place.projections)?;
+                self.to_observer_if_resource(seen)
+            }
             OwnershipMode::Transfer => {
                 let result = self.take_projections(root, &place.projections)?;
                 values.insert(place.root, result.container);
@@ -3504,29 +3519,51 @@ impl<'a> Interpreter<'a> {
                 base,
                 record,
                 field,
-            } => match get(values, base)? {
-                Value::Record { item, fields, .. } if item == *record => fields
-                    .get(*field)
-                    .cloned()
-                    .ok_or_else(|| invalid("record field index out of range")),
-                Value::Resource(handle) => {
-                    let table = self.resources.borrow();
-                    let rec = table.observe(handle)?;
-                    if rec.item != *record {
-                        return Err(invalid(
-                            "expected a resource value of the expected type, found a different resource",
-                        ));
-                    }
-                    rec.fields
+            } => {
+                let selected = match get(values, base)? {
+                    Value::Record { item, fields, .. } if item == *record => fields
                         .get(*field)
                         .cloned()
-                        .ok_or_else(|| invalid("resource field index out of range"))
-                }
-                other => Err(invalid(format!(
-                    "expected a record value of the expected type, found {}",
-                    kind_name(&other)
-                ))),
-            },
+                        .ok_or_else(|| invalid("record field index out of range"))?,
+                    Value::Resource(handle) => {
+                        let table = self.resources.borrow();
+                        let rec = table.observe(handle)?;
+                        if rec.item != *record {
+                            return Err(invalid(
+                                "expected a resource value of the expected type, found a different resource",
+                            ));
+                        }
+                        rec.fields
+                            .get(*field)
+                            .cloned()
+                            .ok_or_else(|| invalid("resource field index out of range"))?
+                    }
+                    other => {
+                        return Err(invalid(format!(
+                            "expected a record value of the expected type, found {}",
+                            kind_name(&other)
+                        )));
+                    }
+                };
+                // Selecting a field is a *read*, never a transfer:
+                // `nir::lower` only ever emits this for a non-affine
+                // field (an affine one becomes a `PlaceRead`, whose
+                // mode says explicitly which it is), and
+                // `nir::verify`'s own lattice already classifies it as
+                // an observation source. Handing back what the storage
+                // holds made the runtime the one stage that disagreed:
+                // a resource's own field storage keeps the owning
+                // handle, so reading it out of a `Session` bound to an
+                // ordinary parameter produced an *owner* for the
+                // nested `File` the caller still owned -- an
+                // observation laundered into ownership by one
+                // projection. Downgraded through the same recursive
+                // view every other observation boundary uses, so a
+                // resource nested at any depth, inline or through a
+                // generic aggregate or a variant payload, is covered by
+                // one answer rather than a second partial one.
+                self.to_observer_if_resource(selected)
+            }
             ValueKind::VariantCreate {
                 variant,
                 case,
@@ -13754,5 +13791,820 @@ mod typed_boundaries {
         interpreter
             .call_function(&returns, &[], Vec::new(), Vec::new())
             .expect("a `File` really may be returned where `File` is declared");
+    }
+}
+
+/// Reading a field is an *observation*, and an observation may never
+/// hand back an owner (`rfcs/0011`, `rfcs/0012`).
+///
+/// These drive the interpreter directly, with hand-built NIR, because
+/// that is the only thing the guarantee is actually about: `nir::verify`
+/// rejects every one of these programs statically, so a test routed
+/// through the source pipeline would pass without the interpreter ever
+/// being asked. The two layers are required to agree, and
+/// `the_verifier_independently_rejects_the_same_flow` asserts the other
+/// half of that agreement.
+#[cfg(test)]
+mod observed_extraction {
+    use super::*;
+    use crate::nir::{
+        BasicBlock, BlockId, CaseLayout, Function, Instruction, Param, RecordLayout, Terminator,
+        VariantLayout,
+    };
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(190);
+    const SESSION: ItemId = ItemId(191);
+    const BOXY: ItemId = ItemId(192);
+    const MAYBE: ItemId = ItemId(193);
+    const STEAL: ItemId = ItemId(194);
+    const HOLDER: ItemId = ItemId(195);
+    const CRATE: ItemId = ItemId(196);
+    const VAULT: ItemId = ItemId(197);
+    const SINK: ItemId = ItemId(198);
+
+    fn name() -> Symbol {
+        Symbol(0)
+    }
+
+    fn param() -> crate::hir::TypeParamId {
+        crate::hir::TypeParamId(0)
+    }
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, name())
+    }
+
+    fn session_ty() -> Ty {
+        Ty::Named(SESSION, name())
+    }
+
+    /// `resource File { descriptor: i64 }`,
+    /// `resource Session { file: File }`,
+    /// `resource Crate { boxed: Box[File] }`,
+    /// `resource Vault { slot: Maybe[File] }`,
+    /// `record Holder { file: File }`,
+    /// `record Box[T] { item: T }`,
+    /// `variant Maybe[T] { Some(T), None }`,
+    /// plus `func sink(take file: File) -> i64`, the one callee with a
+    /// `take` parameter these tests hand an observation to.
+    fn module() -> Module {
+        Module {
+            functions: vec![Function {
+                id: SINK,
+                name: name(),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: vec![Param {
+                    value: ValueId(0),
+                    ty: file_ty(),
+                    take: true,
+                }],
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Drop { value: ValueId(0) },
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::I64,
+                            kind: ValueKind::Const(Const::Int(0)),
+                        },
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                }],
+            }],
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), file_ty())],
+                        affine: true,
+                    },
+                ),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), file_ty())],
+                        affine: false,
+                    },
+                ),
+                (
+                    CRATE,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::Applied(BOXY, vec![file_ty()]))],
+                        affine: true,
+                    },
+                ),
+                (
+                    VAULT,
+                    RecordLayout {
+                        name: name(),
+                        type_params: Vec::new(),
+                        fields: vec![(name(), Ty::Applied(MAYBE, vec![file_ty()]))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name: name(),
+                        type_params: vec![(param(), name())],
+                        fields: vec![(name(), Ty::Param(param(), name()))],
+                        affine: false,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name: name(),
+                    type_params: vec![(param(), name())],
+                    cases: vec![
+                        CaseLayout {
+                            name: name(),
+                            payload: vec![Ty::Param(param(), name())],
+                        },
+                        CaseLayout {
+                            name: name(),
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// A one-block function with a single *non-`take`* parameter: an
+    /// ordinary call-scoped observation of something the caller still
+    /// owns.
+    fn observing(
+        param_ty: Ty,
+        return_type: Ty,
+        body: Vec<Instruction>,
+        tail: Terminator,
+    ) -> Function {
+        Function {
+            id: STEAL,
+            name: name(),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty: param_ty,
+                take: false,
+            }],
+            return_type,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: body,
+                terminator: tail,
+            }],
+        }
+    }
+
+    fn field_of(result: u32, base: u32, record: ItemId, field: usize, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::RecordField {
+                base: ValueId(base),
+                record,
+                field,
+            },
+        }
+    }
+
+    /// Everything a refused observation must leave exactly as it was.
+    #[derive(Debug, PartialEq)]
+    struct Snapshot {
+        records: usize,
+        items: Vec<ItemId>,
+        fields: Vec<Vec<Value>>,
+        generations: Vec<u64>,
+        statuses: Vec<ResourceStatus>,
+    }
+
+    fn snapshot(interpreter: &Interpreter<'_>) -> Snapshot {
+        let table = interpreter.resources.borrow();
+        Snapshot {
+            records: table.records.len(),
+            items: table.records.iter().map(|r| r.item).collect(),
+            fields: table.records.iter().map(|r| r.fields.clone()).collect(),
+            generations: table.records.iter().map(|r| r.generation).collect(),
+            statuses: table.records.iter().map(|r| r.status.clone()).collect(),
+        }
+    }
+
+    /// Binds `owner` the way a non-`take` parameter is bound -- as an
+    /// observation -- and reads field `field` of `record` out of it,
+    /// exactly as `ValueKind::RecordField` does in a real frame.
+    fn read_field_through_observation(
+        interpreter: &Interpreter<'_>,
+        owner: ResourceHandle,
+        record: ItemId,
+        field: usize,
+    ) -> Value {
+        let observed = interpreter
+            .to_observer_if_resource(Value::Resource(owner))
+            .expect("binding a non-take parameter is an observation");
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), observed);
+        interpreter
+            .eval(
+                &ValueKind::RecordField {
+                    base: ValueId(0),
+                    record,
+                    field,
+                },
+                &values,
+                &[],
+                &HashMap::new(),
+            )
+            .expect("reading a field of a live observation is legal")
+    }
+
+    /// A live `Session` owning a live `File`; the returned handle owns
+    /// the session.
+    fn live_session(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(7)]);
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(file)])
+    }
+
+    /// Runs `function` against a freshly-built live `Session`, requires
+    /// it to be refused with a structured error, and requires the
+    /// refusal to have changed nothing observable: no generation moved,
+    /// no field was replaced, nothing was destroyed or added, and the
+    /// extraction appended no event of its own -- the single `call:`
+    /// entry is the frame entry, which really did happen.
+    ///
+    /// Returns the diagnostic, after proving on a second, independent
+    /// interpreter that it is exactly reproducible.
+    fn refused(function: &Function, what: &str) -> String {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+
+        // Mapped to `()` before it is matched on: `Outcome` deliberately
+        // carries no `Debug`, and a test is not a reason to give one to
+        // a runtime type.
+        let outcome = interpreter
+            .call_function(function, &[], vec![Value::Resource(session)], Vec::new())
+            .map(|_| ());
+        let message = match outcome {
+            Err(InterpreterError::InvalidOperation(message)) => message,
+            Err(other) => panic!("{what}: expected a structured InvalidOperation, got {other:?}"),
+            Ok(()) => {
+                panic!("{what}: the interpreter accepted an observation laundered into an owner")
+            }
+        };
+
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "{what}: a refused observation must leave every generation, field, status and record \
+             exactly as it found them"
+        );
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("call:{}", STEAL.0)],
+            "{what}: a refused observation must append no event of its own"
+        );
+        assert!(
+            interpreter.resources.borrow().observe(session).is_ok(),
+            "{what}: the observed resource must still be alive and its handle still current"
+        );
+
+        let again = Interpreter::new(&module);
+        let session_again = live_session(&again);
+        let repeat = again
+            .call_function(
+                function,
+                &[],
+                vec![Value::Resource(session_again)],
+                Vec::new(),
+            )
+            .map(|_| ());
+        match repeat {
+            Err(InterpreterError::InvalidOperation(second)) => assert_eq!(
+                second, message,
+                "{what}: repeating the operation must produce the identical diagnostic"
+            ),
+            other => panic!("{what}: repeating the operation did not fail identically: {other:?}"),
+        }
+        message
+    }
+
+    /// The reproduction: a non-`take` parameter is bound as an observer,
+    /// `RecordField` reads the nested `File` out of it, and the result is
+    /// returned as an ownership transfer. Before the repair the read
+    /// cloned the stored field straight out of the resource table, so
+    /// what came back was `ResourceHandle { generation: 0, role: Owner }`
+    /// -- an observation laundered into ownership by one projection.
+    #[test]
+    fn a_field_read_through_an_observed_resource_cannot_be_returned_as_an_owner() {
+        let steal = observing(
+            session_ty(),
+            file_ty(),
+            vec![field_of(1, 0, SESSION, 0, file_ty())],
+            Terminator::Return(Some(ValueId(1))),
+        );
+        refused(
+            &steal,
+            "returning a field read through an observed resource",
+        );
+    }
+
+    /// The extraction itself must already be an observer, whatever is
+    /// done with it afterwards. Asserted directly on the value the
+    /// instruction produces, so the guarantee does not rest on `Return`
+    /// happening to reject it.
+    #[test]
+    fn the_extracted_value_is_an_observer_before_anything_consumes_it() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let observed = interpreter
+            .to_observer_if_resource(Value::Resource(session))
+            .expect("binding a non-take parameter is an observation");
+
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), observed);
+        let extracted = interpreter
+            .eval(
+                &ValueKind::RecordField {
+                    base: ValueId(0),
+                    record: SESSION,
+                    field: 0,
+                },
+                &values,
+                &[],
+                &HashMap::new(),
+            )
+            .expect("reading a field of a live observation is legal");
+
+        match extracted {
+            Value::Resource(handle) => assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "a field read out of an observation must itself be an observation, got {handle:?}"
+            ),
+            other => panic!("expected a resource handle, got {other:?}"),
+        }
+    }
+
+    // -- Every depth an observation can reach through ------------------
+
+    /// A resource whose field is a *generic* aggregate: reading it out
+    /// of an observation must downgrade the handle nested inside the
+    /// aggregate too, not merely hand back the aggregate untouched.
+    #[test]
+    fn a_generic_aggregate_read_through_an_observed_resource_is_all_observers() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let boxed = Value::Record {
+            item: BOXY,
+            type_args: vec![file_ty()],
+            fields: vec![Value::Resource(file)],
+        };
+        let crate_handle = interpreter
+            .resources
+            .borrow_mut()
+            .construct(CRATE, vec![boxed]);
+
+        match read_field_through_observation(&interpreter, crate_handle, CRATE, 0) {
+            Value::Record { fields, .. } => match fields.as_slice() {
+                [Value::Resource(inner)] => assert_eq!(
+                    inner.role,
+                    RuntimeOwnershipRole::Observer,
+                    "a resource one generic aggregate deep must still be an observation"
+                ),
+                other => panic!("expected one nested resource, got {other:?}"),
+            },
+            other => panic!("expected the generic aggregate, got {other:?}"),
+        }
+    }
+
+    /// The same, one variant payload deep.
+    #[test]
+    fn a_variant_read_through_an_observed_resource_is_all_observers() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let held = Value::Variant {
+            item: MAYBE,
+            type_args: vec![file_ty()],
+            case: 0,
+            payload: vec![Value::Resource(file)],
+        };
+        let vault = interpreter
+            .resources
+            .borrow_mut()
+            .construct(VAULT, vec![held]);
+
+        match read_field_through_observation(&interpreter, vault, VAULT, 0) {
+            Value::Variant { payload, .. } => match payload.as_slice() {
+                [Value::Resource(inner)] => assert_eq!(
+                    inner.role,
+                    RuntimeOwnershipRole::Observer,
+                    "a resource one variant payload deep must still be an observation"
+                ),
+                other => panic!("expected one payload resource, got {other:?}"),
+            },
+            other => panic!("expected the variant, got {other:?}"),
+        }
+    }
+
+    /// An *inline* aggregate bound as an observation: the binding
+    /// already rebuilt it as a view, so the field read must not undo
+    /// that by reaching back into anything.
+    #[test]
+    fn a_resource_nested_in_an_observed_inline_aggregate_stays_an_observation() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let holder = interpreter
+            .to_observer_if_resource(Value::Record {
+                item: HOLDER,
+                type_args: Vec::new(),
+                fields: vec![Value::Resource(file)],
+            })
+            .expect("binding a non-take parameter is an observation");
+
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), holder);
+        let extracted = interpreter
+            .eval(
+                &ValueKind::RecordField {
+                    base: ValueId(0),
+                    record: HOLDER,
+                    field: 0,
+                },
+                &values,
+                &[],
+                &HashMap::new(),
+            )
+            .expect("reading a field of a live observation is legal");
+        match extracted {
+            Value::Resource(handle) => assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "a resource inside an observed inline aggregate must stay an observation"
+            ),
+            other => panic!("expected a resource handle, got {other:?}"),
+        }
+    }
+
+    /// `PlaceRead { Observe }` answers the same question `RecordField`
+    /// does and must answer it the same way -- through an observation,
+    /// and through an owner alike. `observe_field` downgrades only when
+    /// the handle it reads through is already an observer, which is
+    /// right for that helper (it also walks the intermediates of a real
+    /// transfer, where an owning intermediate is exactly what makes the
+    /// final `take_field` legal). The opcode is where `Observe` is
+    /// known to mean "repeatable read", and a repeatable read cannot
+    /// hand back an owner: two repeats would be two owners of one
+    /// resource.
+    #[test]
+    fn an_observing_place_read_never_hands_back_an_owner() {
+        for through_an_observation in [true, false] {
+            let module = module();
+            let interpreter = Interpreter::new(&module);
+            let session = live_session(&interpreter);
+            let root = if through_an_observation {
+                interpreter
+                    .to_observer_if_resource(Value::Resource(session))
+                    .expect("an observation of a live resource is legal")
+            } else {
+                Value::Resource(session)
+            };
+
+            let mut values = HashMap::new();
+            values.insert(ValueId(0), root);
+            let place = Place::root(ValueId(0)).field(SESSION, crate::place::FieldId(0));
+            let seen = interpreter
+                .access_place(
+                    &mut values,
+                    &HashMap::new(),
+                    &place,
+                    crate::nir::OwnershipMode::Observe,
+                )
+                .expect("observing a live field is legal");
+            match seen {
+                Value::Resource(handle) => assert_eq!(
+                    handle.role,
+                    RuntimeOwnershipRole::Observer,
+                    "an observing place read must never hand back an owner \
+                     (through an observation: {through_an_observation})"
+                ),
+                other => panic!("expected a resource handle, got {other:?}"),
+            }
+            // And it really was only a read: the field is untouched and
+            // the resource is still alive and current.
+            assert!(
+                interpreter.resources.borrow().observe(session).is_ok(),
+                "an observing read must leave its own root alive and current"
+            );
+        }
+    }
+
+    // -- Everything that must refuse the observed extraction -----------
+
+    /// Destroying something reached only through an observation would
+    /// destroy what the caller still owns.
+    #[test]
+    fn dropping_a_field_read_through_an_observation_is_refused() {
+        let steal = observing(
+            session_ty(),
+            Ty::I64,
+            vec![
+                field_of(1, 0, SESSION, 0, file_ty()),
+                Instruction::Drop { value: ValueId(1) },
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(0)),
+                },
+            ],
+            Terminator::Return(Some(ValueId(2))),
+        );
+        refused(&steal, "dropping a field read through an observation");
+    }
+
+    /// An explicit `Move` is the ownership-transfer opcode, and an
+    /// observation has no ownership to give it.
+    #[test]
+    fn moving_a_field_read_through_an_observation_is_refused() {
+        let steal = observing(
+            session_ty(),
+            file_ty(),
+            vec![
+                field_of(1, 0, SESSION, 0, file_ty()),
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: file_ty(),
+                    kind: ValueKind::Move { source: ValueId(1) },
+                },
+            ],
+            Terminator::Return(Some(ValueId(2))),
+        );
+        refused(&steal, "moving a field read through an observation");
+    }
+
+    /// Handing it to a `take` parameter is the same transfer by another
+    /// route: the callee would destroy what the caller still owns.
+    #[test]
+    fn handing_a_field_read_through_an_observation_to_a_take_parameter_is_refused() {
+        let steal = observing(
+            session_ty(),
+            Ty::I64,
+            vec![
+                field_of(1, 0, SESSION, 0, file_ty()),
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: Ty::I64,
+                    kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                },
+            ],
+            Terminator::Return(Some(ValueId(2))),
+        );
+        refused(
+            &steal,
+            "handing a field read through an observation to a `take` parameter",
+        );
+    }
+
+    /// Reinitializing through an observation would write into storage
+    /// the caller owns.
+    #[test]
+    fn reinitializing_through_an_observation_is_refused() {
+        let steal = observing(
+            session_ty(),
+            Ty::I64,
+            vec![
+                Instruction::Value {
+                    result: ValueId(1),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(3)),
+                },
+                Instruction::Value {
+                    result: ValueId(2),
+                    ty: file_ty(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(1)]),
+                },
+                Instruction::StorePlace {
+                    place: Place::root(ValueId(0)).field(SESSION, crate::place::FieldId(0)),
+                    value: ValueId(2),
+                },
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::I64,
+                    kind: ValueKind::Const(Const::Int(0)),
+                },
+            ],
+            Terminator::Return(Some(ValueId(3))),
+        );
+        // This one legitimately creates a resource of its own before it
+        // is refused, so the shared `refused` snapshot (which requires
+        // the table to be untouched) does not apply; what matters is
+        // that the store is refused and the observed session's own
+        // field is left exactly as it was.
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let before = interpreter.resources.borrow().records[session.id.0 as usize]
+            .fields
+            .clone();
+        let outcome = interpreter
+            .call_function(&steal, &[], vec![Value::Resource(session)], Vec::new())
+            .map(|_| ());
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "reinitializing a field of an observation must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().records[session.id.0 as usize].fields,
+            before,
+            "a refused reinitialization must leave the observed field exactly as it was"
+        );
+    }
+
+    // -- What must keep working ---------------------------------------
+
+    /// The ownership-transfer opcode still transfers. `Observe` and
+    /// `Transfer` are different instructions for a reason, and the
+    /// repair must not have collapsed them.
+    #[test]
+    fn the_transferring_place_read_still_hands_back_a_real_owner() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+
+        let mut values = HashMap::new();
+        values.insert(ValueId(0), Value::Resource(session));
+        let place = Place::root(ValueId(0)).field(SESSION, crate::place::FieldId(0));
+        let moved = interpreter
+            .access_place(
+                &mut values,
+                &HashMap::new(),
+                &place,
+                crate::nir::OwnershipMode::Transfer,
+            )
+            .expect("moving a field out of an owned resource is legal");
+        match moved {
+            Value::Resource(handle) => assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Owner,
+                "an explicit transfer must still produce an owner"
+            ),
+            other => panic!("expected a resource handle, got {other:?}"),
+        }
+        assert_eq!(
+            interpreter.resources.borrow().records[session.id.0 as usize].fields,
+            vec![Value::Moved],
+            "a transfer must tombstone the storage it took from"
+        );
+    }
+
+    /// `VariantPayload` is deliberately left alone: it is the read a
+    /// `DecomposeVariant` later hands ownership *of*, so downgrading it
+    /// would break decomposition outright. It preserves observation
+    /// already, because its own input was recursively downgraded at the
+    /// boundary -- which is what this proves, rather than assuming it.
+    #[test]
+    fn a_payload_read_of_an_observed_variant_is_already_an_observation() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let owned = Value::Variant {
+            item: MAYBE,
+            type_args: vec![file_ty()],
+            case: 0,
+            payload: vec![Value::Resource(file)],
+        };
+
+        let payload = ValueKind::VariantPayload {
+            base: ValueId(0),
+            variant: MAYBE,
+            case: 0,
+            index: 0,
+        };
+
+        // Off an owned variant it still yields an owner: that is the
+        // value a `DecomposeVariant` transfers ownership to.
+        let mut owned_values = HashMap::new();
+        owned_values.insert(ValueId(0), owned.clone());
+        match interpreter
+            .eval(&payload, &owned_values, &[], &HashMap::new())
+            .expect("reading a payload of an owned variant is legal")
+        {
+            Value::Resource(handle) => assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Owner,
+                "decomposition still needs a real owner to hand ownership to"
+            ),
+            other => panic!("expected a resource handle, got {other:?}"),
+        }
+
+        // Off an observed one it yields an observer, because the
+        // observation boundary already rebuilt the whole payload.
+        let mut observed_values = HashMap::new();
+        observed_values.insert(
+            ValueId(0),
+            interpreter
+                .to_observer_if_resource(owned)
+                .expect("an observation of a live variant is legal"),
+        );
+        match interpreter
+            .eval(&payload, &observed_values, &[], &HashMap::new())
+            .expect("reading a payload of an observed variant is legal")
+        {
+            Value::Resource(handle) => assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "a payload read through an observation must stay an observation"
+            ),
+            other => panic!("expected a resource handle, got {other:?}"),
+        }
+    }
+
+    /// The other half of the agreement these tests exist for. The
+    /// interpreter refuses this flow on its own, and so does the
+    /// verifier -- neither is standing in for the other, which is
+    /// exactly why the interpreter tests above drive it directly
+    /// instead of going through the source pipeline.
+    #[test]
+    fn the_verifier_independently_rejects_the_same_flow() {
+        let steal = observing(
+            session_ty(),
+            file_ty(),
+            vec![field_of(1, 0, SESSION, 0, file_ty())],
+            Terminator::Return(Some(ValueId(1))),
+        );
+        let mut module = module();
+        module.functions = vec![steal];
+
+        let mut map = crate::source::SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        // Every name in this fixture is `Symbol(0)`, so the interner
+        // this verifier renders messages through has to actually hold
+        // one: a `Symbol` is an index into the interner that minted it.
+        let mut interner = crate::symbol::Interner::new();
+        assert_eq!(interner.intern("steal"), name(), "the fixture's own name");
+        let diagnostics = crate::nir::verify::verify_module(
+            &module,
+            source,
+            &interner,
+            &crate::hir::ItemRegistry::default(),
+        );
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        // `V0099`, `OBSERVER_CANNOT_TRANSFER` (`spec/0006`, `rfcs/0012`)
+        // -- spelled out rather than imported, because `nir::verify`'s
+        // own `codes` module is private to it and widening that purely
+        // for a test would be the wrong trade. The code itself is
+        // published in the spec and is what a user actually sees.
+        assert!(
+            codes.contains(&"V0099"),
+            "the verifier must reject the same observer-to-owner flow statically, got {codes:?}"
+        );
     }
 }

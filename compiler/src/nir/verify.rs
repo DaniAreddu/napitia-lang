@@ -9,10 +9,10 @@
 //! reach the interpreter (where it could panic or silently misbehave).
 //! It runs once, after lowering and before interpretation.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::Diagnostic;
-use crate::hir::{ItemId, ItemRegistry, TypeParamId};
+use crate::hir::{ItemId, ItemRegistry, ObservationId, TypeParamId};
 use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_GENERIC_DEPTH};
 use crate::place::Place;
 use crate::source::{SourceId, Span};
@@ -576,6 +576,54 @@ mod codes {
     /// it; two `take` arguments reaching one identity are a duplicate
     /// consumption and keep that diagnostic.
     pub const MIXED_CALL_OWNERSHIP_ALIAS: &str = "V0101";
+    /// One `ObservationId` begins more than once in a single function,
+    /// or begins again while it is still active on a path reaching it
+    /// (`rfcs/0013`). Either way there would be two observations with
+    /// one identity, and no way to say which of them an `end.observe`
+    /// naming it actually ends.
+    pub const DUPLICATE_OBSERVATION_ID: &str = "V0102";
+    /// An `end.observe` naming an observation this function never
+    /// begins (`rfcs/0013`).
+    pub const UNKNOWN_OBSERVATION_ID: &str = "V0103";
+    /// An `observe.place` whose own place does not resolve, or resolves
+    /// to a non-affine type (`rfcs/0013`). There is no ownership to
+    /// suspend on an ordinary, freely-copyable value.
+    pub const OBSERVATION_SOURCE_NOT_AFFINE: &str = "V0104";
+    /// An `observe.place` whose declared result type is not the
+    /// observed place's own type (`rfcs/0013`). An observation is not a
+    /// wrapper: the observer *is* the place's type.
+    pub const OBSERVATION_RESULT_TYPE_MISMATCH: &str = "V0105";
+    /// An `end.observe` on a path where that exact observation is not
+    /// the innermost active one (`rfcs/0013`) -- it never began on this
+    /// path, it already ended, or an observation opened inside it is
+    /// still active. All three are the same invariant: observations
+    /// nest, and a scope can only be left from the inside out.
+    pub const OBSERVATION_END_NOT_INNERMOST: &str = "V0106";
+    /// A reachable `Return`/`Raise` leaves an observation still active
+    /// (`rfcs/0013`) -- the frame is gone, so nothing would ever end it,
+    /// and whatever cleanup that same edge performs would run while the
+    /// observation still claims to hold the place.
+    pub const OBSERVATION_ACTIVE_AT_EXIT: &str = "V0107";
+    /// Two reachable predecessors of one block disagree about which
+    /// observations are active (`rfcs/0013`) -- a missing `end.observe`
+    /// on one branch of an `if`, or an `Invoke` whose success and
+    /// failure edges carry different active sets. There is no single
+    /// truth to check the block's own instructions against, so nothing
+    /// downstream is checked from a state no path actually proved.
+    pub const OBSERVATION_STATE_CONFLICT: &str = "V0108";
+    /// An observer value (or anything derived from one) used at a point
+    /// where its own observation is not active (`rfcs/0013`).
+    pub const OBSERVER_USED_AFTER_END: &str = "V0109";
+    /// An ownership operation -- a transferring place read, a
+    /// structural or whole-slot store, a `Drop`, a `Move`/
+    /// `DeferCapture`, a `take` argument, an aggregate construction, or
+    /// a variant decomposition -- naming a place that overlaps a
+    /// currently-active observation (`rfcs/0013`).
+    ///
+    /// Overlap is `Place::is_ancestor_of` in both directions, so a
+    /// disjoint sibling place is unaffected. Reported once per
+    /// operation, against the innermost overlapping observation.
+    pub const OWNERSHIP_WHILE_OBSERVED: &str = "V0110";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -1678,6 +1726,10 @@ fn verify_function(
                         }
                     }
                 }
+                // Validated entirely by `verify_observations`, which is
+                // the only pass with the path-sensitive active-set this
+                // instruction is meaningful against (`rfcs/0013`).
+                Instruction::EndObserve { .. } => {}
             }
         }
 
@@ -2124,6 +2176,15 @@ fn verify_function(
         &name,
         diagnostics,
     );
+    verify_observations(
+        function,
+        &value_types,
+        known_functions,
+        agg,
+        source,
+        &name,
+        diagnostics,
+    );
     verify_dominance(function, &param_values, source, &name, diagnostics);
 }
 
@@ -2231,6 +2292,9 @@ fn verify_dominance(
                     check_use(place.root, block.id, idx, diagnostics);
                     check_use(*value, block.id, idx, diagnostics);
                 }
+                // Names no value at all (`rfcs/0013`): it refers to an
+                // observation by identity, not to the observer.
+                Instruction::EndObserve { .. } => {}
             }
         }
         // Terminator operands are treated as occurring after every
@@ -2302,7 +2366,9 @@ fn operands_of(kind: &ValueKind) -> Vec<ValueId> {
         ValueKind::VariantPayload { base, .. } => vec![*base],
         ValueKind::ProtocolCall { args, .. } => args.clone(),
         ValueKind::Move { source } | ValueKind::DeferCapture { source } => vec![*source],
-        ValueKind::PlaceRead { place, .. } => vec![place.root],
+        ValueKind::PlaceRead { place, .. } | ValueKind::ObservePlace { place, .. } => {
+            vec![place.root]
+        }
     }
 }
 
@@ -3973,6 +4039,49 @@ fn verify_value_kind(
                                 "function `{function_name}`: %{} reads a place of non-affine type `{}`",
                                 result.0,
                                 ty_name(&resolved_ty)
+                            ),
+                        ));
+                    }
+                }
+                Err(place_error) => {
+                    diagnostics.push(place_error.into_diagnostic(source, function_name, result));
+                }
+            }
+        }
+        // `rfcs/0013`. The shape checks an observation's own beginning
+        // needs, independent of any path: the place resolves, it is
+        // transitively affine, and the observer really is declared as
+        // that place's own type. Everything path-sensitive about it --
+        // when it is active, what it freezes, when it ends -- belongs
+        // to `verify_observations`.
+        ValueKind::ObservePlace { place, .. } => {
+            require_value(place.root, diagnostics);
+            let Some(root_ty) = ty_of(place.root) else {
+                return;
+            };
+            match resolve_place_ty(&root_ty, &place.projections, agg) {
+                Ok(resolved_ty) => {
+                    if !is_affine_in(&resolved_ty, agg) {
+                        diagnostics.push(Diagnostic::error(
+                            codes::OBSERVATION_SOURCE_NOT_AFFINE,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}`: %{} observes a place of non-affine type `{}`",
+                                result.0,
+                                ty_name(&resolved_ty)
+                            ),
+                        ));
+                    } else if resolved_ty != *result_ty {
+                        diagnostics.push(Diagnostic::error(
+                            codes::OBSERVATION_RESULT_TYPE_MISMATCH,
+                            source,
+                            Span::dummy(),
+                            format!(
+                                "function `{function_name}`: %{} observes a place of type `{}` but is declared `{}`",
+                                result.0,
+                                ty_name(&resolved_ty),
+                                ty_name(result_ty)
                             ),
                         ));
                     }
@@ -5817,6 +5926,27 @@ fn verify_resource_ownership(
                                 }
                             }
                         }
+                        // An observation begins here (`rfcs/0013`): the
+                        // observer is a view of a place this frame is
+                        // *not* being given, so it is `Observed` and
+                        // never `live` -- exactly like an observing
+                        // `PlaceRead`, and rejected by exactly the same
+                        // existing checks if anything later tries to
+                        // drop it, move it, return it, or hand it to a
+                        // `take` parameter. Its own `place.root` is not
+                        // consumed here either, for the same reason a
+                        // place read's is not.
+                        ValueKind::ObservePlace { .. } => {
+                            if is_resource(*result) {
+                                provenance.insert(
+                                    *result,
+                                    LocationState::Initialized(Provenance::live(
+                                        BTreeSet::from([*result]),
+                                        Role::Observed,
+                                    )),
+                                );
+                            }
+                        }
                         _ => {
                             for operand in operands_of(kind) {
                                 alias_safe!(operand, false, false);
@@ -5889,7 +6019,15 @@ fn verify_resource_ownership(
                     if is_resource(*result)
                         && !matches!(
                             kind,
-                            ValueKind::Load(_) | ValueKind::Alloc | ValueKind::PlaceRead { .. }
+                            ValueKind::Load(_)
+                                | ValueKind::Alloc
+                                | ValueKind::PlaceRead { .. }
+                                // An observation owns nothing
+                                // (`rfcs/0013`), so it is never a fresh
+                                // obligation this frame has to discharge
+                                // -- its own `Observed` provenance was
+                                // already recorded above.
+                                | ValueKind::ObservePlace { .. }
                         )
                     {
                         live.insert(*result);
@@ -6051,6 +6189,9 @@ fn verify_resource_ownership(
                         legal,
                     );
                 }
+                // Names no value and consumes nothing (`rfcs/0013`) --
+                // `verify_observations` owns it entirely.
+                Instruction::EndObserve { .. } => {}
             }
         }
         match &block.terminator {
@@ -6713,6 +6854,763 @@ enum OwnershipViolation {
 /// independent of predecessor discovery order, block vector order and
 /// `HashMap` order alike.
 #[allow(clippy::too_many_arguments)]
+/// The observations active at one program point (`rfcs/0013`), as a
+/// *stack*: innermost last.
+///
+/// A stack rather than a set, because the nesting is the invariant. An
+/// `end.observe` is legal exactly when it names the top of the stack,
+/// which makes "ended before it began", "ended twice", "never ended"
+/// and "ended out of order" one check instead of four, and makes a
+/// nested observation outliving its parent unrepresentable rather than
+/// separately forbidden.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ObservationStack {
+    Active(Vec<ObservationId>),
+    /// Two reachable predecessors disagreed about what is active.
+    /// Absorbing: nothing downstream is checked against a state no path
+    /// ever proved, and the disagreement itself is reported once, at
+    /// the block it originates in.
+    Conflict,
+}
+
+/// One begin site, with the place it observes and the observer value it
+/// produces.
+#[derive(Clone)]
+struct ObservationBegin {
+    place: Place<ValueId>,
+    observer: ValueId,
+}
+
+/// One observation diagnostic, keyed by where it was found so the
+/// emitted order depends only on the CFG's own block/instruction
+/// numbering -- never on the order `function.blocks` happens to be
+/// stored in, nor on any `HashMap`'s iteration order.
+struct LocatedDiagnostic {
+    block: BlockId,
+    index: usize,
+    diagnostic: Diagnostic,
+}
+
+/// Independently re-establishes every `rfcs/0013` observation invariant
+/// from the NIR alone.
+///
+/// Nothing here consults `resourceck`'s own checked observations --
+/// they never reach this stage at all. The begins, the ends, the places
+/// and the types all come from the instructions, so hand-built NIR that
+/// never passed through the source compiler is held to exactly the same
+/// standard.
+///
+/// A real worklist over a finite lattice, with no pass cap: a block's
+/// state is a stack drawn from the begins the function actually
+/// contains, the join is equality-or-conflict, and `Conflict` is
+/// absorbing -- so every block's state can rise at most twice. Only
+/// reachable predecessors contribute, and a block no reachable
+/// predecessor has yet produced an out-state for is simply absent from
+/// the map (never an empty stack, which is a perfectly valid state in
+/// its own right), so an unreachable block -- or an unreachable cycle
+/// -- can never seed a reachable fact.
+fn verify_observations(
+    function: &Function,
+    value_types: &HashMap<ValueId, Ty>,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let entry = BlockId(0);
+    if !function.blocks.iter().any(|b| b.id == entry) {
+        return;
+    }
+    let mut located: Vec<LocatedDiagnostic> = Vec::new();
+    // A macro rather than a closure purely so recording a diagnostic
+    // does not hold a borrow of `located` across the worklist below,
+    // which appends whole blocks' worth of them at once.
+    macro_rules! report {
+        ($block:expr, $index:expr, $code:expr, $message:expr $(,)?) => {
+            located.push(LocatedDiagnostic {
+                block: $block,
+                index: $index,
+                diagnostic: Diagnostic::error($code, source, Span::dummy(), $message),
+            })
+        };
+    }
+
+    // -- Shape: which observations this function begins, and where ----
+    //
+    // Collected over every block, reachable or not, and ordered by
+    // `(block id, instruction index)` rather than by position in
+    // `function.blocks`: which begin is "the first" one, and therefore
+    // which repeats are the duplicates, must not depend on how the
+    // block vector happens to be ordered.
+    let mut begin_sites: Vec<(BlockId, usize, ObservationId, ObservationBegin)> = Vec::new();
+    let mut end_sites: Vec<(BlockId, usize, ObservationId)> = Vec::new();
+    for block in &function.blocks {
+        for (index, instruction) in block.instructions.iter().enumerate() {
+            match instruction {
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::ObservePlace { observation, place },
+                    ..
+                } => begin_sites.push((
+                    block.id,
+                    index,
+                    *observation,
+                    ObservationBegin {
+                        place: place.clone(),
+                        observer: *result,
+                    },
+                )),
+                Instruction::EndObserve { observation } => {
+                    end_sites.push((block.id, index, *observation))
+                }
+                _ => {}
+            }
+        }
+    }
+    begin_sites.sort_by_key(|(block, index, _, _)| (*block, *index));
+    end_sites.sort_by_key(|(block, index, _)| (*block, *index));
+
+    let mut begins: BTreeMap<ObservationId, ObservationBegin> = BTreeMap::new();
+    for (block, index, id, begin) in &begin_sites {
+        if begins.contains_key(id) {
+            report!(
+                *block,
+                *index,
+                codes::DUPLICATE_OBSERVATION_ID,
+                format!(
+                    "function `{function_name}`: observation @obs{} begins more than once",
+                    id.0
+                ),
+            );
+            continue;
+        }
+        begins.insert(*id, begin.clone());
+    }
+    for (block, index, id) in &end_sites {
+        if !begins.contains_key(id) {
+            report!(
+                *block,
+                *index,
+                codes::UNKNOWN_OBSERVATION_ID,
+                format!(
+                    "function `{function_name}`: `end.observe @obs{}` names an observation this \
+                     function never begins",
+                    id.0
+                ),
+            );
+        }
+    }
+
+    // -- Identity: values that carry an observation -------------------
+    //
+    // The observer itself, plus everything reachable *from* it by
+    // projection, load or observing store. Using any of them once the
+    // observation has ended is a use of something that no longer
+    // denotes anything, so the set has to be transitive rather than
+    // just the one result id.
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let origin = |v: ValueId| -> ValueId { load_origin.get(&v).copied().unwrap_or(v) };
+    let canonical = |place: &Place<ValueId>| -> Place<ValueId> {
+        Place {
+            root: origin(place.root),
+            projections: place.projections.clone(),
+        }
+    };
+    let observer_of = observation_carriers(function, &begins, &origin, &canonical);
+
+    // -- Flow ----------------------------------------------------------
+    let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        for target in terminator_targets(&block.terminator) {
+            successors.entry(block.id).or_default().push(target);
+            predecessors.entry(target).or_default().push(block.id);
+        }
+    }
+    let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for &succ in successors.get(&id).into_iter().flatten() {
+            if reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+    let blocks_by_id: HashMap<BlockId, &BasicBlock> =
+        function.blocks.iter().map(|b| (b.id, b)).collect();
+
+    // Absent means "no reachable predecessor has produced an out-state
+    // yet" -- deliberately not an empty stack, which is a perfectly
+    // ordinary state a block can genuinely be computed to hold.
+    let mut out_state: HashMap<BlockId, ObservationStack> = HashMap::new();
+    // Seeded in block-id order so the fixed point is reached the same
+    // way regardless of the block vector's own order.
+    let mut order: Vec<BlockId> = function.blocks.iter().map(|b| b.id).collect();
+    order.sort_unstable();
+    let mut worklist: Vec<BlockId> = vec![entry];
+    let mut conflicts_reported: HashSet<BlockId> = HashSet::new();
+    let mut visited: HashSet<BlockId> = HashSet::new();
+
+    while let Some(id) = worklist.pop() {
+        if !reachable.contains(&id) {
+            continue;
+        }
+        let Some(block) = blocks_by_id.get(&id).copied() else {
+            continue;
+        };
+        let in_state = if id == entry {
+            ObservationStack::Active(Vec::new())
+        } else {
+            let mut joined: Option<ObservationStack> = None;
+            let mut from_conflict = false;
+            for pred in predecessors.get(&id).into_iter().flatten() {
+                if !reachable.contains(pred) {
+                    continue;
+                }
+                let Some(state) = out_state.get(pred) else {
+                    continue;
+                };
+                if *state == ObservationStack::Conflict {
+                    from_conflict = true;
+                }
+                joined = Some(match joined {
+                    None => state.clone(),
+                    Some(previous) if previous == *state => previous,
+                    Some(_) => ObservationStack::Conflict,
+                });
+            }
+            let Some(joined) = joined else {
+                // Nothing proved yet; this block is re-enqueued when a
+                // predecessor lands.
+                continue;
+            };
+            if joined == ObservationStack::Conflict
+                && !from_conflict
+                && conflicts_reported.insert(id)
+            {
+                report!(
+                    id,
+                    0,
+                    codes::OBSERVATION_STATE_CONFLICT,
+                    format!(
+                        "function `{function_name}`: bb{} is reached with different observations \
+                         active on different paths",
+                        id.0
+                    ),
+                );
+            }
+            joined
+        };
+
+        let (out, mut block_diagnostics) = observation_transfer(
+            block,
+            &in_state,
+            &begins,
+            &observer_of,
+            value_types,
+            known_functions,
+            agg,
+            &origin,
+            &canonical,
+            function_name,
+            source,
+        );
+        // A block's own diagnostics are recorded exactly once, on its
+        // first visit: a later re-visit only ever happens because a
+        // predecessor's state changed, and re-reporting the same
+        // instruction for that would multiply one root cause by however
+        // many times the fixed point happened to iterate.
+        if visited.insert(id) {
+            located.append(&mut block_diagnostics);
+        }
+        let changed = out_state.get(&id) != Some(&out);
+        if changed {
+            out_state.insert(id, out);
+            for &succ in successors.get(&id).into_iter().flatten() {
+                if reachable.contains(&succ) && !worklist.contains(&succ) {
+                    worklist.push(succ);
+                }
+            }
+        }
+        // Keeps the traversal itself deterministic: a block whose
+        // in-state is still `Pending` is retried only through a
+        // predecessor landing, and the initial sweep below guarantees
+        // every reachable block is attempted at least once.
+        for &next in &order {
+            if reachable.contains(&next)
+                && !visited.contains(&next)
+                && !worklist.contains(&next)
+                && predecessors
+                    .get(&next)
+                    .into_iter()
+                    .flatten()
+                    .any(|p| out_state.contains_key(p))
+            {
+                worklist.push(next);
+            }
+        }
+    }
+
+    // -- Exits ---------------------------------------------------------
+    for &id in &order {
+        if !reachable.contains(&id) {
+            continue;
+        }
+        let Some(block) = blocks_by_id.get(&id).copied() else {
+            continue;
+        };
+        if !matches!(
+            block.terminator,
+            Terminator::Return(_) | Terminator::Raise { .. }
+        ) {
+            continue;
+        }
+        let Some(state) = out_state.get(&id) else {
+            continue;
+        };
+        let ObservationStack::Active(stack) = state else {
+            continue;
+        };
+        for observation in stack {
+            report!(
+                id,
+                block.instructions.len(),
+                codes::OBSERVATION_ACTIVE_AT_EXIT,
+                format!(
+                    "function `{function_name}`: bb{} leaves the function with observation @obs{} \
+                     still active",
+                    id.0, observation.0
+                ),
+            );
+        }
+    }
+
+    located.sort_by_key(|entry| (entry.block, entry.index));
+    diagnostics.extend(located.into_iter().map(|entry| entry.diagnostic));
+}
+
+/// Every block a terminator can transfer control to, in a fixed order.
+fn terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
+    match terminator {
+        Terminator::Branch(target) => vec![*target],
+        Terminator::CondBranch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::Switch { cases, .. } => cases.clone(),
+        Terminator::Invoke {
+            ok_target,
+            err_targets,
+            ..
+        } => {
+            let mut targets = vec![*ok_target];
+            targets.extend(err_targets.iter().map(|t| t.target));
+            targets
+        }
+        Terminator::Return(_) | Terminator::Raise { .. } => Vec::new(),
+    }
+}
+
+/// Every value that carries an observation (`rfcs/0013`): each
+/// observer, and everything derived from one by projection, load, or an
+/// observing store-and-reload.
+///
+/// Transitive on purpose. `view.input` is a different `ValueId` from
+/// `view`, but reading it after the observation ended is exactly the
+/// same violation, so the identity has to follow the derivation rather
+/// than stop at the instruction that produced the observer.
+///
+/// A plain closure to a fixed point over the instruction list, so the
+/// answer does not depend on the order blocks are stored in: a value
+/// derived in an earlier-numbered block from one defined in a
+/// later-numbered block is still found.
+fn observation_carriers(
+    function: &Function,
+    begins: &BTreeMap<ObservationId, ObservationBegin>,
+    origin: &impl Fn(ValueId) -> ValueId,
+    canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
+) -> HashMap<ValueId, ObservationId> {
+    let mut carriers: HashMap<ValueId, ObservationId> = HashMap::new();
+    for (id, begin) in begins {
+        carriers.insert(begin.observer, *id);
+    }
+    loop {
+        let mut changed = false;
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Value { result, kind, .. } => {
+                        let mut derived = observation_source(kind, origin, canonical)
+                            .and_then(|place| carriers.get(&place.root).copied());
+                        if derived.is_none()
+                            && let ValueKind::Load(slot) = kind
+                        {
+                            derived = carriers.get(slot).copied();
+                        }
+                        if let Some(id) = derived
+                            && carriers.insert(*result, id).is_none()
+                        {
+                            changed = true;
+                        }
+                    }
+                    // Writing an observer into a slot makes the slot
+                    // carry the observation too, so a later `Load` of
+                    // it is still a use of that observation.
+                    Instruction::Store { slot, value, .. } => {
+                        if let Some(id) = carriers.get(value).copied()
+                            && carriers.insert(*slot, id).is_none()
+                        {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            return carriers;
+        }
+    }
+}
+
+/// Every value one instruction *reads* -- the operands a use-after-end
+/// check has to look at (`rfcs/0013`). Deliberately the same
+/// enumeration `verify_dominance` walks, for the same reason: a use is
+/// a use whatever the instruction does with it.
+fn instruction_operands(instruction: &Instruction) -> Vec<ValueId> {
+    match instruction {
+        Instruction::Value { kind, .. } => operands_of(kind),
+        Instruction::Store { slot, value, .. } => vec![*slot, *value],
+        Instruction::Drop { value } => vec![*value],
+        Instruction::DecomposeVariant { value, taken, .. } => {
+            let mut out = vec![*value];
+            out.extend(taken.iter().map(|(_, owner)| *owner));
+            out
+        }
+        Instruction::StorePlace { place, value } => vec![place.root, *value],
+        Instruction::EndObserve { .. } => Vec::new(),
+    }
+}
+
+/// Every value a terminator reads.
+fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
+    match terminator {
+        Terminator::Return(Some(v)) | Terminator::Raise { value: v } => vec![*v],
+        Terminator::Return(None) | Terminator::Branch(_) => Vec::new(),
+        Terminator::CondBranch { condition, .. } => vec![*condition],
+        Terminator::Switch { scrutinee, .. } => vec![*scrutinee],
+        Terminator::Invoke { args, .. } => args.clone(),
+    }
+}
+
+/// One instruction's own transfer of a `PlaceRead`-shaped place, or
+/// `None` when it names no place at all.
+///
+/// Whether a `Call`/`Invoke` argument transfers is answered
+/// conservatively when the callee's own take flags are missing or
+/// disagree in length -- assuming an argument merely observes there
+/// would let a real transfer past this check, which is exactly the
+/// direction that must never fail open.
+fn consumed_places(
+    instruction: &Instruction,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    is_affine: &impl Fn(ValueId) -> bool,
+    origin: &impl Fn(ValueId) -> ValueId,
+    canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
+) -> Vec<(Place<ValueId>, ValueId, &'static str)> {
+    let root = |v: ValueId| Place::root(origin(v));
+    let mut out: Vec<(Place<ValueId>, ValueId, &'static str)> = Vec::new();
+    match instruction {
+        Instruction::Value { result, kind, .. } => match kind {
+            ValueKind::PlaceRead {
+                place,
+                mode: crate::nir::OwnershipMode::Transfer,
+            } => out.push((canonical(place), *result, "moved out of")),
+            ValueKind::Move { source } | ValueKind::DeferCapture { source } => {
+                if is_affine(*source) {
+                    out.push((root(*source), *result, "moved out of"));
+                }
+            }
+            ValueKind::RecordCreate(_, _, fields) => {
+                for field in fields {
+                    if is_affine(*field) {
+                        out.push((root(*field), *result, "consumed into an aggregate by"));
+                    }
+                }
+            }
+            ValueKind::VariantCreate { payload, .. } => {
+                for field in payload {
+                    if is_affine(*field) {
+                        out.push((root(*field), *result, "consumed into an aggregate by"));
+                    }
+                }
+            }
+            ValueKind::Call(callee, _, args, _) => {
+                let take = known_functions.get(callee).map(|f| f.take.as_slice());
+                for (index, arg) in args.iter().enumerate() {
+                    if is_affine(*arg) && argument_transfers(take, args.len(), index) {
+                        out.push((root(*arg), *result, "passed to a `take` parameter by"));
+                    }
+                }
+            }
+            _ => {}
+        },
+        Instruction::Store { slot, value, mode } => {
+            if *mode == crate::nir::OwnershipMode::Transfer && is_affine(*value) {
+                out.push((root(*value), *value, "moved out of"));
+            }
+            // The write itself discards whatever the slot held, in
+            // either mode -- the mode describes the incoming value, not
+            // what the store overwrites.
+            if is_affine(*slot) {
+                out.push((Place::root(*slot), *slot, "overwritten by"));
+            }
+        }
+        Instruction::Drop { value } => {
+            if is_affine(*value) {
+                out.push((root(*value), *value, "dropped by"));
+            }
+        }
+        Instruction::DecomposeVariant { value, .. } => {
+            out.push((root(*value), *value, "decomposed by"));
+        }
+        Instruction::StorePlace { place, value } => {
+            out.push((canonical(place), *value, "reinitialized by"));
+            if is_affine(*value) {
+                out.push((root(*value), *value, "moved out of"));
+            }
+        }
+        Instruction::EndObserve { .. } => {}
+    }
+    out
+}
+
+/// Whether one `Call`/`Invoke` argument position transfers ownership,
+/// failing closed (to "it transfers") on missing or mismatched callee
+/// metadata -- exactly like `verify_structural_places`' own copy.
+fn argument_transfers(take: Option<&[bool]>, args_len: usize, index: usize) -> bool {
+    match take {
+        Some(flags) if flags.len() == args_len => flags.get(index).copied().unwrap_or(true),
+        _ => true,
+    }
+}
+
+/// One block's own observation transfer function (`rfcs/0013`): the
+/// active stack it leaves behind, plus every violation found inside it.
+#[allow(clippy::too_many_arguments)]
+fn observation_transfer(
+    block: &BasicBlock,
+    in_state: &ObservationStack,
+    begins: &BTreeMap<ObservationId, ObservationBegin>,
+    observer_of: &HashMap<ValueId, ObservationId>,
+    value_types: &HashMap<ValueId, Ty>,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    agg: &AggregateContext,
+    origin: &impl Fn(ValueId) -> ValueId,
+    canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
+    function_name: &str,
+    source: SourceId,
+) -> (ObservationStack, Vec<LocatedDiagnostic>) {
+    let mut diagnostics: Vec<LocatedDiagnostic> = Vec::new();
+    let ObservationStack::Active(entry_stack) = in_state else {
+        // Nothing here is checked against a state no path proved; the
+        // disagreement itself was already reported where it arose.
+        return (ObservationStack::Conflict, diagnostics);
+    };
+    let mut stack = entry_stack.clone();
+    let is_affine =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
+    let mut push = |index: usize, code: &'static str, message: String| {
+        diagnostics.push(LocatedDiagnostic {
+            block: block.id,
+            index,
+            diagnostic: Diagnostic::error(code, source, Span::dummy(), message),
+        });
+    };
+
+    let check_uses = |index: usize,
+                          operands: Vec<ValueId>,
+                          push: &mut dyn FnMut(usize, &'static str, String),
+                          stack: &[ObservationId]| {
+        for operand in operands {
+            if let Some(id) = observer_of.get(&operand)
+                && !stack.contains(id)
+            {
+                push(
+                    index,
+                    codes::OBSERVER_USED_AFTER_END,
+                    format!(
+                        "function `{function_name}`: %{} carries observation @obs{}, which is not \
+                         active here",
+                        operand.0, id.0
+                    ),
+                );
+            }
+        }
+    };
+
+    for (index, instruction) in block.instructions.iter().enumerate() {
+        check_uses(
+            index,
+            instruction_operands(instruction),
+            &mut push,
+            &stack,
+        );
+        for (place, reporter, what) in
+            consumed_places(instruction, known_functions, &is_affine, origin, canonical)
+        {
+            // Innermost first: the observation whose block ends soonest
+            // is the one whose end actually unblocks this operation.
+            if let Some(id) = stack.iter().rev().find(|id| {
+                begins
+                    .get(id)
+                    .is_some_and(|begin| places_overlap(&canonical(&begin.place), &place))
+            }) {
+                push(
+                    index,
+                    codes::OWNERSHIP_WHILE_OBSERVED,
+                    format!(
+                        "function `{function_name}`: %{} names a place {what} it while \
+                         observation @obs{} is still holding it",
+                        reporter.0, id.0
+                    ),
+                );
+            }
+        }
+        match instruction {
+            Instruction::Value {
+                kind: ValueKind::ObservePlace { observation, .. },
+                ..
+            } => {
+                if stack.contains(observation) {
+                    push(
+                        index,
+                        codes::DUPLICATE_OBSERVATION_ID,
+                        format!(
+                            "function `{function_name}`: observation @obs{} begins again while it \
+                             is still active",
+                            observation.0
+                        ),
+                    );
+                } else {
+                    stack.push(*observation);
+                }
+            }
+            Instruction::EndObserve { observation } => {
+                if !begins.contains_key(observation) {
+                    // Already reported once, as a shape problem.
+                    continue;
+                }
+                if stack.last() == Some(observation) {
+                    stack.pop();
+                } else if let Some(position) = stack.iter().position(|id| id == observation) {
+                    push(
+                        index,
+                        codes::OBSERVATION_END_NOT_INNERMOST,
+                        format!(
+                            "function `{function_name}`: `end.observe @obs{}` ends an observation \
+                             that still contains {} inner one(s)",
+                            observation.0,
+                            stack.len() - position - 1
+                        ),
+                    );
+                    stack.truncate(position);
+                } else {
+                    push(
+                        index,
+                        codes::OBSERVATION_END_NOT_INNERMOST,
+                        format!(
+                            "function `{function_name}`: `end.observe @obs{}` ends an observation \
+                             that is not active here",
+                            observation.0
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let after_all = block.instructions.len();
+    check_uses(
+        after_all,
+        terminator_operands(&block.terminator),
+        &mut push,
+        &stack,
+    );
+    // A `Switch` takes its scrutinee apart, and an `Invoke` transfers
+    // every `take` argument -- both are ownership operations, and both
+    // happen on the way out of this block. `Return`/`Raise` also
+    // transfer, but an observation still active there is already
+    // reported as `OBSERVATION_ACTIVE_AT_EXIT`, which says more.
+    let mut terminator_consumes: Vec<(Place<ValueId>, ValueId, &'static str)> = Vec::new();
+    match &block.terminator {
+        Terminator::Switch { scrutinee, .. } => {
+            if is_affine(*scrutinee) {
+                terminator_consumes.push((
+                    Place::root(origin(*scrutinee)),
+                    *scrutinee,
+                    "decomposed by",
+                ));
+            }
+        }
+        Terminator::Invoke { callee, args, .. } => {
+            let take = known_functions.get(callee).map(|f| f.take.as_slice());
+            for (index, arg) in args.iter().enumerate() {
+                if is_affine(*arg) && argument_transfers(take, args.len(), index) {
+                    terminator_consumes.push((
+                        Place::root(origin(*arg)),
+                        *arg,
+                        "passed to a `take` parameter by",
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    for (place, reporter, what) in terminator_consumes {
+        if let Some(id) = stack.iter().rev().find(|id| {
+            begins
+                .get(id)
+                .is_some_and(|begin| places_overlap(&canonical(&begin.place), &place))
+        }) {
+            push(
+                after_all,
+                codes::OWNERSHIP_WHILE_OBSERVED,
+                format!(
+                    "function `{function_name}`: %{} names a place {what} it while observation \
+                     @obs{} is still holding it",
+                    reporter.0, id.0
+                ),
+            );
+        }
+    }
+
+    (ObservationStack::Active(stack), diagnostics)
+}
+
+/// Two places overlap exactly when one is an ancestor of the other,
+/// which includes being the same place (`rfcs/0013`). The identical
+/// relation `resourceck::flow` uses, over the identical shared
+/// [`Place`] representation -- neither stage defines its own.
+fn places_overlap(a: &Place<ValueId>, b: &Place<ValueId>) -> bool {
+    a.is_ancestor_of(b) || b.is_ancestor_of(a)
+}
+
 fn verify_structural_places(
     function: &Function,
     value_types: &HashMap<ValueId, Ty>,
@@ -6899,6 +7797,8 @@ fn verify_structural_places(
                         otherwise_used.insert(*value);
                         otherwise_used.extend(taken.iter().map(|(_, owner)| *owner));
                     }
+                    // Names no value at all (`rfcs/0013`).
+                    Instruction::EndObserve { .. } => {}
                 }
             }
             match &block.terminator {
@@ -6959,6 +7859,15 @@ fn verify_structural_places(
                 let default = if matches!(kind, ValueKind::VariantPayload { .. } | ValueKind::Alloc)
                 {
                     FieldState::EMPTY
+                } else if matches!(kind, ValueKind::ObservePlace { .. }) {
+                    // An observation is never an owner, whatever the
+                    // place it observes currently is (`rfcs/0013`) --
+                    // unconditionally, unlike the `inherited` rule
+                    // below, which carries an *existing* observation
+                    // forward through a projection. Observing a place
+                    // this frame genuinely owns is the ordinary case,
+                    // and the observer must still own nothing.
+                    FieldState::OBSERVED
                 } else {
                     FieldState::OWNED
                 };
@@ -7017,6 +7926,27 @@ fn verify_structural_places(
                     }
                     if *mode == crate::nir::OwnershipMode::Transfer {
                         set_place_state(&mut facts, &place, FieldState::EMPTY);
+                    }
+                }
+                // Beginning an observation requires the place to still
+                // be there, and to be whole: the observer binds that
+                // place's own complete type, so half a value cannot
+                // back it (`rfcs/0013`). It consumes nothing, so no
+                // state is written for the place itself -- only the
+                // observer's own `OBSERVED` role, already set above.
+                Instruction::Value {
+                    result,
+                    kind: ValueKind::ObservePlace { place, .. },
+                    ..
+                } => {
+                    let place = canonical(place);
+                    if !resolve_place_state(&facts, &place).definitely_present() {
+                        violations.push(OwnershipViolation::UseAfterMove(*result));
+                        continue;
+                    }
+                    if !place_is_whole(&facts, &place) {
+                        violations.push(OwnershipViolation::PartialWhole(*result));
+                        continue;
                     }
                 }
                 // Taking a variant apart into one specific case, on
@@ -7387,6 +8317,8 @@ fn verify_structural_places(
                     }
                     _ => {}
                 },
+                // Ends no ownership and names no value (`rfcs/0013`).
+                Instruction::EndObserve { .. } => {}
             }
         }
 
@@ -7888,7 +8820,9 @@ impl CallArgumentProvenance {
                     Instruction::StorePlace { place, value } => {
                         stored_into.entry(place.root).or_default().push(*value);
                     }
-                    Instruction::Drop { .. } | Instruction::DecomposeVariant { .. } => {}
+                    Instruction::Drop { .. }
+                    | Instruction::DecomposeVariant { .. }
+                    | Instruction::EndObserve { .. } => {}
                 }
             }
         }

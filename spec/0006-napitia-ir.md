@@ -210,6 +210,48 @@ here); a generic declaration's own body/layout still lowers exactly once,
 keeping its own parameter types symbolic (`Ty::Param`) — a call site
 never causes it to be cloned or re-checked.
 
+### Observation boundaries (Alpha 0.1.9, `rfcs/0013`)
+
+```text
+%d = observe.place @obs<N> %r.@<owner>.<field>[...]   ; begins observation N
+      end.observe @obs<N>                              ; ends it
+```
+
+`observe.place` begins the observation `@obsN` over a place and produces
+the observer value the source-level alias is bound to; its result type
+is the place's own type, exactly. `end.observe` ends it, performing no
+cleanup and no ownership transfer at all -- it is purely the point at
+which the observer stops being readable and every place overlapping the
+observed one stops being frozen.
+
+Both are real instructions, never comments, lowering-side maps or
+inferred use counts: the verifier and the interpreter each re-establish
+the whole discipline from these two alone. `ObservationId` is a stable
+`u32` identity minted once per source `observe` statement and carried
+through unchanged; it is unique within one function.
+
+Ends are emitted on the *edge*, before whatever ownership cleanup that
+same edge carries, because that cleanup is precisely the destruction an
+active observation exists to forbid. An `Invoke` inside a scope
+therefore ends it on both its success and its failure edge
+independently, which is what stops a failure path from either skipping
+the end or duplicating it at a shared merge block.
+
+The verifier re-derives, over its own worklist and finite lattice with
+no pass cap: one begin per identity (`V0102`), no end naming an
+observation this function never begins (`V0103`), an affine and
+resolvable source place (`V0104`), an observer typed as its own place
+(`V0105`), an end only while that exact observation is the innermost
+active one -- which subsumes end-before-begin, double end and non-LIFO
+nesting (`V0106`), no reachable `Return`/`Raise` with one still active
+(`V0107`), no predecessor disagreement about the active set (`V0108`),
+no use of an observer or anything derived from one once it has ended
+(`V0109`), and no ownership operation on an overlapping place
+(`V0110`). The observer is additionally `Observed` in the structural
+ownership lattice, so every pre-existing rule about an observation --
+it may not be transferred, consumed, dropped, moved, stored as an owner
+or returned -- applies to it with no second implementation.
+
 ### Terminators implemented
 
 ```text

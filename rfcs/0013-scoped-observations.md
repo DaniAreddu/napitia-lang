@@ -329,11 +329,30 @@ struct RuntimeObservation {
 }
 ```
 
-- `ObservePlace` walks the place, mutating nothing, collects every
-  resource identity reachable through it in deterministic order, and
-  mints one lease. The resulting view is an observing view *recursively*
-  -- every handle it carries at any depth is an `Observer` tagged with
-  that lease.
+- `ObservePlace` is a transaction: it resolves the complete place,
+  rejects a handle that is moved, dropped, stale or bound to an ended
+  observation, rejects a partially moved or otherwise incomplete affine
+  value, checks the source against the type the instruction declares
+  for the view, collects every resource identity reachable through it
+  in deterministic order, and builds the complete view -- all of it
+  mutating nothing. Only once nothing is left that can fail is the
+  lease committed, pushed onto the frame's active stack and the view
+  handed back. A rejected begin therefore leaves the records,
+  generations, values, leases, active lease indexes and event log
+  exactly as it found them, and repeating it on the same interpreter
+  reports the same refusal -- naming the next run-time observation
+  identity, as identities do, and nothing else differing.
+  The resulting view is an observing view *recursively* -- every handle
+  it carries at any depth is an `Observer` tagged with that lease.
+- A frame that fails for any reason closes every lease it opened before
+  the error leaves it, innermost first. Errors do not unwind through
+  Rust's own `Drop`; the frame has a structured epilogue that records
+  the lease table's height on entry and abandons everything opened
+  above it on an `Err`. So no lease from a failed frame is ever left in
+  the active list, a caller's own resources are never permanently
+  frozen by a callee that failed, and repeated failures on one
+  interpreter neither accumulate open leases nor change what is
+  reported.
 - Reading through a handle whose lease has ended is a structured error,
   not a silent success and not a panic.
 - `EndObserve` ends the lease exactly once; ending an already-ended

@@ -178,7 +178,13 @@ the reasoning and the open questions this raises.
   a structured error, ending one twice or out of order is refused, and
   every ownership boundary consults the active leases during its own
   plan phase -- so a refused operation leaves every generation, status,
-  field, tombstone, lease and event exactly as it found them.
+  field, tombstone, lease and event exactly as it found them. Opening
+  an observation is itself a transaction: the whole place is resolved
+  and validated, every reachable resource checked and the complete view
+  built before the lease is committed, so a rejected begin opens nothing
+  at all. And a frame that fails closes every lease it opened, innermost
+  first, before the error leaves it -- a callee that fails can never
+  leave a caller's own resources frozen.
 
 ## Accepted design direction
 

@@ -1,0 +1,26 @@
+// Dropping a parent while an observing `defer` still holds one of its
+// own fields is rejected (`rfcs/0012`): LIFO replay runs that deferred
+// call *after* the drop, so it would observe a field this statement
+// already destroyed.
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 1 },
+        output: File { descriptor: 2 },
+    };
+    defer inspect(session.input);
+    drop session;
+    return 0;
+}

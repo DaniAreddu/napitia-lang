@@ -1119,18 +1119,24 @@ impl<'a> FlowChecker<'a> {
     /// recorded ownership transition, the observations holding it, and
     /// whether it is structurally partial -- see [`PlaceStatus`].
     ///
-    /// The order below is the order a user needs to hear about: a place
-    /// that was already moved has nothing to say about observations,
-    /// and a place an observation is holding is blocked for that
-    /// reason, not because some disjoint sibling of it happens to have
-    /// been moved out.
+    /// Structural facts come first, deliberately: a place that was
+    /// moved, dropped, or is missing one of its own fields is not a
+    /// whole value at all, and saying "an observation is holding it"
+    /// instead would answer a question nobody asked. The *conflict*
+    /// question -- may this ownership operation run -- is answered by
+    /// [`Self::conflicting_observation`] directly, precisely so an
+    /// observation still wins there even over a partially moved parent.
     fn place_status(&self, place: &Place<LocalId>) -> PlaceStatus {
         match self.place_state(place) {
             ResourceState::Error => return PlaceStatus::Error,
             ResourceState::Moved => return PlaceStatus::Moved,
             ResourceState::Dropped => return PlaceStatus::Dropped,
-            ResourceState::DropScheduled => return PlaceStatus::DropScheduled,
-            ResourceState::Available => {}
+            ResourceState::DropScheduled | ResourceState::Available => {}
+        }
+        if let Some(ty) = self.place_ty(place)
+            && !self.place_is_wholly_present(place, &ty)
+        {
+            return PlaceStatus::PartiallyMoved;
         }
         let holders: Vec<ObservationId> = self
             .observations
@@ -1141,10 +1147,10 @@ impl<'a> FlowChecker<'a> {
         if !holders.is_empty() {
             return PlaceStatus::Observed(holders);
         }
-        match self.place_ty(place) {
-            Some(ty) if !self.place_is_wholly_available(place, &ty) => PlaceStatus::PartiallyMoved,
-            _ => PlaceStatus::Available,
+        if self.place_state(place) == ResourceState::DropScheduled {
+            return PlaceStatus::DropScheduled;
         }
+        PlaceStatus::Available
     }
 
     /// The one definition of overlap (`rfcs/0013`): two places overlap
@@ -1404,37 +1410,42 @@ impl<'a> FlowChecker<'a> {
             self.check_block(&o.body);
             return;
         };
-        if !Self::holds_live_value(self.place_state(&place)) {
-            // Either already diagnosed by `check_place_read` just
-            // above, or an `Error` place whose own root cause was
-            // reported earlier -- no second diagnostic either way.
-            self.check_block(&o.body);
-            return;
-        }
-        if !self.place_is_wholly_present(&place, &ty) {
-            // The alias binds this place's own complete type, so half a
-            // value cannot back it. Reported as exactly what it is: a
-            // whole-value use of a partially moved aggregate.
-            let (name, span) = Self::field_name_and_span(&o.source);
-            let display = match &o.source {
-                HirExpr::Local { name, .. } => self.interner.resolve(*name).to_string(),
-                _ => self.field_display(name),
-            };
-            let span = match &o.source {
-                HirExpr::Local { span, .. } => *span,
-                _ => span,
-            };
-            self.diagnose(
-                PARTIAL_PARENT_USED_AS_WHOLE,
-                span,
-                format!(
-                    "`{display}` has already had an affine field moved out of it and cannot be \
-                     observed as a whole value"
-                ),
-                "partially moved aggregate observed as a whole",
-            );
-            self.check_block(&o.body);
-            return;
+        match self.place_status(&place) {
+            // Live and whole. Already being observed is fine and
+            // expected: observations are read-only, so any number of
+            // them may overlap (`rfcs/0013`).
+            PlaceStatus::Available | PlaceStatus::DropScheduled | PlaceStatus::Observed(_) => {}
+            PlaceStatus::PartiallyMoved => {
+                // The alias binds this place's own complete type, so
+                // half a value cannot back it. Reported as exactly what
+                // it is: a whole-value use of a partially moved
+                // aggregate.
+                let (name, field_span) = Self::field_name_and_span(&o.source);
+                let (display, span) = match &o.source {
+                    HirExpr::Local { name, span, .. } => {
+                        (self.interner.resolve(*name).to_string(), *span)
+                    }
+                    _ => (self.field_display(name), field_span),
+                };
+                self.diagnose(
+                    PARTIAL_PARENT_USED_AS_WHOLE,
+                    span,
+                    format!(
+                        "`{display}` has already had an affine field moved out of it and cannot \
+                         be observed as a whole value"
+                    ),
+                    "partially moved aggregate observed as a whole",
+                );
+                self.check_block(&o.body);
+                return;
+            }
+            // Already diagnosed by `check_place_read` just above, or an
+            // `Error` place whose own root cause was reported earlier --
+            // no second diagnostic about the same thing either way.
+            PlaceStatus::Moved | PlaceStatus::Dropped | PlaceStatus::Error => {
+                self.check_block(&o.body);
+                return;
+            }
         }
         self.checked_observations.insert(
             o.id,

@@ -1,7 +1,8 @@
 # Spec 0004: Memory Model
 
-- Status: Partially implemented as of Alpha 0.1.7 (`resource`/`take`/
-  `drop`/`defer`, `rfcs/0011-deterministic-resources.md`). The rest of
+- Status: Partially implemented as of Alpha 0.1.8 (`resource`/`take`/
+  `drop`/`defer`, `rfcs/0011-deterministic-resources.md`; structural
+  field ownership, `rfcs/0012-structural-ownership.md`). The rest of
   this document (universal ownership inference over every type,
   automatic region inference, `owned`/`borrow`/`shared` boundary
   annotations, `unsafe`) remains design direction only, not implemented.
@@ -11,15 +12,33 @@ the universal ownership-inference design this document originally
 sketched: rather than inferring move-vs-copy for *every* type, it
 introduces one new nominal kind, `resource`, that is *always* affine and
 non-copyable, tracked by a dedicated compiler stage (`resourceck/`).
-Every other type (primitives, `record`, `variant`) keeps its existing,
-unconditional copy semantics — this spec's own "value semantics by
-default" section describing implicit move-vs-copy *inference* for every
-type, and its "compiler-inferred memory regions"/`owned`/`borrow` API
-vocabulary, are not what Alpha 0.1.7 implements; see
-`rfcs/0011-deterministic-resources.md` for the actual design (`resource`
-declarations, `take` parameters, `drop`, `defer`) and its own explicit
-non-goals. The sections below describe the original, broader design
-direction this narrower feature does not (yet) fully realize.
+Alpha 0.1.8 lifts Alpha 0.1.7's own narrower restriction that a
+`resource` could never appear as a field of anything: a `record`,
+`variant`, or another `resource` that reachably contains an affine field
+now becomes affine *transitively*, and ownership is tracked per
+structural place (a root binding plus a path of field projections), not
+only per whole binding -- see `rfcs/0012-structural-ownership.md`. That
+tracking is a lattice over the place *tree*: moving or dropping a parent
+consumes everything reachable through it, a consumed descendant makes
+its ancestors unusable as a whole while leaving siblings freely usable,
+and reinitializing an emptied child restores its ancestors'
+completeness. A generic aggregate's affinity is recomputed per
+instantiation from its substituted field types, so `Box[File]` owns a
+resource where `Box[i64]` owns nothing. Every affine identity an
+accepted program creates is transferred or destroyed exactly once, in a
+deterministic order -- reverse declaration order within an aggregate,
+only the active variant case, a declared `resource`'s own outer identity
+after its remaining children. Every
+type that is not itself affine (either a declared `resource`, or an
+aggregate reachably containing one) keeps its existing, unconditional
+copy semantics — this spec's own "value semantics by default" section
+describing implicit move-vs-copy *inference* for every type, and its
+"compiler-inferred memory regions"/`owned`/`borrow` API vocabulary, are
+not what Alpha 0.1.7/0.1.8 implement; see `rfcs/0011-deterministic-
+resources.md` and `rfcs/0012-structural-ownership.md` for the actual
+design and their own explicit non-goals. The sections below describe the
+original, broader design direction this narrower feature does not (yet)
+fully realize.
 
 The vocabulary below (`owned`, `borrow`, `shared`, `region`) is the
 provisional set accepted in `rfcs/0004-language-independence.md`. It

@@ -53,8 +53,8 @@ resource File { descriptor: i64 }
 resource Session { input: File, output: File }
 
 func detach(take session: Session) -> File {
-    value input = session.input   // transfers only this field
-    drop session                   // structurally destroys `output`,
+    value input = session.input;   // transfers only this field
+    drop session;                  // structurally destroys `output`,
     return input                   // then `session`'s own outer identity
 }
 ```

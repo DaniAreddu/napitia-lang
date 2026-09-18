@@ -182,12 +182,40 @@ impl ResourceTable {
 
     /// Opens a lease over `observed` (`rfcs/0013`), nested inside
     /// `parent` when one is already active in the same frame.
-    fn begin_lease(
+    /// The identity the next lease will take, without taking it
+    /// (`rfcs/0013`).
+    ///
+    /// Reserved during an observation's own validate-and-plan phase so
+    /// the whole leased view can be *built* -- which is fallible --
+    /// before anything about the table changes. The reserved id is
+    /// never resolved while the plan is being built: it is only ever
+    /// stamped onto fresh handles, and every lease a handle already
+    /// carries is one that genuinely exists.
+    fn reserved_lease_id(&self) -> RuntimeObservationId {
+        RuntimeObservationId(self.leases.len() as u32)
+    }
+
+    /// Installs a lease previously reserved by
+    /// [`Self::reserved_lease_id`] (`rfcs/0013`). The last step of an
+    /// observation's own commit phase, after which nothing can fail.
+    ///
+    /// The identity is re-checked rather than assumed: committing a
+    /// reserved id that no longer matches would silently give two
+    /// observations one identity. Nothing in this interpreter can open
+    /// a lease between the reservation and the commit, so this is a
+    /// structured guard against a future caller that could, never a
+    /// condition ordinary execution reaches.
+    fn commit_lease(
         &mut self,
+        id: RuntimeObservationId,
         observed: Vec<ResourceId>,
         parent: Option<RuntimeObservationId>,
-    ) -> RuntimeObservationId {
-        let id = RuntimeObservationId(self.leases.len() as u32);
+    ) -> Result<(), InterpreterError> {
+        if id.0 as usize != self.leases.len() {
+            return Err(invalid(
+                "an observation lease was committed against an identity that is no longer free",
+            ));
+        }
         self.leases.push(RuntimeObservation {
             id,
             status: LeaseStatus::Active,
@@ -195,7 +223,7 @@ impl ResourceTable {
             parent,
         });
         self.active.push(id);
-        id
+        Ok(())
     }
 
     fn lease(&self, id: RuntimeObservationId) -> Result<&RuntimeObservation, InterpreterError> {
@@ -935,6 +963,84 @@ impl<'a> Interpreter<'a> {
     /// A failure anywhere before the lease is opened therefore leaves
     /// the lease table, the resource table and the frame's values
     /// exactly as they were.
+    /// Everything an `ObservePlace` can refuse, asked against a value
+    /// nothing has written to yet (`rfcs/0013`).
+    ///
+    /// An observation binds a *complete* value for the whole scope, so
+    /// this is stricter than the ownership walks: a tombstone anywhere
+    /// reachable means the aggregate is partially moved and cannot back
+    /// an alias of its own declared type, and every handle -- including
+    /// one nested inside a resource's own field storage -- must be a
+    /// live, current, still-observable one.
+    ///
+    /// Deliberately independent of `nir::verify`: this is the layer
+    /// that has to hold for NIR the verifier never saw.
+    fn validate_observation_source(
+        &self,
+        value: &Value,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "an observed value is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Moved => Err(invalid(
+                "cannot observe a place whose value was already moved out",
+            )),
+            Value::Dropped => Err(invalid(
+                "cannot observe a place whose value was already destroyed",
+            )),
+            Value::Resource(handle) => {
+                // Rejects a stale generation, an already-dropped
+                // resource, and a handle whose own observation already
+                // ended -- all of them before anything is opened.
+                let fields = {
+                    let table = self.resources.borrow();
+                    table.observe(*handle)?.fields.clone()
+                };
+                for field in &fields {
+                    self.validate_observation_source(field, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.validate_observation_source(field, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.validate_observation_source(slot, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `%v = observe.place @obsN <place>` (`rfcs/0013`), as a genuine
+    /// preflight-plan-commit transaction.
+    ///
+    /// Phase A answers every fallible question against a value nothing
+    /// has written to yet: the place resolves, the observed value is
+    /// live and complete, it agrees with the type the instruction
+    /// declares, every reachable identity is collected, and the whole
+    /// leased view is *built* -- against a lease id that is reserved
+    /// but not yet installed. Nothing in phase A mutates the resource
+    /// table, the lease table, the active list or the frame's values.
+    ///
+    /// Phase B installs the lease and pushes it onto the frame's own
+    /// stack. It cannot fail: the only thing left that could is
+    /// committing a reserved id that no longer matches, which is
+    /// checked and reported rather than assumed.
+    ///
+    /// Opening the lease first and building the view afterwards -- as
+    /// this once did -- left a lease open and pushed whenever the view
+    /// turned out to be unbuildable, freezing the owner's resources for
+    /// the rest of the run for an observation that never began.
     fn begin_observe(
         &self,
         values: &mut HashMap<ValueId, Value>,
@@ -942,22 +1048,32 @@ impl<'a> Interpreter<'a> {
         active_leases: &mut Vec<(crate::hir::ObservationId, RuntimeObservationId)>,
         observation: crate::hir::ObservationId,
         place: &Place<ValueId>,
+        declared: &Ty,
     ) -> Result<Value, InterpreterError> {
         if active_leases.iter().any(|(id, _)| *id == observation) {
             return Err(invalid(
                 "an observation began again while it was still active",
             ));
         }
+        // Phase A -- validate and plan, mutating nothing.
         let root_id = canonical_root(load_origin, place.root);
         let root = get(values, &root_id)?;
         let seen = self.observe_projections(&root, &place.projections)?;
+        self.validate_observation_source(&seen, 0)?;
+        self.validate_argument(&seen, declared)?;
         let mut identities = HashSet::new();
         let mut observed = Vec::new();
         self.collect_reachable_resources(&seen, &mut identities, &mut observed, 0)?;
+        let reserved = self.resources.borrow().reserved_lease_id();
+        let view = self.to_leased_view(seen, reserved, 0)?;
+
+        // Phase B -- commit.
         let parent = active_leases.last().map(|(_, lease)| *lease);
-        let lease = self.resources.borrow_mut().begin_lease(observed, parent);
-        active_leases.push((observation, lease));
-        self.to_leased_view(seen, lease, 0)
+        self.resources
+            .borrow_mut()
+            .commit_lease(reserved, observed, parent)?;
+        active_leases.push((observation, reserved));
+        Ok(view)
     }
 
     /// `end.observe @obsN` (`rfcs/0013`).
@@ -3297,23 +3413,29 @@ impl<'a> Interpreter<'a> {
 
             for instruction in &block.instructions {
                 match instruction {
-                    crate::nir::Instruction::Value { result, kind, .. } => {
+                    crate::nir::Instruction::Value { result, ty, kind } => {
                         let value = match kind {
                             ValueKind::PlaceRead { place, mode } => {
                                 self.access_place(&mut values, &load_origin, place, *mode)?
                             }
                             // Beginning an observation (`rfcs/0013`):
                             // reads the place without disturbing it,
-                            // opens a lease over every resource it
-                            // reaches, and binds the resulting view --
-                            // recursively, at every depth -- to that
-                            // lease.
+                            // validates and plans the whole operation,
+                            // and only then opens a lease over every
+                            // resource it reaches, binding the
+                            // resulting view -- recursively, at every
+                            // depth -- to that lease. The declared type
+                            // is checked here too, against this frame's
+                            // own instantiation, so a value that
+                            // disagrees with the NIR is refused rather
+                            // than observed.
                             ValueKind::ObservePlace { observation, place } => self.begin_observe(
                                 &mut values,
                                 &load_origin,
                                 &mut active_leases,
                                 *observation,
                                 place,
+                                &crate::types::substitute(ty, &frame_subst),
                             )?,
                             _ => self.eval(kind, &values, &evidence, &frame_subst)?,
                         };

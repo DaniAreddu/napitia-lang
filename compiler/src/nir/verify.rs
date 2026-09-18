@@ -7056,26 +7056,39 @@ fn verify_observations(
     // yet" -- deliberately not an empty stack, which is a perfectly
     // ordinary state a block can genuinely be computed to hold.
     let mut out_state: HashMap<BlockId, ObservationStack> = HashMap::new();
-    // Seeded in block-id order so the fixed point is reached the same
-    // way regardless of the block vector's own order.
+    // Every block id, sorted -- so the reporting sweep below visits
+    // blocks in their own declared numbering rather than in whatever
+    // order `function.blocks` happens to store them.
     let mut order: Vec<BlockId> = function.blocks.iter().map(|b| b.id).collect();
     order.sort_unstable();
-    let mut worklist: Vec<BlockId> = vec![entry];
-    let mut conflicts_reported: HashSet<BlockId> = HashSet::new();
-    let mut visited: HashSet<BlockId> = HashSet::new();
 
-    while let Some(id) = worklist.pop() {
-        if !reachable.contains(&id) {
-            continue;
-        }
-        let Some(block) = blocks_by_id.get(&id).copied() else {
-            continue;
-        };
-        let in_state = if id == entry {
-            ObservationStack::Active(Vec::new())
-        } else {
+    // The in-state of `id`, joined over reachable predecessors that
+    // have actually produced an out-state. `None` is the `Pending`
+    // case: no reachable predecessor has proved anything yet, which is
+    // deliberately distinct from "computed, and empty" -- the second
+    // component says whether a conflict *originated* here rather than
+    // being inherited from a predecessor that was already conflicting,
+    // so one disagreement is reported once, at the join that created
+    // it.
+    // The in-state of `id`, joined over reachable predecessors that
+    // have actually produced an out-state. `None` is the `Pending`
+    // case: no reachable predecessor has proved anything yet, which is
+    // deliberately distinct from "computed, and empty".
+    //
+    // `Conflict` is absorbing and *propagates*: a block reached only
+    // through a conflicting one is itself unchecked, because there is
+    // no single state its instructions could be checked against. That
+    // is what makes the result independent of the order the worklist
+    // drains -- the alternative (leaving the conflicting block's own
+    // out-state at whichever value happened to be computed first)
+    // would make every downstream answer depend on predecessor arrival
+    // order.
+    let join_in =
+        |id: BlockId, out_state: &HashMap<BlockId, ObservationStack>| -> Option<ObservationStack> {
+            if id == entry {
+                return Some(ObservationStack::Active(Vec::new()));
+            }
             let mut joined: Option<ObservationStack> = None;
-            let mut from_conflict = false;
             for pred in predecessors.get(&id).into_iter().flatten() {
                 if !reachable.contains(pred) {
                     continue;
@@ -7083,39 +7096,32 @@ fn verify_observations(
                 let Some(state) = out_state.get(pred) else {
                     continue;
                 };
-                if *state == ObservationStack::Conflict {
-                    from_conflict = true;
-                }
                 joined = Some(match joined {
                     None => state.clone(),
                     Some(previous) if previous == *state => previous,
                     Some(_) => ObservationStack::Conflict,
                 });
             }
-            let Some(joined) = joined else {
-                // Nothing proved yet; this block is re-enqueued when a
-                // predecessor lands.
-                continue;
-            };
-            if joined == ObservationStack::Conflict
-                && !from_conflict
-                && conflicts_reported.insert(id)
-            {
-                report!(
-                    id,
-                    0,
-                    codes::OBSERVATION_STATE_CONFLICT,
-                    format!(
-                        "function `{function_name}`: bb{} is reached with different observations \
-                         active on different paths",
-                        id.0
-                    ),
-                );
-            }
             joined
         };
 
-        let (out, mut block_diagnostics) = observation_transfer(
+    // Phase 1: run to a fixed point, recording nothing. A block visited
+    // before all of its predecessors have landed would otherwise report
+    // against an in-state later refined by the very predecessor that
+    // had not run yet, which is exactly how diagnostics would come to
+    // depend on the order the worklist happened to drain.
+    let mut worklist: Vec<BlockId> = vec![entry];
+    while let Some(id) = worklist.pop() {
+        if !reachable.contains(&id) {
+            continue;
+        }
+        let Some(block) = blocks_by_id.get(&id).copied() else {
+            continue;
+        };
+        let Some(in_state) = join_in(id, &out_state) else {
+            continue;
+        };
+        let (out, _) = observation_transfer(
             block,
             &in_state,
             &begins,
@@ -7128,16 +7134,7 @@ fn verify_observations(
             function_name,
             source,
         );
-        // A block's own diagnostics are recorded exactly once, on its
-        // first visit: a later re-visit only ever happens because a
-        // predecessor's state changed, and re-reporting the same
-        // instruction for that would multiply one root cause by however
-        // many times the fixed point happened to iterate.
-        if visited.insert(id) {
-            located.append(&mut block_diagnostics);
-        }
-        let changed = out_state.get(&id) != Some(&out);
-        if changed {
+        if out_state.get(&id) != Some(&out) {
             out_state.insert(id, out);
             for &succ in successors.get(&id).into_iter().flatten() {
                 if reachable.contains(&succ) && !worklist.contains(&succ) {
@@ -7145,23 +7142,58 @@ fn verify_observations(
                 }
             }
         }
-        // Keeps the traversal itself deterministic: a block whose
-        // in-state is still `Pending` is retried only through a
-        // predecessor landing, and the initial sweep below guarantees
-        // every reachable block is attempted at least once.
-        for &next in &order {
-            if reachable.contains(&next)
-                && !visited.contains(&next)
-                && !worklist.contains(&next)
-                && predecessors
-                    .get(&next)
-                    .into_iter()
-                    .flatten()
-                    .any(|p| out_state.contains_key(p))
-            {
-                worklist.push(next);
-            }
+    }
+
+    // One disagreement produces one diagnostic, at the lowest-numbered
+    // block that actually has one. Reporting every block whose in-state
+    // is `Conflict` would report the *propagation* of a single
+    // disagreement once per block it reaches, and no local rule can
+    // tell "this is where it started" apart from "this inherited it"
+    // in a cycle, where a block is its own predecessor and the state it
+    // disagrees with is its own earlier one.
+    let first_conflict = order.iter().copied().find(|id| {
+        reachable.contains(id) && join_in(*id, &out_state) == Some(ObservationStack::Conflict)
+    });
+
+    // Phase 2: report, once per reachable block, against the settled
+    // in-state -- in block-id order, so the emitted sequence depends
+    // only on the CFG's own numbering.
+    for &id in &order {
+        if !reachable.contains(&id) {
+            continue;
         }
+        let Some(block) = blocks_by_id.get(&id).copied() else {
+            continue;
+        };
+        let Some(in_state) = join_in(id, &out_state) else {
+            continue;
+        };
+        if Some(id) == first_conflict {
+            report!(
+                id,
+                0,
+                codes::OBSERVATION_STATE_CONFLICT,
+                format!(
+                    "function `{function_name}`: bb{} is reached with different observations \
+                     active on different paths",
+                    id.0
+                ),
+            );
+        }
+        let (_, mut block_diagnostics) = observation_transfer(
+            block,
+            &in_state,
+            &begins,
+            &observer_of,
+            value_types,
+            known_functions,
+            agg,
+            &origin,
+            &canonical,
+            function_name,
+            source,
+        );
+        located.append(&mut block_diagnostics);
     }
 
     // -- Exits ---------------------------------------------------------
@@ -7443,9 +7475,9 @@ fn observation_transfer(
     };
 
     let check_uses = |index: usize,
-                          operands: Vec<ValueId>,
-                          push: &mut dyn FnMut(usize, &'static str, String),
-                          stack: &[ObservationId]| {
+                      operands: Vec<ValueId>,
+                      push: &mut dyn FnMut(usize, &'static str, String),
+                      stack: &[ObservationId]| {
         for operand in operands {
             if let Some(id) = observer_of.get(&operand)
                 && !stack.contains(id)
@@ -7464,12 +7496,7 @@ fn observation_transfer(
     };
 
     for (index, instruction) in block.instructions.iter().enumerate() {
-        check_uses(
-            index,
-            instruction_operands(instruction),
-            &mut push,
-            &stack,
-        );
+        check_uses(index, instruction_operands(instruction), &mut push, &stack);
         for (place, reporter, what) in
             consumed_places(instruction, known_functions, &is_affine, origin, canonical)
         {
@@ -25606,5 +25633,1205 @@ mod structural_ownership {
             !codes.contains(&codes::MIXED_CALL_OWNERSHIP_ALIAS),
             "two observations cannot conflict, got {codes:?}"
         );
+    }
+
+    /// `rfcs/0013` -- lexically scoped observations, verified from
+    /// hand-built NIR alone. Nothing here passes through the source
+    /// compiler, so every invariant is re-established from the
+    /// instructions themselves.
+    mod scoped_observations {
+        use super::*;
+        use crate::hir::ObservationId;
+        use crate::nir::InvokeErrTarget;
+
+        fn observe_at(result: u32, ty: Ty, id: u32, place: Place<ValueId>) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty,
+                kind: ValueKind::ObservePlace {
+                    observation: ObservationId(id),
+                    place,
+                },
+            }
+        }
+
+        fn end(id: u32) -> Instruction {
+            Instruction::EndObserve {
+                observation: ObservationId(id),
+            }
+        }
+
+        /// Only the observation family, sorted -- so a test asserts
+        /// exactly what this pass decided, independently of whatever
+        /// else a deliberately malformed fixture also trips.
+        fn observation_codes(fx: &mut Fixture, function: Function) -> Vec<&'static str> {
+            let mut codes: Vec<&'static str> = all_codes(fx, function)
+                .into_iter()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        codes::DUPLICATE_OBSERVATION_ID
+                            | codes::UNKNOWN_OBSERVATION_ID
+                            | codes::OBSERVATION_SOURCE_NOT_AFFINE
+                            | codes::OBSERVATION_RESULT_TYPE_MISMATCH
+                            | codes::OBSERVATION_END_NOT_INNERMOST
+                            | codes::OBSERVATION_ACTIVE_AT_EXIT
+                            | codes::OBSERVATION_STATE_CONFLICT
+                            | codes::OBSERVER_USED_AFTER_END
+                            | codes::OWNERSHIP_WHILE_OBSERVED
+                    )
+                })
+                .collect();
+            codes.sort_unstable();
+            codes
+        }
+
+        /// The canonical well-formed shape every negative case here is
+        /// one edit away from: observe one field of a `take` parameter,
+        /// end the scope, then destroy the parameter structurally.
+        fn well_formed(fx: &Fixture) -> Function {
+            under_test(
+                take_session(fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            )
+        }
+
+        #[test]
+        fn the_well_formed_shape_verifies_cleanly() {
+            let mut fx = fixture();
+            let f = well_formed(&fx);
+            assert!(
+                all_codes(&mut fx, f).is_empty(),
+                "the baseline shape must verify with no diagnostics at all"
+            );
+        }
+
+        // -- identity and shape ---------------------------------------
+
+        #[test]
+        fn one_observation_id_beginning_twice_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        end(0),
+                        observe_at(3, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert_eq!(
+                observation_codes(&mut fx, f),
+                vec![codes::DUPLICATE_OBSERVATION_ID]
+            );
+        }
+
+        #[test]
+        fn one_observation_id_beginning_again_while_active_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        observe_at(3, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::DUPLICATE_OBSERVATION_ID),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_end_naming_an_observation_that_never_begins_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![int(2, 0), end(7), drop_of(0)],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert_eq!(
+                observation_codes(&mut fx, f),
+                vec![codes::UNKNOWN_OBSERVATION_ID]
+            );
+        }
+
+        #[test]
+        fn observing_a_non_affine_place_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.plain.clone(),
+                    take: false,
+                }],
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.plain.clone(), 0, Place::root(ValueId(0))),
+                        int(2, 0),
+                        end(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert_eq!(
+                observation_codes(&mut fx, f),
+                vec![codes::OBSERVATION_SOURCE_NOT_AFFINE]
+            );
+        }
+
+        #[test]
+        fn an_observer_declared_a_different_type_than_its_place_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.session.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_RESULT_TYPE_MISMATCH),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_malformed_place_is_reported_by_the_place_layer_not_this_one() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(
+                            1,
+                            fx.file.clone(),
+                            0,
+                            Place::root(ValueId(0)).field(SESSION, FieldId(9)),
+                        ),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = all_codes(&mut fx, f);
+            assert!(found.contains(&codes::UNKNOWN_PLACE_FIELD), "got {found:?}");
+        }
+
+        // -- ends -------------------------------------------------------
+
+        #[test]
+        fn ending_the_same_observation_twice_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert_eq!(
+                observation_codes(&mut fx, f),
+                vec![codes::OBSERVATION_END_NOT_INNERMOST]
+            );
+        }
+
+        #[test]
+        fn ending_before_beginning_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        end(0),
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert_eq!(
+                observation_codes(&mut fx, f),
+                vec![codes::OBSERVATION_END_NOT_INNERMOST]
+            );
+        }
+
+        #[test]
+        fn nested_observations_ending_innermost_first_are_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        observe_at(3, fx.file.clone(), 1, session_field(1)),
+                        int(2, 0),
+                        end(1),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert!(all_codes(&mut fx, f).is_empty());
+        }
+
+        #[test]
+        fn ending_an_outer_observation_first_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        observe_at(3, fx.file.clone(), 1, session_field(1)),
+                        int(2, 0),
+                        end(0),
+                        end(1),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_END_NOT_INNERMOST),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_missing_end_at_a_return_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        int(2, 0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_ACTIVE_AT_EXIT),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_missing_end_at_a_raise_is_rejected() {
+            let mut fx = fixture();
+            let mut f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.holder.clone(),
+                            kind: ValueKind::VariantCreate {
+                                variant: HOLDER,
+                                case: 1,
+                                type_args: Vec::new(),
+                                payload: Vec::new(),
+                            },
+                        },
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Raise { value: ValueId(2) },
+                }],
+            );
+            f.raises = vec![HOLDER];
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_ACTIVE_AT_EXIT),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn ending_on_only_one_branch_is_a_state_conflict() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![observe_at(1, fx.file.clone(), 0, session_field(0))],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(9),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![end(0)],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_STATE_CONFLICT),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn ending_on_both_branches_of_a_diamond_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![observe_at(1, fx.file.clone(), 0, session_field(0))],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(9),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![end(0)],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![end(0)],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(all_codes(&mut fx, f).is_empty());
+        }
+
+        // -- the observer ------------------------------------------------
+
+        #[test]
+        fn using_the_observer_after_its_end_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        end(0),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::RecordField {
+                                base: ValueId(1),
+                                record: FILE,
+                                field: 0,
+                            },
+                        },
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_value_derived_from_the_observer_is_also_unusable_after_the_end() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: true,
+                }],
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // Observe the whole session, project a field out
+                        // of the *view*, end the scope, then read the
+                        // projection.
+                        observe_at(1, fx.session.clone(), 0, Place::root(ValueId(0))),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::PlaceRead {
+                                place: Place::root(ValueId(1)).field(SESSION, FieldId(0)),
+                                mode: OwnershipMode::Observe,
+                            },
+                        },
+                        end(0),
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: Ty::I64,
+                            kind: ValueKind::RecordField {
+                                base: ValueId(2),
+                                record: FILE,
+                                field: 0,
+                            },
+                        },
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(3))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn returning_the_observer_is_rejected_as_an_observer_transfer() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                fx.file.clone(),
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(1))),
+                }],
+            );
+            let found = all_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::RESOURCE_OBSERVER_CONSUMED)
+                    || found.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "an observer must never leave the frame as ownership, got {found:?}"
+            );
+        }
+
+        // -- conflicting ownership operations -----------------------------
+
+        #[test]
+        fn moving_the_observed_place_while_active_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OWNERSHIP_WHILE_OBSERVED),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn dropping_an_ancestor_of_the_observed_place_while_active_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        drop_of(0),
+                        int(2, 0),
+                        end(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OWNERSHIP_WHILE_OBSERVED),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_disjoint_sibling_field_stays_movable_while_observed() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert!(
+                all_codes(&mut fx, f).is_empty(),
+                "a disjoint sibling place is untouched by an observation"
+            );
+        }
+
+        #[test]
+        fn reinitializing_a_disjoint_sibling_while_observed_stays_legal() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        observe_at(1, fx.file.clone(), 0, session_field(1)),
+                        int(4, 1),
+                        Instruction::Value {
+                            result: ValueId(5),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(4)]),
+                        },
+                        Instruction::StorePlace {
+                            place: session_field(0),
+                            value: ValueId(5),
+                        },
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                !found.contains(&codes::OWNERSHIP_WHILE_OBSERVED),
+                "a reinitialization of a disjoint sibling must stay legal, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn reinitializing_the_exact_observed_place_while_active_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        drop_of(3),
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        int(4, 1),
+                        Instruction::Value {
+                            result: ValueId(5),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(4)]),
+                        },
+                        Instruction::StorePlace {
+                            place: session_field(0),
+                            value: ValueId(5),
+                        },
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OWNERSHIP_WHILE_OBSERVED),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn passing_the_observed_place_to_a_take_parameter_while_active_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(0),
+                            OwnershipMode::Transfer,
+                        ),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(3)], Vec::new()),
+                        },
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OWNERSHIP_WHILE_OBSERVED),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_take_call_on_a_disjoint_sibling_stays_legal_while_observed() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        read(
+                            3,
+                            fx.file.clone(),
+                            session_field(1),
+                            OwnershipMode::Transfer,
+                        ),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: Ty::Unit,
+                            kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(3)], Vec::new()),
+                        },
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            assert!(all_codes(&mut fx, f).is_empty());
+        }
+
+        // -- control flow --------------------------------------------------
+
+        #[test]
+        fn an_observation_opened_and_closed_inside_a_loop_body_is_accepted() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            end(0),
+                        ],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(9),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            assert!(all_codes(&mut fx, f).is_empty());
+        }
+
+        #[test]
+        fn an_observation_left_active_across_a_loop_back_edge_is_rejected() {
+            let mut fx = fixture();
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![observe_at(1, fx.file.clone(), 0, session_field(0))],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(9),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(2, 0), end(0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVATION_STATE_CONFLICT)
+                    || found.contains(&codes::DUPLICATE_OBSERVATION_ID),
+                "a scope that survives its own back edge must be rejected, got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_invoke_whose_two_edges_disagree_is_a_state_conflict() {
+            let mut fx = fixture();
+            let raiser_name = fx.interner.intern("raiser");
+            let raiser = Function {
+                id: RAISER,
+                name: raiser_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: vec![HOLDER],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.holder.clone(),
+                        kind: ValueKind::VariantCreate {
+                            variant: HOLDER,
+                            case: 1,
+                            type_args: Vec::new(),
+                            payload: Vec::new(),
+                        },
+                    }],
+                    terminator: Terminator::Raise { value: ValueId(1) },
+                }],
+            };
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            Instruction::Value {
+                                result: ValueId(5),
+                                ty: Ty::I64,
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(6),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: RAISER,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(5),
+                            ok_target: BlockId(1),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(6),
+                                target: BlockId(2),
+                            }],
+                        },
+                    },
+                    // The success edge ends the observation...
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![end(0)],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    // ...and the failure edge does not.
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: vec![int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            let helpers = helpers(&mut fx);
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let mut functions = vec![f, raiser];
+            functions.extend(helpers);
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions,
+                records: fx.records.clone(),
+                variants: fx.variants.clone(),
+            };
+            let found: Vec<&'static str> =
+                verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                    .into_iter()
+                    .map(|d| d.code)
+                    .collect();
+            assert!(
+                found.contains(&codes::OBSERVATION_STATE_CONFLICT),
+                "got {found:?}"
+            );
+        }
+
+        // -- unreachable code ------------------------------------------------
+
+        #[test]
+        fn an_unreachable_begin_never_seeds_a_reachable_path() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![observe_at(1, fx.file.clone(), 0, session_field(0))],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                ],
+            );
+            assert!(
+                observation_codes(&mut fx, f).is_empty(),
+                "an unreachable begin must not be demanded of a reachable exit"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_end_never_ends_anything_on_a_reachable_path() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            int(2, 0),
+                            end(0),
+                            drop_of(0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![end(0)],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                ],
+            );
+            assert!(
+                observation_codes(&mut fx, f).is_empty(),
+                "an unreachable end is not a second end on the reachable path"
+            );
+        }
+
+        // -- order independence -------------------------------------------
+
+        #[test]
+        fn the_block_vector_order_does_not_change_the_result() {
+            fn build(reversed: bool) -> (Fixture, Function) {
+                let fx = fixture();
+                let mut blocks = vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Value {
+                            result: ValueId(1),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::ObservePlace {
+                                observation: ObservationId(0),
+                                place: Place::root(ValueId(0)).field(SESSION, FieldId(0)),
+                            },
+                        }],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: Ty::I64,
+                                kind: ValueKind::Const(Const::Int(0)),
+                            },
+                            Instruction::Drop { value: ValueId(0) },
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ];
+                if reversed {
+                    blocks.reverse();
+                }
+                let params = vec![Param {
+                    value: ValueId(0),
+                    ty: fx.session.clone(),
+                    take: true,
+                }];
+                let f = under_test(params, Ty::I64, blocks);
+                (fx, f)
+            }
+            let (mut forward_fx, forward) = build(false);
+            let (mut reversed_fx, reversed) = build(true);
+            assert_eq!(
+                observation_codes(&mut forward_fx, forward),
+                observation_codes(&mut reversed_fx, reversed)
+            );
+        }
+
+        #[test]
+        fn repeated_verification_reports_byte_identical_diagnostics() {
+            fn build() -> (Fixture, Function) {
+                let fx = fixture();
+                let f = under_test(
+                    vec![Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    }],
+                    Ty::I64,
+                    vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction::Value {
+                                result: ValueId(1),
+                                ty: fx.file.clone(),
+                                kind: ValueKind::ObservePlace {
+                                    observation: ObservationId(0),
+                                    place: Place::root(ValueId(0)).field(SESSION, FieldId(0)),
+                                },
+                            },
+                            Instruction::Value {
+                                result: ValueId(3),
+                                ty: fx.file.clone(),
+                                kind: ValueKind::ObservePlace {
+                                    observation: ObservationId(1),
+                                    place: Place::root(ValueId(0)).field(SESSION, FieldId(1)),
+                                },
+                            },
+                            Instruction::Drop { value: ValueId(0) },
+                            Instruction::Value {
+                                result: ValueId(2),
+                                ty: Ty::I64,
+                                kind: ValueKind::Const(Const::Int(0)),
+                            },
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    }],
+                );
+                (fx, f)
+            }
+            let (mut a_fx, a) = build();
+            let (mut b_fx, b) = build();
+            assert_eq!(rendered(&mut a_fx, a), rendered(&mut b_fx, b));
+        }
+
+        #[test]
+        fn a_deep_chain_of_blocks_reaches_a_fixed_point_without_a_pass_cap() {
+            let mut fx = fixture();
+            // Deep enough that any fixed guess at "enough passes" would
+            // fail, and shallow enough that the whole verifier's own
+            // (unrelated, pre-existing) quadratic dominator computation
+            // does not dominate this suite's runtime.
+            let depth = 150u32;
+            let mut blocks = vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, fx.file.clone(), 0, session_field(0))],
+                terminator: Terminator::Branch(BlockId(1)),
+            }];
+            for i in 1..depth {
+                blocks.push(BasicBlock {
+                    id: BlockId(i),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(i + 1)),
+                });
+            }
+            blocks.push(BasicBlock {
+                id: BlockId(depth),
+                instructions: vec![int(2, 0), end(0), drop_of(0)],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            });
+            let f = under_test(take_session(&fx), Ty::I64, blocks);
+            assert!(all_codes(&mut fx, f).is_empty());
+        }
     }
 }

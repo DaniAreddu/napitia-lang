@@ -238,11 +238,63 @@ impl ResourceTable {
         // handle: the field's stored handle is the owner's, and
         // returning it as-is would let an observation promote itself by
         // one projection.
-        match (handle.role, field) {
-            (RuntimeOwnershipRole::Observer, Value::Resource(inner)) => {
-                Ok(Value::Resource(self.to_observer(inner)?))
-            }
-            (_, field) => Ok(field),
+        //
+        // Transitively, and at every depth. Downgrading only a handle
+        // stored *directly* in the field left a field holding a plain
+        // `Box[Session]` record handed back untouched, owning handles
+        // and all -- so one projection through a generic aggregate
+        // laundered an observation back into ownership.
+        match handle.role {
+            RuntimeOwnershipRole::Observer => self.observing_view(field, 0),
+            RuntimeOwnershipRole::Owner => Ok(field),
+        }
+    }
+
+    /// Rebuilds `value` as an observing view of itself: every resource
+    /// handle it carries inline, at any depth, becomes an `Observer`
+    /// (`rfcs/0011`).
+    ///
+    /// The table-level counterpart of
+    /// [`Interpreter::to_observing_view`], needed here because a
+    /// resource's own fields are read out of this table rather than
+    /// held inline by the value that owns them. Nothing is mutated: the
+    /// stored field keeps its owning handles, and only the copy handed
+    /// back is downgraded.
+    fn observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(inner) => Ok(Value::Resource(self.to_observer(inner)?)),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|field| self.observing_view(field, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|slot| self.observing_view(slot, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            other => Ok(other),
         }
     }
 
@@ -370,6 +422,20 @@ impl ResourceTable {
 struct AccessResult {
     extracted: Value,
     container: Value,
+}
+
+/// What a projection chain is about to be walked *for*
+/// (`rfcs/0012`). The navigation is identical either way; only the
+/// final step's own conditions differ, and both are refused outright
+/// once the walk has crossed an observer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathIntent {
+    /// The final field's value is about to be moved out of it, so it
+    /// must currently hold one.
+    Take,
+    /// The final field is about to be reinitialized, so it must
+    /// currently be a tombstone.
+    Store,
 }
 
 /// A complete, not-yet-applied plan for one structural store
@@ -1284,6 +1350,22 @@ impl<'a> Interpreter<'a> {
         container: Value,
         projections: &[Projection],
     ) -> Result<AccessResult, InterpreterError> {
+        // Preflight. The whole chain is validated against a value
+        // nothing has written to yet, so a rejection cannot leave a
+        // half-applied mutation behind: every reason this walk could
+        // fail is discovered here, before the committing walk below
+        // touches anything.
+        self.validate_place_path(&container, projections, PathIntent::Take, false, 0)?;
+        self.commit_take_projections(container, projections)
+    }
+
+    /// The committing half of [`Self::take_projections`], run only once
+    /// [`Self::validate_place_path`] has proven the whole chain.
+    fn commit_take_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+    ) -> Result<AccessResult, InterpreterError> {
         let Some((first, rest)) = projections.split_first() else {
             // A zero-projection place is the whole root value itself:
             // there is no container above it to tombstone a field in,
@@ -1316,7 +1398,7 @@ impl<'a> Interpreter<'a> {
                     })
                 } else {
                     let inner = self.resources.borrow().observe_field(handle, index)?;
-                    let inner = self.take_projections(inner, rest)?;
+                    let inner = self.commit_take_projections(inner, rest)?;
                     self.resources
                         .borrow_mut()
                         .restore_field(handle, index, inner.container)?;
@@ -1352,7 +1434,7 @@ impl<'a> Interpreter<'a> {
                         },
                     })
                 } else {
-                    let inner = self.take_projections(fields[index].clone(), rest)?;
+                    let inner = self.commit_take_projections(fields[index].clone(), rest)?;
                     fields[index] = inner.container;
                     Ok(AccessResult {
                         extracted: inner.extracted,
@@ -1370,6 +1452,126 @@ impl<'a> Interpreter<'a> {
                 "a place projects through a non-aggregate value ({})",
                 kind_name(&other)
             ))),
+        }
+    }
+
+    /// Validates a complete projection chain before any of it is
+    /// applied (`rfcs/0011`, `rfcs/0012`) -- mutating nothing, emitting
+    /// no event, and advancing no generation.
+    ///
+    /// This is the preflight half of the three-phase shape every
+    /// ownership operation in this interpreter now follows: *validate
+    /// the whole access, build the complete plan, commit only once
+    /// every validation succeeded.* The walk it guards used to mutate
+    /// as it went and discover an ancestor's role on the way back out,
+    /// which left a nested resource tombstoned behind a returned
+    /// `Err`.
+    ///
+    /// `observed` is the transitive observation capability, and is the
+    /// heart of the invariant: once the traversal crosses a merely
+    /// observing handle it stays crossed, through records, variants and
+    /// generic aggregates alike, so no owner-capable operation can
+    /// emerge anywhere in the subtree below it. A resource's own fields
+    /// are stored as the owner minted them, so propagating this flag --
+    /// rather than re-reading the stored handle's role -- is what makes
+    /// observation transitive rather than one level deep.
+    fn validate_place_path(
+        &self,
+        container: &Value,
+        projections: &[Projection],
+        intent: PathIntent,
+        observed: bool,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a place projects more deeply than this milestone supports",
+            ));
+        }
+        let Some((first, rest)) = projections.split_first() else {
+            return Ok(());
+        };
+        let index = Self::projection_index(first)?;
+        match container {
+            Value::Resource(handle) => {
+                // Reading the record validates the handle itself: an
+                // unknown identity, a stale generation and an
+                // already-dropped resource are each refused here,
+                // before anything downstream is considered.
+                let inner = {
+                    let table = self.resources.borrow();
+                    let record = table.observe(*handle)?;
+                    record.fields.get(index).cloned().ok_or_else(|| {
+                        invalid("a place projects a field index out of range for this resource")
+                    })?
+                };
+                let observed = observed || handle.role != RuntimeOwnershipRole::Owner;
+                if rest.is_empty() {
+                    Self::validate_final_step(&inner, intent, observed, true)
+                } else {
+                    self.validate_place_path(&inner, rest, intent, observed, depth + 1)
+                }
+            }
+            Value::Record { fields, .. } => {
+                let inner = fields.get(index).ok_or_else(|| {
+                    invalid("a place projects a field index out of range for this record")
+                })?;
+                if rest.is_empty() {
+                    Self::validate_final_step(inner, intent, observed, false)
+                } else {
+                    self.validate_place_path(inner, rest, intent, observed, depth + 1)
+                }
+            }
+            Value::Moved => Err(invalid("use of a field after it was already moved")),
+            Value::Dropped => Err(invalid("use of a field after it was already dropped")),
+            other => Err(invalid(format!(
+                "a place projects through a non-aggregate value ({})",
+                kind_name(other)
+            ))),
+        }
+    }
+
+    /// The final projection step's own conditions, which are the only
+    /// ones that differ between reading a value out of a place and
+    /// writing one back into it.
+    fn validate_final_step(
+        slot: &Value,
+        intent: PathIntent,
+        observed: bool,
+        in_resource: bool,
+    ) -> Result<(), InterpreterError> {
+        let tombstone = matches!(slot, Value::Moved | Value::Dropped);
+        match intent {
+            PathIntent::Take => {
+                if observed {
+                    return Err(invalid(
+                        "cannot transfer a field through a merely-observing resource handle",
+                    ));
+                }
+                if tombstone {
+                    return Err(invalid(if in_resource {
+                        "transfer of a resource field that was already moved or dropped"
+                    } else {
+                        "transfer of a record field that was already moved or dropped"
+                    }));
+                }
+                Ok(())
+            }
+            PathIntent::Store => {
+                if observed {
+                    return Err(invalid(
+                        "cannot reinitialize a field through a merely-observing resource handle",
+                    ));
+                }
+                if !tombstone {
+                    return Err(invalid(if in_resource {
+                        "cannot overwrite a resource field that still owns a live value"
+                    } else {
+                        "cannot overwrite a record field that still owns a live value"
+                    }));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1398,6 +1600,22 @@ impl<'a> Interpreter<'a> {
         projections: &[Projection],
         value: Value,
     ) -> Result<Value, InterpreterError> {
+        // Preflight, for the same reason [`Self::take_projections`]
+        // runs one: reaching the destination used to write into the
+        // last resource on the path before discovering that an ancestor
+        // above it was merely observed.
+        self.validate_place_path(&container, projections, PathIntent::Store, false, 0)?;
+        self.commit_store_projections(container, projections, value)
+    }
+
+    /// The committing half of [`Self::store_projections`], run only
+    /// once [`Self::validate_place_path`] has proven the whole chain.
+    fn commit_store_projections(
+        &self,
+        container: Value,
+        projections: &[Projection],
+        value: Value,
+    ) -> Result<Value, InterpreterError> {
         let Some((first, rest)) = projections.split_first() else {
             return Ok(value);
         };
@@ -1418,7 +1636,7 @@ impl<'a> Interpreter<'a> {
                     // internal `restore_field`, never `set_field`,
                     // which would reject it as a live overwrite.
                     let inner = self.resources.borrow().observe_field(handle, index)?;
-                    let updated_inner = self.store_projections(inner, rest, value)?;
+                    let updated_inner = self.commit_store_projections(inner, rest, value)?;
                     self.resources
                         .borrow_mut()
                         .restore_field(handle, index, updated_inner)?;
@@ -1448,7 +1666,8 @@ impl<'a> Interpreter<'a> {
                     // failure deeper in the chain must never leave this
                     // record holding a `Moved` tombstone where a live
                     // intermediate used to be.
-                    fields[index] = self.store_projections(fields[index].clone(), rest, value)?;
+                    fields[index] =
+                        self.commit_store_projections(fields[index].clone(), rest, value)?;
                 }
                 Ok(Value::Record {
                     item,
@@ -12093,6 +12312,460 @@ mod stage_agreement {
                 .count(),
             2,
             "each of the two real owners is destroyed exactly once"
+        );
+    }
+}
+
+/// Observation is *transitive* and every rejected access is atomic
+/// (`rfcs/0011`, `rfcs/0012`).
+///
+/// Two independent properties are proven here, on the same fixture,
+/// because the first one failing is what made the second one visible.
+///
+/// **Transitivity.** Once a traversal crosses an observer boundary, no
+/// owner-capable handle may emerge anywhere in the subtree it reaches.
+/// Reading a field out of an observed resource used to downgrade only a
+/// handle stored *directly* in that field: a field holding a plain
+/// `Box[Session]` record was handed back untouched, owning handles and
+/// all, so one projection through a generic aggregate laundered an
+/// observation back into ownership.
+///
+/// **Atomicity.** A rejected access must perform no semantic mutation.
+/// The walk used to tombstone the field it reached and only afterwards
+/// discover that an ancestor on the path was merely observed, leaving
+/// the nested resource `Moved` behind a returned `Err`.
+#[cfg(test)]
+mod observed_projection_atomicity {
+    use super::*;
+    use crate::nir::{CaseLayout, RecordLayout, VariantLayout};
+    use crate::place::{FieldId, Projection};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(170);
+    const SESSION: ItemId = ItemId(171);
+    const BOXY: ItemId = ItemId(172);
+    const OUTER: ItemId = ItemId(173);
+    const HOLDER: ItemId = ItemId(174);
+    const MAYBE: ItemId = ItemId(175);
+
+    fn module() -> Module {
+        let name = Symbol(0);
+        let param = crate::hir::TypeParamId(0);
+        Module {
+            functions: Vec::new(),
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Named(FILE, name))],
+                        affine: true,
+                    },
+                ),
+                (
+                    BOXY,
+                    RecordLayout {
+                        name,
+                        type_params: vec![(param, name)],
+                        fields: vec![(name, Ty::Param(param, name))],
+                        affine: false,
+                    },
+                ),
+                (
+                    OUTER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Applied(BOXY, vec![Ty::Named(SESSION, name)]))],
+                        affine: true,
+                    },
+                ),
+                (
+                    HOLDER,
+                    RecordLayout {
+                        name,
+                        type_params: Vec::new(),
+                        fields: vec![(name, Ty::Applied(MAYBE, vec![Ty::Named(SESSION, name)]))],
+                        affine: true,
+                    },
+                ),
+            ],
+            variants: vec![(
+                MAYBE,
+                VariantLayout {
+                    name,
+                    type_params: vec![(param, name)],
+                    cases: vec![
+                        CaseLayout {
+                            name,
+                            payload: vec![Ty::Param(param, name)],
+                        },
+                        CaseLayout {
+                            name,
+                            payload: Vec::new(),
+                        },
+                    ],
+                },
+            )],
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    /// `Outer{ Box[Session]{ Session{ File{ i64 } } } }`, with every
+    /// resource owned exactly once, and every handle an owner.
+    struct Fixture {
+        file: ResourceHandle,
+        session: ResourceHandle,
+        outer: ResourceHandle,
+    }
+
+    fn build(interpreter: &Interpreter<'_>) -> Fixture {
+        let name = Symbol(0);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(7)]);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(file)]);
+        let boxed = Value::Record {
+            item: BOXY,
+            type_args: vec![Ty::Named(SESSION, name)],
+            fields: vec![Value::Resource(session)],
+        };
+        let outer = interpreter
+            .resources
+            .borrow_mut()
+            .construct(OUTER, vec![boxed]);
+        Fixture {
+            file,
+            session,
+            outer,
+        }
+    }
+
+    /// The same shape, but with the generic aggregate on the path being
+    /// a *variant payload* rather than a record field.
+    fn build_variant(interpreter: &Interpreter<'_>) -> (ResourceHandle, ResourceHandle) {
+        let name = Symbol(0);
+        let file = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(9)]);
+        let session = interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(file)]);
+        let payload = Value::Variant {
+            item: MAYBE,
+            type_args: vec![Ty::Named(SESSION, name)],
+            case: 0,
+            payload: vec![Value::Resource(session)],
+        };
+        let holder = interpreter
+            .resources
+            .borrow_mut()
+            .construct(HOLDER, vec![payload]);
+        (session, holder)
+    }
+
+    fn field_of(interpreter: &Interpreter<'_>, handle: ResourceHandle, index: usize) -> Value {
+        interpreter.resources.borrow().records[handle.id.0 as usize].fields[index].clone()
+    }
+
+    fn generation_of(interpreter: &Interpreter<'_>, handle: ResourceHandle) -> u64 {
+        interpreter.resources.borrow().records[handle.id.0 as usize].generation
+    }
+
+    /// Every observable fact a rejected operation must leave untouched.
+    #[derive(Debug, PartialEq)]
+    struct Snapshot {
+        fields: Vec<Vec<Value>>,
+        generations: Vec<u64>,
+        statuses: Vec<ResourceStatus>,
+        items: Vec<ItemId>,
+        events: Vec<String>,
+    }
+
+    fn snapshot(interpreter: &Interpreter<'_>) -> Snapshot {
+        let table = interpreter.resources.borrow();
+        Snapshot {
+            fields: table.records.iter().map(|r| r.fields.clone()).collect(),
+            generations: table.records.iter().map(|r| r.generation).collect(),
+            statuses: table.records.iter().map(|r| r.status.clone()).collect(),
+            items: table.records.iter().map(|r| r.item).collect(),
+            events: interpreter.event_log().to_vec(),
+        }
+    }
+
+    fn observer(interpreter: &Interpreter<'_>, handle: ResourceHandle) -> ResourceHandle {
+        interpreter
+            .resources
+            .borrow()
+            .to_observer(handle)
+            .expect("the fixture's own resources are all live")
+    }
+
+    fn field(owner: ItemId) -> Projection {
+        Projection::Field {
+            owner,
+            field: FieldId(0),
+        }
+    }
+
+    /// Every handle `value` carries inline, at any depth.
+    fn collect_handles(value: &Value, out: &mut Vec<ResourceHandle>) {
+        match value {
+            Value::Resource(handle) => out.push(*handle),
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    collect_handles(field, out);
+                }
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    collect_handles(slot, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_all_observers(value: &Value, what: &str) {
+        let mut found = Vec::new();
+        collect_handles(value, &mut found);
+        assert!(!found.is_empty(), "{what}: the fixture carries no handles");
+        for handle in found {
+            assert_eq!(
+                handle.role,
+                RuntimeOwnershipRole::Observer,
+                "{what}: an owning handle emerged from an observed ancestor"
+            );
+        }
+    }
+
+    /// The reported defect, at its own layer: a take that crosses an
+    /// observed ancestor, passes through a generic record, and reaches a
+    /// field two resources deeper.
+    #[test]
+    fn a_take_through_an_observed_ancestor_is_refused_without_mutating_anything() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+        let before = snapshot(&interpreter);
+
+        let view = observer(&interpreter, fixture.outer);
+        let path = [field(OUTER), field(BOXY), field(SESSION)];
+        let result = interpreter.take_projections(Value::Resource(view), &path);
+
+        assert!(
+            result.is_err(),
+            "a take may never cross an observed ancestor, however many aggregates intervene"
+        );
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "a rejected take must leave every observable fact exactly as it was"
+        );
+    }
+
+    /// The same defect with the observer boundary one level shallower:
+    /// the session itself is observed, and the file below it is taken.
+    #[test]
+    fn a_take_through_a_nearer_observed_ancestor_is_refused_without_mutating_anything() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+        let before = snapshot(&interpreter);
+
+        let view = observer(&interpreter, fixture.session);
+        let path = [field(SESSION)];
+        let result = interpreter.take_projections(Value::Resource(view), &path);
+
+        assert!(result.is_err(), "the nearer boundary is refused too");
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "and it mutates nothing either"
+        );
+    }
+
+    /// The variant-payload spelling of the same chain: observer ->
+    /// variant payload -> record -> resource.
+    #[test]
+    fn a_take_through_an_observed_variant_payload_is_refused_without_mutating_anything() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let (_session, holder) = build_variant(&interpreter);
+        let before = snapshot(&interpreter);
+
+        let view = observer(&interpreter, holder);
+        // The payload slot is reached as field 0 of the holder, then the
+        // variant's own payload index 0, then the session's own field.
+        let path = [
+            field(HOLDER),
+            Projection::VariantField {
+                variant: MAYBE,
+                case: crate::place::CaseId(0),
+                field: FieldId(0),
+            },
+            field(SESSION),
+        ];
+        let result = interpreter.take_projections(Value::Resource(view), &path);
+
+        assert!(
+            result.is_err(),
+            "a variant payload is no more a laundering route than a record field"
+        );
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "and the rejection mutates nothing"
+        );
+    }
+
+    /// The laundering itself, independent of whether anything is later
+    /// taken: reading through an observer must not yield an owner at any
+    /// depth, through any aggregate.
+    #[test]
+    fn reading_through_an_observer_yields_no_owner_at_any_depth() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+
+        let view = observer(&interpreter, fixture.outer);
+        let boxed = interpreter
+            .resources
+            .borrow()
+            .observe_field(view, 0)
+            .expect("reading an observed resource's own field is always legal");
+
+        assert_all_observers(&boxed, "a `Box[Session]` read out of an observed resource");
+    }
+
+    /// The same, through the projection walker rather than one field
+    /// read, and at every depth the walk can stop at.
+    #[test]
+    fn observing_a_projection_through_an_observer_yields_no_owner() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+        let view = Value::Resource(observer(&interpreter, fixture.outer));
+
+        for depth in 1..=2 {
+            let path = [field(OUTER), field(BOXY)];
+            let reached = interpreter
+                .observe_projections(&view, &path[..depth])
+                .expect("observing is always legal through an observer");
+            assert_all_observers(&reached, "a projection observed through an observer");
+        }
+    }
+
+    /// A store *into* a place reached through an observed ancestor is
+    /// refused, and changes nothing.
+    #[test]
+    fn a_store_through_an_observed_ancestor_is_refused_without_mutating_anything() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+        // Empty the field first, through the real owner, so the store
+        // would otherwise have somewhere legal to land.
+        let path = [field(OUTER), field(BOXY), field(SESSION)];
+        let taken = interpreter
+            .take_projections(Value::Resource(fixture.outer), &path)
+            .expect("the owner may empty its own nested field");
+        let before = snapshot(&interpreter);
+
+        let view = Value::Resource(observer(&interpreter, fixture.outer));
+        let result = interpreter.store_projections(view, &path, taken.extracted);
+
+        assert!(
+            result.is_err(),
+            "reinitializing through an observed ancestor is still an observation"
+        );
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "and the refused store wrote nothing"
+        );
+    }
+
+    /// The same path through a genuine owner still works, so the fix is
+    /// a restriction on observation rather than on depth.
+    #[test]
+    fn the_same_path_through_a_real_owner_still_transfers() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+
+        let path = [field(OUTER), field(BOXY), field(SESSION)];
+        let taken = interpreter
+            .take_projections(Value::Resource(fixture.outer), &path)
+            .expect("an owner may take its own nested field");
+
+        assert_eq!(
+            taken.extracted,
+            Value::Resource(fixture.file),
+            "the owner really does receive the file it reached"
+        );
+        assert_eq!(
+            field_of(&interpreter, fixture.session, 0),
+            Value::Moved,
+            "and the field it came out of is tombstoned exactly once"
+        );
+        assert_eq!(
+            generation_of(&interpreter, fixture.file),
+            0,
+            "a field moved out of its owner does not change the moved value's own generation"
+        );
+    }
+
+    /// Repeating a rejected operation must be deterministic: the same
+    /// error, and still no mutation.
+    #[test]
+    fn repeating_a_rejected_take_is_deterministic() {
+        let module = module();
+        let interpreter = Interpreter::new(&module);
+        let fixture = build(&interpreter);
+        let before = snapshot(&interpreter);
+        let path = [field(OUTER), field(BOXY), field(SESSION)];
+
+        let first = interpreter
+            .take_projections(
+                Value::Resource(observer(&interpreter, fixture.outer)),
+                &path,
+            )
+            .err()
+            .expect("refused the first time");
+        let second = interpreter
+            .take_projections(
+                Value::Resource(observer(&interpreter, fixture.outer)),
+                &path,
+            )
+            .err()
+            .expect("refused identically the second time");
+
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "a rejected operation is deterministic"
+        );
+        assert_eq!(
+            snapshot(&interpreter),
+            before,
+            "neither attempt mutated anything"
         );
     }
 }

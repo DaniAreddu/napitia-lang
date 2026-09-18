@@ -25864,6 +25864,57 @@ mod structural_ownership {
         }
 
         #[test]
+        fn an_observation_of_a_value_that_does_not_exist_is_rejected_not_a_panic() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, Place::root(ValueId(77))),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = all_codes(&mut fx, f);
+            assert!(found.contains(&codes::UNKNOWN_VALUE), "got {found:?}");
+        }
+
+        #[test]
+        fn dropping_the_observer_is_rejected_as_an_observer_operation() {
+            // The one laundering this construct could otherwise enable:
+            // an observer is an ordinary affine-typed value, so nothing
+            // but its recorded *role* stops a `Drop` of it from
+            // destroying something the caller owns.
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        drop_of(1),
+                        int(2, 0),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = all_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::RESOURCE_OBSERVER_CONSUMED)
+                    || found.contains(&codes::OBSERVER_CANNOT_TRANSFER),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
         fn a_malformed_place_is_reported_by_the_place_layer_not_this_one() {
             let mut fx = fixture();
             let f = under_test(

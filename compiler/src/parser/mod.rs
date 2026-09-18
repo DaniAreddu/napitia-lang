@@ -32,15 +32,18 @@ const ERROR_CODE: &str = "P0001";
 /// chain exhausted the native stack while a 400-deep parenthesis nest
 /// was caught.
 ///
-/// Sized from measurement rather than taste. On the tightest platform
-/// this compiler is built for (Windows, debug, the 1 MiB default
-/// main-thread stack) the most expensive shape per nesting level is a
-/// nested block -- parsing, HIR lowering, type checking, resource
-/// checking and NIR lowering each descend once per level -- and it
-/// exhausted the stack at roughly 115 levels. 32 keeps better than a 3x
-/// margin under that while sitting far above anything hand-written
-/// source plausibly reaches.
-const MAX_EXPRESSION_DEPTH: usize = 32;
+/// Sized from measurement rather than taste, against the *smallest*
+/// stack the parser is ever driven on. `cli::run` gives the compiler a
+/// stack it sizes itself, but a unit test drives the parser on an
+/// ordinary 2 MiB test thread, and a library caller on whatever it
+/// happens to have. The measurement to beat is the most expensive shape
+/// per nesting level -- a nested block, which parsing, HIR lowering,
+/// type checking, resource checking and NIR lowering each descend once
+/// per level -- exhausting a 1 MiB stack at roughly 115 levels. 64
+/// keeps a margin of several times that even on the smallest of those
+/// stacks, while sitting far above anything hand-written source
+/// plausibly reaches.
+const MAX_EXPRESSION_DEPTH: usize = 64;
 
 /// Parses a token stream (already produced by [`crate::lexer::tokenize`])
 /// into a [`Module`], plus every diagnostic encountered along the way. A

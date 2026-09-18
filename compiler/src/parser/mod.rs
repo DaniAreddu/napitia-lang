@@ -12,6 +12,39 @@ use crate::syntax::ast::{Ident, Module};
 
 const ERROR_CODE: &str = "P0001";
 
+/// Maximum expression *nesting* depth the parser will construct before
+/// reporting `P0001` and refusing to nest any further.
+///
+/// Deliberately not in `crate::limits`, whose bounds are the ones every
+/// stage re-enforces for itself because each is separately reachable
+/// with hand-built input. This one is different: it bounds the shape of
+/// the syntax tree *at the only place a syntax tree is ever built from
+/// source*, so `hir::lower`, `typeck`, `resourceck::flow`, `nir::lower`
+/// and Rust's own recursive `Drop` for the boxed tree are all bounded by
+/// construction rather than by a guard each repeats. There is no second
+/// way for a `.npt` file to reach them.
+///
+/// The bound counts *constructed* nesting, not parser recursion.
+/// `1 + 1 + 1 + ...` and `f(a)(b)(c)` are folded by a loop rather than
+/// by recursion, yet each iteration still wraps the accumulated tree in
+/// one more node -- so counting only the recursive descents would leave
+/// exactly those shapes unbounded, which is how a 400-term addition
+/// chain exhausted the native stack while a 400-deep parenthesis nest
+/// was caught.
+///
+/// Sized from measurement rather than taste, against the *smallest*
+/// stack the parser is ever driven on. `cli::run` gives the compiler a
+/// stack it sizes itself, but a unit test drives the parser on an
+/// ordinary 2 MiB test thread, and a library caller on whatever it
+/// happens to have. The measurement to beat is the most expensive shape
+/// per nesting level -- a nested block, which parsing, HIR lowering,
+/// type checking, resource checking and NIR lowering each descend once
+/// per level -- exhausting a 1 MiB stack at roughly 115 levels. 64
+/// keeps a margin of several times that even on the smallest of those
+/// stacks, while sitting far above anything hand-written source
+/// plausibly reaches.
+const MAX_EXPRESSION_DEPTH: usize = 64;
+
 /// Parses a token stream (already produced by [`crate::lexer::tokenize`])
 /// into a [`Module`], plus every diagnostic encountered along the way. A
 /// syntax error never aborts parsing: the parser records a diagnostic,
@@ -34,6 +67,26 @@ pub struct Parser<'a> {
     /// unaffected, since `(` starts a nested, independently-scoped
     /// expression.
     no_struct_literal: bool,
+    /// How many expression nodes deep the tree currently being built
+    /// already is ([`MAX_EXPRESSION_DEPTH`]). Maintained by
+    /// [`Self::enter_expression`]/[`Self::leave_expression`] around
+    /// every point that adds one more level of nesting — the recursive
+    /// descents *and* the two loops that wrap an already-parsed operand
+    /// in another node per iteration.
+    expr_depth: usize,
+    /// Whether this file has already been told its expressions nest too
+    /// deeply.
+    ///
+    /// Latched for the rest of the parse, never reset. Once one
+    /// expression has been refused, the parse of everything after it
+    /// resumes mid-construct and every later "expected X" describes
+    /// that truncation rather than anything the author wrote — and on a
+    /// chain of tens of thousands of operators there is one such token
+    /// per operator, each rendering the same (very long) source line.
+    /// One honest diagnostic about the real problem is worth more than
+    /// tens of thousands of consequences of it, and the file is rejected
+    /// either way.
+    reported_expression_too_deep: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -49,6 +102,8 @@ impl<'a> Parser<'a> {
             interner,
             diagnostics: Vec::new(),
             no_struct_literal: false,
+            expr_depth: 0,
+            reported_expression_too_deep: false,
         }
     }
 
@@ -122,6 +177,57 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Claims one more level of expression nesting, or refuses
+    /// ([`MAX_EXPRESSION_DEPTH`]).
+    ///
+    /// `false` means the budget is spent: the caller must *not* recurse
+    /// and must not wrap anything in another node. It reports `P0001`
+    /// once, here, so every refusal site gets the same diagnostic
+    /// without repeating it, and so a single pathological expression
+    /// cannot emit one diagnostic per surplus level.
+    ///
+    /// Every `true` must be paired with exactly one
+    /// [`Self::leave_expression`], including on the paths that bail out
+    /// early -- an unbalanced pair would leak budget and start refusing
+    /// perfectly ordinary later expressions.
+    fn enter_expression(&mut self, span: Span) -> bool {
+        if self.expr_depth >= MAX_EXPRESSION_DEPTH {
+            self.error_expression_too_deep(span);
+            return false;
+        }
+        self.expr_depth += 1;
+        true
+    }
+
+    fn leave_expression(&mut self) {
+        self.expr_depth = self.expr_depth.saturating_sub(1);
+    }
+
+    /// An expression nested past [`MAX_EXPRESSION_DEPTH`].
+    ///
+    /// Reported at most once per item. The refusal stops the tree from
+    /// growing, and every enclosing level then unwinds with its own
+    /// ordinary "expected `)`"-style recovery, refusing again as it
+    /// goes; repeating this message for each of those would bury the one
+    /// line that explains what actually happened. The item is rejected
+    /// either way -- the surplus levels still produce their own ordinary
+    /// syntax diagnostics.
+    fn error_expression_too_deep(&mut self, span: Span) {
+        if self.reported_expression_too_deep {
+            return;
+        }
+        self.reported_expression_too_deep = true;
+        self.diagnostics.push(
+            Diagnostic::error(
+                ERROR_CODE,
+                self.source,
+                span,
+                "expression is nested too deeply to parse",
+            )
+            .with_primary_label("expression is too complex"),
+        );
+    }
+
     fn error_pattern_too_deep(&mut self, span: Span) {
         self.diagnostics.push(
             Diagnostic::error(
@@ -157,6 +263,19 @@ impl<'a> Parser<'a> {
         // adding "expected X, found an invalid token" on top of it would
         // just be noise pointing at the same span.
         if matches!(self.current(), TokenKind::Error) {
+            return;
+        }
+        // Same principle, one level up: once this item has been told its
+        // expressions nest too deeply, the parse of it was truncated in
+        // the middle of an expression on purpose, and every "expected X"
+        // after that describes the truncation rather than anything the
+        // author did. On a chain of tens of thousands of operators there
+        // is one of those per surplus token, each rendering the same
+        // (very long) source line -- which is how a file with exactly
+        // one thing wrong with it produced enough output to look like a
+        // hang. The item is still rejected: the depth diagnostic is an
+        // error in its own right.
+        if self.reported_expression_too_deep {
             return;
         }
         let span = self.current_span();

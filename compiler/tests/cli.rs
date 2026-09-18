@@ -436,6 +436,112 @@ fn deeply_nested_pattern_terminates_diagnostically_at_every_stage() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Expressions nested far past the parser's own nesting bound, one
+/// shape per grammar recursion, generated here rather than committed as
+/// giant fixture files.
+///
+/// Each of these used to abort the process with a native stack overflow
+/// -- no diagnostic, no error code, nothing on stderr -- because every
+/// stage after the parser walks the expression tree on the call stack.
+/// The exit code is asserted exactly: a stack overflow on Windows exits
+/// with a status code too (`0xC0000409`), so "not a signal" is not
+/// enough to tell the two apart, while "exit 1 and a P0001 on stderr"
+/// is.
+///
+/// The size of stderr is asserted as well. A refused expression resumes
+/// mid-construct, so every surplus token can produce its own follow-on
+/// syntax error; on a chain this long that is tens of thousands of
+/// diagnostics, each re-rendering the same tens-of-kilobytes source
+/// line, which is slow enough to be indistinguishable from a hang.
+#[test]
+fn deeply_nested_expressions_terminate_diagnostically_at_every_stage() {
+    let depth = 20_000;
+    let cases = [
+        (
+            "parentheses",
+            format!(
+                "func main() -> i64 {{ return {}1{}; }}\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            ),
+        ),
+        (
+            "blocks",
+            format!(
+                "func main() -> i64 {{ return {}1{}; }}\n",
+                "{".repeat(depth),
+                "}".repeat(depth)
+            ),
+        ),
+        (
+            "unary operators",
+            format!("func main() -> i64 {{ return {}1; }}\n", "-".repeat(depth)),
+        ),
+        (
+            "a binary fold",
+            format!(
+                "func main() -> i64 {{ return 1{}; }}\n",
+                " + 1".repeat(depth)
+            ),
+        ),
+        (
+            "a postfix fold",
+            format!(
+                "func g() -> i64 {{ return 0; }}\nfunc main() -> i64 {{ return g{}; }}\n",
+                "()".repeat(depth)
+            ),
+        ),
+        (
+            "an assignment chain",
+            format!(
+                "func main() -> i64 {{ mutable a = 0; a {}= 1; return a; }}\n",
+                "= a ".repeat(depth)
+            ),
+        ),
+        (
+            "an else-if chain",
+            format!(
+                "func main() -> i64 {{ if false {{ return 0; }}{} else {{ return 1; }} }}\n",
+                " else if false { return 0; }".repeat(depth)
+            ),
+        ),
+    ];
+
+    for (index, (what, source)) in cases.iter().enumerate() {
+        let path = std::env::temp_dir().join(format!(
+            "napitia_deep_expr_{}_{index}.npt",
+            std::process::id()
+        ));
+        std::fs::write(&path, source).expect("failed to write the temp fixture");
+        let path_str = path.to_string_lossy().into_owned();
+
+        for cmd in ["check", "ir", "run"] {
+            let output = napitia(&[cmd, &path_str]);
+            let err = stderr(&output);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "`{cmd}` on {what} nested {depth} deep did not exit with a diagnostic status: {err}"
+            );
+            assert!(
+                err.contains("P0001") && err.contains("nested too deeply"),
+                "`{cmd}` on {what} did not report the depth diagnostic: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+                "`{cmd}` on {what} panicked instead of reporting a diagnostic: {err}"
+            );
+            assert!(
+                err.len() < 1_000_000,
+                "`{cmd}` on {what} produced {} bytes of diagnostics for one defect",
+                err.len()
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 // -- Generics (`rfcs/0008`) ---------------------------------------------
 
 #[test]

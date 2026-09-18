@@ -410,6 +410,13 @@ fn format_instruction(
                 value.0
             )
         }
+        // `rfcs/0013`. Printed with the same `@obsN` spelling its
+        // matching `observe.place` uses, so an observation's own
+        // boundaries are visible as a matched pair when reading a
+        // printed function top to bottom.
+        Instruction::EndObserve { observation } => {
+            format!("end.observe @obs{}", observation.0)
+        }
     }
 }
 
@@ -617,6 +624,13 @@ fn format_value_kind(
                 crate::nir::OwnershipMode::Observe => format!("load.place {place_str}"),
                 crate::nir::OwnershipMode::Transfer => format!("move.place {place_str}"),
             }
+        }
+        ValueKind::ObservePlace { observation, place } => {
+            format!(
+                "observe.place @obs{} {}",
+                observation.0,
+                format_place(place, registry, interner)
+            )
         }
     }
 }

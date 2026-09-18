@@ -1,6 +1,6 @@
 //! NIR instructions.
 
-use crate::hir::ItemId;
+use crate::hir::{ItemId, ObservationId};
 use crate::place::Place;
 use crate::types::{Evidence, Ty};
 
@@ -164,6 +164,26 @@ pub enum ValueKind {
         place: Place<ValueId>,
         mode: OwnershipMode,
     },
+    /// Begins a lexically scoped observation of `place` (`rfcs/0013`),
+    /// producing the observer value the observation's own alias is
+    /// bound to. Its result type is `place`'s own type, exactly -- an
+    /// observation is not a wrapper or a reference type, only a
+    /// capability the value is reached through.
+    ///
+    /// Explicit, and paired with exactly one
+    /// [`Instruction::EndObserve`] on every reachable path leaving the
+    /// scope. Deliberately *not* inferable from use counts, a lowering-
+    /// side map or a comment: `nir::verify` and the interpreter each
+    /// re-establish the whole discipline from these two instructions
+    /// alone, without any source-level metadata to consult.
+    ///
+    /// `observation` is the stable identity minted once per `observe`
+    /// statement. It is unique within one function; the verifier
+    /// rejects a repeat rather than assuming lowering produced one.
+    ObservePlace {
+        observation: ObservationId,
+        place: Place<ValueId>,
+    },
 }
 
 /// Whether a `Store` (or, by extension, any other place a value flows
@@ -253,4 +273,15 @@ pub enum Instruction {
         place: Place<ValueId>,
         value: ValueId,
     },
+    /// Ends the observation `observation` began with
+    /// [`ValueKind::ObservePlace`] (`rfcs/0013`).
+    ///
+    /// Performs **no** cleanup and **no** ownership transfer: it is
+    /// purely the point at which the observer value stops being
+    /// readable and every place overlapping the observed one stops
+    /// being frozen. It is emitted on the edge, before whatever
+    /// ownership cleanup that same edge carries, precisely because
+    /// that cleanup is the destruction the observation exists to
+    /// forbid.
+    EndObserve { observation: ObservationId },
 }

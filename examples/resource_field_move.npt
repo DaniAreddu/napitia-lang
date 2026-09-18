@@ -1,0 +1,33 @@
+// Transferring one structural field out of a resource-containing
+// resource, and accessing an unaffected sibling field afterward
+// (`rfcs/0012`).
+resource File {
+    descriptor: i64,
+}
+
+resource Session {
+    input: File,
+    output: File,
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func sink(take file: File) -> unit {
+    drop file;
+}
+
+func main() -> i64 {
+    value session = Session {
+        input: File { descriptor: 10 },
+        output: File { descriptor: 20 },
+    };
+    // Moves `session.input` into `moved_input`; `session.output` is
+    // completely unaffected by this move.
+    value moved_input = session.input;
+    value total = inspect(session.output);
+    sink(moved_input);
+    drop session;
+    return total;
+}

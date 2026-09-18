@@ -1,0 +1,42 @@
+import resources.File as ResourceFile;
+import resources.OpenError;
+import resources.open;
+import resources.inspect;
+import resources.validate;
+import resources.close;
+
+// The imported resource named through its local alias: `ResourceFile`
+// and the `File` `close` declares are the same nominal type, so this
+// hands ownership straight on (`rfcs/0007`, `rfcs/0013`).
+func detach(take file: ResourceFile) -> i64 {
+    return close(file);
+}
+
+// An observation opened in *this* module over a resource type declared
+// in another one, handed to that other module's own observing
+// parameter -- and a fallible cross-module call inside the scope, whose
+// failure edge must end the observation before destroying the owner.
+func process(descriptor: i64) -> i64 raises OpenError {
+    value file = open(descriptor)?;
+    mutable total = 0;
+
+    observe file as view {
+        total = inspect(view);
+        validate(descriptor)?;
+    }
+
+    // The owner is an ordinary owner again the moment the block ends.
+    return total + detach(file);
+}
+
+func main() -> i64 {
+    value ok = handle process(7) {
+        success v => v,
+        failure OpenError.Invalid => -1,
+    };
+    value failed = handle process(150) {
+        success v => v,
+        failure OpenError.Invalid => -1,
+    };
+    return ok + failed;
+}

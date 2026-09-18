@@ -4123,12 +4123,16 @@ impl<'a> Checker<'a> {
     ///   the same ambiguous text twice (`rfcs/0007`). Never the raw
     ///   `ItemId` alone, and never an import alias -- the registry only
     ///   ever returns an item's own true declared identity.
+    fn display_for_diagnostic(&self, ty: &Ty) -> String {
+        self.display_for_diagnostic_at_depth(ty, 0)
+    }
+
     /// `ty` with every still-unresolved inference variable that already
     /// carries a numeric default replaced by that default
     /// (`rfcs/0013`).
     ///
-    /// The same substitution `display_for_diagnostic` already applies
-    /// when rendering such a type, promoted to a real answer: a
+    /// The same substitution [`Self::display_for_diagnostic`] already
+    /// applies when rendering such a type, promoted to a real answer: a
     /// variable created by an integer or float literal is only ever
     /// going to become `i64`/`f64`, so a check that must decide
     /// something about it now (is it affine?) may legitimately decide
@@ -4152,10 +4156,6 @@ impl<'a> Checker<'a> {
             ),
             other => other.clone(),
         }
-    }
-
-    fn display_for_diagnostic(&self, ty: &Ty) -> String {
-        self.display_for_diagnostic_at_depth(ty, 0)
     }
 
     /// `depth`-bounded the same way every other stage that walks a

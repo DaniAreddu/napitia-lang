@@ -27262,6 +27262,332 @@ mod structural_ownership {
             );
             assert_eq!(forward_messages, messages(&reversed_fx, reversed));
         }
+
+        // -- carrier provenance ------------------------------------------
+        //
+        // Which observations a value or slot may carry is a fact about
+        // the path, joined at merges and replaced by every store. A
+        // single representative per value cannot express either.
+
+        fn store(slot: u32, value: u32, mode: OwnershipMode) -> Instruction {
+            Instruction::Store {
+                slot: ValueId(slot),
+                value: ValueId(value),
+                mode,
+            }
+        }
+
+        fn load(result: u32, ty: Ty, slot: u32) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty,
+                kind: ValueKind::Load(ValueId(slot)),
+            }
+        }
+
+        fn alloc(result: u32, ty: Ty) -> Instruction {
+            Instruction::Value {
+                result: ValueId(result),
+                ty,
+                kind: ValueKind::Alloc,
+            }
+        }
+
+        /// Two observers, one written into the same slot on each branch
+        /// of an `if`; the merge ends only the second. Reading the slot
+        /// afterwards is illegal because the slot *may* carry the ended
+        /// one -- which collapsing the two possibilities to a single
+        /// representative cannot see whenever the survivor is the one
+        /// still active.
+        fn two_observers_into_one_slot(reversed_branches: bool, reversed_blocks: bool) -> Function {
+            let fx = fixture();
+            let mut merge = vec![
+                end(1),
+                load(4, fx.file.clone(), 3),
+                end(0),
+                int(5, 0),
+                drop_of(0),
+            ];
+            merge.insert(0, int(6, 0));
+            let (then_block, else_block) = if reversed_branches {
+                (BlockId(2), BlockId(1))
+            } else {
+                (BlockId(1), BlockId(2))
+            };
+            let mut blocks = vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        observe_at(2, fx.file.clone(), 1, session_field(1)),
+                        alloc(3, fx.file.clone()),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(9),
+                        then_block,
+                        else_block,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    instructions: vec![store(3, 1, OwnershipMode::Observe)],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![store(3, 2, OwnershipMode::Observe)],
+                    terminator: Terminator::Branch(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: merge,
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                },
+            ];
+            if reversed_blocks {
+                blocks.reverse();
+            }
+            under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                blocks,
+            )
+        }
+
+        #[test]
+        fn a_slot_written_with_a_different_observer_per_branch_carries_both() {
+            let mut fx = fixture();
+            let found = observation_codes(&mut fx, two_observers_into_one_slot(false, false));
+            assert!(
+                found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "the slot may carry the ended observation, so reading it is a use after end: \
+                 {found:?}"
+            );
+        }
+
+        #[test]
+        fn carrier_joins_do_not_depend_on_branch_or_block_order() {
+            for (branches, blocks) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut fx = fixture();
+                let found =
+                    observation_codes(&mut fx, two_observers_into_one_slot(branches, blocks));
+                assert!(
+                    found.contains(&codes::OBSERVER_USED_AFTER_END),
+                    "reversed branches={branches} blocks={blocks} changed the answer: {found:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_transferring_store_kills_the_slots_finished_observer_provenance() {
+            // The legal way to recycle a slot: the view it held is
+            // finished, and a real owner is written over it. Reading it
+            // afterwards reads the owner, not the dead view.
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        alloc(2, fx.file.clone()),
+                        store(2, 1, OwnershipMode::Observe),
+                        end(0),
+                        int(3, 1),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                        },
+                        store(2, 4, OwnershipMode::Transfer),
+                        load(5, fx.file.clone(), 2),
+                        drop_of(5),
+                        int(6, 0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(6))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.is_empty(),
+                "the store replaced what the slot yields, so the load is clean: {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_observing_store_of_a_finished_view_is_still_carried_forward() {
+            // The mirror image of the test above: an *observing* store
+            // makes the slot a window onto the stored value, so the
+            // dead view survives the write and the later load is a use
+            // of it.
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        alloc(2, fx.file.clone()),
+                        end(0),
+                        store(2, 1, OwnershipMode::Observe),
+                        load(3, fx.file.clone(), 2),
+                        int(4, 0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(4))),
+                }],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_unreachable_store_never_contaminates_a_reachable_slot() {
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            alloc(2, fx.file.clone()),
+                            end(0),
+                            int(3, 0),
+                            load(4, fx.file.clone(), 2),
+                            drop_of(0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(3))),
+                    },
+                    // Never reached: its store must not make the slot
+                    // above look like it carries the ended observation.
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![store(2, 1, OwnershipMode::Observe)],
+                        terminator: Terminator::Branch(BlockId(0)),
+                    },
+                ],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                !found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "an unreachable predecessor contributed a fact nothing proved: {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_slot_refilled_each_iteration_does_not_accumulate_stale_provenance() {
+            // The loop-carried case: the slot is written with a fresh
+            // owner every iteration, so a previous iteration's view
+            // must not survive the back edge.
+            let mut fx = fixture();
+            let f = under_test(
+                vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ],
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![alloc(2, fx.file.clone())],
+                        terminator: Terminator::Branch(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            store(2, 1, OwnershipMode::Observe),
+                            end(0),
+                            int(3, 1),
+                            Instruction::Value {
+                                result: ValueId(4),
+                                ty: fx.file.clone(),
+                                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(3)]),
+                            },
+                            store(2, 4, OwnershipMode::Transfer),
+                            load(5, fx.file.clone(), 2),
+                            drop_of(5),
+                        ],
+                        terminator: Terminator::CondBranch {
+                            condition: ValueId(9),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![int(6, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(6))),
+                    },
+                ],
+            );
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                !found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "the transferring store kills the view every iteration: {found:?}"
+            );
+        }
+
+        #[test]
+        fn provenance_survives_a_deep_chain_of_blocks() {
+            let mut fx = fixture();
+            let depth = 60u32;
+            let mut blocks = vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, fx.file.clone(), 0, session_field(0)),
+                    alloc(2, fx.file.clone()),
+                    store(2, 1, OwnershipMode::Observe),
+                    end(0),
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+            }];
+            for i in 1..depth {
+                blocks.push(BasicBlock {
+                    id: BlockId(i),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Branch(BlockId(i + 1)),
+                });
+            }
+            blocks.push(BasicBlock {
+                id: BlockId(depth),
+                instructions: vec![load(3, fx.file.clone(), 2), int(4, 0), drop_of(0)],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            });
+            let f = under_test(take_session(&fx), Ty::I64, blocks);
+            let found = observation_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::OBSERVER_USED_AFTER_END),
+                "the fact must reach the end of the chain: {found:?}"
+            );
+        }
         #[test]
         fn a_deep_chain_of_blocks_reaches_a_fixed_point_without_a_pass_cap() {
             let mut fx = fixture();

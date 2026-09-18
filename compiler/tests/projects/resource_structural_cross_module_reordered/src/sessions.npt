@@ -1,0 +1,45 @@
+// A module exporting a resource-containing aggregate, a variant with an
+// affine payload, and a fallible constructor -- everything the entry
+// module needs to transfer one field across a module boundary and let
+// the compiler structurally clean up the rest (`rfcs/0012`).
+public variant OpenError {
+    Refused,
+}
+
+public resource File {
+    public descriptor: i64,
+}
+
+public record Envelope {
+    public file: File,
+}
+
+public resource Session {
+    public input: File,
+    public output: File,
+}
+
+public variant Held {
+    Carrying(Envelope),
+    Nothing,
+}
+
+public func open(descriptor: i64) -> Session raises OpenError {
+    if descriptor < 0 {
+        raise OpenError.Refused;
+    }
+    return Session {
+        input: File { descriptor: descriptor },
+        output: File { descriptor: descriptor + 1 },
+    };
+}
+
+public func sink(take file: File) -> i64 {
+    value result = file.descriptor;
+    drop file;
+    return result;
+}
+
+public func wrap(take file: File) -> Held {
+    return Held.Carrying(Envelope { file: file });
+}

@@ -815,6 +815,160 @@ mod tests {
         }
 
         #[test]
+        fn one_diverging_arm_does_not_leave_a_scope_open_for_the_other() {
+            accepted(
+                "func f(take file: File, flag: bool) -> i64 {\n\
+                   mutable n = 0;\n\
+                   if flag {\n\
+                     observe file as view { return inspect(view); }\n\
+                   } else {\n\
+                     observe file as view { n = inspect(view); }\n\
+                   }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn every_arm_diverging_through_its_own_scope_is_accepted() {
+            accepted(
+                "func f(take file: File, flag: bool) -> i64 {\n\
+                   if flag {\n\
+                     observe file as view { return inspect(view); }\n\
+                   } else {\n\
+                     observe file as view { return inspect(view) + 1; }\n\
+                   }\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn a_handle_success_arm_may_open_and_close_its_own_scope() {
+            accepted(
+                "variant Failed { Bad }\n\
+                 func fallible() -> i64 raises Failed { return 1; }\n\
+                 func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   n = handle fallible() {\n\
+                     success v => { observe file as view { n = inspect(view); } n + v },\n\
+                     failure _ => { observe file as view { n = inspect(view); } n },\n\
+                   };\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn a_generic_aggregates_affine_field_is_observable() {
+            accepted(
+                "record Cell[T] { slot: T }\n\
+                 func f(take boxed: Cell[File]) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe boxed.slot as view { n = inspect(view); }\n\
+                   drop boxed;\n\
+                   return n;\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn moving_a_generic_aggregates_observed_field_is_rejected() {
+            rejected_with(
+                "record Cell[T] { slot: T }\n\
+                 func f(take boxed: Cell[File]) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe boxed.slot as view { n = sink(boxed.slot); }\n\
+                   return n;\n\
+                 }",
+                "U0017",
+            );
+        }
+
+        #[test]
+        fn an_alias_escaping_through_a_variant_payload_is_rejected() {
+            rejected_with(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as view {\n\
+                     value held = Maybe.Some(view);\n\
+                     drop held;\n\
+                   }\n\
+                   return sink(file);\n\
+                 }",
+                "U0016",
+            );
+        }
+
+        #[test]
+        fn an_alias_escaping_through_a_compound_expression_is_rejected() {
+            // A `return` whose operand is a compound `if` is the one
+            // shape lowering *can* push a sink into per branch, so the
+            // alias really is reached here as a transfer rather than
+            // being stopped earlier by the unsupported-compound-origin
+            // rule -- which is exactly what makes this a test of the
+            // escape check rather than of that one.
+            // One diagnostic per branch leaf, because each really is
+            // its own distinct use of the alias -- not a cascade from
+            // one.
+            let codes = codes(
+                "func f(take file: File, flag: bool) -> File {\n\
+                   observe file as view {\n\
+                     return if flag { view } else { view };\n\
+                   }\n\
+                 }",
+            );
+            assert_eq!(codes, vec!["U0016", "U0016"]);
+        }
+
+        #[test]
+        fn a_compound_consuming_position_the_lowering_cannot_sink_is_still_rejected() {
+            // The same alias in a compound origin lowering has no
+            // per-branch sink for is refused by that pre-existing rule
+            // (`U0008`) before the escape is even reached -- rejected
+            // either way, never accepted.
+            let codes = codes(
+                "func f(take file: File, flag: bool) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view {\n\
+                     n = sink(if flag { view } else { view });\n\
+                   }\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(codes, vec!["U0008"]);
+        }
+
+        #[test]
+        fn a_scope_opened_inside_a_loop_is_closed_before_its_own_back_edge() {
+            // If the scope survived the back edge, the second iteration
+            // would find the same observation already active.
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   while n < 3 {\n\
+                     observe file as view { n = n + inspect(view); }\n\
+                   }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
+        fn a_loop_nested_inside_a_scope_keeps_it_open_across_continue() {
+            accepted(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view {\n\
+                     while n < 2 {\n\
+                       n = n + inspect(view);\n\
+                       continue;\n\
+                     }\n\
+                   }\n\
+                   return n + sink(file);\n\
+                 }",
+            );
+        }
+
+        #[test]
         fn a_reversed_declaration_order_checks_identically() {
             // The place's identity is structural, not positional: the
             // same program with its two resource fields declared the

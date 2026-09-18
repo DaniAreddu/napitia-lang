@@ -2326,19 +2326,30 @@ impl<'a> Interpreter<'a> {
     /// own* calling frame first (see `resolve_evidence`), so a running
     /// frame's own evidence never itself needs further resolution, only
     /// a lookup.
-    /// Resolves one call site's own type arguments against the frame's
-    /// instantiation and requires the result to be concrete
-    /// (`rfcs/0008`).
+    /// Resolves one instruction's own written type arguments against the
+    /// running frame's instantiation and requires the result to be
+    /// concrete (`rfcs/0008`).
     ///
     /// A generic body is lowered once and shared, so `outer[T]` calling
-    /// `inner[T]` really does carry `Ty::Param(T)` at the call site.
-    /// What makes it concrete is the frame: executing `outer[i64]`
-    /// carries `T -> i64`, and substituting through that is what turns
-    /// the symbolic argument back into the instantiation actually being
-    /// run. Anything still unresolved afterwards names a type nobody
-    /// can supply, and is refused rather than silently used to build a
+    /// `inner[T]`, or constructing a `Box[T]`, really does carry
+    /// `Ty::Param(T)` on the instruction. What makes it concrete is the
+    /// frame: executing `outer[i64]` carries `T -> i64`, and
+    /// substituting through that is what turns the symbolic argument
+    /// back into the instantiation actually being run.
+    ///
+    /// Every site that carries type arguments goes through this, not
+    /// just calls. A construction that kept them symbolic would hand the
+    /// resulting *value* a type argument naming a parameter of a frame
+    /// that has already returned -- and every later question asked of
+    /// that value reads it: its own declared field types resolve to
+    /// `Ty::Param`, which disagrees with the concrete value actually
+    /// stored there, and `is_affine` answers `false` for it, which is
+    /// the direction that leaks rather than over-demands.
+    ///
+    /// Anything still unresolved afterwards names a type nobody can
+    /// supply, and is refused rather than silently used to build a
     /// substitution that would leave parameters symbolic.
-    fn resolve_call_type_args(
+    fn resolve_type_args(
         &self,
         type_args: &[Ty],
         frame_subst: &HashMap<crate::hir::TypeParamId, Ty>,
@@ -2351,8 +2362,8 @@ impl<'a> Interpreter<'a> {
                     Ok(resolved)
                 } else {
                     Err(invalid(
-                        "a call site's own type argument is still unresolved after the calling \
-                         frame's instantiation is applied",
+                        "a type argument is still unresolved after the running frame's own \
+                         instantiation is applied",
                     ))
                 }
             })
@@ -2860,7 +2871,7 @@ impl<'a> Interpreter<'a> {
                     // exactly the terms `ValueKind::Call` uses: an
                     // `Invoke` inside a generic body carries its type
                     // arguments symbolically too.
-                    let invoke_type_args = self.resolve_call_type_args(type_args, &frame_subst)?;
+                    let invoke_type_args = self.resolve_type_args(type_args, &frame_subst)?;
                     let arg_values = args
                         .iter()
                         .map(|id| get(&values, id))
@@ -3073,7 +3084,7 @@ impl<'a> Interpreter<'a> {
                 // Resolved through the frame's own instantiation, so a
                 // nested generic call inside a generic body reaches its
                 // callee concretely rather than symbolically.
-                let call_type_args = self.resolve_call_type_args(type_args, frame_subst)?;
+                let call_type_args = self.resolve_type_args(type_args, frame_subst)?;
                 let arg_values = args
                     .iter()
                     .map(|id| get(values, id))
@@ -3143,7 +3154,7 @@ impl<'a> Interpreter<'a> {
                 // extend's declared protocol arguments against this call
                 // site's is what recovers it, and a concrete extension
                 // (`extend Equal[i64]`) simply binds nothing.
-                let call_arguments = self.resolve_call_type_args(arguments, frame_subst)?;
+                let call_arguments = self.resolve_type_args(arguments, frame_subst)?;
                 if extend_layout.protocol_arguments.len() != call_arguments.len() {
                     return Err(invalid(
                         "a protocol call's own type arguments do not match the arity its \
@@ -3193,6 +3204,16 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ValueKind::RecordCreate(item, type_args, field_ids) => {
+                // Resolved against the running frame *before* anything
+                // moves: a construction inside a generic body writes its
+                // own type arguments symbolically (`Box[Box[T]]`), and a
+                // value carrying `Ty::Param` outlives the frame that
+                // parameter belongs to. Every later question asked of
+                // the value reads those arguments -- its declared field
+                // types, whether it is affine, whether it agrees with
+                // the position it sits in -- and a symbolic one makes
+                // all three wrong at once.
+                let type_args = self.resolve_type_args(type_args, frame_subst)?;
                 // Every field is planned into one shared plan before any
                 // of them moves (`rfcs/0012`). Transferring field by
                 // field meant a construction that failed on its *last*
@@ -3220,7 +3241,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Ok(Value::Record {
                         item: *item,
-                        type_args: type_args.clone(),
+                        type_args,
                         fields,
                     })
                 }
@@ -3258,6 +3279,9 @@ impl<'a> Interpreter<'a> {
                 type_args,
                 payload,
             } => {
+                // Resolved against the running frame first, for the same
+                // reason `RecordCreate` resolves its own.
+                let type_args = self.resolve_type_args(type_args, frame_subst)?;
                 // One plan across the whole payload, for the identical
                 // reason `RecordCreate` uses one across the whole field
                 // list.
@@ -3270,7 +3294,7 @@ impl<'a> Interpreter<'a> {
                 self.commit_transfer(&plan);
                 Ok(Value::Variant {
                     item: *variant,
-                    type_args: type_args.clone(),
+                    type_args,
                     case: *case,
                     payload: values_out,
                 })
@@ -10882,7 +10906,7 @@ mod transfer_transaction {
         let mut frame = HashMap::new();
         frame.insert(param, Ty::I64);
         let resolved = interpreter
-            .resolve_call_type_args(
+            .resolve_type_args(
                 &[Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))])],
                 &frame,
             )
@@ -11400,7 +11424,7 @@ mod transfer_transaction {
         // No frame substitution binds `T`, so this call site names a
         // type nobody can supply.
         let error = interpreter
-            .resolve_call_type_args(&[Ty::Param(param, Symbol(0))], &HashMap::new())
+            .resolve_type_args(&[Ty::Param(param, Symbol(0))], &HashMap::new())
             .map(|_| ())
             .expect_err("an unresolved call-site type argument is refused");
         assert!(
@@ -11418,7 +11442,7 @@ mod transfer_transaction {
         frame.insert(param, Ty::I64);
         // `outer[i64]` calling `inner[T]` reaches `inner[i64]`.
         let resolved = interpreter
-            .resolve_call_type_args(
+            .resolve_type_args(
                 &[Ty::Applied(BOXY, vec![Ty::Param(param, Symbol(0))])],
                 &frame,
             )

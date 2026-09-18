@@ -44,6 +44,26 @@ pub(crate) const MAX_GENERIC_DEPTH: usize = 64;
 /// `f[T] -> f[Box[T]] -> f[Box[Box[T]]] -> ...`).
 pub(crate) const MAX_GENERIC_INSTANCES: usize = 4096;
 
+/// Maximum number of Napitia call frames the interpreter will have
+/// entered at once before refusing to enter another.
+///
+/// One Napitia frame is one native `Interpreter::call_function` frame,
+/// so an unbounded Napitia recursion is an unbounded native recursion:
+/// the process exhausts its stack and aborts, with no diagnostic, no
+/// error code and nothing on stderr -- the one failure mode the
+/// interpreter's own structured `InterpreterError` exists to avoid, and
+/// reachable from an ordinary recursive function rather than from
+/// anything malformed.
+///
+/// This bound is what turns that into an ordinary runtime error. It
+/// only helps if the native stack actually outlasts it, so `cli::run`
+/// provisions a stack sized for it (`cli::INTERPRETER_STACK_BYTES`)
+/// rather than relying on whatever default the platform gives the main
+/// thread -- 1 MiB on Windows, which a debug build exhausts after
+/// roughly 25 frames. A library caller driving `Interpreter` on a
+/// thread of its own is responsible for its own stack the same way.
+pub(crate) const MAX_CALL_DEPTH: usize = 512;
+
 /// Maximum recursion depth the capability solver (`typeck`'s `uses`
 /// requirement resolution, `rfcs/0009`) will descend into while
 /// resolving one requirement through a chain of conditional extensions

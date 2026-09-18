@@ -832,8 +832,7 @@ mod tests {
 
     #[test]
     fn parses_an_observation_of_a_nested_field_place() {
-        let observe =
-            observe_of("func f(x: i64) -> i64 { observe a.b.c as view { } return 0 }");
+        let observe = observe_of("func f(x: i64) -> i64 { observe a.b.c as view { } return 0 }");
         let Expr::Field { base, .. } = &observe.source else {
             panic!("expected a field chain")
         };
@@ -851,15 +850,15 @@ mod tests {
 
     #[test]
     fn an_observation_body_is_an_ordinary_block() {
-        let observe = observe_of(
-            "func f() -> i64 { observe a as view { value x = 1; drop a; } return 0 }",
-        );
+        let observe =
+            observe_of("func f() -> i64 { observe a as view { value x = 1; drop a; } return 0 }");
         assert_eq!(observe.body.statements.len(), 2);
     }
 
     #[test]
     fn nested_observations_parse_as_nested_statements() {
-        let outer = observe_of("func f() -> i64 { observe a as v { observe v as w { } } return 0 }");
+        let outer =
+            observe_of("func f() -> i64 { observe a as v { observe v as w { } } return 0 }");
         assert_eq!(outer.body.statements.len(), 1);
         assert!(matches!(outer.body.statements[0], Stmt::Observe(_)));
     }

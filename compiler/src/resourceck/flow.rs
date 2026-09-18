@@ -3115,12 +3115,8 @@ impl<'a> FlowChecker<'a> {
         if self.reject_alias_ownership(&root, display.clone(), span, "moved, returned, or stored") {
             return;
         }
-        if self.reject_ownership_while_observed(
-            &root,
-            display,
-            span,
-            "moved, returned, or stored",
-        ) {
+        if self.reject_ownership_while_observed(&root, display, span, "moved, returned, or stored")
+        {
             return;
         }
         let Some(state) = self.states.get(&root).copied() else {

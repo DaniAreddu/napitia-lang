@@ -148,6 +148,19 @@ struct ResourceTable {
     /// to something to *reject*, rather than silently going out of
     /// bounds or -- worse -- colliding with a later lease's id.
     leases: Vec<RuntimeObservation>,
+    /// Exactly the leases currently `Active`, in the ascending id order
+    /// they were opened in (`rfcs/0013`).
+    ///
+    /// `leases` itself never shrinks, so scanning it to answer "is this
+    /// resource held?" would cost one pass over every observation the
+    /// whole run has ever opened -- which a program that observes
+    /// inside a loop pays on every single ownership operation, growing
+    /// without bound. This list holds only what is actually open, which
+    /// is bounded by observation *nesting depth*. Ascending order is
+    /// preserved by construction (ids are minted monotonically and
+    /// removal keeps the rest in place), so the lease reported for a
+    /// conflict is still deterministically the lowest-numbered one.
+    active: Vec<RuntimeObservationId>,
 }
 
 impl ResourceTable {
@@ -181,6 +194,7 @@ impl ResourceTable {
             observed,
             parent,
         });
+        self.active.push(id);
         id
     }
 
@@ -205,15 +219,17 @@ impl ResourceTable {
             ));
         }
         if self
-            .leases
+            .active
             .iter()
-            .any(|other| other.parent == Some(id) && other.status == LeaseStatus::Active)
+            .filter_map(|open| self.leases.get(open.0 as usize))
+            .any(|other| other.parent == Some(id))
         {
             return Err(invalid(
                 "cannot end an observation while an observation opened inside it is still active",
             ));
         }
         self.leases[id.0 as usize].status = LeaseStatus::Ended;
+        self.active.retain(|open| *open != id);
         Ok(())
     }
 
@@ -221,9 +237,10 @@ impl ResourceTable {
     /// (`rfcs/0013`) -- a `Vec` scan in index order, so the answer never
     /// depends on iteration order of anything hashed.
     fn active_lease_holding(&self, resource: ResourceId) -> Option<RuntimeObservationId> {
-        self.leases
+        self.active
             .iter()
-            .find(|lease| lease.status == LeaseStatus::Active && lease.observed.contains(&resource))
+            .filter_map(|open| self.leases.get(open.0 as usize))
+            .find(|lease| lease.observed.contains(&resource))
             .map(|lease| lease.id)
     }
 
@@ -15605,6 +15622,43 @@ mod observation_leases {
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_ended_lease_stops_being_consulted_by_later_ownership_checks() {
+        // Every ownership operation asks "is this held?", and the
+        // answer must be looked up against the leases that are actually
+        // open rather than against every lease the run has ever taken
+        // -- otherwise a program observing inside a loop pays for its
+        // whole history on every single operation.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        for _ in 0..64 {
+            let session = live_session(&interpreter);
+            assert_eq!(
+                interpreter.call_item(SELF, vec![Value::Resource(session)]),
+                Ok(Value::Int(0))
+            );
+        }
+        let table = interpreter.resources.borrow();
+        assert_eq!(table.leases.len(), 64, "one lease per call was taken");
+        assert!(
+            table.active.is_empty(),
+            "every one of them ended, so none may still be consulted"
         );
     }
 

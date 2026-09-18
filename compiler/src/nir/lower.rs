@@ -75,6 +75,8 @@ pub fn lower_module(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
 ) -> Result<Module, Vec<Diagnostic>> {
@@ -89,6 +91,8 @@ pub fn lower_module(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
         interner,
         source,
         ModulePathMode::SingleFile,
@@ -116,6 +120,8 @@ pub fn lower_module_with_paths(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
     module_path_of: &HashMap<SourceId, String>,
@@ -131,6 +137,8 @@ pub fn lower_module_with_paths(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
         interner,
         source,
         ModulePathMode::Project(module_path_of),
@@ -149,6 +157,8 @@ fn lower_module_impl(
     cleanup_edges: &BTreeMap<ExprId, Vec<crate::resourceck::CleanupAction>>,
     consume_sites: &BTreeMap<ExprId, crate::resourceck::ConsumeInfo>,
     defer_plans: &BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    observations: &BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    observation_exits: &BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
     interner: &Interner,
     source: SourceId,
     module_path_mode: ModulePathMode<'_>,
@@ -402,6 +412,8 @@ fn lower_module_impl(
         cleanup_edges,
         consume_sites,
         defer_plans,
+        observations,
+        observation_exits,
     };
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -818,6 +830,24 @@ struct Lowering<'a> {
     /// (`rfcs/0011`), keyed by that exact call expression's own
     /// `ExprId` -- see `resourceck::CheckedDeferPlan`.
     defer_plans: &'a BTreeMap<ExprId, crate::resourceck::CheckedDeferPlan>,
+    /// `resourceck`'s own checked observations (`rfcs/0013`), by stable
+    /// identity -- the canonical observed place, the alias, the
+    /// resolved type and the body scope. Lowering builds every
+    /// `observe.place` from this and nothing else: it never re-resolves
+    /// which place an `observe` statement names, whether that place was
+    /// legal to observe, or where the scope ends.
+    ///
+    /// An observation absent here is one the checker rejected. Lowering
+    /// only ever runs on a module whose resource check produced no
+    /// diagnostics, so reaching a rejected observation is a genuine
+    /// internal inconsistency between the two stages and is reported as
+    /// one -- never silently lowered as if it had been accepted.
+    observations: &'a BTreeMap<crate::hir::ObservationId, crate::resourceck::CheckedObservation>,
+    /// Every exit edge's own observation ends (`rfcs/0013`), keyed by
+    /// exactly the same exiting-node id `cleanup_edges` uses, and
+    /// already innermost-first. Replayed by `emit_checked_cleanup`,
+    /// immediately before that same edge's ownership cleanup.
+    observation_exits: &'a BTreeMap<ExprId, Vec<crate::resourceck::ObservationExit>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1352,7 +1382,67 @@ impl<'a> Lowering<'a> {
                 condition, body, ..
             } => self.lower_while(fb, condition, body),
             HirStmt::Loop { body, .. } => self.lower_loop(fb, body),
+            HirStmt::Observe(o) => self.lower_observe(fb, o),
         }
+    }
+
+    /// `observe <place> as <alias> { .. }` (`rfcs/0013`).
+    ///
+    /// Built entirely from `resourceck`'s own [`crate::resourceck::
+    /// CheckedObservation`]: the canonical place, the alias and the
+    /// resolved type all come from there, and the NIR place is then
+    /// independently re-resolved from that checked HIR place through
+    /// the same `resolve_nir_place` every other structural instruction
+    /// uses -- so a disagreement between the two stages is reported as
+    /// an internal error rather than lowered as if neither had noticed.
+    ///
+    /// The scope's own *normal* end is emitted here, structurally,
+    /// after the body block's own cleanup; every early exit already
+    /// emitted its own end through `emit_observation_ends` and left the
+    /// block terminated, which is exactly why this is guarded on the
+    /// block still being open.
+    fn lower_observe(&mut self, fb: &mut FnBuilder, o: &crate::hir::HirObserve) -> LowerResult<()> {
+        let Some(checked) = self.observations.get(&o.id) else {
+            return Err(self.internal_error(&format!(
+                "observation {:?} reached lowering with no checked record from resourceck",
+                o.id
+            )));
+        };
+        if checked.lexical_scope != o.body.id {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked scope disagrees with its own body block",
+                o.id
+            )));
+        }
+        if checked.alias != o.alias {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked alias disagrees with its own statement",
+                o.id
+            )));
+        }
+        let source = checked.source.clone();
+        let checked_ty = checked.ty.clone();
+        let (place, ty) = self.resolve_nir_place(fb, &source)?;
+        if ty != checked_ty {
+            return Err(self.internal_error(&format!(
+                "observation {:?}'s checked type disagrees with its own resolved place type",
+                o.id
+            )));
+        }
+        let view = fb.push_value(
+            ty,
+            ValueKind::ObservePlace {
+                observation: o.id,
+                place,
+            },
+        );
+        fb.local_bindings
+            .insert(o.alias, LocalBinding::Direct(view));
+        self.lower_scoped_block_void(fb, &o.body)?;
+        if !fb.current_terminated() {
+            fb.push_instruction(crate::nir::Instruction::EndObserve { observation: o.id });
+        }
+        Ok(())
     }
 
     /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
@@ -1799,7 +1889,45 @@ impl<'a> Lowering<'a> {
     /// plan for an exit lowering still reached, a structural mismatch
     /// between the two stages -- reported as an internal error, never
     /// silently treated as "nothing to clean up".
+    /// Replays every observation `exit_id` has to end (`rfcs/0013`), in
+    /// `resourceck`'s own already-innermost-first order.
+    ///
+    /// Emitted *before* the ownership cleanup on the same edge, because
+    /// that cleanup is exactly the destruction an active observation
+    /// exists to forbid -- the verifier and the interpreter each reject
+    /// the other order independently, so getting it wrong here is a
+    /// rejected program rather than a silently unsound one.
+    ///
+    /// Every entry is cross-checked against the plan it came from: an
+    /// entry filed under the wrong exit, or naming an observation that
+    /// was never accepted, means the two stages disagree and is an
+    /// internal error rather than something to replay anyway.
+    fn emit_observation_ends(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        let Some(ends) = self.observation_exits.get(&exit_id) else {
+            return Ok(());
+        };
+        for end in ends {
+            if end.exit != exit_id {
+                return Err(self.internal_error(&format!(
+                    "a checked observation end filed under exit {exit_id:?} names exit {:?}",
+                    end.exit
+                )));
+            }
+            if !self.observations.contains_key(&end.observation) {
+                return Err(self.internal_error(&format!(
+                    "exit {exit_id:?} ends observation {:?}, which has no checked record",
+                    end.observation
+                )));
+            }
+            fb.push_instruction(crate::nir::Instruction::EndObserve {
+                observation: end.observation,
+            });
+        }
+        Ok(())
+    }
+
     fn emit_checked_cleanup(&mut self, fb: &mut FnBuilder, exit_id: ExprId) -> LowerResult<()> {
+        self.emit_observation_ends(fb, exit_id)?;
         let Some(actions) = self.cleanup_edges.get(&exit_id).cloned() else {
             return Err(self.internal_error(&format!(
                 "exit {exit_id:?} is reachable but resourceck recorded no checked cleanup plan for it"
@@ -4896,6 +5024,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -4953,6 +5083,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -5025,6 +5157,8 @@ mod tests {
             // decision, rather than the authentic `consume_sites`.
             &BTreeMap::new(),
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5155,6 +5289,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5305,6 +5441,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5378,6 +5516,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             // Deliberately empty, discarding resourceck's own real plan.
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             id,
@@ -5458,6 +5598,8 @@ mod tests {
             &BTreeMap::new(),
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5527,11 +5669,183 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
         .expect("expected lowering to succeed");
         crate::nir::verify_module(&module, id, &interner, &crate::hir::ItemRegistry::default())
+    }
+
+    /// `rfcs/0013` -- what lowering actually emits for an observation,
+    /// as opposed to what the checker decided about it: the boundaries
+    /// themselves, their order, and their position relative to the
+    /// ownership cleanup on the same edge.
+    mod observations {
+        use super::{lower, lower_and_verify};
+        use crate::nir::{Function, Instruction, ValueKind};
+
+        const PRELUDE: &str = "\
+            resource File { descriptor: i64 }\n\
+            resource Session { left: File, right: File }\n\
+            variant Failed { Bad }\n\
+            func inspect(file: File) -> i64 { return file.descriptor; }\n\
+            func gate(flag: bool) -> i64 raises Failed {\n\
+              if flag { raise Failed.Bad; }\n\
+              return 1;\n\
+            }\n";
+
+        /// The one function in a fixture that actually observes
+        /// something. Selected by what it contains rather than by name:
+        /// a symbol is interned per compilation, so comparing against a
+        /// fresh interner's own id would compare two unrelated numbers.
+        fn observing_function(text: &str) -> Function {
+            lower(&format!("{PRELUDE}{text}"))
+                .functions
+                .into_iter()
+                .find(|f| {
+                    f.blocks.iter().any(|b| {
+                        b.instructions.iter().any(|i| {
+                            matches!(
+                                i,
+                                Instruction::Value {
+                                    kind: ValueKind::ObservePlace { .. },
+                                    ..
+                                }
+                            )
+                        })
+                    })
+                })
+                .expect("no function in the fixture observes anything")
+        }
+
+        /// Every observation instruction in one block, in order, as a
+        /// compact readable trace: `begin N`, `end N`, `drop`.
+        fn trace(f: &Function, block: usize) -> Vec<String> {
+            f.blocks[block]
+                .instructions
+                .iter()
+                .filter_map(|instruction| match instruction {
+                    Instruction::Value {
+                        kind: ValueKind::ObservePlace { observation, .. },
+                        ..
+                    } => Some(format!("begin {}", observation.0)),
+                    Instruction::EndObserve { observation } => {
+                        Some(format!("end {}", observation.0))
+                    }
+                    Instruction::Drop { .. } => Some("drop".to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_straight_line_scope_ends_before_the_owners_own_cleanup() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as view { n = inspect(view); }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            assert_eq!(trace(&f, 0), vec!["begin 0", "end 0", "drop"]);
+        }
+
+        #[test]
+        fn nested_scopes_end_innermost_first_on_a_return() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   observe file as outer {\n\
+                     observe outer as inner { return inspect(inner); }\n\
+                   }\n\
+                 }",
+            );
+            assert_eq!(
+                trace(&f, 0),
+                vec!["begin 0", "begin 1", "end 1", "end 0", "drop"],
+                "the inner scope must end first, and both before the drop"
+            );
+        }
+
+        #[test]
+        fn both_invoke_edges_end_every_active_scope_innermost_first() {
+            // The failure edge is the one a per-block (rather than
+            // per-edge) placement would silently skip.
+            let f = observing_function(
+                "func f(take file: File, flag: bool) -> i64 raises Failed {\n\
+                   mutable n = 0;\n\
+                   observe file as outer {\n\
+                     observe outer as inner { n = inspect(inner) + gate(flag)?; }\n\
+                   }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            let success = trace(&f, 1);
+            let failure = trace(&f, 2);
+            assert_eq!(success, vec!["end 1", "end 0", "drop"]);
+            assert_eq!(failure, vec!["end 1", "end 0", "drop"]);
+        }
+
+        #[test]
+        fn a_scope_left_by_break_ends_only_what_the_loop_encloses() {
+            let f = observing_function(
+                "func f(take file: File) -> i64 {\n\
+                   mutable n = 0;\n\
+                   observe file as outer {\n\
+                     loop {\n\
+                       observe outer as inner { n = inspect(inner); break; }\n\
+                     }\n\
+                   }\n\
+                   drop file;\n\
+                   return n;\n\
+                 }",
+            );
+            let all: Vec<String> = (0..f.blocks.len()).flat_map(|b| trace(&f, b)).collect();
+            assert_eq!(all.iter().filter(|e| *e == "begin 0").count(), 1, "{all:?}");
+            assert_eq!(
+                all.iter().filter(|e| *e == "end 0").count(),
+                1,
+                "the outer scope is left exactly once, after the loop: {all:?}"
+            );
+            assert_eq!(
+                all.iter().filter(|e| *e == "end 1").count(),
+                1,
+                "the `break` ends only the scope the loop encloses: {all:?}"
+            );
+        }
+
+        #[test]
+        fn every_lowered_observation_shape_verifies_cleanly() {
+            let diagnostics = lower_and_verify(&format!(
+                "{PRELUDE}\
+                 func straight(take file: File) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe file as view {{ n = inspect(view); }}\n\
+                   drop file;\n\
+                   return n;\n\
+                 }}\n\
+                 func siblings(take session: Session) -> i64 {{\n\
+                   mutable n = 0;\n\
+                   observe session.left as view {{ n = inspect(view) + inspect(session.right); }}\n\
+                   drop session;\n\
+                   return n;\n\
+                 }}\n\
+                 func propagating(take file: File, flag: bool) -> i64 raises Failed {{\n\
+                   mutable n = 0;\n\
+                   observe file as view {{ n = inspect(view) + gate(flag)?; }}\n\
+                   drop file;\n\
+                   return n;\n\
+                 }}\n\
+                 func main() -> i64 {{ return 0; }}"
+            ));
+            assert!(
+                diagnostics.is_empty(),
+                "lowered observations must verify with no diagnostics: {diagnostics:?}"
+            );
+        }
     }
 
     fn drop_count(f: &Function) -> usize {
@@ -7502,6 +7816,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -7555,6 +7871,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -7741,6 +8059,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7821,6 +8141,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7880,6 +8202,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7936,6 +8260,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7982,6 +8308,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8047,6 +8375,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8151,6 +8481,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             manifest_source,
             &module_path_of,
@@ -8244,6 +8576,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -8315,6 +8649,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &HashMap::new(),
@@ -8355,6 +8691,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8403,6 +8741,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8448,6 +8788,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8487,6 +8829,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8531,6 +8875,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8586,6 +8932,8 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
@@ -8647,6 +8995,8 @@ mod tests {
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
             consume_sites: Box::leak(Box::new(BTreeMap::new())),
             defer_plans: Box::leak(Box::new(BTreeMap::new())),
+            observations: Box::leak(Box::new(BTreeMap::new())),
+            observation_exits: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -8686,6 +9036,8 @@ mod tests {
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
             consume_sites: Box::leak(Box::new(BTreeMap::new())),
             defer_plans: Box::leak(Box::new(BTreeMap::new())),
+            observations: Box::leak(Box::new(BTreeMap::new())),
+            observation_exits: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -9749,6 +10101,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -9904,6 +10258,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),

@@ -1,0 +1,30 @@
+// An observation alias carries no ownership (`rfcs/0013`).
+//
+// `view` names a place `file` still owns. Passing it to a `take`
+// parameter would hand `sink` something the caller never gave away, and
+// `file` would be destroyed under its own owner. There is no `mutable`
+// or `take` spelling of an alias that would make this legal: the
+// capability is read-only by construction.
+resource File {
+    descriptor: i64
+}
+
+func sink(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func launder(take file: File) -> i64 {
+    mutable result = 0;
+
+    observe file as view {
+        result = sink(view);
+    }
+
+    return result;
+}
+
+func main() -> i64 {
+    return launder(File { descriptor: 9 });
+}

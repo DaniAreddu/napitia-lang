@@ -60,6 +60,55 @@ pub struct ResourceHandle {
     id: ResourceId,
     generation: u64,
     role: RuntimeOwnershipRole,
+    /// The observation lease this handle was minted under (`rfcs/0013`),
+    /// or `None` for a handle that belongs to no explicit observation
+    /// scope at all (an owner, or an ordinary parameter's own
+    /// call-scoped observation).
+    ///
+    /// Carried on the handle rather than looked up from the resource,
+    /// because the same resource can legitimately be reached both
+    /// through an observation and directly by its owner at the same
+    /// time: what has ended is the *view*, not the resource. A read
+    /// through a handle whose lease has ended is a structured error;
+    /// the owner's own untagged handle keeps working.
+    lease: Option<RuntimeObservationId>,
+}
+
+/// One runtime observation lease's own identity within one
+/// [`Interpreter`]'s own lease table (`rfcs/0013`): a plain,
+/// monotonically-growing index, never a pointer address and never a
+/// `HashMap` key iterated for output, so nothing about a lease's
+/// identity or ordering depends on allocator or hashing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct RuntimeObservationId(u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseStatus {
+    Active,
+    Ended,
+}
+
+/// One lexically scoped observation, as a real runtime object
+/// (`rfcs/0013`).
+///
+/// The interpreter enforces observations itself and does not assume the
+/// module it is running passed `nir::verify`: an ended lease really
+/// stops working, a still-active lease really blocks every ownership
+/// operation on what it holds, and ending a lease a derived one is
+/// still nested inside is refused here too rather than left to the
+/// verifier's LIFO guarantee.
+#[derive(Debug, Clone)]
+struct RuntimeObservation {
+    id: RuntimeObservationId,
+    status: LeaseStatus,
+    /// Every resource identity reachable through the observed place at
+    /// the moment the lease was taken, in deterministic discovery
+    /// order (outermost first, then each field in declaration order).
+    observed: Vec<ResourceId>,
+    /// The lease this one was opened inside, if any -- what makes
+    /// "ending a parent while a child is still active" answerable here
+    /// rather than only statically.
+    parent: Option<RuntimeObservationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +142,25 @@ struct ResourceRecord {
 #[derive(Default)]
 struct ResourceTable {
     records: Vec<ResourceRecord>,
+    /// Every observation lease taken during this run, indexed by
+    /// [`RuntimeObservationId`] (`rfcs/0013`). Never shrinks: an ended
+    /// lease keeps its slot so a handle still tagged with it resolves
+    /// to something to *reject*, rather than silently going out of
+    /// bounds or -- worse -- colliding with a later lease's id.
+    leases: Vec<RuntimeObservation>,
+    /// Exactly the leases currently `Active`, in the ascending id order
+    /// they were opened in (`rfcs/0013`).
+    ///
+    /// `leases` itself never shrinks, so scanning it to answer "is this
+    /// resource held?" would cost one pass over every observation the
+    /// whole run has ever opened -- which a program that observes
+    /// inside a loop pays on every single ownership operation, growing
+    /// without bound. This list holds only what is actually open, which
+    /// is bounded by observation *nesting depth*. Ascending order is
+    /// preserved by construction (ids are minted monotonically and
+    /// removal keeps the rest in place), so the lease reported for a
+    /// conflict is still deterministically the lowest-numbered one.
+    active: Vec<RuntimeObservationId>,
 }
 
 impl ResourceTable {
@@ -108,10 +176,148 @@ impl ResourceTable {
             id,
             generation: 0,
             role: RuntimeOwnershipRole::Owner,
+            lease: None,
         }
     }
 
+    /// Opens a lease over `observed` (`rfcs/0013`), nested inside
+    /// `parent` when one is already active in the same frame.
+    /// How many leases have already been taken, recorded before a frame
+    /// runs so its own can be told from every other frame's
+    /// (`rfcs/0013`). Lease identities are handed out in increasing
+    /// order and the table never shrinks, so "opened by this frame" is
+    /// exactly "at or past this mark".
+    fn lease_mark(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Ends every lease opened at or after `mark` that is still open,
+    /// innermost first (`rfcs/0013`) -- the epilogue of a frame that
+    /// ended in an error.
+    ///
+    /// Infallible on purpose: this runs while an error is already
+    /// propagating, so there is no second failure it could usefully
+    /// report and nothing it may mask. It touches only leases, never a
+    /// resource's generation or status: unwinding an observation
+    /// releases a claim, it does not destroy anything.
+    fn abandon_leases_from(&mut self, mark: usize) {
+        // `active` is in ascending identity order, so the innermost
+        // lease this frame still holds is always the last one.
+        while let Some(id) = self.active.last().copied() {
+            if (id.0 as usize) < mark {
+                break;
+            }
+            self.active.pop();
+            if let Some(lease) = self.leases.get_mut(id.0 as usize) {
+                lease.status = LeaseStatus::Ended;
+            }
+        }
+    }
+
+    /// The identity the next lease will take, without taking it
+    /// (`rfcs/0013`).
+    ///
+    /// Reserved during an observation's own validate-and-plan phase so
+    /// the whole leased view can be *built* -- which is fallible --
+    /// before anything about the table changes. The reserved id is
+    /// never resolved while the plan is being built: it is only ever
+    /// stamped onto fresh handles, and every lease a handle already
+    /// carries is one that genuinely exists.
+    fn reserved_lease_id(&self) -> RuntimeObservationId {
+        RuntimeObservationId(self.leases.len() as u32)
+    }
+
+    /// Installs a lease previously reserved by
+    /// [`Self::reserved_lease_id`] (`rfcs/0013`). The last step of an
+    /// observation's own commit phase, after which nothing can fail.
+    ///
+    /// The identity is re-checked rather than assumed: committing a
+    /// reserved id that no longer matches would silently give two
+    /// observations one identity. Nothing in this interpreter can open
+    /// a lease between the reservation and the commit, so this is a
+    /// structured guard against a future caller that could, never a
+    /// condition ordinary execution reaches.
+    fn commit_lease(
+        &mut self,
+        id: RuntimeObservationId,
+        observed: Vec<ResourceId>,
+        parent: Option<RuntimeObservationId>,
+    ) -> Result<(), InterpreterError> {
+        if id.0 as usize != self.leases.len() {
+            return Err(invalid(
+                "an observation lease was committed against an identity that is no longer free",
+            ));
+        }
+        self.leases.push(RuntimeObservation {
+            id,
+            status: LeaseStatus::Active,
+            observed,
+            parent,
+        });
+        self.active.push(id);
+        Ok(())
+    }
+
+    fn lease(&self, id: RuntimeObservationId) -> Result<&RuntimeObservation, InterpreterError> {
+        self.leases
+            .get(id.0 as usize)
+            .ok_or_else(|| invalid("an observation handle does not refer to any known observation"))
+    }
+
+    /// Ends `id` exactly once (`rfcs/0013`).
+    ///
+    /// Refused when it was never opened, when it already ended, or
+    /// when a lease derived from it is still active -- the last one
+    /// being the runtime's own independent statement of the nesting
+    /// rule, so the interpreter does not depend on having been handed
+    /// verified NIR.
+    fn end_lease(&mut self, id: RuntimeObservationId) -> Result<(), InterpreterError> {
+        let lease = self.lease(id)?;
+        if lease.status == LeaseStatus::Ended {
+            return Err(invalid(
+                "an observation was ended more than once at run time",
+            ));
+        }
+        if self
+            .active
+            .iter()
+            .filter_map(|open| self.leases.get(open.0 as usize))
+            .any(|other| other.parent == Some(id))
+        {
+            return Err(invalid(
+                "cannot end an observation while an observation opened inside it is still active",
+            ));
+        }
+        self.leases[id.0 as usize].status = LeaseStatus::Ended;
+        self.active.retain(|open| *open != id);
+        Ok(())
+    }
+
+    /// The lowest-numbered still-active lease holding `resource`, if any
+    /// (`rfcs/0013`) -- a `Vec` scan in index order, so the answer never
+    /// depends on iteration order of anything hashed.
+    fn active_lease_holding(&self, resource: ResourceId) -> Option<RuntimeObservationId> {
+        self.active
+            .iter()
+            .filter_map(|open| self.leases.get(open.0 as usize))
+            .find(|lease| lease.observed.contains(&resource))
+            .map(|lease| lease.id)
+    }
+
     fn record(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
+        // A handle minted under an observation stops working the moment
+        // that observation ends (`rfcs/0013`) -- checked here, at the
+        // one place every read and every ownership operation resolves a
+        // handle, so no later caller can forget it. The owner's own
+        // untagged handle for the same resource is unaffected: what
+        // ended is the view, not the resource.
+        if let Some(lease) = handle.lease
+            && self.lease(lease)?.status == LeaseStatus::Ended
+        {
+            return Err(invalid(
+                "use of an observation after its own `observe` block already ended",
+            ));
+        }
         let record = self
             .records
             .get(handle.id.0 as usize)
@@ -155,6 +361,28 @@ impl ResourceTable {
             id: handle.id,
             generation: handle.generation,
             role: RuntimeOwnershipRole::Observer,
+            // Preserved, not cleared: downgrading an already-leased
+            // handle keeps it bound to the same observation
+            // (`rfcs/0013`).
+            lease: handle.lease,
+        })
+    }
+
+    /// Like [`Self::to_observer`], but binding the result to `lease`
+    /// (`rfcs/0013`) -- what every handle an `observe.place` view
+    /// carries is minted through, so ending that lease really does stop
+    /// all of them working at once.
+    fn to_leased_observer(
+        &self,
+        handle: ResourceHandle,
+        lease: RuntimeObservationId,
+    ) -> Result<ResourceHandle, InterpreterError> {
+        self.observe(handle)?;
+        Ok(ResourceHandle {
+            id: handle.id,
+            generation: handle.generation,
+            role: RuntimeOwnershipRole::Observer,
+            lease: Some(lease),
         })
     }
 
@@ -198,6 +426,7 @@ impl ResourceTable {
             id,
             generation: record.generation,
             role: RuntimeOwnershipRole::Owner,
+            lease: None,
         })
     }
 
@@ -245,7 +474,12 @@ impl ResourceTable {
         // and all -- so one projection through a generic aggregate
         // laundered an observation back into ownership.
         match handle.role {
-            RuntimeOwnershipRole::Observer => self.observing_view(field, 0),
+            // Reading through a *leased* observer binds what comes back
+            // to that same lease (`rfcs/0013`): the stored field's own
+            // handle belongs to the owner and carries no lease at all,
+            // so handing it back untouched would let one projection
+            // outlive the observation it was reached through.
+            RuntimeOwnershipRole::Observer => self.observing_view(field, handle.lease, 0),
             RuntimeOwnershipRole::Owner => Ok(field),
         }
     }
@@ -260,14 +494,22 @@ impl ResourceTable {
     /// held inline by the value that owns them. Nothing is mutated: the
     /// stored field keeps its owning handles, and only the copy handed
     /// back is downgraded.
-    fn observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
+    fn observing_view(
+        &self,
+        value: Value,
+        lease: Option<RuntimeObservationId>,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
         match value {
-            Value::Resource(inner) => Ok(Value::Resource(self.to_observer(inner)?)),
+            Value::Resource(inner) => Ok(Value::Resource(match lease {
+                Some(lease) => self.to_leased_observer(inner, lease)?,
+                None => self.to_observer(inner)?,
+            })),
             Value::Record {
                 item,
                 type_args,
@@ -277,7 +519,7 @@ impl ResourceTable {
                 type_args,
                 fields: fields
                     .into_iter()
-                    .map(|field| self.observing_view(field, depth + 1))
+                    .map(|field| self.observing_view(field, lease, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Value::Variant {
@@ -291,7 +533,7 @@ impl ResourceTable {
                 case,
                 payload: payload
                     .into_iter()
-                    .map(|slot| self.observing_view(slot, depth + 1))
+                    .map(|slot| self.observing_view(slot, lease, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             other => Ok(other),
@@ -742,6 +984,150 @@ impl<'a> Interpreter<'a> {
     /// 8). `mode: Observe` never mutates anything at all (only ever
     /// clones); `mode: Transfer` leaves a [`Value::Moved`] tombstone
     /// behind at the exact field it removed.
+    /// `%v = observe.place @obsN <place>` (`rfcs/0013`).
+    ///
+    /// Strictly read-only in its first half: the place is walked
+    /// through `observe_projections`, which mutates nothing at any
+    /// depth, and every resource it reaches is collected in
+    /// deterministic discovery order. Only then is a lease opened, and
+    /// the view rebuilt around handles bound to it.
+    ///
+    /// A failure anywhere before the lease is opened therefore leaves
+    /// the lease table, the resource table and the frame's values
+    /// exactly as they were.
+    /// Everything an `ObservePlace` can refuse, asked against a value
+    /// nothing has written to yet (`rfcs/0013`).
+    ///
+    /// An observation binds a *complete* value for the whole scope, so
+    /// this is stricter than the ownership walks: a tombstone anywhere
+    /// reachable means the aggregate is partially moved and cannot back
+    /// an alias of its own declared type, and every handle -- including
+    /// one nested inside a resource's own field storage -- must be a
+    /// live, current, still-observable one.
+    ///
+    /// Deliberately independent of `nir::verify`: this is the layer
+    /// that has to hold for NIR the verifier never saw.
+    fn validate_observation_source(
+        &self,
+        value: &Value,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "an observed value is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Moved => Err(invalid(
+                "cannot observe a place whose value was already moved out",
+            )),
+            Value::Dropped => Err(invalid(
+                "cannot observe a place whose value was already destroyed",
+            )),
+            Value::Resource(handle) => {
+                // Rejects a stale generation, an already-dropped
+                // resource, and a handle whose own observation already
+                // ended -- all of them before anything is opened.
+                let fields = {
+                    let table = self.resources.borrow();
+                    table.observe(*handle)?.fields.clone()
+                };
+                for field in &fields {
+                    self.validate_observation_source(field, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.validate_observation_source(field, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.validate_observation_source(slot, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `%v = observe.place @obsN <place>` (`rfcs/0013`), as a genuine
+    /// preflight-plan-commit transaction.
+    ///
+    /// Phase A answers every fallible question against a value nothing
+    /// has written to yet: the place resolves, the observed value is
+    /// live and complete, it agrees with the type the instruction
+    /// declares, every reachable identity is collected, and the whole
+    /// leased view is *built* -- against a lease id that is reserved
+    /// but not yet installed. Nothing in phase A mutates the resource
+    /// table, the lease table, the active list or the frame's values.
+    ///
+    /// Phase B installs the lease and pushes it onto the frame's own
+    /// stack. It cannot fail: the only thing left that could is
+    /// committing a reserved id that no longer matches, which is
+    /// checked and reported rather than assumed.
+    ///
+    /// Opening the lease first and building the view afterwards -- as
+    /// this once did -- left a lease open and pushed whenever the view
+    /// turned out to be unbuildable, freezing the owner's resources for
+    /// the rest of the run for an observation that never began.
+    fn begin_observe(
+        &self,
+        values: &mut HashMap<ValueId, Value>,
+        load_origin: &HashMap<ValueId, ValueId>,
+        active_leases: &mut Vec<(crate::hir::ObservationId, RuntimeObservationId)>,
+        observation: crate::hir::ObservationId,
+        place: &Place<ValueId>,
+        declared: &Ty,
+    ) -> Result<Value, InterpreterError> {
+        if active_leases.iter().any(|(id, _)| *id == observation) {
+            return Err(invalid(
+                "an observation began again while it was still active",
+            ));
+        }
+        // Phase A -- validate and plan, mutating nothing.
+        let root_id = canonical_root(load_origin, place.root);
+        let root = get(values, &root_id)?;
+        let seen = self.observe_projections(&root, &place.projections)?;
+        self.validate_observation_source(&seen, 0)?;
+        self.validate_argument(&seen, declared)?;
+        let mut identities = HashSet::new();
+        let mut observed = Vec::new();
+        self.collect_reachable_resources(&seen, &mut identities, &mut observed, 0)?;
+        let reserved = self.resources.borrow().reserved_lease_id();
+        let view = self.to_leased_view(seen, reserved, 0)?;
+
+        // Phase B -- commit.
+        let parent = active_leases.last().map(|(_, lease)| *lease);
+        self.resources
+            .borrow_mut()
+            .commit_lease(reserved, observed, parent)?;
+        active_leases.push((observation, reserved));
+        Ok(view)
+    }
+
+    /// `end.observe @obsN` (`rfcs/0013`).
+    fn end_observe(
+        &self,
+        active_leases: &mut Vec<(crate::hir::ObservationId, RuntimeObservationId)>,
+        observation: crate::hir::ObservationId,
+    ) -> Result<(), InterpreterError> {
+        match active_leases.last() {
+            Some((id, lease)) if *id == observation => {
+                let lease = *lease;
+                self.resources.borrow_mut().end_lease(lease)?;
+                active_leases.pop();
+                Ok(())
+            }
+            Some(_) => Err(invalid(
+                "an observation ended while an observation opened inside it is still active",
+            )),
+            None => Err(invalid("an observation ended that this frame never began")),
+        }
+    }
+
     fn access_place(
         &self,
         values: &mut HashMap<ValueId, Value>,
@@ -779,6 +1165,14 @@ impl<'a> Interpreter<'a> {
                 self.to_observer_if_resource(seen)
             }
             OwnershipMode::Transfer => {
+                // Preflight, mutating nothing: what this move would
+                // take out must not be held by an active observation
+                // (`rfcs/0013`). Asked against a read-only view of the
+                // exact same place, so a refusal leaves the container,
+                // every generation and every field precisely as they
+                // were.
+                let seen = self.observe_projections(&root, &place.projections)?;
+                self.reject_leased_value(&seen, "moved out of its place")?;
                 let result = self.take_projections(root, &place.projections)?;
                 values.insert(place.root, result.container);
                 Ok(result.extracted)
@@ -1005,6 +1399,13 @@ impl<'a> Interpreter<'a> {
                 "a variant decomposition names a case other than the one actually live",
             ));
         }
+        // Taking a variant apart transfers every payload position it
+        // claims, so an observation holding any of them blocks the
+        // whole decomposition (`rfcs/0013`) -- checked before the shell
+        // is touched.
+        for slot in &payload {
+            self.reject_leased_value(slot, "decomposed out of its variant")?;
+        }
         // The shell's own shape first: every claim below is checked
         // against its declared payload types, so a shell that disagrees
         // with its declaration must be refused before any of that is
@@ -1112,6 +1513,123 @@ impl<'a> Interpreter<'a> {
         plan: &mut StorePlan,
         depth: usize,
     ) -> Result<Value, InterpreterError> {
+        let rebuilt = self.plan_transfer_inner(value, plan, depth)?;
+        // Asked once, at the top of the whole planned operation, over
+        // *every* identity the transfer would move -- including the
+        // ones nested inside a moved resource, which the recursion
+        // reaches only through `collect_owned_identities` and never
+        // individually (`rfcs/0013`). Still strictly inside phase A:
+        // nothing has been mutated yet, so a refusal here leaves every
+        // generation, status, field and event exactly as it found them.
+        if depth == 0 {
+            self.reject_leased_identities(&plan.reachable, "transferred")?;
+        }
+        Ok(rebuilt)
+    }
+
+    /// Refuses an ownership operation over any identity a still-active
+    /// observation is holding (`rfcs/0013`).
+    ///
+    /// Deterministic in its own right: the offending identity is the
+    /// lowest-numbered one, and the lease named is the lowest-numbered
+    /// active lease holding it, so the same refused operation reports a
+    /// byte-identical error every time.
+    fn reject_leased_identities(
+        &self,
+        identities: &HashSet<ResourceId>,
+        what: &str,
+    ) -> Result<(), InterpreterError> {
+        let mut ordered: Vec<ResourceId> = identities.iter().copied().collect();
+        ordered.sort_by_key(|id| id.0);
+        let table = self.resources.borrow();
+        for id in ordered {
+            if let Some(lease) = table.active_lease_holding(id) {
+                return Err(invalid(format!(
+                    "a resource cannot be {what} while observation {} is still holding it",
+                    lease.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::reject_leased_identities`] for a value rather than an
+    /// already-collected identity set: collects every resource the
+    /// value reaches, tolerating repeats (an ownership graph's own
+    /// duplicate/cycle rejection belongs to the operation being
+    /// planned, not to this question).
+    fn reject_leased_value(&self, value: &Value, what: &str) -> Result<(), InterpreterError> {
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        self.collect_reachable_resources(value, &mut seen, &mut ordered, 0)?;
+        self.reject_leased_identities(&seen, what)
+    }
+
+    /// Every resource identity reachable through `value`, in
+    /// deterministic discovery order: the value's own handles
+    /// outermost-first, then each resource's own stored fields in
+    /// declaration order (`rfcs/0013`).
+    ///
+    /// Unlike [`Self::collect_owned_identities`], a repeat is skipped
+    /// rather than refused: this answers "what does this reach", which
+    /// is a question with an answer even for a graph no ownership
+    /// operation would accept. Skipping repeats is also what bounds the
+    /// walk on a malformed cyclic graph, alongside the depth guard.
+    fn collect_reachable_resources(
+        &self,
+        value: &Value,
+        seen: &mut HashSet<ResourceId>,
+        ordered: &mut Vec<ResourceId>,
+        depth: usize,
+    ) -> Result<(), InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime ownership graph is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => {
+                if !seen.insert(handle.id) {
+                    return Ok(());
+                }
+                ordered.push(handle.id);
+                let fields = {
+                    let table = self.resources.borrow();
+                    // A stale or dropped handle has nothing to walk
+                    // into; whichever operation is being planned reports
+                    // that on its own terms.
+                    match table.record(*handle) {
+                        Ok(record) => record.fields.clone(),
+                        Err(_) => return Ok(()),
+                    }
+                };
+                for field in &fields {
+                    self.collect_reachable_resources(field, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields, .. } => {
+                for field in fields {
+                    self.collect_reachable_resources(field, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Variant { payload, .. } => {
+                for slot in payload {
+                    self.collect_reachable_resources(slot, seen, ordered, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn plan_transfer_inner(
+        &self,
+        value: &Value,
+        plan: &mut StorePlan,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
                 "a runtime value is nested more deeply than this milestone supports",
@@ -1152,6 +1670,7 @@ impl<'a> Interpreter<'a> {
                     id: handle.id,
                     generation,
                     role: RuntimeOwnershipRole::Owner,
+                    lease: None,
                 }))
             }
             Value::Record {
@@ -1168,7 +1687,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = fields
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan, depth + 1))
+                    .map(|field| self.plan_transfer_inner(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Record {
                     item: *item,
@@ -1191,7 +1710,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let rebuilt = payload
                     .iter()
-                    .map(|field| self.plan_transfer(field, plan, depth + 1))
+                    .map(|field| self.plan_transfer_inner(field, plan, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Variant {
                     item: *item,
@@ -2023,6 +2542,12 @@ impl<'a> Interpreter<'a> {
         // sitting where an `i64` is declared is refused rather than
         // walked past and left unreachable.
         self.validate_owned_graph(&value)?;
+        // Phase A1 -- observations, before the destruction order is
+        // even computed (`rfcs/0013`). Destroying something an
+        // observation is still holding is exactly what a lease exists
+        // to prevent, and refusing it here leaves every status,
+        // generation and event untouched.
+        self.reject_leased_value(&value, "dropped")?;
         let mut plan = Vec::new();
         let mut seen = HashSet::new();
         self.plan_drop(&value, &mut seen, &mut plan, 0)?;
@@ -2341,6 +2866,55 @@ impl<'a> Interpreter<'a> {
     ///
     /// Nothing is mutated: a new value is built, and the caller's own
     /// keeps its owning handles.
+    /// [`Self::to_observing_view`], but binding every handle it rebuilds
+    /// to `lease` (`rfcs/0013`) -- what an `observe.place` hands to its
+    /// own alias, so every handle the view carries, at any depth, stops
+    /// working the instant that exact observation ends.
+    fn to_leased_view(
+        &self,
+        value: Value,
+        lease: RuntimeObservationId,
+        depth: usize,
+    ) -> Result<Value, InterpreterError> {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return Err(invalid(
+                "a runtime value is nested more deeply than this milestone supports",
+            ));
+        }
+        match value {
+            Value::Resource(handle) => Ok(Value::Resource(
+                self.resources.borrow().to_leased_observer(handle, lease)?,
+            )),
+            Value::Record {
+                item,
+                type_args,
+                fields,
+            } => Ok(Value::Record {
+                item,
+                type_args,
+                fields: fields
+                    .into_iter()
+                    .map(|field| self.to_leased_view(field, lease, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Value::Variant {
+                item,
+                type_args,
+                case,
+                payload,
+            } => Ok(Value::Variant {
+                item,
+                type_args,
+                case,
+                payload: payload
+                    .into_iter()
+                    .map(|slot| self.to_leased_view(slot, lease, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            other => Ok(other),
+        }
+    }
+
     fn to_observing_view(&self, value: Value, depth: usize) -> Result<Value, InterpreterError> {
         if depth >= crate::limits::MAX_GENERIC_DEPTH {
             return Err(invalid(
@@ -2648,7 +3222,21 @@ impl<'a> Interpreter<'a> {
             )));
         }
         self.call_depth.set(self.call_depth.get() + 1);
+        // Every observation this frame opens is its own to close. A
+        // frame that ends in `Err` -- from anywhere, including deep
+        // inside a helper this function never sees -- has abandoned its
+        // own lease stack wherever it stood, so the epilogue closes
+        // what the frame itself opened (`rfcs/0013`).
+        //
+        // Without it, any error after an `ObservePlace` left that lease
+        // `Active` forever, and the *caller* -- which legitimately owns
+        // the observed resources -- was refused every ownership
+        // operation on them for the rest of the run.
+        let mark = self.resources.borrow().lease_mark();
         let outcome = self.call_function_in_frame(function, type_args, args, evidence);
+        if outcome.is_err() {
+            self.resources.borrow_mut().abandon_leases_from(mark);
+        }
         self.call_depth.set(self.call_depth.get() - 1);
         outcome
     }
@@ -2830,6 +3418,14 @@ impl<'a> Interpreter<'a> {
         for (id, bound, _) in bindings {
             values.insert(id, bound);
         }
+        // This frame's own currently-active observation leases
+        // (`rfcs/0013`), innermost last: the NIR identity paired with
+        // the runtime lease it opened. A stack, so `end.observe` can
+        // insist on being handed the innermost one at run time,
+        // independently of whatever the verifier already proved, and so
+        // a nested observation records the right `parent`. Per frame,
+        // never shared: an observation cannot span a call boundary.
+        let mut active_leases: Vec<(crate::hir::ObservationId, RuntimeObservationId)> = Vec::new();
 
         // The one place a call is recorded, and it means exactly one
         // thing: this callee's frame was successfully entered, with
@@ -2863,13 +3459,41 @@ impl<'a> Interpreter<'a> {
 
             for instruction in &block.instructions {
                 match instruction {
-                    crate::nir::Instruction::Value { result, kind, .. } => {
-                        let value = if let ValueKind::PlaceRead { place, mode } = kind {
-                            self.access_place(&mut values, &load_origin, place, *mode)?
-                        } else {
-                            self.eval(kind, &values, &evidence, &frame_subst)?
+                    crate::nir::Instruction::Value { result, ty, kind } => {
+                        let value = match kind {
+                            ValueKind::PlaceRead { place, mode } => {
+                                self.access_place(&mut values, &load_origin, place, *mode)?
+                            }
+                            // Beginning an observation (`rfcs/0013`):
+                            // reads the place without disturbing it,
+                            // validates and plans the whole operation,
+                            // and only then opens a lease over every
+                            // resource it reaches, binding the
+                            // resulting view -- recursively, at every
+                            // depth -- to that lease. The declared type
+                            // is checked here too, against this frame's
+                            // own instantiation, so a value that
+                            // disagrees with the NIR is refused rather
+                            // than observed.
+                            ValueKind::ObservePlace { observation, place } => self.begin_observe(
+                                &mut values,
+                                &load_origin,
+                                &mut active_leases,
+                                *observation,
+                                place,
+                                &crate::types::substitute(ty, &frame_subst),
+                            )?,
+                            _ => self.eval(kind, &values, &evidence, &frame_subst)?,
                         };
                         values.insert(*result, value);
+                    }
+                    // Ending one (`rfcs/0013`). Refused unless it is
+                    // this frame's own innermost active observation:
+                    // ending out of order, ending twice, and ending one
+                    // that never began here are each rejected at run
+                    // time in their own right, not merely statically.
+                    crate::nir::Instruction::EndObserve { observation } => {
+                        self.end_observe(&mut active_leases, *observation)?;
                     }
                     // Ownership of one active case's payload position
                     // genuinely moves out of the shell here
@@ -3016,6 +3640,29 @@ impl<'a> Interpreter<'a> {
                 }
             }
 
+            // A frame may never leave with an observation still open
+            // (`rfcs/0013`). Nothing would ever end that lease, so
+            // every resource it holds would stay frozen for the rest of
+            // the run -- and the *caller*, which legitimately owns
+            // those resources, would be refused every ownership
+            // operation on them from here on.
+            //
+            // Checked before any exit does anything fallible or
+            // committing, so a frame refused for this reason has
+            // transferred nothing and changed no state. Deliberately a
+            // refusal rather than an implicit end: silently closing the
+            // scope here would accept exactly the NIR `V0107` exists to
+            // reject.
+            if matches!(
+                block.terminator,
+                Terminator::Return(_) | Terminator::Raise { .. }
+            ) && let Some((_, lease)) = active_leases.last()
+            {
+                return Err(invalid(format!(
+                    "function exited with observation {} still active",
+                    lease.0
+                )));
+            }
             match &block.terminator {
                 Terminator::Return(Some(id)) => {
                     // A returned resource transfers ownership back to
@@ -3264,6 +3911,12 @@ impl<'a> Interpreter<'a> {
             // `&mut`) signature cannot do.
             ValueKind::PlaceRead { .. } => Err(invalid(
                 "ValueKind::PlaceRead must be evaluated by call_function directly, never through eval",
+            )),
+            // Same reason (`rfcs/0013`): beginning an observation needs
+            // the frame's own lease stack, which this method cannot
+            // reach.
+            ValueKind::ObservePlace { .. } => Err(invalid(
+                "ValueKind::ObservePlace must be evaluated by call_function directly, never through eval",
             )),
             ValueKind::Add(a, b) => arith(
                 get(values, a)?,
@@ -3852,7 +4505,7 @@ mod tests {
     use crate::source::SourceMap;
     use crate::typeck::check_module;
 
-    fn run(text: &str) -> Result<Value, InterpreterError> {
+    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -3899,6 +4552,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -3957,6 +4612,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -4259,6 +4916,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -4311,6 +4970,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -14606,5 +15267,1584 @@ mod observed_extraction {
             codes.contains(&"V0099"),
             "the verifier must reject the same observer-to-owner flow statically, got {codes:?}"
         );
+    }
+}
+
+/// `rfcs/0013` -- observations as real runtime leases, enforced by the
+/// interpreter itself rather than assumed from `nir::verify`.
+///
+/// Every negative case here is hand-built NIR that the verifier would
+/// reject, fed straight to the interpreter: the point is precisely that
+/// it does not depend on having been verified.
+#[cfg(test)]
+mod observation_leases {
+    use super::tests::{run, run_with_log};
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::place::{FieldId, Place};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(90);
+    const SESSION: ItemId = ItemId(91);
+    const SINK: ItemId = ItemId(92);
+    const SELF: ItemId = ItemId(93);
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, Symbol(0))
+    }
+
+    fn session_ty() -> Ty {
+        Ty::Named(SESSION, Symbol(1))
+    }
+
+    /// `resource File { descriptor: i64 }`, `resource Session { left:
+    /// File, right: File }`, and `sink(take File)`.
+    fn module_with(under_test: Function) -> Module {
+        Module {
+            functions: vec![
+                under_test,
+                Function {
+                    id: SINK,
+                    name: Symbol(2),
+                    type_params: Vec::new(),
+                    requirements: Vec::new(),
+                    params: vec![Param {
+                        value: ValueId(0),
+                        ty: file_ty(),
+                        take: true,
+                    }],
+                    return_type: Ty::Unit,
+                    raises: Vec::new(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction::Drop { value: ValueId(0) }],
+                        terminator: Terminator::Return(None),
+                    }],
+                },
+            ],
+            records: vec![
+                (
+                    FILE,
+                    RecordLayout {
+                        name: Symbol(0),
+                        type_params: Vec::new(),
+                        fields: vec![(Symbol(3), Ty::I64)],
+                        affine: true,
+                    },
+                ),
+                (
+                    SESSION,
+                    RecordLayout {
+                        name: Symbol(1),
+                        type_params: Vec::new(),
+                        fields: vec![(Symbol(4), file_ty()), (Symbol(5), file_ty())],
+                        affine: true,
+                    },
+                ),
+            ],
+            variants: Vec::new(),
+            protocols: Vec::new(),
+            extends: Vec::new(),
+        }
+    }
+
+    fn under_test(params: Vec<Param>, return_type: Ty, blocks: Vec<BasicBlock>) -> Function {
+        Function {
+            id: SELF,
+            name: Symbol(6),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn take_session() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: session_ty(),
+            take: true,
+        }]
+    }
+
+    fn session_field(index: u32) -> Place<ValueId> {
+        Place::root(ValueId(0)).field(SESSION, FieldId(index))
+    }
+
+    fn observe_at(result: u32, ty: Ty, id: u32, place: Place<ValueId>) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::ObservePlace {
+                observation: crate::hir::ObservationId(id),
+                place,
+            },
+        }
+    }
+
+    fn end(id: u32) -> Instruction {
+        Instruction::EndObserve {
+            observation: crate::hir::ObservationId(id),
+        }
+    }
+
+    fn read(result: u32, ty: Ty, place: Place<ValueId>, mode: OwnershipMode) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::PlaceRead { place, mode },
+        }
+    }
+
+    fn int(result: u32, value: i128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(value as u128)),
+        }
+    }
+
+    /// Builds a live `Session` owning two `File`s inside `interpreter`.
+    fn live_session(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        let left = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(1)]);
+        let right = interpreter
+            .resources
+            .borrow_mut()
+            .construct(FILE, vec![Value::Int(2)]);
+        interpreter
+            .resources
+            .borrow_mut()
+            .construct(SESSION, vec![Value::Resource(left), Value::Resource(right)])
+    }
+
+    /// Everything a rejected operation is required to leave untouched:
+    /// every resource record (item, generation, status and fields,
+    /// tombstones included), every lease (status, observed set and
+    /// parent), and the execution event log.
+    fn snapshot(interpreter: &Interpreter<'_>) -> String {
+        let table = interpreter.resources.borrow();
+        format!(
+            "records={:?}\nleases={:?}\nevents={:?}",
+            table.records,
+            table.leases,
+            interpreter.event_log()
+        )
+    }
+
+    /// An *ordinary* (non-`take`) session parameter: the frame observes
+    /// it and owes it nothing, so a test can isolate a defect that is
+    /// not about ownership at all.
+    fn observing_session() -> Vec<Param> {
+        vec![Param {
+            value: ValueId(0),
+            ty: session_ty(),
+            take: false,
+        }]
+    }
+
+    /// Like [`run_under_test`], but the session is handed in as an
+    /// observation rather than transferred.
+    fn run_observing(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
+        let interpreter = Interpreter::new(module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        let after = snapshot(&interpreter);
+        (outcome, before, after)
+    }
+
+    fn run_under_test(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
+        let interpreter = Interpreter::new(module);
+        let session = live_session(&interpreter);
+        let before = snapshot(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        let after = snapshot(&interpreter);
+        (outcome, before, after)
+    }
+
+    // -- the ordinary shape -------------------------------------------
+
+    #[test]
+    fn begin_read_end_runs_and_leaves_the_owner_usable() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_valid_ownership_operation_after_the_end_is_accepted() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+                    },
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    // -- ended leases ---------------------------------------------------
+
+    #[test]
+    fn reading_through_an_ended_lease_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        let Err(InterpreterError::InvalidOperation(message)) = outcome else {
+            panic!("expected a structured error, got {outcome:?}")
+        };
+        assert!(
+            message.contains("already ended"),
+            "the error names the ended observation, got {message}"
+        );
+    }
+
+    #[test]
+    fn ending_the_same_observation_twice_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn ending_an_observation_this_frame_never_began_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![end(0), Instruction::Drop { value: ValueId(0) }, int(3, 0)],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn beginning_one_observation_identity_twice_is_a_structured_error() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    observe_at(2, file_ty(), 0, session_field(1)),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    // -- conflicting ownership, and the atomicity of refusing it --------
+
+    /// The item, status and fields of the first `upto` resource records
+    /// -- everything a rejected operation must leave exactly as it found
+    /// it, for every resource that already existed when it ran.
+    ///
+    /// Two things are deliberately out of scope, both because they move
+    /// for reasons that have nothing to do with the refusal:
+    ///
+    /// - Generations. A call boundary that takes ownership of its
+    ///   argument legitimately advances one before the frame's own body
+    ///   ever runs.
+    /// - Records beyond `upto`. A program whose refused instruction is
+    ///   preceded by a successful `record.create` really does have one
+    ///   more resource afterwards, created by an instruction nobody
+    ///   claims was refused.
+    ///
+    /// What a refusal must never do -- destroy something, move a field
+    /// out, write a field -- is precisely what `status` and `fields`
+    /// record, for precisely the resources it could have reached.
+    fn shape_snapshot(interpreter: &Interpreter<'_>, upto: usize) -> String {
+        let table = interpreter.resources.borrow();
+        let shapes: Vec<(ItemId, ResourceStatus, Vec<Value>)> = table
+            .records
+            .iter()
+            .take(upto)
+            .map(|record| (record.item, record.status.clone(), record.fields.clone()))
+            .collect();
+        format!("{shapes:?}")
+    }
+
+    fn record_count(interpreter: &Interpreter<'_>) -> usize {
+        interpreter.resources.borrow().records.len()
+    }
+
+    /// A refusal with every run-time identity blanked out.
+    ///
+    /// Repeating a refused call on the *same* interpreter is the whole
+    /// point of these comparisons, and the observation it opens on the
+    /// second attempt legitimately carries the next identity -- which
+    /// the diagnostic names, correctly. What must not differ is the
+    /// refusal itself.
+    fn refusal_shape(outcome: &Result<Value, InterpreterError>) -> String {
+        format!("{outcome:?}")
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect()
+    }
+
+    fn open_leases(interpreter: &Interpreter<'_>) -> usize {
+        interpreter.resources.borrow().active.len()
+    }
+
+    fn every_lease_ended(interpreter: &Interpreter<'_>) -> bool {
+        interpreter
+            .resources
+            .borrow()
+            .leases
+            .iter()
+            .all(|lease| lease.status == LeaseStatus::Ended)
+    }
+
+    fn drop_events(interpreter: &Interpreter<'_>) -> Vec<String> {
+        interpreter
+            .event_log()
+            .into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    /// Every rejected ownership operation must leave the runtime as it
+    /// found it -- compared before and after on the *same* interpreter,
+    /// which is the only comparison that can see an accumulated
+    /// mutation at all. Comparing two freshly-built interpreters cannot:
+    /// each starts from nothing, so two equally wrong runs agree with
+    /// each other perfectly.
+    fn assert_refused_without_mutation(instructions: Vec<Instruction>) {
+        let mut all = instructions;
+        all.push(int(9, 0));
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: all,
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let existing = record_count(&interpreter);
+        let before = shape_snapshot(&interpreter, existing);
+        let before_drops = drop_events(&interpreter);
+        assert!(before.contains("Alive"), "the fixture really was alive");
+
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "expected the operation to be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            before,
+            shape_snapshot(&interpreter, existing),
+            "a refused operation destroyed, moved out of or wrote into a resource"
+        );
+        assert_eq!(
+            before_drops,
+            drop_events(&interpreter),
+            "a refused operation destroyed a resource"
+        );
+        assert_eq!(
+            open_leases(&interpreter),
+            0,
+            "the refused frame left one of its own observations open"
+        );
+        assert!(
+            every_lease_ended(&interpreter),
+            "an observation the refused frame opened is still active"
+        );
+
+        // The same refusal again, on the *same* interpreter: reported
+        // identically and still changing nothing, which is what proves
+        // that nothing accumulated between the two attempts.
+        let retry = live_session(&interpreter);
+        let carried = record_count(&interpreter);
+        let midpoint = shape_snapshot(&interpreter, carried);
+        let repeat = interpreter.call_item(SELF, vec![Value::Resource(retry)]);
+        assert_eq!(
+            refusal_shape(&outcome),
+            refusal_shape(&repeat),
+            "a refusal must be deterministic on the same interpreter"
+        );
+        assert_eq!(
+            midpoint,
+            shape_snapshot(&interpreter, carried),
+            "the retry destroyed, moved out of or wrote into a resource"
+        );
+        assert_eq!(
+            open_leases(&interpreter),
+            0,
+            "the retry left an observation open"
+        );
+    }
+
+    #[test]
+    fn moving_the_observed_place_while_active_is_refused_without_mutation() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn dropping_the_owner_while_active_is_refused_without_mutation() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            Instruction::Drop { value: ValueId(0) },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn a_take_call_on_the_observed_place_while_active_is_refused() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+            Instruction::Value {
+                result: ValueId(3),
+                ty: Ty::Unit,
+                kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+            },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn storing_over_the_observed_place_while_active_is_refused() {
+        assert_refused_without_mutation(vec![
+            observe_at(1, file_ty(), 0, session_field(0)),
+            int(4, 7),
+            Instruction::Value {
+                result: ValueId(5),
+                ty: file_ty(),
+                kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(4)]),
+            },
+            Instruction::StorePlace {
+                place: session_field(0),
+                value: ValueId(5),
+            },
+            end(0),
+        ]);
+    }
+
+    #[test]
+    fn a_frame_that_exits_with_an_active_lease_is_refused() {
+        // Nothing about the returned value is wrong here -- it is an
+        // ordinary `i64`. What is wrong is the frame itself: it ends
+        // with an observation still open, so nothing would ever end
+        // that lease, and every resource it holds would stay frozen for
+        // the rest of the run.
+        //
+        // The session is an *ordinary* parameter here, so this frame
+        // owes it no destruction and leaks nothing: the only thing
+        // wrong is the open lease, which is exactly what has to be
+        // caught.
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0)), int(2, 0)],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "a frame must not exit with an observation still open, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_returns_no_value_with_an_active_lease_is_refused() {
+        let mut function = under_test(
+            observing_session(),
+            Ty::Unit,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0))],
+                terminator: Terminator::Return(None),
+            }],
+        );
+        function.return_type = Ty::Unit;
+        let module = module_with(function);
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_raises_with_an_active_lease_is_refused() {
+        let mut function = under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(0)),
+                    },
+                ],
+                terminator: Terminator::Raise { value: ValueId(2) },
+            }],
+        );
+        function.raises = vec![FILE];
+        let module = module_with(function);
+        let (outcome, _, _) = run_observing(&module);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_ended_lease_stops_being_consulted_by_later_ownership_checks() {
+        // Every ownership operation asks "is this held?", and the
+        // answer must be looked up against the leases that are actually
+        // open rather than against every lease the run has ever taken
+        // -- otherwise a program observing inside a loop pays for its
+        // whole history on every single operation.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        for _ in 0..64 {
+            let session = live_session(&interpreter);
+            assert_eq!(
+                interpreter.call_item(SELF, vec![Value::Resource(session)]),
+                Ok(Value::Int(0))
+            );
+        }
+        let table = interpreter.resources.borrow();
+        assert_eq!(table.leases.len(), 64, "one lease per call was taken");
+        assert!(
+            table.active.is_empty(),
+            "every one of them ended, so none may still be consulted"
+        );
+    }
+
+    #[test]
+    fn a_lease_left_open_by_a_refused_frame_never_freezes_a_later_one() {
+        // The same guarantee from the other side, and the reason the
+        // frame epilogue exists at all: once a frame has been refused
+        // *with an observation still open*, nothing of that observation
+        // may survive to reject a later operation on the very resources
+        // it held.
+        //
+        // The session is an ordinary parameter, so the caller keeps its
+        // own owning handle and can try exactly that afterwards. The
+        // frame ends an observation it never began, which fails while
+        // its own `@obs0` is open.
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(7),
+                    int(2, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(2))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let refused = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert!(
+            matches!(refused, Err(InterpreterError::InvalidOperation(_))),
+            "the fixture must really be refused, got {refused:?}"
+        );
+        assert_eq!(
+            open_leases(&interpreter),
+            0,
+            "the refused frame's own observation is still listed as open"
+        );
+        assert!(
+            every_lease_ended(&interpreter),
+            "the refused frame's own observation is still active"
+        );
+
+        // The operation the surviving lease would have frozen: the
+        // caller destroying the very resource that observation held.
+        assert_eq!(
+            interpreter.drop_value(Value::Resource(session)),
+            Ok(()),
+            "a lease from a refused frame froze the caller's own session"
+        );
+        assert_eq!(
+            drop_events(&interpreter).len(),
+            3,
+            "the session and both of its files were really destroyed"
+        );
+
+        // And a later frame observing a fresh session still runs.
+        let second = live_session(&interpreter);
+        let again = interpreter.call_item(SELF, vec![Value::Resource(second)]);
+        assert_eq!(
+            refusal_shape(&refused),
+            refusal_shape(&again),
+            "a later frame must be refused for its own reason, not the first frame's"
+        );
+        assert_eq!(open_leases(&interpreter), 0);
+        assert_eq!(
+            interpreter.drop_value(Value::Resource(second)),
+            Ok(()),
+            "the second refusal froze its own session"
+        );
+    }
+
+    #[test]
+    fn returning_the_owner_while_active_is_refused() {
+        let module = module_with(under_test(
+            take_session(),
+            session_ty(),
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![observe_at(1, file_ty(), 0, session_field(0))],
+                terminator: Terminator::Return(Some(ValueId(0))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn a_disjoint_sibling_stays_transferable_while_observed() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    read(2, file_ty(), session_field(1), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(3),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(2)], Vec::new()),
+                    },
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    // -- nesting ---------------------------------------------------------
+
+    #[test]
+    fn nested_leases_end_innermost_first() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                    end(1),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn ending_a_parent_while_a_derived_lease_is_active_is_refused() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                    end(0),
+                    end(1),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(3, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(3))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert!(matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn two_simultaneous_observations_of_disjoint_places_both_work() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    observe_at(2, file_ty(), 1, session_field(1)),
+                    read(
+                        3,
+                        file_ty(),
+                        Place::root(ValueId(1)),
+                        OwnershipMode::Observe,
+                    ),
+                    read(
+                        4,
+                        file_ty(),
+                        Place::root(ValueId(2)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(1),
+                    end(0),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(5, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(5))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        assert_eq!(outcome, Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn a_view_of_a_resource_record_carries_the_lease_at_every_depth() {
+        // The view is of the whole `Session`; the `File` reached through
+        // it lives in the resource table, not inline, so its handle is
+        // only bound to the lease if the projection propagates it.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    read(
+                        2,
+                        file_ty(),
+                        Place::root(ValueId(1)).field(SESSION, FieldId(0)),
+                        OwnershipMode::Observe,
+                    ),
+                    end(0),
+                    read(
+                        3,
+                        file_ty(),
+                        Place::root(ValueId(2)),
+                        OwnershipMode::Observe,
+                    ),
+                    Instruction::Drop { value: ValueId(0) },
+                    int(4, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(4))),
+            }],
+        ));
+        let (outcome, _, _) = run_under_test(&module);
+        let Err(InterpreterError::InvalidOperation(message)) = outcome else {
+            panic!("a projection out of a view must not outlive it, got {outcome:?}")
+        };
+        assert!(message.contains("already ended"), "got {message}");
+    }
+
+    // -- malformed runtime graphs ----------------------------------------
+
+    #[test]
+    fn a_cyclic_ownership_graph_terminates_instead_of_recursing_forever() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(9, 0)],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        // Make the session own itself: a graph no ownership operation
+        // could ever satisfy, and one a naive walk would never leave.
+        interpreter.resources.borrow_mut().records[session.id.0 as usize].fields[0] =
+            Value::Resource(session);
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        let outcome = interpreter.collect_reachable_resources(
+            &Value::Resource(session),
+            &mut seen,
+            &mut ordered,
+            0,
+        );
+        assert!(outcome.is_ok());
+        assert!(
+            ordered.len() <= 3,
+            "a cycle must be walked once, got {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_owner_handle_is_rejected_before_any_lease_is_opened() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![int(9, 0)],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let fresh = interpreter
+            .resources
+            .borrow_mut()
+            .transfer(session)
+            .expect("the fixture is transferable");
+        let _ = fresh;
+        let before = snapshot(&interpreter);
+        let error = interpreter
+            .call_item(SELF, vec![Value::Resource(session)])
+            .expect_err("a stale handle must not enter a frame");
+        assert!(matches!(error, InterpreterError::InvalidOperation(_)));
+        assert_eq!(
+            before,
+            snapshot(&interpreter),
+            "a refused call changes nothing"
+        );
+    }
+
+    // -- source-level end-to-end behavior ---------------------------------
+
+    const SOURCE_PRELUDE: &str = "\
+        resource File { descriptor: i64 }\n\
+        resource Session { left: File, right: File }\n\
+        record Envelope { item: File }\n\
+        record Box2 { inner: Envelope }\n\
+        variant Maybe { Some(File), None }\n\
+        func inspect(file: File) -> i64 { return file.descriptor; }\n";
+
+    #[test]
+    fn an_observation_of_a_resource_inside_an_ordinary_record_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value packed = Envelope {{ item: File {{ descriptor: 5 }} }};\n\
+               mutable n = 0;\n\
+               observe packed.item as view {{ n = inspect(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(5)));
+    }
+
+    #[test]
+    fn an_observation_of_a_resource_inside_a_resource_record_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value session = Session {{ left: File {{ descriptor: 3 }}, right: File {{ descriptor: 4 }} }};\n\
+               mutable n = 0;\n\
+               observe session.left as view {{ n = inspect(view); }}\n\
+               drop session;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(3)));
+    }
+
+    #[test]
+    fn an_observation_through_deep_mixed_nesting_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value packed = Box2 {{ inner: Envelope {{ item: File {{ descriptor: 9 }} }} }};\n\
+               mutable n = 0;\n\
+               observe packed.inner.item as view {{ n = inspect(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(9)));
+    }
+
+    #[test]
+    fn an_observation_of_a_whole_aggregate_reads_through_it() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func peek(packed: Envelope) -> i64 {{ return inspect(packed.item); }}\n\
+             func main() -> i64 {{\n\
+               value packed = Envelope {{ item: File {{ descriptor: 6 }} }};\n\
+               mutable n = 0;\n\
+               observe packed as view {{ n = peek(view); }}\n\
+               drop packed;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(6)));
+    }
+
+    #[test]
+    fn the_owner_is_destroyed_exactly_once_after_an_observation() {
+        let (result, log) = run_with_log(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value file = File {{ descriptor: 2 }};\n\
+               mutable n = 0;\n\
+               observe file as view {{ n = inspect(view); }}\n\
+               drop file;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(result, Ok(Value::Int(2)));
+        let drops: Vec<String> = log
+            .into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect();
+        assert_eq!(drops, vec!["drop:0"]);
+    }
+
+    #[test]
+    fn the_execution_log_is_identical_across_repeated_runs() {
+        let program = format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value session = Session {{ left: File {{ descriptor: 1 }}, right: File {{ descriptor: 2 }} }};\n\
+               mutable n = 0;\n\
+               observe session.left as a {{\n\
+                 observe session.right as b {{ n = inspect(a) + inspect(b); }}\n\
+               }}\n\
+               drop session;\n\
+               return n;\n\
+             }}"
+        );
+        let (first, first_log) = run_with_log(&program);
+        let (second, second_log) = run_with_log(&program);
+        assert_eq!(first, Ok(Value::Int(3)));
+        assert_eq!(first, second);
+        assert_eq!(first_log, second_log);
+    }
+
+    #[test]
+    fn an_observation_of_a_variant_payload_runs() {
+        let value = run(&format!(
+            "{SOURCE_PRELUDE}\
+             func main() -> i64 {{\n\
+               value held = Maybe.Some(File {{ descriptor: 8 }});\n\
+               mutable n = 0;\n\
+               observe held as view {{ n = 1; }}\n\
+               drop held;\n\
+               return n;\n\
+             }}"
+        ));
+        assert_eq!(value, Ok(Value::Int(1)));
+    }
+
+    // -- unwinding a frame that fails with an observation open ----------
+
+    /// Runs a frame expected to fail with at least one observation still
+    /// open, and proves the frame's own epilogue closed every lease it
+    /// opened: nothing is left in the active list, every lease it opened
+    /// is `Ended`, and -- the point of all of it -- the caller can still
+    /// destroy the very resources those leases held.
+    ///
+    /// The session is an ordinary parameter so the caller keeps a live
+    /// owning handle to check that with. Which diagnostic each shape
+    /// produces is not what is under test here; that no lease ever
+    /// survives one is.
+    fn assert_frame_error_unwinds_leases(instructions: Vec<Instruction>, what: &str) {
+        let mut all = instructions;
+        all.push(int(9, 0));
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: all,
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected the frame to fail, got {outcome:?}"
+        );
+        assert_eq!(
+            open_leases(&interpreter),
+            0,
+            "{what}: an observation outlived the frame that opened it"
+        );
+        assert!(
+            every_lease_ended(&interpreter),
+            "{what}: an observation the failed frame opened is still active"
+        );
+        assert_eq!(
+            interpreter.drop_value(Value::Resource(session)),
+            Ok(()),
+            "{what}: the caller's own resources were frozen by an abandoned observation"
+        );
+    }
+
+    #[test]
+    fn a_failed_move_unwinds_the_frames_observation() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, file_ty(), 0, session_field(0)),
+                read(2, file_ty(), session_field(0), OwnershipMode::Transfer),
+            ],
+            "move",
+        );
+    }
+
+    #[test]
+    fn a_failed_drop_unwinds_the_frames_observation() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, file_ty(), 0, session_field(0)),
+                Instruction::Drop { value: ValueId(0) },
+            ],
+            "drop",
+        );
+    }
+
+    #[test]
+    fn a_failed_take_call_unwinds_the_frames_observation() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, file_ty(), 0, session_field(0)),
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                },
+            ],
+            "take call",
+        );
+    }
+
+    #[test]
+    fn a_failed_structural_store_unwinds_the_frames_observation() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, file_ty(), 0, session_field(0)),
+                int(4, 7),
+                Instruction::Value {
+                    result: ValueId(5),
+                    ty: file_ty(),
+                    kind: ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(4)]),
+                },
+                Instruction::StorePlace {
+                    place: session_field(0),
+                    value: ValueId(5),
+                },
+            ],
+            "structural store",
+        );
+    }
+
+    #[test]
+    fn an_error_inside_a_nested_call_unwinds_the_callers_observation() {
+        // `sink` declares `take file: File` and is handed the whole
+        // `Session`, so the callee's own boundary refuses it -- while
+        // this frame's observation is open. The callee has an epilogue
+        // of its own; neither may leave anything behind.
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                Instruction::Value {
+                    result: ValueId(3),
+                    ty: Ty::Unit,
+                    kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                },
+            ],
+            "nested call",
+        );
+    }
+
+    #[test]
+    fn a_failed_nested_observation_unwinds_the_outer_one_too() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                // `@obs1` observes a place no value ever defined, so the
+                // nested begin fails with the outer one still open.
+                observe_at(2, file_ty(), 1, Place::root(ValueId(6))),
+            ],
+            "nested observation",
+        );
+    }
+
+    #[test]
+    fn an_error_with_two_observations_open_unwinds_both() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                // Ends an observation this frame never began: an error
+                // with two of them open.
+                end(7),
+            ],
+            "two observations",
+        );
+    }
+
+    #[test]
+    fn an_invalid_end_order_unwinds_both_observations() {
+        assert_frame_error_unwinds_leases(
+            vec![
+                observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                end(0),
+            ],
+            "invalid end order",
+        );
+    }
+
+    #[test]
+    fn a_frame_exiting_with_an_observation_open_unwinds_it() {
+        assert_frame_error_unwinds_leases(
+            vec![observe_at(1, file_ty(), 0, session_field(0))],
+            "frame exit",
+        );
+    }
+
+    #[test]
+    fn repeated_failed_frames_do_not_accumulate_open_observations() {
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, file_ty(), 0, session_field(0)),
+                    end(7),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let mut first: Option<String> = None;
+        for _ in 0..8 {
+            let session = live_session(&interpreter);
+            let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+            let rendered = refusal_shape(&outcome);
+            match &first {
+                None => first = Some(rendered),
+                Some(expected) => assert_eq!(
+                    *expected, rendered,
+                    "repeated failures stopped reporting identically"
+                ),
+            }
+            assert_eq!(
+                open_leases(&interpreter),
+                0,
+                "a failed frame accumulated an open observation"
+            );
+        }
+        assert_eq!(
+            interpreter.resources.borrow().leases.len(),
+            8,
+            "one observation per call was opened and then abandoned"
+        );
+        assert!(every_lease_ended(&interpreter));
+    }
+
+    // -- invalid observation sources, refused by the runtime itself -----
+    //
+    // `nir::verify` rejects every one of these statically. The point
+    // here is that the interpreter refuses them anyway, with a
+    // structured error and without opening anything: it never assumes it
+    // was handed verified NIR.
+
+    /// A frame with a single *wildcard* parameter, observed at `%2`
+    /// under the declared type `declared`.
+    ///
+    /// The wildcard is what lets a test hand the frame a value the call
+    /// boundary would otherwise reject on its own, so that what refuses
+    /// it is provably `observe.place` itself.
+    fn wildcard_observer(declared: Ty) -> Module {
+        module_with(under_test(
+            vec![Param {
+                value: ValueId(1),
+                ty: Ty::Param(crate::hir::TypeParamId(0), Symbol(7)),
+                take: false,
+            }],
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(2, declared, 0, Place::root(ValueId(1))),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ))
+    }
+
+    fn assert_refused_without_opening_anything(
+        interpreter: &Interpreter<'_>,
+        outcome: &Result<Value, InterpreterError>,
+        already_open: usize,
+        what: &str,
+    ) {
+        assert!(
+            matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
+            "{what}: expected a structured refusal, got {outcome:?}"
+        );
+        assert_eq!(
+            interpreter.resources.borrow().leases.len(),
+            already_open,
+            "{what}: a source that must be refused still opened an observation"
+        );
+        assert_eq!(
+            open_leases(interpreter),
+            0,
+            "{what}: an observation is open"
+        );
+    }
+
+    #[test]
+    fn observing_a_moved_tombstone_is_refused() {
+        let module = wildcard_observer(file_ty());
+        let interpreter = Interpreter::new(&module);
+        let outcome = interpreter.call_item(SELF, vec![Value::Moved]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "moved tombstone");
+    }
+
+    #[test]
+    fn observing_a_dropped_tombstone_is_refused() {
+        let module = wildcard_observer(file_ty());
+        let interpreter = Interpreter::new(&module);
+        let outcome = interpreter.call_item(SELF, vec![Value::Dropped]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "dropped tombstone");
+    }
+
+    #[test]
+    fn observing_a_field_that_was_already_moved_out_is_refused() {
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(1, file_ty(), session_field(0), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                    },
+                    observe_at(3, file_ty(), 0, session_field(0)),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "moved field");
+    }
+
+    #[test]
+    fn observing_a_partially_moved_aggregate_is_refused() {
+        // The whole `Session` is observed *after* one of its own files
+        // has been moved out from under it: a value that owns a hole.
+        let module = module_with(under_test(
+            take_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    read(1, file_ty(), session_field(0), OwnershipMode::Transfer),
+                    Instruction::Value {
+                        result: ValueId(2),
+                        ty: Ty::Unit,
+                        kind: ValueKind::Call(SINK, Vec::new(), vec![ValueId(1)], Vec::new()),
+                    },
+                    observe_at(3, session_ty(), 0, Place::root(ValueId(0))),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(
+            &interpreter,
+            &outcome,
+            0,
+            "partially moved aggregate",
+        );
+    }
+
+    /// The `Session` fixture with its own `left` file's ownership
+    /// transferred away behind its back, so the handle the session still
+    /// stores for that field names a generation that no longer exists.
+    fn session_with_a_stale_field(interpreter: &Interpreter<'_>) -> ResourceHandle {
+        let session = live_session(interpreter);
+        let nested = nested_file(interpreter, session);
+        let fresh = interpreter.resources.borrow_mut().transfer(nested);
+        assert!(fresh.is_ok(), "the fixture's own field is transferable");
+        session
+    }
+
+    fn nested_file(interpreter: &Interpreter<'_>, session: ResourceHandle) -> ResourceHandle {
+        let table = interpreter.resources.borrow();
+        match &table.records[session.id.0 as usize].fields[0] {
+            Value::Resource(handle) => *handle,
+            other => panic!("the fixture's own field is a resource, got {other:?}"),
+        }
+    }
+
+    /// A frame that observes its ordinary session parameter whole.
+    fn observes_the_whole_session() -> Module {
+        module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ))
+    }
+
+    #[test]
+    fn observing_an_aggregate_holding_a_stale_nested_handle_is_refused() {
+        // The root itself is perfectly current, so nothing before
+        // `observe.place` has any reason to look further down: it is the
+        // begin's own walk of what it is about to freeze that has to
+        // notice.
+        let module = observes_the_whole_session();
+        let interpreter = Interpreter::new(&module);
+        let session = session_with_a_stale_field(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "stale nested handle");
+    }
+
+    #[test]
+    fn observing_a_stale_whole_resource_handle_is_refused() {
+        let module = observes_the_whole_session();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let fresh = interpreter.resources.borrow_mut().transfer(session);
+        assert!(fresh.is_ok(), "the fixture is transferable");
+        let existing = record_count(&interpreter);
+        let before = shape_snapshot(&interpreter, existing);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "stale whole handle");
+        assert_eq!(
+            before,
+            shape_snapshot(&interpreter, existing),
+            "a refused source still changed the resource table"
+        );
+    }
+
+    #[test]
+    fn observing_an_aggregate_holding_an_already_destroyed_resource_is_refused() {
+        let module = observes_the_whole_session();
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let nested = nested_file(&interpreter, session);
+        assert!(
+            interpreter
+                .resources
+                .borrow_mut()
+                .drop_resource(nested)
+                .is_ok(),
+            "the fixture's own field is droppable"
+        );
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "destroyed field");
+    }
+
+    #[test]
+    fn observing_through_a_view_whose_observation_already_ended_is_refused() {
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, session_ty(), 0, Place::root(ValueId(0))),
+                    end(0),
+                    observe_at(2, session_ty(), 1, Place::root(ValueId(1))),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        // One observation legitimately opened and ended; the second must
+        // not have opened at all.
+        assert_refused_without_opening_anything(&interpreter, &outcome, 1, "ended view");
+    }
+
+    #[test]
+    fn observing_a_value_disagreeing_with_its_declared_type_is_refused() {
+        // The place resolves to a live `Session`; the instruction says
+        // the view is an `i64`. The begin is the last stage that can
+        // still say so.
+        let module = module_with(under_test(
+            observing_session(),
+            Ty::I64,
+            vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    observe_at(1, Ty::I64, 0, Place::root(ValueId(0))),
+                    int(9, 0),
+                ],
+                terminator: Terminator::Return(Some(ValueId(9))),
+            }],
+        ));
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "declared type");
+        assert_eq!(
+            interpreter.drop_value(Value::Resource(session)),
+            Ok(()),
+            "the refused begin left the session unusable"
+        );
+    }
+
+    #[test]
+    fn observing_a_value_nested_past_the_supported_depth_is_refused() {
+        let module = wildcard_observer(Ty::Param(crate::hir::TypeParamId(0), Symbol(7)));
+        let interpreter = Interpreter::new(&module);
+        let mut nested = Value::Int(0);
+        for _ in 0..(crate::limits::MAX_GENERIC_DEPTH + 4) {
+            nested = Value::Record {
+                item: FILE,
+                type_args: Vec::new(),
+                fields: vec![nested],
+            };
+        }
+        let outcome = interpreter.call_item(SELF, vec![nested]);
+        assert_refused_without_opening_anything(&interpreter, &outcome, 0, "excessive nesting");
     }
 }

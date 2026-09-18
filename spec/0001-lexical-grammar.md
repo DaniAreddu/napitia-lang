@@ -60,6 +60,8 @@ unsafe
 async await
 region
 defer
+resource take drop
+observe
 ```
 
 `true` and `false` are boolean literal keywords, not general identifiers.
@@ -79,6 +81,13 @@ keyword from the earlier table was dropped: with ownership transfer
 inferred by default (`spec/0004`), an explicit move marker is not
 currently needed, and reserving one anyway would imply a feature that has
 not been designed.
+
+`resource` declares an affine, non-copyable aggregate, `take` marks an
+ownership-transferring parameter and `drop` destroys a live resource
+(`rfcs/0011`). `observe` opens a lexically scoped, read-only observation
+of an affine place (`rfcs/0013`); it reuses the existing `as` keyword
+for its alias rather than introducing one, and introduces no reference
+or lifetime syntax of any kind.
 
 ### Integer literals
 

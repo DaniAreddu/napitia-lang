@@ -238,6 +238,31 @@ pub enum Stmt {
     },
     While(WhileStmt),
     Loop(LoopStmt),
+    /// `observe <place> as <name> { ... }` (`rfcs/0013`): opens a
+    /// lexically scoped, read-only observation of an affine place.
+    Observe(ObserveStmt),
+}
+
+/// `observe <place> as <name> { ... }` (`rfcs/0013`). A statement with
+/// a lexical block, never an expression: it produces no value and can
+/// never appear as a block's own tail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObserveStmt {
+    /// The observed place, restricted by the grammar itself to an
+    /// identifier followed by zero or more `.field` steps -- never a
+    /// general expression. Two reasons, both load-bearing: only a place
+    /// can be observed at all, and `x as T` is already the cast
+    /// operator, so parsing a general expression here would swallow
+    /// `as` and the alias name into a `Cast` before this production
+    /// ever saw them.
+    pub source: Expr,
+    pub alias: Ident,
+    pub body: Block,
+    /// The `observe` keyword's own span, kept distinct from `span` so a
+    /// diagnostic about the construct itself can underline the keyword
+    /// rather than the whole (possibly very large) statement.
+    pub keyword_span: Span,
+    pub span: Span,
 }
 
 /// `value`/`mutable` binding statement.

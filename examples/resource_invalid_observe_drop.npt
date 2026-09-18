@@ -1,0 +1,28 @@
+// Destroying what an observation is holding (`rfcs/0013`).
+//
+// `drop file` while `view` is active would destroy the resource the
+// view still names. The observation ends at the closing brace, and the
+// owner is droppable again the instant it does -- so the fix is to move
+// the `drop` out of the block, not to weaken the rule.
+resource File {
+    descriptor: i64
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func close_early(take file: File) -> i64 {
+    mutable result = 0;
+
+    observe file as view {
+        result = inspect(view);
+        drop file;
+    }
+
+    return result;
+}
+
+func main() -> i64 {
+    return close_early(File { descriptor: 4 });
+}

@@ -69,6 +69,12 @@ pub struct CheckOutput {
     pub consume_sites: std::collections::BTreeMap<hir::ExprId, crate::resourceck::ConsumeInfo>,
     /// See [`crate::resourceck::ResourceCheckResult::defer_plans`].
     pub defer_plans: std::collections::BTreeMap<hir::ExprId, crate::resourceck::CheckedDeferPlan>,
+    /// See [`crate::resourceck::ResourceCheckResult::observations`].
+    pub observations:
+        std::collections::BTreeMap<hir::ObservationId, crate::resourceck::CheckedObservation>,
+    /// See [`crate::resourceck::ResourceCheckResult::observation_exits`].
+    pub observation_exits:
+        std::collections::BTreeMap<hir::ExprId, Vec<crate::resourceck::ObservationExit>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -103,6 +109,8 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         cleanup_edges: resourceck_result.cleanup_edges,
         consume_sites: resourceck_result.consume_sites,
         defer_plans: resourceck_result.defer_plans,
+        observations: resourceck_result.observations,
+        observation_exits: resourceck_result.observation_exits,
         diagnostics,
     }
 }
@@ -142,6 +150,8 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         &checked.cleanup_edges,
         &checked.consume_sites,
         &checked.defer_plans,
+        &checked.observations,
+        &checked.observation_exits,
         interner,
         source,
     ) {

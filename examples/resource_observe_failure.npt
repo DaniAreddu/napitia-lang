@@ -1,0 +1,108 @@
+// Every exit ends an observation exactly once (`rfcs/0013`).
+//
+// The interesting exits are the ones that leave the block without
+// reaching its end: `return`, `break`, `continue`, `raise`, and postfix
+// `?`'s own failure edge. Each of them emits the scope's `end.observe`
+// *before* the cleanup on that same edge, because that cleanup is
+// exactly the destruction an active observation exists to forbid.
+resource File {
+    descriptor: i64
+}
+
+variant OpenError {
+    Denied,
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func gate(flag: bool) -> i64 raises OpenError {
+    if flag {
+        raise OpenError.Denied;
+    }
+    return 5;
+}
+
+// Returning out of the middle of a scope.
+func early(take file: File) -> i64 {
+    observe file as view {
+        return inspect(view);
+    }
+}
+
+// Propagating out of one with `?`: the failure edge ends the
+// observation, then destroys the owner, then raises.
+func propagate(take file: File, flag: bool) -> i64 raises OpenError {
+    mutable total = 0;
+
+    observe file as view {
+        total = inspect(view) + gate(flag)?;
+    }
+
+    drop file;
+    return total;
+}
+
+// Raising directly out of the middle of a scope: the end runs, then
+// the owner is destroyed, then control leaves through the failure
+// edge.
+func refuse(take file: File, flag: bool) -> i64 raises OpenError {
+    observe file as view {
+        if flag {
+            raise OpenError.Denied;
+        }
+        value seen = inspect(view);
+    }
+
+    drop file;
+    return 1;
+}
+
+// Continuing from inside a scope opened inside a loop body: the scope
+// ends on that edge too, and a fresh one opens next iteration.
+func tally(take file: File) -> i64 {
+    mutable total = 0;
+
+    while total < 4 {
+        observe file as view {
+            total = total + inspect(view);
+            continue;
+        }
+    }
+
+    drop file;
+    return total;
+}
+
+// Breaking out of a loop from inside a scope opened inside it.
+func first_look(take file: File) -> i64 {
+    mutable total = 0;
+
+    loop {
+        observe file as view {
+            total = inspect(view);
+            break;
+        }
+    }
+
+    drop file;
+    return total;
+}
+
+func main() -> i64 {
+    value handled = handle propagate(File { descriptor: 3 }, true) {
+        success v => v,
+        failure OpenError.Denied => 100,
+    };
+    value succeeded = handle propagate(File { descriptor: 3 }, false) {
+        success v => v,
+        failure _ => 0,
+    };
+    value refused = handle refuse(File { descriptor: 1 }, true) {
+        success v => v,
+        failure OpenError.Denied => 10,
+    };
+    return early(File { descriptor: 1 }) + handled + succeeded
+        + first_look(File { descriptor: 2 }) + tally(File { descriptor: 2 }) + refused;
+}

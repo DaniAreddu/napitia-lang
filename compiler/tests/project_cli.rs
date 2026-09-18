@@ -775,3 +775,81 @@ fn a_cross_module_structural_projects_own_nir_is_deterministic() {
         "the same project produced different NIR across two runs"
     );
 }
+
+// -- Lexically scoped observations across modules (`rfcs/0013`) -------
+
+/// An observation opened in one module over a resource type declared in
+/// another, handed to that other module's own observing parameter, with
+/// a fallible cross-module call inside the scope -- and the owner used
+/// again, as an owner, the moment the scope ends.
+#[test]
+fn an_observation_of_an_imported_resource_works_across_modules() {
+    let dir = project("resource_observe_two_file");
+
+    let checked = napitia(&["check", &dir]);
+    assert!(
+        checked.status.success(),
+        "check failed: {}",
+        stderr(&checked)
+    );
+    assert!(stdout(&checked).contains("no errors"));
+
+    let ired = napitia(&["ir", &dir]);
+    assert!(ired.status.success(), "ir failed: {}", stderr(&ired));
+    let ir = stdout(&ired);
+    assert!(!ir.contains("V0"), "leaked internal diagnostic: {ir}");
+    // One scope, begun once and ended on both of the inner `invoke`'s
+    // own edges -- the success path and the propagating failure path.
+    assert_eq!(
+        ir.matches("observe.place @obs").count(),
+        1,
+        "expected exactly one observation begin: {ir}"
+    );
+    assert_eq!(
+        ir.matches("end.observe @obs").count(),
+        2,
+        "expected the scope to end on both invoke edges: {ir}"
+    );
+
+    // 7 (inspected) + 7 (closed) on the success path, and -1 from the
+    // handled failure of the second call.
+    let ran = napitia(&["run", &dir]);
+    assert!(ran.status.success(), "run failed: {}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "13");
+}
+
+/// The same project with every `import` reversed must produce
+/// byte-identical NIR: an observation's own place, identity and end
+/// edges are all structural, never dependent on declaration order.
+#[test]
+fn observation_nir_is_deterministic_under_reversed_import_order() {
+    let forward = project("resource_observe_two_file");
+    let reversed = project("resource_observe_two_file_reordered");
+
+    let a = napitia(&["ir", &forward]);
+    let b = napitia(&["ir", &reversed]);
+    assert!(a.status.success(), "ir failed: {}", stderr(&a));
+    assert!(b.status.success(), "ir failed: {}", stderr(&b));
+    assert_eq!(
+        stdout(&a),
+        stdout(&b),
+        "reversed imports produced different NIR"
+    );
+
+    assert_eq!(stdout(&napitia(&["run", &forward])).trim(), "13");
+    assert_eq!(stdout(&napitia(&["run", &reversed])).trim(), "13");
+}
+
+/// Repeated `ir` runs of the same observation project are byte-identical
+/// too -- no `HashMap` iteration order may reach the printed output.
+#[test]
+fn an_observation_projects_own_nir_is_deterministic_across_runs() {
+    let dir = project("resource_observe_two_file");
+    let first = napitia(&["ir", &dir]);
+    let second = napitia(&["ir", &dir]);
+    assert_eq!(
+        stdout(&first),
+        stdout(&second),
+        "the same project produced different NIR across two runs"
+    );
+}

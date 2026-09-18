@@ -1,0 +1,29 @@
+// `observe` requires a place that owns a resource (`rfcs/0013`).
+//
+// An ordinary value is freely copyable and has no ownership to suspend,
+// so there is nothing for an observation of it to mean -- the block
+// would freeze nothing and the alias would be an ordinary copy. Both a
+// primitive and a record containing no resource anywhere are refused
+// for exactly that reason, and for the same one.
+record Point {
+    x: i64,
+    y: i64
+}
+
+func observe_a_number() -> i64 {
+    value count = 3;
+
+    observe count as view {
+        return 0;
+    }
+}
+
+func observe_a_plain_record(origin: Point) -> i64 {
+    observe origin as view {
+        return 0;
+    }
+}
+
+func main() -> i64 {
+    return observe_a_number() + observe_a_plain_record(Point { x: 1, y: 2 });
+}

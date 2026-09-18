@@ -223,6 +223,32 @@ mod codes {
     /// function call specifically, never to constructing a generic
     /// record/variant.
     pub const UNSUPPORTED_GENERIC_AFFINE_INSTANTIATION: &str = "T0068";
+    /// `observe <expr> as <name> { .. }` whose source does not name an
+    /// addressable place (`rfcs/0013`) -- a local, or a chain of field
+    /// accesses rooted in one. The grammar itself already admits
+    /// nothing else, so this is reachable only for a source that failed
+    /// to resolve into a place-shaped HIR node at all; it exists so no
+    /// later stage ever has to invent a place for an observation.
+    pub const OBSERVATION_SOURCE_NOT_A_PLACE: &str = "T0069";
+    /// An observation source that is not transitively affine
+    /// (`rfcs/0013`): a primitive, `str`, or an ordinary record/variant
+    /// containing no resource anywhere. There is no ownership to
+    /// suspend there, so the construct would mean nothing.
+    pub const OBSERVATION_SOURCE_NOT_AFFINE: &str = "T0070";
+    /// Assigning to an observation alias (`rfcs/0013`). Distinct from
+    /// `IMMUTABLE_ASSIGN`: the alias is not merely an immutable
+    /// binding the author could have declared `mutable` instead --
+    /// there is no form of it that could ever be assigned to, because
+    /// it names a place someone else owns.
+    pub const ASSIGN_TO_OBSERVATION_ALIAS: &str = "T0071";
+    /// An observation source whose own type is still an unresolved
+    /// inference variable, or is symbolic in an enclosing generic
+    /// declaration's own type parameters (`rfcs/0013`). A generic body
+    /// is checked once, symbolically, so nothing here can decide
+    /// whether a bare `T` is affine -- rejected for that reason rather
+    /// than silently answering "not affine" and reporting `T0070`,
+    /// which would be the wrong reason for the right rejection.
+    pub const OBSERVATION_SOURCE_TYPE_UNRESOLVED: &str = "T0072";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -434,6 +460,7 @@ pub fn check_module_with_registry(
         extends: Vec::new(),
         capability_cache: HashMap::new(),
         field_projections: HashMap::new(),
+        observation_aliases: HashSet::new(),
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
@@ -516,6 +543,37 @@ pub fn check_module_with_registry(
 /// level (`rfcs/0008`).
 fn deep_resolve(ctx: &TypeContext, ty: &Ty) -> Ty {
     deep_resolve_at_depth(ctx, ty, 0)
+}
+
+/// Whether `ty` is (or reachably contains) something this stage cannot
+/// decide affinity for (`rfcs/0013`): a still-unresolved inference
+/// variable, or a rigid `Ty::Param` standing for an enclosing generic
+/// declaration's own parameter. Bounded by the same
+/// `MAX_GENERIC_DEPTH` every other type walk here is; past the bound
+/// it answers `true`, which fails *closed* -- an observation is
+/// refused rather than admitted on a type nothing could inspect.
+fn contains_symbolic_type(ty: &Ty, depth: usize) -> bool {
+    if depth >= crate::limits::MAX_GENERIC_DEPTH {
+        return true;
+    }
+    match ty {
+        Ty::Var(_) | Ty::Param(..) => true,
+        Ty::Applied(_, args) => args.iter().any(|a| contains_symbolic_type(a, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Whether `expr` names an addressable place (`rfcs/0013`): a resolved
+/// local, or an arbitrarily deep chain of field accesses rooted in one.
+/// Deliberately structural over already-resolved HIR rather than over
+/// surface syntax, so it agrees exactly with what `resourceck::flow::
+/// resolve_place` and `nir::lower::resolve_place_expr` can build.
+fn is_place_expr(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Local { .. } => true,
+        HirExpr::Field { base, .. } => is_place_expr(base),
+        _ => false,
+    }
 }
 
 fn deep_resolve_at_depth(ctx: &TypeContext, ty: &Ty, depth: usize) -> Ty {
@@ -645,6 +703,13 @@ struct Checker<'a> {
     capability_cache: HashMap<CapabilityRequirement, Evidence>,
     /// See [`TypeckResult::field_projections`].
     field_projections: HashMap<ExprId, (ItemId, usize)>,
+    /// Every `observe` statement's own alias local (`rfcs/0013`) --
+    /// keyed by identity, never by name, so two sibling scopes that
+    /// spell their alias the same way stay independent. Consulted by
+    /// `check_assign` so an assignment to one reports the reason it can
+    /// never be assigned to, rather than the generic
+    /// "not declared `mutable`".
+    observation_aliases: HashSet<LocalId>,
 }
 
 #[derive(Clone)]
@@ -1411,7 +1476,103 @@ impl<'a> Checker<'a> {
                     Ty::Never
                 }
             }
+            // `observe <place> as <alias> { .. }` (`rfcs/0013`). The
+            // body always runs exactly once, unconditionally, so unlike
+            // `while`/`loop` this statement really does diverge the
+            // enclosing block whenever its own body does.
+            HirStmt::Observe(o) => {
+                let source_ty = self.check_expr(&o.source);
+                let alias_ty = self.check_observation_source(o, &source_ty);
+                self.locals.insert(
+                    o.alias,
+                    LocalInfo {
+                        ty: alias_ty,
+                        mutable: false,
+                    },
+                );
+                self.observation_aliases.insert(o.alias);
+                let body_ty = self.check_block(&o.body);
+                if matches!(body_ty, Ty::Never) {
+                    Ty::Never
+                } else {
+                    Ty::Unit
+                }
+            }
         }
+    }
+
+    /// Validates one `observe` statement's own source and returns the
+    /// type its alias binds at (`rfcs/0013`): the source place's own
+    /// resolved type, exactly -- never a wrapper, a reference type or a
+    /// distinct nominal type. `Ty::Error` (already-diagnosed, here or
+    /// earlier) whenever the source cannot back an observation at all,
+    /// so the alias still *has* a recorded type and every later stage
+    /// skips it rather than finding no metadata for a local that
+    /// nevertheless exists.
+    fn check_observation_source(&mut self, o: &crate::hir::HirObserve, source_ty: &Ty) -> Ty {
+        // Resolved *with* the numeric defaults already attached to any
+        // literal-derived variable. An integer literal's own binding is
+        // still a `Ty::Var` at this point, but one that can only ever
+        // end up `i64`, so answering "this type is not resolved"
+        // (`T0072`) for it would blame inference for what is plainly a
+        // non-affine source (`T0070`). A variable with *no* default is
+        // a different matter and is still reported as unresolved below.
+        let resolved = self.resolve_defaulted(&deep_resolve(&self.ctx, source_ty), 0);
+        // An unresolvable name, or a source whose own type already
+        // failed, has a diagnostic of its own already; a second one
+        // about the same root cause would be noise.
+        if matches!(resolved, Ty::Error) {
+            return Ty::Error;
+        }
+        if !is_place_expr(&o.source) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::OBSERVATION_SOURCE_NOT_A_PLACE,
+                    self.source,
+                    o.source.span(),
+                    "an observation source must be a local or a field of one",
+                )
+                .with_primary_label("not an addressable place")
+                .with_help("bind the value to a `value` first, then observe that binding"),
+            );
+            return Ty::Error;
+        }
+        if contains_symbolic_type(&resolved, 0) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::OBSERVATION_SOURCE_TYPE_UNRESOLVED,
+                    self.source,
+                    o.source.span(),
+                    format!(
+                        "the type of an observation source must be fully resolved, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("type is not resolved here")
+                .with_help(
+                    "a generic body is checked once, symbolically, so nothing here can decide \
+                     whether this type owns a resource",
+                ),
+            );
+            return Ty::Error;
+        }
+        if !self.is_affine(&resolved) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::OBSERVATION_SOURCE_NOT_AFFINE,
+                    self.source,
+                    o.source.span(),
+                    format!(
+                        "`observe` requires a value that owns a resource, found `{}`",
+                        self.display_for_diagnostic(&resolved)
+                    ),
+                )
+                .with_primary_label("owns no resource")
+                .with_help("an ordinary value is freely copyable and has no ownership to suspend"),
+            );
+            return Ty::Error;
+        }
+        resolved
     }
 
     /// Type-checks one expression and records its final resolved type
@@ -1747,6 +1908,28 @@ impl<'a> Checker<'a> {
     fn check_assign(&mut self, target: &HirExpr, op: AssignOp, value: &HirExpr, span: Span) -> Ty {
         let target_ty = self.check_expr(target);
         match target {
+            // An observation alias is never assignable, in any form:
+            // it names a place another binding owns, so there is no
+            // `mutable` spelling of it that would make this legal
+            // (`rfcs/0013`). Checked before the ordinary immutability
+            // rule so the diagnostic says that, rather than suggesting
+            // a `mutable` that would not help.
+            HirExpr::Local { local, name, .. } if self.observation_aliases.contains(local) => {
+                let text = self.interner.resolve(*name);
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        codes::ASSIGN_TO_OBSERVATION_ALIAS,
+                        self.source,
+                        span,
+                        format!("cannot assign to `{text}`, which is an observation alias"),
+                    )
+                    .with_primary_label("assignment to an observation")
+                    .with_help(
+                        "an observation carries no ownership; assign to the owner instead, after \
+                         the `observe` block ends",
+                    ),
+                );
+            }
             HirExpr::Local { local, name, .. } => {
                 if let Some(info) = self.locals.get(local)
                     && !info.mutable
@@ -3944,6 +4127,37 @@ impl<'a> Checker<'a> {
         self.display_for_diagnostic_at_depth(ty, 0)
     }
 
+    /// `ty` with every still-unresolved inference variable that already
+    /// carries a numeric default replaced by that default
+    /// (`rfcs/0013`).
+    ///
+    /// The same substitution [`Self::display_for_diagnostic`] already
+    /// applies when rendering such a type, promoted to a real answer: a
+    /// variable created by an integer or float literal is only ever
+    /// going to become `i64`/`f64`, so a check that must decide
+    /// something about it now (is it affine?) may legitimately decide
+    /// from the default rather than refuse. A variable with no default
+    /// at all is genuinely undetermined and is left exactly as it is.
+    fn resolve_defaulted(&self, ty: &Ty, depth: usize) -> Ty {
+        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+            return ty.clone();
+        }
+        match ty {
+            Ty::Var(var) => match self.ctx.kind_of(*var) {
+                Some(VarKind::Integer) => Ty::I64,
+                Some(VarKind::Float) => Ty::F64,
+                None => ty.clone(),
+            },
+            Ty::Applied(item, args) => Ty::Applied(
+                *item,
+                args.iter()
+                    .map(|a| self.resolve_defaulted(a, depth + 1))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     /// `depth`-bounded the same way every other stage that walks a
     /// nested type application is (`crate::limits::MAX_GENERIC_DEPTH`):
     /// diagnostics must never overflow the stack rendering a
@@ -4308,6 +4522,10 @@ fn loop_has_reachable_break(body: &HirBlock) -> bool {
             HirStmt::Binding(b) => in_expr(&b.value),
             HirStmt::Expr(e) => in_expr(e),
             HirStmt::Defer { expr, .. } | HirStmt::Drop { expr, .. } => in_expr(expr),
+            // An observation's body is an ordinary lexical block of
+            // this same loop (`rfcs/0013`): a `break` inside it targets
+            // this loop exactly like one written directly in the body.
+            HirStmt::Observe(o) => in_block(&o.body),
             // A nested loop's own `break` never targets this outer one.
             HirStmt::While { .. } | HirStmt::Loop { .. } => false,
         }
@@ -4396,6 +4614,221 @@ mod tests {
             "unexpected resolve diagnostics: {resolve_diags:?}"
         );
         check_module(&hir, id, &interner, EntryMain::ByName).diagnostics
+    }
+
+    /// `rfcs/0013` -- the observation source/alias rules.
+    mod observations {
+        use super::check;
+
+        const RESOURCE: &str = "resource File { descriptor: i64 }\n\
+                                record Holder { item: File }\n\
+                                record Plain { count: i64 }\n\
+                                func inspect(file: File) -> i64 { return file.descriptor; }\n";
+
+        /// `text` declares whatever functions the case needs; an entry
+        /// point is supplied here so no case has to spend its own
+        /// signature satisfying `EntryMain`.
+        fn codes(text: &str) -> Vec<String> {
+            check(&format!(
+                "{RESOURCE}{text}\nfunc main() -> i64 {{ return 0; }}"
+            ))
+            .into_iter()
+            .map(|d| d.code.to_string())
+            .collect()
+        }
+
+        #[test]
+        fn observing_an_affine_local_is_accepted() {
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe file as view { n = inspect(view); }\n\
+                       drop file;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn observing_a_nested_affine_field_is_accepted() {
+            assert!(
+                codes(
+                    "func probe(take holder: Holder) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe holder.item as view { n = inspect(view); }\n\
+                       drop holder;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn observing_a_primitive_binding_is_not_affine_not_unresolved() {
+            // An integer literal's own binding is still an inference
+            // variable when the observation is checked, but one with a
+            // numeric *default* already attached: it can only ever end
+            // up `i64`, which is emphatically not affine. Reporting
+            // `T0072` ("type is not resolved") for it blamed the
+            // inference machinery for what is plainly a non-affine
+            // source.
+            assert_eq!(
+                codes(
+                    "func probe() -> i64 {\n\
+                       value n = 1;\n\
+                       observe n as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn observing_an_explicitly_typed_primitive_is_not_affine() {
+            assert_eq!(
+                codes(
+                    "func probe(count: i64) -> i64 {\n\
+                       observe count as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn a_source_that_resolves_to_something_other_than_a_place_is_rejected() {
+            // The grammar only admits an identifier chain, but an
+            // identifier can still resolve to something that is not a
+            // place at all -- here a payload-less variant case, which
+            // is a complete value with no storage behind it.
+            assert_eq!(
+                codes(
+                    "variant Choice { A, B }\n\
+                     func probe() -> i64 {\n\
+                       observe A as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0069"]
+            );
+        }
+
+        #[test]
+        fn a_function_named_as_a_source_keeps_its_own_earlier_diagnostic() {
+            // `helper` is not a value at all in this milestone, which is
+            // the real root cause -- reported once, by the rule that
+            // owns it, rather than also as a second "not a place".
+            assert_eq!(
+                codes(
+                    "func helper(file: File) -> i64 { return file.descriptor; }\n\
+                     func probe() -> i64 {\n\
+                       observe helper as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0010"]
+            );
+        }
+
+        #[test]
+        fn observing_a_non_affine_record_is_rejected() {
+            assert_eq!(
+                codes(
+                    "func probe(plain: Plain) -> i64 {\n\
+                       observe plain as view { }\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0070"]
+            );
+        }
+
+        #[test]
+        fn observing_a_symbolic_generic_place_is_rejected_as_unresolved() {
+            // A generic body is checked once, symbolically: nothing here
+            // can decide whether `T` owns a resource, so this is refused
+            // for that reason rather than answered "not affine".
+            assert_eq!(
+                codes(
+                    "func peek[T](slot: T) -> i64 {\n\
+                       observe slot as view { }\n\
+                       return 0;\n\
+                     }\n\
+                     func other() -> i64 { return peek[i64](1); }"
+                ),
+                vec!["T0072"]
+            );
+        }
+
+        #[test]
+        fn assigning_to_an_observation_alias_is_its_own_diagnostic() {
+            assert_eq!(
+                codes(
+                    "func probe(take file: File, take other: File) -> i64 {\n\
+                       observe file as view { view = other; }\n\
+                       drop file;\n\
+                       drop other;\n\
+                       return 0;\n\
+                     }"
+                ),
+                vec!["T0071"]
+            );
+        }
+
+        #[test]
+        fn the_alias_binds_the_observed_places_own_type() {
+            // `inspect` takes a `File`; if the alias bound anything else
+            // -- a wrapper, a distinct nominal type -- this would be an
+            // argument type mismatch instead of clean.
+            assert!(
+                codes(
+                    "func probe(take holder: Holder) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe holder.item as view { n = inspect(view); }\n\
+                       drop holder;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn two_sibling_scopes_may_reuse_one_alias_name() {
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       mutable n = 0;\n\
+                       observe file as view { n = inspect(view); }\n\
+                       observe file as view { n = n + inspect(view); }\n\
+                       drop file;\n\
+                       return n;\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn an_observation_body_that_always_returns_makes_the_rest_unreachable() {
+            // The body runs exactly once, unconditionally, so a `return`
+            // inside it really does end the function -- this would be a
+            // missing-return diagnostic otherwise.
+            assert!(
+                codes(
+                    "func probe(take file: File) -> i64 {\n\
+                       observe file as view { return inspect(view); }\n\
+                     }"
+                )
+                .is_empty()
+            );
+        }
     }
 
     fn check_full(text: &str) -> TypeckResult {
@@ -4802,6 +5235,7 @@ mod tests {
             extends: Vec::new(),
             capability_cache: HashMap::new(),
             field_projections: HashMap::new(),
+            observation_aliases: HashSet::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -4861,6 +5295,7 @@ mod tests {
             extends: Vec::new(),
             capability_cache: HashMap::new(),
             field_projections: HashMap::new(),
+            observation_aliases: HashSet::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }

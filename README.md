@@ -40,9 +40,86 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.8
+## Current status: Alpha 0.1.9
 
-This milestone extends Alpha 0.1.7's ownership tracking from whole
+This milestone adds one construct: a lexically scoped, read-only
+*observation* of a place another binding still owns.
+
+```napitia
+resource File { descriptor: i64 }
+
+func inspect(file: File) -> i64 { return file.descriptor; }
+
+func read(take file: File) -> i64 {
+    mutable result = 0;
+
+    observe file as view {
+        result = inspect(view);   // `view` reads, and never owns
+    }
+
+    drop file;                    // the owner is an owner again
+    return result;
+}
+```
+
+Alpha 0.1.7 already had observation, but only ever at a call boundary
+and only for exactly as long as that call: an ordinary (non-`take`)
+parameter. `observe <place> as <name> { ... }` is the same capability
+with the extent written down by the author instead of implied.
+
+**This is not general borrowing.** There is no reference type, no `&`,
+no apostrophe lifetime, no lifetime parameter, and no inference of a
+non-lexical extent. The alias has the observed place's own ordinary
+type, carries observation capability and never ownership, and cannot
+escape its block in any way — it cannot be returned, raised, dropped,
+stored in an aggregate or a longer-lived slot, passed to a `take`
+parameter, decomposed, or captured by a `defer`. Observations are not
+storable in user aggregates and are not inferred anywhere.
+
+While an observation is active, only *overlapping* places are frozen —
+the exact place, any ancestor of it, and any descendant, using the same
+structural place representation Alpha 0.1.8 introduced. A disjoint
+sibling stays completely ownable:
+
+```napitia
+observe session.left as view {
+    drop session.right;   // a disjoint sibling: untouched
+    // drop session;      // rejected: an ancestor of the observed place
+}
+```
+
+Any number of overlapping observations may be active at once, because
+all of them are read-only and none of them ends anything; observing an
+observation yields another observation, never an owner. Ownership
+becomes available again only once every overlapping observation has
+ended, and every path out of the block ends it exactly once —
+fallthrough, `return`, an implicit tail return, `raise`, postfix `?`, a
+`handle` arm, `break`, `continue`, or a diverging arm — always before
+the ownership cleanup on that same edge, since that cleanup is
+precisely what an active observation forbids. Ending an observation
+itself performs no cleanup and no ownership transfer.
+
+NIR writes both boundaries down explicitly
+(`%v = observe.place @obs0 %0.@Session#1.0` and `end.observe @obs0`),
+and `nir::verify` re-establishes every invariant from those
+instructions alone — one begin per identity, ends only innermost-first,
+no reachable exit with one still active, no predecessor disagreement,
+no use of an observer after its end, and no ownership operation on an
+overlapping place. The interpreter enforces the same thing again as
+real runtime *leases*, independently of the verifier: a view's handles
+are bound to its lease at every depth, reading through an ended lease
+is a structured error, and every ownership boundary consults the active
+leases during its own plan phase, so a refused operation changes no
+generation, status, field, tombstone, lease or event at all.
+
+`take` still transfers ownership, ordinary parameters remain
+call-scoped observations, and native allocation is still not
+implemented. See `rfcs/0013-scoped-observations.md` for the full design,
+the exact overlap relation, and the deliberately unsupported cases.
+
+### Alpha 0.1.8: structural ownership
+
+This milestone extended Alpha 0.1.7's ownership tracking from whole
 local bindings to individual resource-bearing *fields*. A `record`,
 `variant`, or `resource` that reachably contains an affine field
 becomes affine *transitively* — Alpha 0.1.7's blanket rejection of a
@@ -256,6 +333,21 @@ identity and import aliases (`rfcs/0007`).
   place (partial move, sibling independence, reinitialization,
   structural drop order) rather than only per whole binding — see
   `rfcs/0012-structural-ownership.md`.
+- Lexically scoped observations (`observe <place> as <name> { ... }`):
+  a read-only view of an addressable, live, transitively affine place,
+  active for exactly one lexical block. The alias has the place's own
+  ordinary type and carries no ownership; overlapping places (the exact
+  place, its ancestors, its descendants) are frozen against every
+  ownership operation for the duration, while disjoint siblings stay
+  freely ownable; any number of overlapping observations may be active
+  at once. NIR carries explicit `observe.place`/`end.observe`
+  boundaries, the verifier re-derives the whole discipline from them
+  over its own worklist with no pass cap, and the interpreter enforces
+  it again as runtime leases — see
+  `rfcs/0013-scoped-observations.md` for the full design and current
+  honest limitations (no reference type, no lifetime syntax, no
+  non-lexical extent, no observation stored in a user aggregate, no
+  observation returned from a function).
 
 See `spec/` for the language specifications this milestone implements
 against, and `rfcs/` for accepted design direction and open research
@@ -459,7 +551,12 @@ diagnosed, not merely unspellable — a `raises` entry naming a generic
 variant is rejected), partial `handle` (consuming only some raised
 effects and re-raising the rest), first-class effect/error values, stack
 traces or
-`panic`/`recover`, general references/borrowing, lifetime annotations,
+`panic`/`recover`, general references/borrowing (Alpha 0.1.9's
+`observe` is a lexically scoped, read-only observation with no
+reference type, no `&`, no lifetime syntax and no escape of any kind —
+see `rfcs/0013`), an observation stored in a user aggregate, returned
+from a function, or given a non-lexical/inferred extent, lifetime
+annotations,
 raw pointers, shared ownership, reference counting, a tracing garbage
 collector, a native heap allocator (Alpha 0.1.7's `resource` values are
 semantic runtime objects the interpreter tracks, not pointers into

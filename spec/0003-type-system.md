@@ -309,6 +309,37 @@ behavior:
   exercised by tests, not just asserted by the diagnostics a divergent
   program does or doesn't produce.
 
+### Observation bindings (Alpha 0.1.9)
+
+`observe <place> as <name> { ... }` (`rfcs/0013`) introduces one
+binding, and the type rules for it are deliberately minimal:
+
+- **The alias has the observed place's own resolved type, exactly.** Not
+  a wrapper, not a reference type, not a distinct nominal type. There is
+  no `&T`, no lifetime parameter, and nothing a signature or a field
+  could carry an observation in.
+- **The source must be an addressable place** -- a local, or a chain of
+  field accesses rooted in one (`T0069`). The grammar already admits
+  nothing else, so this is the check that no later stage ever has to
+  invent a place for an observation.
+- **The source must be transitively affine** (`T0070`): a declared
+  `resource`, or a `record`/`variant` reachably containing one. An
+  ordinary value is freely copyable and has no ownership to suspend.
+- **The source's type must be resolved** (`T0072`). A literal-derived
+  inference variable is answered from its own numeric default, since it
+  can only ever become `i64`/`f64`; a variable with no default, and a
+  `Ty::Param` symbolic in an enclosing generic declaration, are refused
+  -- a generic body is checked once, symbolically, so nothing there can
+  decide whether `T` owns a resource.
+- **The alias is never assignable** (`T0071`), and this is its own
+  diagnostic rather than the ordinary immutable-binding one: there is no
+  `mutable` spelling of an alias that would make an assignment legal,
+  because it names a place someone else owns.
+
+The alias is scoped to the block and nothing else. A use after the block
+closed is an unresolved name reported as `R0034`, which says why the
+name is gone rather than merely that it is unknown.
+
 ### Diagnostics
 
 Type errors report the two types that failed to unify and a single span

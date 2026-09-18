@@ -1,0 +1,50 @@
+// Nested and overlapping observations (`rfcs/0013`).
+//
+// Observing an observation yields another observation, never an owner,
+// so scopes compose: `inner` is a view of `outer`, which is itself a
+// view of `session`. Every one of them is read-only, which is exactly
+// why any number of them may overlap -- nothing orders them against
+// each other because none of them ends anything.
+//
+// The scopes close innermost first, and the owner is whole again the
+// moment the outermost one does.
+resource File {
+    descriptor: i64
+}
+
+resource Session {
+    left: File,
+    right: File
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func peek(session: Session) -> i64 {
+    return inspect(session.left) + inspect(session.right);
+}
+
+func survey(take session: Session) -> i64 {
+    mutable total = 0;
+
+    observe session as whole {
+        // An overlapping observation of one field of the very place
+        // `whole` already covers: still legal, still read-only.
+        observe session.left as part {
+            observe part as again {
+                total = peek(whole) + inspect(part) + inspect(again);
+            }
+        }
+    }
+
+    drop session;
+    return total;
+}
+
+func main() -> i64 {
+    return survey(Session {
+        left: File { descriptor: 1 },
+        right: File { descriptor: 2 }
+    });
+}

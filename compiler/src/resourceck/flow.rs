@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
-    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirPattern, HirStmt, ItemId, LocalId,
-    TypeParamId,
+    HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirObserve, HirPattern, HirStmt, ItemId,
+    LocalId, ObservationId, TypeParamId,
 };
 use crate::place::{FieldId, Place, Projection};
 use crate::source::{SourceId, Span};
@@ -26,8 +26,10 @@ use crate::symbol::{Interner, Symbol};
 use crate::types::Ty;
 
 use super::AffineContext;
-use super::plan::{CheckedDeferPlan, CleanupAction, ConsumeInfo};
-use super::state::ResourceState;
+use super::plan::{
+    CheckedDeferPlan, CheckedObservation, CleanupAction, ConsumeInfo, ObservationExit,
+};
+use super::state::{PlaceStatus, ResourceState};
 
 /// One resource-typed (or transitively affine) local's own current
 /// structural state, keyed by the exact [`Place`] the state describes
@@ -171,6 +173,35 @@ mod codes {
     /// reaching one identity stay rejected by the move rules that
     /// already covered them.
     pub const MIXED_OBSERVE_TAKE_ALIAS: &str = "U0015";
+    /// An `observe` statement's own alias -- or any place reached
+    /// through it -- used as ownership (`rfcs/0013`): moved, returned,
+    /// raised, dropped, stored into an aggregate or a longer-lived
+    /// slot, passed to a `take` parameter, decomposed by a `match`, or
+    /// captured by a `defer`.
+    ///
+    /// Deliberately its own code rather than reusing
+    /// `OBSERVATION_ESCAPES` (`U0005`, an ordinary parameter's own
+    /// call-scoped observation): the two are the same *kind* of
+    /// violation but have completely different advice attached. An
+    /// ordinary parameter's caller decides whether to declare it
+    /// `take`; an observation alias has no such alternative at all, and
+    /// the fix is always to act on the owner outside the block instead.
+    pub const OBSERVATION_ALIAS_ESCAPES: &str = "U0016";
+    /// An ownership operation on a place that overlaps a currently-
+    /// active observation (`rfcs/0013`): moved, dropped, overwritten,
+    /// structurally reinitialized, passed to a `take` parameter,
+    /// decomposed, returned or raised.
+    ///
+    /// Overlap is the shared structural relation (`rfcs/0012`'s
+    /// `Place::is_ancestor_of`, in both directions): the exact place,
+    /// any ancestor of it, and any descendant of it. A disjoint sibling
+    /// is untouched and stays freely movable, which is exactly why this
+    /// is asked per place rather than per root.
+    ///
+    /// Reported once, against the operation, naming the innermost
+    /// observation actually holding the place -- never once per nested
+    /// field of it.
+    pub const OWNERSHIP_WHILE_OBSERVED: &str = "U0017";
 }
 
 pub use codes::*;
@@ -226,6 +257,13 @@ struct LoopFrame {
     /// `pending_cleanup[cleanup_marker..]`, mirroring `nir::lower`'s
     /// own `LoopCtx::cleanup_marker`.
     cleanup_marker: usize,
+    /// `observations.len()` at the point this loop's own body began
+    /// being checked (`rfcs/0013`) -- every observation opened at or
+    /// inside this loop is left by a `break`/`continue` and must end on
+    /// that edge, while one opened *around* the whole loop stays active
+    /// past it and must not. Exactly the same "whose responsibility is
+    /// this" question `cleanup_marker` answers for cleanup.
+    observation_marker: usize,
     /// `defer_scopes.len()` at the point this loop's own body began
     /// being checked -- every scope pushed at or after this index
     /// belongs to this exact iteration (the body's own top-level scope,
@@ -358,6 +396,59 @@ pub struct FlowChecker<'a> {
     /// walk encounters them, matching `pending_cleanup`'s own append
     /// order (`rfcs/0011`).
     next_defer_registration: u32,
+    /// Every lexically-enclosing `observe` scope, innermost last
+    /// (`rfcs/0013`).
+    ///
+    /// A stack, not a map and not a function-global set, and that is
+    /// the whole design: an observation's extent *is* its block, so
+    /// pushing on entry and popping on exit makes the state
+    /// path-sensitive by construction. A scope opened inside one `if`
+    /// branch is popped at that branch's own block end, so the sibling
+    /// branch, the join after them, and the next loop iteration each
+    /// see exactly the stack they had before -- there is no
+    /// cross-branch observation state to leak, and no join rule that
+    /// could get it wrong.
+    observations: Vec<ActiveObservation>,
+    /// Every alias local this function's own `observe` statements have
+    /// introduced, by the observation that introduced it (`rfcs/0013`)
+    /// -- keyed by identity, never by name. Deliberately *not* removed
+    /// when the scope pops: name resolution already makes the alias
+    /// unreachable after its own block, and keeping the entry means
+    /// hand-built HIR that references it anyway is still rejected as an
+    /// escape rather than silently treated as an ordinary local.
+    observation_aliases: HashMap<LocalId, ObservationId>,
+    /// Every *accepted* observation's own checked record -- see
+    /// [`super::plan::CheckedObservation`].
+    checked_observations: BTreeMap<ObservationId, CheckedObservation>,
+    /// Every non-local exit's own observation ends -- see
+    /// [`super::plan::ResourceCheckResult::observation_exits`].
+    observation_exits: BTreeMap<ExprId, Vec<ObservationExit>>,
+}
+
+/// One currently-active observation, while its own block is being
+/// walked (`rfcs/0013`).
+#[derive(Debug, Clone)]
+struct ActiveObservation {
+    id: ObservationId,
+    /// The exact canonical place observed -- the granularity every
+    /// overlap question is answered at.
+    place: Place<LocalId>,
+    alias: LocalId,
+    /// The alias's own written name, for a diagnostic that has to say
+    /// which observation is holding a place.
+    alias_name: Symbol,
+}
+
+/// One function's own complete checked plan, handed to
+/// [`super::check_module`] for merging (`rfcs/0011`, `rfcs/0013`). A
+/// struct rather than a tuple purely so adding one more checked output
+/// cannot silently transpose two existing ones at a call site.
+pub struct FunctionPlan {
+    pub cleanup_edges: BTreeMap<ExprId, Vec<CleanupAction>>,
+    pub consume_sites: BTreeMap<ExprId, ConsumeInfo>,
+    pub defer_plans: BTreeMap<ExprId, CheckedDeferPlan>,
+    pub observations: BTreeMap<ObservationId, CheckedObservation>,
+    pub observation_exits: BTreeMap<ExprId, Vec<ObservationExit>>,
 }
 
 impl<'a> FlowChecker<'a> {
@@ -393,6 +484,10 @@ impl<'a> FlowChecker<'a> {
             consume_sites: BTreeMap::new(),
             defer_plans: BTreeMap::new(),
             next_defer_registration: 0,
+            observations: Vec::new(),
+            observation_aliases: HashMap::new(),
+            checked_observations: BTreeMap::new(),
+            observation_exits: BTreeMap::new(),
         }
     }
 
@@ -409,15 +504,14 @@ impl<'a> FlowChecker<'a> {
     /// [`super::check_module`] for merging into the module-wide
     /// [`super::ResourceCheckResult`]. Called once this checker's own
     /// function/extend-method has been fully checked.
-    #[allow(clippy::type_complexity)]
-    pub fn into_plan(
-        self,
-    ) -> (
-        BTreeMap<ExprId, Vec<CleanupAction>>,
-        BTreeMap<ExprId, ConsumeInfo>,
-        BTreeMap<ExprId, CheckedDeferPlan>,
-    ) {
-        (self.cleanup_edges, self.consume_sites, self.defer_plans)
+    pub fn into_plan(self) -> FunctionPlan {
+        FunctionPlan {
+            cleanup_edges: self.cleanup_edges,
+            consume_sites: self.consume_sites,
+            defer_plans: self.defer_plans,
+            observations: self.checked_observations,
+            observation_exits: self.observation_exits,
+        }
     }
 
     pub fn check_function(&mut self, f: &HirFunction) {
@@ -826,6 +920,11 @@ impl<'a> FlowChecker<'a> {
     fn field_name_and_span(expr: &HirExpr) -> (Option<Symbol>, Span) {
         match expr {
             HirExpr::Field { name, span, .. } => (Some(*name), *span),
+            // A place can be a bare local too, not only a field access
+            // (`rfcs/0013`: an observation source is either). Naming it
+            // is what stops "`this field` was already dropped" from
+            // being reported about something that is plainly a local.
+            HirExpr::Local { name, span, .. } => (Some(*name), *span),
             other => (None, other.span()),
         }
     }
@@ -928,6 +1027,13 @@ impl<'a> FlowChecker<'a> {
         if self.reject_observed_place(place, name, span, "moved out") {
             return;
         }
+        let display = self.field_display(name);
+        if self.reject_alias_ownership(place, display.clone(), span, "moved out") {
+            return;
+        }
+        if self.reject_ownership_while_observed(place, display, span, "moved out") {
+            return;
+        }
         match self.place_state(place) {
             ResourceState::Available => {
                 self.set_place_state(place, ResourceState::Moved);
@@ -970,6 +1076,158 @@ impl<'a> FlowChecker<'a> {
                 self.set_place_state(place, ResourceState::Error);
             }
         }
+    }
+
+    /// `true` iff `state` still holds a live value -- `Available`, or
+    /// `DropScheduled` (which owes a pending `defer` but has not been
+    /// consumed by it). Both are observable; `Moved`/`Dropped`/`Error`
+    /// are not.
+    fn holds_live_value(state: ResourceState) -> bool {
+        matches!(
+            state,
+            ResourceState::Available | ResourceState::DropScheduled
+        )
+    }
+
+    /// Like [`Self::place_is_wholly_available`], but accepting a
+    /// `DropScheduled` place as present (`rfcs/0013`).
+    ///
+    /// An observation needs the whole value to still *exist*, not to be
+    /// free of other obligations: a place a pending observing `defer`
+    /// also needs is perfectly observable, because neither the defer
+    /// nor the observation consumes anything. Deliberately a separate
+    /// walk rather than a flag on the existing one, so no caller of
+    /// that (every one of which really does need `Available`) can
+    /// accidentally acquire this looser meaning.
+    fn place_is_wholly_present(&self, place: &Place<LocalId>, ty: &Ty) -> bool {
+        // Same infinite-place-tree bound, for the same reason, as
+        // `place_is_wholly_available`.
+        if place.projections.len() >= crate::limits::MAX_GENERIC_DEPTH {
+            return true;
+        }
+        if !Self::holds_live_value(self.place_state(place)) {
+            return false;
+        }
+        let Some((item, fields)) = self.decomposable_fields(ty) else {
+            return true;
+        };
+        fields
+            .iter()
+            .enumerate()
+            .filter(|(_, fty)| self.is_affine(fty))
+            .all(|(index, fty)| {
+                self.place_is_wholly_present(&place.field(item, FieldId(index as u32)), fty)
+            })
+    }
+
+    /// `place`'s own *complete* current status (`rfcs/0013`): its
+    /// recorded ownership transition, the observations holding it, and
+    /// whether it is structurally partial -- see [`PlaceStatus`].
+    ///
+    /// Structural facts come first, deliberately: a place that was
+    /// moved, dropped, or is missing one of its own fields is not a
+    /// whole value at all, and saying "an observation is holding it"
+    /// instead would answer a question nobody asked. The *conflict*
+    /// question -- may this ownership operation run -- is answered by
+    /// [`Self::conflicting_observation`] directly, precisely so an
+    /// observation still wins there even over a partially moved parent.
+    fn place_status(&self, place: &Place<LocalId>) -> PlaceStatus {
+        match self.place_state(place) {
+            ResourceState::Error => return PlaceStatus::Error,
+            ResourceState::Moved => return PlaceStatus::Moved,
+            ResourceState::Dropped => return PlaceStatus::Dropped,
+            ResourceState::DropScheduled | ResourceState::Available => {}
+        }
+        if let Some(ty) = self.place_ty(place)
+            && !self.place_is_wholly_present(place, &ty)
+        {
+            return PlaceStatus::PartiallyMoved;
+        }
+        let holders: Vec<ObservationId> = self
+            .observations
+            .iter()
+            .filter(|o| Self::places_overlap(&o.place, place))
+            .map(|o| o.id)
+            .collect();
+        if !holders.is_empty() {
+            return PlaceStatus::Observed(holders);
+        }
+        if self.place_state(place) == ResourceState::DropScheduled {
+            return PlaceStatus::DropScheduled;
+        }
+        PlaceStatus::Available
+    }
+
+    /// The one definition of overlap (`rfcs/0013`): two places overlap
+    /// exactly when one is an ancestor of the other, which by
+    /// [`Place::is_ancestor_of`]'s own contract includes being the same
+    /// place. Disjoint siblings never overlap.
+    fn places_overlap(a: &Place<LocalId>, b: &Place<LocalId>) -> bool {
+        a.is_ancestor_of(b) || b.is_ancestor_of(a)
+    }
+
+    /// The innermost currently-active observation whose own place
+    /// overlaps `place`, if any (`rfcs/0013`) -- innermost because that
+    /// is the one whose block ends soonest, and therefore the one whose
+    /// end actually unblocks the operation being rejected.
+    fn conflicting_observation(&self, place: &Place<LocalId>) -> Option<&ActiveObservation> {
+        self.observations
+            .iter()
+            .rev()
+            .find(|o| Self::places_overlap(&o.place, place))
+    }
+
+    /// Rejects an ownership operation on a place an active observation
+    /// is holding (`rfcs/0013`). Returns `true` when it did, in which
+    /// case the caller must leave `place`'s own state completely
+    /// untouched: the operation did not happen, so nothing about the
+    /// owner changed, and the owner stays exactly as usable after the
+    /// observation ends as it was before.
+    fn reject_ownership_while_observed(
+        &mut self,
+        place: &Place<LocalId>,
+        display: String,
+        span: Span,
+        what: &str,
+    ) -> bool {
+        let Some(observation) = self.conflicting_observation(place) else {
+            return false;
+        };
+        let alias = self.interner.resolve(observation.alias_name).to_string();
+        self.diagnose(
+            OWNERSHIP_WHILE_OBSERVED,
+            span,
+            format!(
+                "`{display}` cannot be {what} while the observation `{alias}` is still holding it"
+            ),
+            "held by an active observation",
+        );
+        true
+    }
+
+    /// Rejects any ownership use of a place reached through an
+    /// observation alias (`rfcs/0013`) -- the alias itself, or any
+    /// field under it. Returns `true` when it did.
+    fn reject_alias_ownership(
+        &mut self,
+        place: &Place<LocalId>,
+        display: String,
+        span: Span,
+        what: &str,
+    ) -> bool {
+        if !self.observation_aliases.contains_key(&place.root) {
+            return false;
+        }
+        self.diagnose(
+            OBSERVATION_ALIAS_ESCAPES,
+            span,
+            format!(
+                "`{display}` is reached through an observation alias, which carries no ownership, \
+                 and cannot be {what}"
+            ),
+            "observation alias used as ownership",
+        );
+        true
     }
 
     fn diverges(&self, id: crate::hir::ExprId) -> bool {
@@ -1073,6 +1331,11 @@ impl<'a> FlowChecker<'a> {
             // than by the outer `return`'s id (which only a *direct*,
             // non-compound return value would ever be looked up by).
             if kind == ConsumeKind::Return && !self.diverges(tail.id()) {
+                // The same leaf is where this `return`'s own
+                // observation ends land too (`rfcs/0013`), for exactly
+                // the same reason: `nir::lower` replays this leaf's own
+                // id, never the outer `return`'s.
+                self.record_observation_exit(tail.id(), 0);
                 self.record_exit(tail.id(), 0);
             }
         }
@@ -1083,6 +1346,11 @@ impl<'a> FlowChecker<'a> {
             HirStmt::Expr(e) => self.diverges(e.id()),
             HirStmt::Binding(b) => self.diverges(b.value.id()),
             HirStmt::Drop { .. } | HirStmt::Defer { .. } | HirStmt::While { .. } => false,
+            // An observation's body always runs exactly once,
+            // unconditionally (`rfcs/0013`) -- so unlike a loop body,
+            // its own divergence really does make everything after the
+            // statement unreachable.
+            HirStmt::Observe(o) => self.diverges(o.body.id),
             HirStmt::Loop { body, .. } => self.diverging_loops.contains(&body.id),
         }
     }
@@ -1109,7 +1377,161 @@ impl<'a> FlowChecker<'a> {
                 condition, body, ..
             } => self.check_while_loop(condition, body),
             HirStmt::Loop { body, .. } => self.check_loop_body(body),
+            HirStmt::Observe(o) => self.check_observe(o),
         }
+    }
+
+    /// `observe <place> as <alias> { .. }` (`rfcs/0013`).
+    ///
+    /// The source is *read*, never consumed: reading is precisely what
+    /// an observation is, and the owner keeps owning the place
+    /// throughout. What the statement adds is a scope during which
+    /// every place overlapping that one is frozen against ownership
+    /// operations -- pushed here, popped when the block's own walk
+    /// ends, on every path out of it, because the walk is structured
+    /// and a block is left exactly once however it is left.
+    ///
+    /// A source this stage cannot resolve to a real place, or one that
+    /// is not affine, was already rejected by `typeck` (`T0069`/
+    /// `T0070`/`T0072`). No observation is registered for it at all --
+    /// the body is still walked for its own independent diagnostics,
+    /// but nothing downstream ever sees a half-built observation.
+    /// Walks one observation body (`rfcs/0013`), on every path that
+    /// walks one at all -- accepted or rejected.
+    ///
+    /// The body's own tail value is *discarded*: the statement produces
+    /// no value and nothing above it consumes one, exactly like a bare
+    /// statement-expression. So a freshly constructed resource there is
+    /// never bound, returned, dropped or transferred to a `take`
+    /// parameter, and nothing would ever destroy it -- the identical
+    /// leak `RESOURCE_TEMPORARY_LEAK` already covers everywhere else,
+    /// caught here rather than left for `nir::verify` to report as a
+    /// leak with no source to point at.
+    ///
+    /// A diverging tail never actually produces a value at this point
+    /// at all, so it is not this check's concern, matching
+    /// [`Self::reject_leaked_temporary`]'s own rule for every other
+    /// transparent position.
+    fn check_observation_body(&mut self, body: &HirBlock) {
+        self.check_block(body);
+        if let Some(tail) = &body.tail
+            && !self.diverges(tail.id())
+        {
+            self.reject_leaked_temporary(tail);
+        }
+    }
+
+    fn check_observe(&mut self, o: &HirObserve) {
+        let place = if self.is_affine_expr(o.source.id()) {
+            self.resolve_place(&o.source)
+        } else {
+            None
+        };
+        let Some(place) = place else {
+            self.check_expr(&o.source);
+            self.check_observation_body(&o.body);
+            return;
+        };
+        // A use-after-move/use-after-drop of the source is exactly the
+        // same violation it would be anywhere else, at exactly the same
+        // grain, so it reports through exactly the same path.
+        self.check_place_read(&place, &o.source);
+        let Some(ty) = self.place_ty(&place) else {
+            self.check_observation_body(&o.body);
+            return;
+        };
+        match self.place_status(&place) {
+            // Live and whole. Already being observed is fine and
+            // expected: observations are read-only, so any number of
+            // them may overlap (`rfcs/0013`).
+            PlaceStatus::Available | PlaceStatus::DropScheduled | PlaceStatus::Observed(_) => {}
+            PlaceStatus::PartiallyMoved => {
+                // The alias binds this place's own complete type, so
+                // half a value cannot back it. Reported as exactly what
+                // it is: a whole-value use of a partially moved
+                // aggregate.
+                let (name, field_span) = Self::field_name_and_span(&o.source);
+                let (display, span) = match &o.source {
+                    HirExpr::Local { name, span, .. } => {
+                        (self.interner.resolve(*name).to_string(), *span)
+                    }
+                    _ => (self.field_display(name), field_span),
+                };
+                self.diagnose(
+                    PARTIAL_PARENT_USED_AS_WHOLE,
+                    span,
+                    format!(
+                        "`{display}` has already had an affine field moved out of it and cannot \
+                         be observed as a whole value"
+                    ),
+                    "partially moved aggregate observed as a whole",
+                );
+                self.check_observation_body(&o.body);
+                return;
+            }
+            // Already diagnosed by `check_place_read` just above, or an
+            // `Error` place whose own root cause was reported earlier --
+            // no second diagnostic about the same thing either way.
+            PlaceStatus::Moved | PlaceStatus::Dropped | PlaceStatus::Error => {
+                self.check_observation_body(&o.body);
+                return;
+            }
+        }
+        self.checked_observations.insert(
+            o.id,
+            CheckedObservation {
+                id: o.id,
+                source: place.clone(),
+                alias: o.alias,
+                ty,
+                lexical_scope: o.body.id,
+                begin: o.keyword_span,
+            },
+        );
+        self.observation_aliases.insert(o.alias, o.id);
+        self.observations.push(ActiveObservation {
+            id: o.id,
+            place,
+            alias: o.alias,
+            alias_name: o.alias_name,
+        });
+        self.check_observation_body(&o.body);
+        // A block is left exactly once, however it is left: an early
+        // `return`/`raise`/`?`/`break`/`continue` inside it already
+        // recorded its own end edge (see
+        // `Self::record_observation_exit`) and truncated the walk, and
+        // this pop is the *lexical* end of the scope, not a second end
+        // on that same path.
+        let popped = self.observations.pop();
+        debug_assert!(
+            popped.is_some_and(|active| active.id == o.id),
+            "observation scopes are pushed and popped in strict LIFO order"
+        );
+    }
+
+    /// Records every observation one non-local exit edge has to end
+    /// (`rfcs/0013`), innermost first.
+    ///
+    /// `marker` is the point in the stack this exit actually escapes
+    /// past: `0` for `return`/`raise`/`?` (which leave the whole
+    /// function), and the enclosing loop's own
+    /// [`LoopFrame::observation_marker`] for `break`/`continue` (which
+    /// leave only the scopes opened at or inside that loop). An
+    /// observation opened *around* a loop stays active past a `break`
+    /// out of it and must not be ended here.
+    fn record_observation_exit(&mut self, exit: ExprId, marker: usize) {
+        if marker >= self.observations.len() {
+            return;
+        }
+        let ends: Vec<ObservationExit> = self.observations[marker..]
+            .iter()
+            .rev()
+            .map(|active| ObservationExit {
+                observation: active.id,
+                exit,
+            })
+            .collect();
+        self.observation_exits.insert(exit, ends);
     }
 
     fn check_binding(&mut self, b: &HirBinding) {
@@ -1140,6 +1562,38 @@ impl<'a> FlowChecker<'a> {
     /// call that still needs to observe it.
     fn check_defer(&mut self, expr: &HirExpr, span: Span) {
         self.check_expr(expr);
+        // A deferred action runs at its *enclosing scope's* exit, which
+        // is always strictly later than the end of any observation
+        // scope opened inside it -- so a `defer` may never capture an
+        // observation alias, however the capture is written
+        // (`rfcs/0013`). Asked over every place the whole expression
+        // reaches, so a capture through a nested aggregate, a
+        // conditional operand, or any other compound shape is caught
+        // exactly like a bare `defer inspect(view)` is, and asked
+        // *before* the registration below so a rejected `defer` never
+        // protects anything or takes a registration order.
+        let captured = self.observed_places(expr);
+        if let Some(place) = captured
+            .iter()
+            .find(|place| self.observation_aliases.contains_key(&place.root))
+        {
+            let alias = self
+                .observations
+                .iter()
+                .find(|active| active.alias == place.root)
+                .map(|active| self.interner.resolve(active.alias_name).to_string())
+                .unwrap_or_else(|| "this observation".to_string());
+            self.diagnose(
+                OBSERVATION_ALIAS_ESCAPES,
+                span,
+                format!(
+                    "`{alias}` is an observation alias and cannot be captured by a `defer`, which \
+                     runs after the observation has already ended"
+                ),
+                "observation alias captured by a defer",
+            );
+            return;
+        }
         // `nir::lower`'s own `lower_defer_call` independently re-checks
         // that `expr` is structurally a direct call to a plain function
         // reference (a well-formedness concern outside this stage's own
@@ -1330,6 +1784,13 @@ impl<'a> FlowChecker<'a> {
             return;
         }
         let root = Place::root(*local);
+        let display = self.local_name(*local, *name);
+        if self.reject_alias_ownership(&root, display.clone(), span, "dropped") {
+            return;
+        }
+        if self.reject_ownership_while_observed(&root, display, span, "dropped") {
+            return;
+        }
         let Some(state) = self.states.get(&root).copied() else {
             return;
         };
@@ -1435,6 +1896,13 @@ impl<'a> FlowChecker<'a> {
         if self.reject_observed_place(place, name, span, "dropped") {
             return;
         }
+        let display = self.field_display(name);
+        if self.reject_alias_ownership(place, display.clone(), span, "dropped") {
+            return;
+        }
+        if self.reject_ownership_while_observed(place, display, span, "dropped") {
+            return;
+        }
         match self.place_state(place) {
             ResourceState::Available => {
                 if self.has_defer_protected_descendant(place) {
@@ -1508,6 +1976,7 @@ impl<'a> FlowChecker<'a> {
         let entry = self.states.clone();
         self.loop_stack.push(LoopFrame {
             cleanup_marker: self.pending_cleanup.len(),
+            observation_marker: self.observations.len(),
             defer_scope_marker: self.defer_scopes.len(),
             ..LoopFrame::default()
         });
@@ -1550,6 +2019,7 @@ impl<'a> FlowChecker<'a> {
         let entry = self.states.clone();
         self.loop_stack.push(LoopFrame {
             cleanup_marker: self.pending_cleanup.len(),
+            observation_marker: self.observations.len(),
             defer_scope_marker: self.defer_scopes.len(),
             ..LoopFrame::default()
         });
@@ -1795,6 +2265,9 @@ impl<'a> FlowChecker<'a> {
             | HirExpr::ProtocolMethodRef { .. }
             | HirExpr::Error { .. } => {}
             HirExpr::Continue { id, .. } => {
+                if let Some(marker) = self.loop_stack.last().map(|f| f.observation_marker) {
+                    self.record_observation_exit(*id, marker);
+                }
                 if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
                     self.record_exit(*id, marker);
                 }
@@ -2041,6 +2514,7 @@ impl<'a> FlowChecker<'a> {
                 // propagation's own checked cleanup up by this same
                 // `Try` expression's id, the same way `lower_raise`
                 // looks an explicit `raise` up by its own.
+                self.record_observation_exit(*id, 0);
                 self.record_exit(*id, 0);
             }
             HirExpr::If {
@@ -2089,12 +2563,21 @@ impl<'a> FlowChecker<'a> {
                 // A `return` always unwinds the *whole* function, from
                 // the very start (`rfcs/0011`) -- marker 0, mirroring
                 // `nir::lower`'s own `emit_cleanup` (as opposed to
-                // `emit_cleanup_since`).
+                // `emit_cleanup_since`). Every currently-active
+                // observation is left the same way, and ends first
+                // (`rfcs/0013`): the cleanup this exit replays is
+                // exactly the destruction an observation exists to
+                // forbid, so it must not still be holding anything by
+                // the time that cleanup runs.
+                self.record_observation_exit(*id, 0);
                 self.record_exit(*id, 0);
             }
             HirExpr::Break { value, id, .. } => {
                 if let Some(value) = value {
                     self.check_expr_ctx(value, ConsumeKind::Other);
+                }
+                if let Some(marker) = self.loop_stack.last().map(|f| f.observation_marker) {
+                    self.record_observation_exit(*id, marker);
                 }
                 if let Some(marker) = self.loop_stack.last().map(|f| f.cleanup_marker) {
                     self.record_exit(*id, marker);
@@ -2124,6 +2607,7 @@ impl<'a> FlowChecker<'a> {
             }
             HirExpr::Raise { operand, id, .. } => {
                 self.check_expr_ctx(operand, ConsumeKind::Other);
+                self.record_observation_exit(*id, 0);
                 self.record_exit(*id, 0);
             }
             HirExpr::Handle {
@@ -2657,6 +3141,14 @@ impl<'a> FlowChecker<'a> {
             return;
         }
         let root = Place::root(local);
+        let display = self.local_name(local, name);
+        if self.reject_alias_ownership(&root, display.clone(), span, "moved, returned, or stored") {
+            return;
+        }
+        if self.reject_ownership_while_observed(&root, display, span, "moved, returned, or stored")
+        {
+            return;
+        }
         let Some(state) = self.states.get(&root).copied() else {
             return;
         };
@@ -2727,6 +3219,13 @@ impl<'a> FlowChecker<'a> {
         span: Span,
     ) {
         if self.reject_observed_place(place, Some(name), span, "reassigned") {
+            return;
+        }
+        let display = self.interner.resolve(name).to_string();
+        if self.reject_alias_ownership(place, display.clone(), span, "reassigned") {
+            return;
+        }
+        if self.reject_ownership_while_observed(place, display, span, "overwritten") {
             return;
         }
         match self.place_state(place) {
@@ -2855,6 +3354,7 @@ impl<'a> FlowChecker<'a> {
                     let return_leaf_recorded =
                         kind == ConsumeKind::Return && self.is_affine_expr(match_id);
                     if return_leaf_recorded && !diverges {
+                        self.record_observation_exit(e.id(), 0);
                         self.record_exit(e.id(), 0);
                     }
                     (e.id(), diverges, return_leaf_recorded)
@@ -2944,6 +3444,7 @@ impl<'a> FlowChecker<'a> {
                     let return_leaf_recorded =
                         kind == ConsumeKind::Return && self.is_affine_expr(handle_id);
                     if return_leaf_recorded && !diverges {
+                        self.record_observation_exit(e.id(), 0);
                         self.record_exit(e.id(), 0);
                     }
                     (e.id(), diverges, return_leaf_recorded)
@@ -3251,6 +3752,15 @@ fn collect_observed_places_block(
                 collect_observed_places_block(checker, body, out);
             }
             HirStmt::Loop { body, .. } => collect_observed_places_block(checker, body, out),
+            // An observation reaches both its own source place and
+            // whatever its body reaches (`rfcs/0013`) -- the alias's
+            // own places are among the latter, which is exactly how a
+            // `defer` written inside the block is caught trying to
+            // capture one.
+            HirStmt::Observe(o) => {
+                collect_observed_places(checker, &o.source, out);
+                collect_observed_places_block(checker, &o.body, out);
+            }
         }
     }
     if let Some(tail) = &block.tail {

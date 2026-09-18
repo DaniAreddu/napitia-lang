@@ -1534,6 +1534,110 @@ fn resource_invalid_observed_field_move_example_is_rejected() {
     assert_resource_example_rejected("resource_invalid_observed_field_move.npt", "U0005");
 }
 
+// -- Lexically scoped observations (`rfcs/0013`) ----------------------
+//
+// `observe <place> as <name> { ... }`: the same read-only capability an
+// ordinary parameter already carried, with the extent written down by
+// the author instead of implied by a call.
+
+#[test]
+fn resource_observe_scope_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observe_scope.npt", "17");
+}
+
+#[test]
+fn resource_observe_nested_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observe_nested.npt", "5");
+}
+
+#[test]
+fn resource_observe_siblings_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observe_siblings.npt", "18");
+}
+
+#[test]
+fn resource_observe_failure_example_runs_end_to_end() {
+    assert_resource_example_runs("resource_observe_failure.npt", "125");
+}
+
+/// Moving the ancestor of an observed place is refused by `check`
+/// itself -- not by the verifier after `check` already accepted it.
+#[test]
+fn resource_invalid_observe_move_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observe_move.npt", "U0017");
+}
+
+#[test]
+fn resource_invalid_observe_drop_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observe_drop.npt", "U0017");
+}
+
+#[test]
+fn resource_invalid_observe_escape_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observe_escape.npt", "U0016");
+}
+
+#[test]
+fn resource_invalid_observe_defer_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observe_defer.npt", "U0016");
+}
+
+#[test]
+fn resource_invalid_observe_non_affine_example_is_rejected() {
+    assert_resource_example_rejected("resource_invalid_observe_non_affine.npt", "T0070");
+}
+
+/// Textual NIR shows an observation's own boundaries explicitly -- the
+/// begin, its place, and the matching end -- rather than leaving them
+/// implicit in a lowering-side map or a use count.
+#[test]
+fn textual_nir_shows_explicit_observation_boundaries() {
+    let output = napitia(&["ir", &example("resource_observe_scope.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("observe.place @obs"),
+        "expected an explicit observation begin in textual NIR: {text}"
+    );
+    assert!(
+        text.contains("end.observe @obs"),
+        "expected an explicit observation end in textual NIR: {text}"
+    );
+    // Three scopes across the two functions, each begun and ended once.
+    assert_eq!(
+        text.matches("observe.place @obs").count(),
+        text.matches("end.observe @obs").count(),
+        "every begin must have exactly one matching end: {text}"
+    );
+}
+
+/// Every exit out of an observation block emits its own end -- and the
+/// end always precedes the ownership cleanup on that same edge, because
+/// that cleanup is precisely what an active observation forbids.
+#[test]
+fn textual_nir_ends_an_observation_before_the_cleanup_on_the_same_edge() {
+    let output = napitia(&["ir", &example("resource_observe_failure.npt")]);
+    assert!(output.status.success(), "ir failed: {}", stderr(&output));
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("drop ") {
+            continue;
+        }
+        // Walk back to the nearest observation instruction: if it is a
+        // begin rather than an end, this drop runs inside a live scope.
+        let preceding = lines[..index].iter().rev().find(|earlier| {
+            earlier.contains("observe.place @obs") || earlier.contains("end.observe @obs")
+        });
+        if let Some(earlier) = preceding {
+            assert!(
+                !earlier.contains("observe.place @obs"),
+                "a drop follows a begin with no intervening end: {text}"
+            );
+        }
+    }
+}
+
 /// Textual NIR shows the decomposition explicitly, on the arm's own
 /// path -- the ownership event a function-global consumption scan used
 /// to stand in for.

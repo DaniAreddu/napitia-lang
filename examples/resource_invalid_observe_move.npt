@@ -1,0 +1,40 @@
+// An ownership operation on a place an observation is holding
+// (`rfcs/0013`).
+//
+// `session.left` is being observed, and `session` is an ancestor of it:
+// handing the whole aggregate to a `take` parameter would transfer the
+// very field `view` still names. Rejected at the source layer, so
+// `check`, `ir` and `run` all refuse it for the same reason.
+//
+// The sibling `session.right` is untouched by the observation and stays
+// freely movable -- see `resource_observe_siblings.npt`.
+resource File {
+    descriptor: i64
+}
+
+resource Session {
+    left: File,
+    right: File
+}
+
+func swallow(take session: Session) -> i64 {
+    drop session;
+    return 1;
+}
+
+func steal(take session: Session) -> i64 {
+    mutable result = 0;
+
+    observe session.left as view {
+        result = swallow(session);
+    }
+
+    return result;
+}
+
+func main() -> i64 {
+    return steal(Session {
+        left: File { descriptor: 1 },
+        right: File { descriptor: 2 }
+    });
+}

@@ -1,0 +1,49 @@
+// Overlap is structural, not by root (`rfcs/0013`).
+//
+// Observing `session.left` freezes exactly that place, every place
+// under it, and every place it is reached through. `session.right` is a
+// disjoint sibling: nothing about it overlaps, so it stays completely
+// ownable -- movable, droppable, and observable in its own right --
+// while `session.left` is being observed.
+resource File {
+    descriptor: i64
+}
+
+resource Session {
+    left: File,
+    right: File
+}
+
+func inspect(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func consume(take file: File) -> i64 {
+    value descriptor = file.descriptor;
+    drop file;
+    return descriptor;
+}
+
+func split(take session: Session) -> i64 {
+    mutable total = 0;
+
+    observe session.left as view {
+        // A disjoint sibling may be observed...
+        observe session.right as other {
+            total = inspect(view) + inspect(other);
+        }
+        // ...and moved away entirely, all while `left` is held.
+        total = total + consume(session.right);
+    }
+
+    // `left` is an ordinary owned field again here.
+    drop session.left;
+    return total;
+}
+
+func main() -> i64 {
+    return split(Session {
+        left: File { descriptor: 10 },
+        right: File { descriptor: 4 }
+    });
+}

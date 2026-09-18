@@ -505,6 +505,12 @@ pub struct Interpreter<'a> {
     /// program's own final return value.
     #[cfg(test)]
     event_log: RefCell<Vec<String>>,
+    /// How many Napitia call frames are currently entered
+    /// (`crate::limits::MAX_CALL_DEPTH`). One Napitia frame is one
+    /// native `call_function` frame, so without this an ordinary
+    /// recursive function exhausts the native stack and aborts the
+    /// process instead of producing an error anything can report.
+    call_depth: std::cell::Cell<usize>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -514,6 +520,7 @@ impl<'a> Interpreter<'a> {
             resources: RefCell::new(ResourceTable::default()),
             #[cfg(test)]
             event_log: RefCell::new(Vec::new()),
+            call_depth: std::cell::Cell::new(0),
         }
     }
 
@@ -2368,7 +2375,42 @@ impl<'a> Interpreter<'a> {
     /// is exactly the inconsistency this substitution exists to
     /// prevent. Callers that need a generic function instantiate it the
     /// way NIR does: through a `Call` carrying its arguments.
+    ///
+    /// Every entry claims one frame of
+    /// [`crate::limits::MAX_CALL_DEPTH`], because one Napitia frame is
+    /// one native frame: a recursion the program never terminates would
+    /// otherwise exhaust the native stack and abort the process, which
+    /// is not something a `Result` can report, a CLI can exit with, or a
+    /// caller can catch. Exceeding the budget is an ordinary
+    /// [`InterpreterError`] instead, on the same terms as every other
+    /// runtime refusal.
+    ///
+    /// The claim is released here rather than by a `Drop` guard: this
+    /// stage deliberately never relies on Rust's own destruction order
+    /// for anything it means, and the one call below has exactly one way
+    /// out.
     fn call_function(
+        &self,
+        function: &Function,
+        type_args: &[Ty],
+        args: Vec<Value>,
+        evidence: Vec<Evidence>,
+    ) -> Result<Outcome, InterpreterError> {
+        if self.call_depth.get() >= crate::limits::MAX_CALL_DEPTH {
+            return Err(invalid(format!(
+                "call depth exceeded {} frames: a recursion this execution never unwound",
+                crate::limits::MAX_CALL_DEPTH
+            )));
+        }
+        self.call_depth.set(self.call_depth.get() + 1);
+        let outcome = self.call_function_in_frame(function, type_args, args, evidence);
+        self.call_depth.set(self.call_depth.get() - 1);
+        outcome
+    }
+
+    /// One frame's own body, entered only through [`Self::call_function`]
+    /// so the depth budget can never be bypassed.
+    fn call_function_in_frame(
         &self,
         function: &Function,
         type_args: &[Ty],

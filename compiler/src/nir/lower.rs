@@ -5024,6 +5024,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -5081,6 +5083,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -5153,6 +5157,8 @@ mod tests {
             // decision, rather than the authentic `consume_sites`.
             &BTreeMap::new(),
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5283,6 +5289,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5433,6 +5441,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5506,6 +5516,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             // Deliberately empty, discarding resourceck's own real plan.
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &interner,
             id,
@@ -5586,6 +5598,8 @@ mod tests {
             &BTreeMap::new(),
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         );
@@ -5655,6 +5669,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )
@@ -7630,6 +7646,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             id,
         )
@@ -7683,6 +7701,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -7869,6 +7889,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -7949,6 +7971,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8008,6 +8032,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8064,6 +8090,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8110,6 +8138,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8175,6 +8205,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8279,6 +8311,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             manifest_source,
             &module_path_of,
@@ -8372,6 +8406,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &module_path_of,
@@ -8443,6 +8479,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             manifest_source,
             &HashMap::new(),
@@ -8483,6 +8521,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8531,6 +8571,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8576,6 +8618,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -8615,6 +8659,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8659,6 +8705,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -8714,6 +8762,8 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
@@ -8775,6 +8825,8 @@ mod tests {
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
             consume_sites: Box::leak(Box::new(BTreeMap::new())),
             defer_plans: Box::leak(Box::new(BTreeMap::new())),
+            observations: Box::leak(Box::new(BTreeMap::new())),
+            observation_exits: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -8814,6 +8866,8 @@ mod tests {
             cleanup_edges: Box::leak(Box::new(BTreeMap::new())),
             consume_sites: Box::leak(Box::new(BTreeMap::new())),
             defer_plans: Box::leak(Box::new(BTreeMap::new())),
+            observations: Box::leak(Box::new(BTreeMap::new())),
+            observation_exits: Box::leak(Box::new(BTreeMap::new())),
         }
     }
 
@@ -9877,6 +9931,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &interner,
             source,
         );
@@ -10032,6 +10088,8 @@ mod tests {
             &result.call_type_args,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),

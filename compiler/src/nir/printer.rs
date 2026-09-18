@@ -777,6 +777,8 @@ mod tests {
             &resourceck_result.cleanup_edges,
             &resourceck_result.consume_sites,
             &resourceck_result.defer_plans,
+            &resourceck_result.observations,
+            &resourceck_result.observation_exits,
             &interner,
             id,
         )

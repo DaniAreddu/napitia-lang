@@ -300,10 +300,13 @@ Statement = BindingStmt
           | DeferStmt
           | WhileStmt
           | LoopStmt
+          | ObserveStmt
           ;
 
 BindingStmt = ("value" | "mutable") IDENT [ ":" Type ] "=" Expression ";" ;
 ExprStmt    = Expression ";" ;
+ObserveStmt = "observe" PlaceExpr "as" IDENT Block ;
+PlaceExpr   = IDENT { "." IDENT } ;
 ```
 
 `ExprStmt`'s trailing `;` is optional when `Expression` is an `IfExpr`,
@@ -334,6 +337,23 @@ LIFO order, when its own enclosing lexical scope exits by any path
 (fallthrough, `return`, `raise`, postfix `?`, `handle`, `break`, or
 `continue`); `drop` destroys a live resource immediately. See
 `spec/0004`/`rfcs/0011` for the full ownership semantics.
+
+`ObserveStmt` (Alpha 0.1.9, `rfcs/0013`) opens a lexically scoped,
+read-only observation of an affine place. It is a statement, never an
+expression: it produces no value and can never be a block's tail. Like
+`while`/`loop` it is brace-terminated, so no `;` follows the closing
+brace.
+
+Its source is deliberately restricted to `PlaceExpr` -- an identifier
+followed by zero or more `.field` steps -- rather than a general
+`Expression`. Only a place can be observed at all, and `x as T` is
+already the cast operator, so a general expression would consume
+`as <alias>` as a cast to a type named after the alias and the
+statement's own `as` would never be seen. The alias is an ordinary
+immutable binding of the observed place's own type, visible only inside
+the block; it carries observation capability and never ownership. No
+reference type, `&`, apostrophe lifetime or lifetime parameter is
+introduced anywhere by this construct.
 
 ### Expressions
 

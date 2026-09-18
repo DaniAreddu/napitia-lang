@@ -6873,12 +6873,73 @@ enum ObservationStack {
     Conflict,
 }
 
-/// One begin site, with the place it observes and the observer value it
-/// produces.
+/// Every observation a value or slot *may* carry at one program point
+/// (`rfcs/0013`) -- the observer itself, and everything derived from
+/// one by projection, load, or an observing store-and-reload.
+///
+/// A set per location, not one representative. A slot written with a
+/// different observer on each branch of an `if` genuinely may carry
+/// either afterwards, and a later use is illegal the moment *any* of
+/// them has ended -- so collapsing the two to one identity (however it
+/// is chosen) silently accepts the use whenever the surviving choice
+/// happens to be the one still active. The join is set union for
+/// exactly that reason.
+///
+/// A location absent from the map carries nothing, which is the same
+/// thing as an empty set; the empty set is never stored, so two states
+/// that mean the same thing always compare equal.
+type CarrierFacts = BTreeMap<ValueId, BTreeSet<ObservationId>>;
+
+/// One program point's complete observation state (`rfcs/0013`): which
+/// observations are open, and which values carry one.
+///
+/// The two travel together because they are answered against the same
+/// point: "is this use legal" is `carriers[value] ⊆ stack`, and both
+/// sides change as a block executes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ObservationState {
+    stack: ObservationStack,
+    carriers: CarrierFacts,
+}
+
+/// Records `value`'s own carried observations, dropping the entry when
+/// there are none so "carries nothing" has exactly one representation.
+fn set_carriers(facts: &mut CarrierFacts, value: ValueId, carried: BTreeSet<ObservationId>) {
+    if carried.is_empty() {
+        facts.remove(&value);
+    } else {
+        facts.insert(value, carried);
+    }
+}
+
+fn carriers_of(facts: &CarrierFacts, value: ValueId) -> BTreeSet<ObservationId> {
+    facts.get(&value).cloned().unwrap_or_default()
+}
+
+/// Joins two predecessors' carrier facts: union by key, union per key.
+/// A location only one side knows about is carried through unchanged,
+/// because the other side's own answer for it is the empty set.
+fn join_carriers(a: &CarrierFacts, b: &CarrierFacts) -> CarrierFacts {
+    let mut joined = a.clone();
+    for (value, carried) in b {
+        joined
+            .entry(*value)
+            .or_default()
+            .extend(carried.iter().copied());
+    }
+    joined
+}
+
+/// One begin site: the place it observes.
+///
+/// The observer value it produces is deliberately *not* recorded here.
+/// Which values carry the observation is a path-sensitive fact that
+/// [`CarrierFacts`] answers at each point; a single id stored once per
+/// begin could only ever describe the definition, never what a slot
+/// holds after a branch wrote a different view into it.
 #[derive(Clone)]
 struct ObservationBegin {
     place: Place<ValueId>,
-    observer: ValueId,
 }
 
 /// One observation diagnostic, keyed by where it was found so the
@@ -6949,7 +7010,6 @@ fn verify_observations(
         for (index, instruction) in block.instructions.iter().enumerate() {
             match instruction {
                 Instruction::Value {
-                    result,
                     kind: ValueKind::ObservePlace { observation, place },
                     ..
                 } => begin_sites.push((
@@ -6958,7 +7018,6 @@ fn verify_observations(
                     *observation,
                     ObservationBegin {
                         place: place.clone(),
-                        observer: *result,
                     },
                 )),
                 Instruction::EndObserve { observation } => {
@@ -7002,13 +7061,12 @@ fn verify_observations(
         }
     }
 
-    // -- Identity: values that carry an observation -------------------
+    // -- Identity ------------------------------------------------------
     //
-    // The observer itself, plus everything reachable *from* it by
-    // projection, load or observing store. Using any of them once the
-    // observation has ended is a use of something that no longer
-    // denotes anything, so the set has to be transitive rather than
-    // just the one result id.
+    // Which values carry an observation is a fact about the *path*, not
+    // about the function: a slot is written, read, rewritten, and each
+    // write replaces what reading it yields. It is therefore carried by
+    // the dataflow below rather than precomputed once.
     let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
     for block in &function.blocks {
         for instruction in &block.instructions {
@@ -7029,15 +7087,25 @@ fn verify_observations(
             projections: place.projections.clone(),
         }
     };
-    let observer_of = observation_carriers(function, &begins, &origin, &canonical);
-
     // -- Flow ----------------------------------------------------------
+    //
+    // Every edge carries the slot *that edge itself* writes: an
+    // `Invoke` fills `ok_slot` on its success edge and one error
+    // target's own slot on that failure edge, and neither on the other.
+    // Recording it against the target block instead would either kill a
+    // slot's provenance on a path that never wrote it, or keep stale
+    // provenance on the path that did -- the same per-edge distinction
+    // `verify_invoke_slot_initialization` already needs, for the same
+    // reason.
     let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut predecessors: HashMap<BlockId, Vec<(BlockId, Option<ValueId>)>> = HashMap::new();
     for block in &function.blocks {
-        for target in terminator_targets(&block.terminator) {
+        for (target, written) in terminator_edges(&block.terminator) {
             successors.entry(block.id).or_default().push(target);
-            predecessors.entry(target).or_default().push(block.id);
+            predecessors
+                .entry(target)
+                .or_default()
+                .push((block.id, written));
         }
     }
     let mut reachable: HashSet<BlockId> = HashSet::from([entry]);
@@ -7055,7 +7123,7 @@ fn verify_observations(
     // Absent means "no reachable predecessor has produced an out-state
     // yet" -- deliberately not an empty stack, which is a perfectly
     // ordinary state a block can genuinely be computed to hold.
-    let mut out_state: HashMap<BlockId, ObservationStack> = HashMap::new();
+    let mut out_state: HashMap<BlockId, ObservationState> = HashMap::new();
     // Every block id, sorted -- so the reporting sweep below visits
     // blocks in their own declared numbering rather than in whatever
     // order `function.blocks` happens to store them.
@@ -7084,22 +7152,38 @@ fn verify_observations(
     // would make every downstream answer depend on predecessor arrival
     // order.
     let join_in =
-        |id: BlockId, out_state: &HashMap<BlockId, ObservationStack>| -> Option<ObservationStack> {
+        |id: BlockId, out_state: &HashMap<BlockId, ObservationState>| -> Option<ObservationState> {
             if id == entry {
-                return Some(ObservationStack::Active(Vec::new()));
+                return Some(ObservationState {
+                    stack: ObservationStack::Active(Vec::new()),
+                    carriers: CarrierFacts::new(),
+                });
             }
-            let mut joined: Option<ObservationStack> = None;
-            for pred in predecessors.get(&id).into_iter().flatten() {
+            let mut joined: Option<ObservationState> = None;
+            for (pred, written) in predecessors.get(&id).into_iter().flatten() {
                 if !reachable.contains(pred) {
                     continue;
                 }
                 let Some(state) = out_state.get(pred) else {
                     continue;
                 };
+                // This edge overwrites `written`, so whatever the slot
+                // carried before it no longer says anything about what
+                // reading it here would yield.
+                let mut incoming = state.clone();
+                if let Some(slot) = written {
+                    incoming.carriers.remove(slot);
+                }
                 joined = Some(match joined {
-                    None => state.clone(),
-                    Some(previous) if previous == *state => previous,
-                    Some(_) => ObservationStack::Conflict,
+                    None => incoming,
+                    Some(previous) => ObservationState {
+                        stack: if previous.stack == incoming.stack {
+                            previous.stack
+                        } else {
+                            ObservationStack::Conflict
+                        },
+                        carriers: join_carriers(&previous.carriers, &incoming.carriers),
+                    },
                 });
             }
             joined
@@ -7125,7 +7209,6 @@ fn verify_observations(
             block,
             &in_state,
             &begins,
-            &observer_of,
             value_types,
             known_functions,
             agg,
@@ -7152,7 +7235,9 @@ fn verify_observations(
     // in a cycle, where a block is its own predecessor and the state it
     // disagrees with is its own earlier one.
     let first_conflict = order.iter().copied().find(|id| {
-        reachable.contains(id) && join_in(*id, &out_state) == Some(ObservationStack::Conflict)
+        reachable.contains(id)
+            && join_in(*id, &out_state)
+                .is_some_and(|state| state.stack == ObservationStack::Conflict)
     });
 
     // Phase 2: report, once per reachable block, against the settled
@@ -7184,7 +7269,6 @@ fn verify_observations(
             block,
             &in_state,
             &begins,
-            &observer_of,
             value_types,
             known_functions,
             agg,
@@ -7213,7 +7297,7 @@ fn verify_observations(
         let Some(state) = out_state.get(&id) else {
             continue;
         };
-        let ObservationStack::Active(stack) = state else {
+        let ObservationStack::Active(stack) = &state.stack else {
             continue;
         };
         for observation in stack {
@@ -7232,6 +7316,31 @@ fn verify_observations(
 
     located.sort_by_key(|entry| (entry.block, entry.index));
     diagnostics.extend(located.into_iter().map(|entry| entry.diagnostic));
+}
+
+/// Every edge a terminator can take, in a fixed order, paired with the
+/// slot *that edge itself* writes (`rfcs/0013`).
+///
+/// Only an `Invoke` writes anything on an edge: its own result slot on
+/// the success edge, and one error target's own slot on that failure
+/// edge. Every other edge writes nothing.
+fn terminator_edges(terminator: &Terminator) -> Vec<(BlockId, Option<ValueId>)> {
+    match terminator {
+        Terminator::Invoke {
+            ok_slot,
+            ok_target,
+            err_targets,
+            ..
+        } => {
+            let mut edges = vec![(*ok_target, Some(*ok_slot))];
+            edges.extend(err_targets.iter().map(|t| (t.target, Some(t.slot))));
+            edges
+        }
+        other => terminator_targets(other)
+            .into_iter()
+            .map(|target| (target, None))
+            .collect(),
+    }
 }
 
 /// Every block a terminator can transfer control to, in a fixed order.
@@ -7257,103 +7366,20 @@ fn terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
     }
 }
 
-/// Every value that carries an observation (`rfcs/0013`): each
-/// observer, and everything derived from one by projection, load, or an
-/// observing store-and-reload.
-///
-/// Transitive on purpose. `view.input` is a different `ValueId` from
-/// `view`, but reading it after the observation ended is exactly the
-/// same violation, so the identity has to follow the derivation rather
-/// than stop at the instruction that produced the observer.
-///
-/// A plain closure to a fixed point over the instruction list, so the
-/// answer does not depend on the order blocks are stored in: a value
-/// derived in an earlier-numbered block from one defined in a
-/// later-numbered block is still found.
-///
-/// A location that two *different* observations both reach -- a slot
-/// written with one observer on each branch of an `if` -- keeps the
-/// lowest-numbered of them. Keeping whichever arrived first instead
-/// made the diagnostic name a different observation depending on which
-/// branch the block vector happened to list first. The choice is
-/// arbitrary either way; making it by identity rather than by arrival
-/// is what makes it the *same* arbitrary choice every time. Lowering
-/// this rule further -- to a set of carried observations -- would be
-/// more precise, and is deliberately not done here: the value is
-/// unusable once *any* of them has ended, so one representative is
-/// enough to reject it, and the extra state would have to be joined at
-/// every merge for no additional rejection.
-fn observation_carriers(
-    function: &Function,
-    begins: &BTreeMap<ObservationId, ObservationBegin>,
-    origin: &impl Fn(ValueId) -> ValueId,
-    canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
-) -> HashMap<ValueId, ObservationId> {
-    let mut carriers: HashMap<ValueId, ObservationId> = HashMap::new();
-    for (id, begin) in begins {
-        carriers.insert(begin.observer, *id);
-    }
-    /// Records `value` as carrying `id`, keeping the lowest-numbered
-    /// observation whenever more than one reaches it. Monotone
-    /// downwards and bounded below by the smallest identity, so the
-    /// fixed point below terminates.
-    fn note(
-        carriers: &mut HashMap<ValueId, ObservationId>,
-        value: ValueId,
-        id: ObservationId,
-    ) -> bool {
-        match carriers.get(&value) {
-            Some(existing) if *existing <= id => false,
-            _ => {
-                carriers.insert(value, id);
-                true
-            }
-        }
-    }
-
-    loop {
-        let mut changed = false;
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                match instruction {
-                    Instruction::Value { result, kind, .. } => {
-                        let mut derived = observation_source(kind, origin, canonical)
-                            .and_then(|place| carriers.get(&place.root).copied());
-                        if derived.is_none()
-                            && let ValueKind::Load(slot) = kind
-                        {
-                            derived = carriers.get(slot).copied();
-                        }
-                        if let Some(id) = derived {
-                            changed |= note(&mut carriers, *result, id);
-                        }
-                    }
-                    // Writing an observer into a slot makes the slot
-                    // carry the observation too, so a later `Load` of
-                    // it is still a use of that observation.
-                    Instruction::Store { slot, value, .. } => {
-                        if let Some(id) = carriers.get(value).copied() {
-                            changed |= note(&mut carriers, *slot, id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if !changed {
-            return carriers;
-        }
-    }
-}
-
 /// Every value one instruction *reads* -- the operands a use-after-end
-/// check has to look at (`rfcs/0013`). Deliberately the same
-/// enumeration `verify_dominance` walks, for the same reason: a use is
-/// a use whatever the instruction does with it.
+/// check has to look at (`rfcs/0013`).
+///
+/// Deliberately *not* quite `verify_dominance`'s own enumeration: a
+/// `Store`'s destination slot is written, never read, so listing it
+/// here would report overwriting a slot that happens to hold a
+/// finished view as a use of that view -- which is precisely the legal
+/// way to recycle the slot, and the one the provenance kill exists to
+/// permit. The slot still has to be *defined*, which is
+/// `verify_dominance`'s own concern and unaffected by this.
 fn instruction_operands(instruction: &Instruction) -> Vec<ValueId> {
     match instruction {
         Instruction::Value { kind, .. } => operands_of(kind),
-        Instruction::Store { slot, value, .. } => vec![*slot, *value],
+        Instruction::Store { value, .. } => vec![*value],
         Instruction::Drop { value } => vec![*value],
         Instruction::DecomposeVariant { value, taken, .. } => {
             let mut out = vec![*value];
@@ -7473,9 +7499,8 @@ fn argument_transfers(take: Option<&[bool]>, args_len: usize, index: usize) -> b
 #[allow(clippy::too_many_arguments)]
 fn observation_transfer(
     block: &BasicBlock,
-    in_state: &ObservationStack,
+    in_state: &ObservationState,
     begins: &BTreeMap<ObservationId, ObservationBegin>,
-    observer_of: &HashMap<ValueId, ObservationId>,
     value_types: &HashMap<ValueId, Ty>,
     known_functions: &HashMap<ItemId, KnownFunction>,
     agg: &AggregateContext,
@@ -7483,14 +7508,23 @@ fn observation_transfer(
     canonical: &impl Fn(&Place<ValueId>) -> Place<ValueId>,
     function_name: &str,
     source: SourceId,
-) -> (ObservationStack, Vec<LocatedDiagnostic>) {
+) -> (ObservationState, Vec<LocatedDiagnostic>) {
     let mut diagnostics: Vec<LocatedDiagnostic> = Vec::new();
-    let ObservationStack::Active(entry_stack) = in_state else {
+    let ObservationStack::Active(entry_stack) = &in_state.stack else {
         // Nothing here is checked against a state no path proved; the
-        // disagreement itself was already reported where it arose.
-        return (ObservationStack::Conflict, diagnostics);
+        // disagreement itself was already reported where it arose. The
+        // carriers are still carried through, so a block downstream of
+        // a disagreement is not silently given a clean slate either.
+        return (
+            ObservationState {
+                stack: ObservationStack::Conflict,
+                carriers: in_state.carriers.clone(),
+            },
+            diagnostics,
+        );
     };
     let mut stack = entry_stack.clone();
+    let mut carriers = in_state.carriers.clone();
     let is_affine =
         |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
     let mut push = |index: usize, code: &'static str, message: String| {
@@ -7501,14 +7535,20 @@ fn observation_transfer(
         });
     };
 
+    // One diagnostic per operand, naming the lowest-numbered
+    // observation the operand may carry that is not active here.
+    // Reporting every inactive one would multiply a single unusable
+    // value by however many observations happen to reach it.
     let check_uses = |index: usize,
                       operands: Vec<ValueId>,
                       push: &mut dyn FnMut(usize, &'static str, String),
-                      stack: &[ObservationId]| {
+                      stack: &[ObservationId],
+                      carriers: &CarrierFacts| {
         for operand in operands {
-            if let Some(id) = observer_of.get(&operand)
-                && !stack.contains(id)
-            {
+            let Some(carried) = carriers.get(&operand) else {
+                continue;
+            };
+            if let Some(id) = carried.iter().find(|id| !stack.contains(id)) {
                 push(
                     index,
                     codes::OBSERVER_USED_AFTER_END,
@@ -7523,7 +7563,13 @@ fn observation_transfer(
     };
 
     for (index, instruction) in block.instructions.iter().enumerate() {
-        check_uses(index, instruction_operands(instruction), &mut push, &stack);
+        check_uses(
+            index,
+            instruction_operands(instruction),
+            &mut push,
+            &stack,
+            &carriers,
+        );
         for (place, reporter, what) in
             consumed_places(instruction, known_functions, &is_affine, origin, canonical)
         {
@@ -7544,6 +7590,46 @@ fn observation_transfer(
                     ),
                 );
             }
+        }
+        // Provenance, before the begin/end transition below: what a
+        // value carries is decided by the instruction that defines it,
+        // against the facts holding where it appears.
+        match instruction {
+            Instruction::Value { result, kind, .. } => {
+                let carried = match kind {
+                    // A begin is the one place an observation enters
+                    // the picture at all.
+                    ValueKind::ObservePlace { observation, .. } => BTreeSet::from([*observation]),
+                    // A load yields whatever the slot currently holds.
+                    ValueKind::Load(slot) => carriers_of(&carriers, *slot),
+                    // Anything projected, moved or captured out of an
+                    // observation is an observation in turn.
+                    _ => observation_source(kind, origin, canonical)
+                        .map(|place| carriers_of(&carriers, place.root))
+                        .unwrap_or_default(),
+                };
+                // Assigned, not merged: a value-producing instruction
+                // defines its own result afresh every time it runs, so
+                // a fact left over from a previous loop iteration must
+                // not survive into this definition.
+                set_carriers(&mut carriers, *result, carried);
+            }
+            // A store replaces what reading the slot yields. An
+            // observing store makes the slot a window onto the stored
+            // value and inherits its observations; a transferring one
+            // makes the slot an owner, and an owner carries none --
+            // which is what lets a slot that held a finished view be
+            // legally refilled. (A transfer whose value really is an
+            // observer is its own violation, reported once by the rule
+            // that owns it rather than again here.)
+            Instruction::Store { slot, value, mode } => {
+                let carried = match mode {
+                    crate::nir::OwnershipMode::Observe => carriers_of(&carriers, *value),
+                    crate::nir::OwnershipMode::Transfer => BTreeSet::new(),
+                };
+                set_carriers(&mut carriers, *slot, carried);
+            }
+            _ => {}
         }
         match instruction {
             Instruction::Value {
@@ -7605,6 +7691,7 @@ fn observation_transfer(
         terminator_operands(&block.terminator),
         &mut push,
         &stack,
+        &carriers,
     );
     // A `Switch` takes its scrutinee apart, and an `Invoke` transfers
     // every `take` argument -- both are ownership operations, and both
@@ -7654,7 +7741,13 @@ fn observation_transfer(
         }
     }
 
-    (ObservationStack::Active(stack), diagnostics)
+    (
+        ObservationState {
+            stack: ObservationStack::Active(stack),
+            carriers,
+        },
+        diagnostics,
+    )
 }
 
 /// Two places overlap exactly when one is an ancestor of the other,

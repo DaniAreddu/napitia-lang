@@ -7270,6 +7270,19 @@ fn terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
 /// answer does not depend on the order blocks are stored in: a value
 /// derived in an earlier-numbered block from one defined in a
 /// later-numbered block is still found.
+///
+/// A location that two *different* observations both reach -- a slot
+/// written with one observer on each branch of an `if` -- keeps the
+/// lowest-numbered of them. Keeping whichever arrived first instead
+/// made the diagnostic name a different observation depending on which
+/// branch the block vector happened to list first. The choice is
+/// arbitrary either way; making it by identity rather than by arrival
+/// is what makes it the *same* arbitrary choice every time. Lowering
+/// this rule further -- to a set of carried observations -- would be
+/// more precise, and is deliberately not done here: the value is
+/// unusable once *any* of them has ended, so one representative is
+/// enough to reject it, and the extra state would have to be joined at
+/// every merge for no additional rejection.
 fn observation_carriers(
     function: &Function,
     begins: &BTreeMap<ObservationId, ObservationBegin>,
@@ -7280,6 +7293,24 @@ fn observation_carriers(
     for (id, begin) in begins {
         carriers.insert(begin.observer, *id);
     }
+    /// Records `value` as carrying `id`, keeping the lowest-numbered
+    /// observation whenever more than one reaches it. Monotone
+    /// downwards and bounded below by the smallest identity, so the
+    /// fixed point below terminates.
+    fn note(
+        carriers: &mut HashMap<ValueId, ObservationId>,
+        value: ValueId,
+        id: ObservationId,
+    ) -> bool {
+        match carriers.get(&value) {
+            Some(existing) if *existing <= id => false,
+            _ => {
+                carriers.insert(value, id);
+                true
+            }
+        }
+    }
+
     loop {
         let mut changed = false;
         for block in &function.blocks {
@@ -7293,20 +7324,16 @@ fn observation_carriers(
                         {
                             derived = carriers.get(slot).copied();
                         }
-                        if let Some(id) = derived
-                            && carriers.insert(*result, id).is_none()
-                        {
-                            changed = true;
+                        if let Some(id) = derived {
+                            changed |= note(&mut carriers, *result, id);
                         }
                     }
                     // Writing an observer into a slot makes the slot
                     // carry the observation too, so a later `Load` of
                     // it is still a use of that observation.
                     Instruction::Store { slot, value, .. } => {
-                        if let Some(id) = carriers.get(value).copied()
-                            && carriers.insert(*slot, id).is_none()
-                        {
-                            changed = true;
+                        if let Some(id) = carriers.get(value).copied() {
+                            changed |= note(&mut carriers, *slot, id);
                         }
                     }
                     _ => {}
@@ -26708,6 +26735,107 @@ mod structural_ownership {
         }
 
         // -- order independence -------------------------------------------
+
+        #[test]
+        fn two_observations_reaching_one_slot_name_the_same_one_in_either_block_order() {
+            // A slot written with a different observer on each branch
+            // carries *an* observation afterwards, and which one the
+            // diagnostic names must not depend on which branch the
+            // block vector happens to list first.
+            fn build(reversed: bool) -> (Fixture, Function) {
+                let fx = fixture();
+                let mut branches = vec![
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![Instruction::Store {
+                            slot: ValueId(3),
+                            value: ValueId(1),
+                            mode: OwnershipMode::Observe,
+                        }],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![Instruction::Store {
+                            slot: ValueId(3),
+                            value: ValueId(2),
+                            mode: OwnershipMode::Observe,
+                        }],
+                        terminator: Terminator::Branch(BlockId(3)),
+                    },
+                ];
+                if reversed {
+                    branches.reverse();
+                }
+                let mut blocks = vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        observe_at(2, fx.file.clone(), 1, session_field(1)),
+                        Instruction::Value {
+                            result: ValueId(3),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::Alloc,
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        condition: ValueId(9),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                }];
+                blocks.extend(branches);
+                blocks.push(BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        end(1),
+                        end(0),
+                        Instruction::Value {
+                            result: ValueId(4),
+                            ty: fx.file.clone(),
+                            kind: ValueKind::Load(ValueId(3)),
+                        },
+                        drop_of(0),
+                        int(5, 0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(5))),
+                });
+                let params = vec![
+                    Param {
+                        value: ValueId(0),
+                        ty: fx.session.clone(),
+                        take: true,
+                    },
+                    Param {
+                        value: ValueId(9),
+                        ty: Ty::Bool,
+                        take: false,
+                    },
+                ];
+                let f = under_test(params, Ty::I64, blocks);
+                (fx, f)
+            }
+            let (mut forward_fx, forward) = build(false);
+            let (mut reversed_fx, reversed) = build(true);
+            let messages = |fx: &mut Fixture, f: Function| -> Vec<String> {
+                let mut out: Vec<String> = rendered(fx, f)
+                    .into_iter()
+                    .filter(|line| line.starts_with("V010"))
+                    .collect();
+                out.sort();
+                out
+            };
+            let forward_messages = messages(&mut forward_fx, forward);
+            assert!(
+                !forward_messages.is_empty(),
+                "the fixture must actually report something"
+            );
+            assert_eq!(
+                forward_messages,
+                messages(&mut reversed_fx, reversed),
+                "which observation a shared slot carries must not depend on block order"
+            );
+        }
 
         #[test]
         fn the_block_vector_order_does_not_change_the_result() {

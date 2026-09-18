@@ -44,6 +44,37 @@ func propagate(take file: File, flag: bool) -> i64 raises OpenError {
     return total;
 }
 
+// Raising directly out of the middle of a scope: the end runs, then
+// the owner is destroyed, then control leaves through the failure
+// edge.
+func refuse(take file: File, flag: bool) -> i64 raises OpenError {
+    observe file as view {
+        if flag {
+            raise OpenError.Denied;
+        }
+        value seen = inspect(view);
+    }
+
+    drop file;
+    return 1;
+}
+
+// Continuing from inside a scope opened inside a loop body: the scope
+// ends on that edge too, and a fresh one opens next iteration.
+func tally(take file: File) -> i64 {
+    mutable total = 0;
+
+    while total < 4 {
+        observe file as view {
+            total = total + inspect(view);
+            continue;
+        }
+    }
+
+    drop file;
+    return total;
+}
+
 // Breaking out of a loop from inside a scope opened inside it.
 func first_look(take file: File) -> i64 {
     mutable total = 0;
@@ -68,6 +99,10 @@ func main() -> i64 {
         success v => v,
         failure _ => 0,
     };
+    value refused = handle refuse(File { descriptor: 1 }, true) {
+        success v => v,
+        failure OpenError.Denied => 10,
+    };
     return early(File { descriptor: 1 }) + handled + succeeded
-        + first_look(File { descriptor: 2 });
+        + first_look(File { descriptor: 2 }) + tally(File { descriptor: 2 }) + refused;
 }

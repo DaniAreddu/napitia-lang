@@ -1557,7 +1557,7 @@ fn resource_observe_siblings_example_runs_end_to_end() {
 
 #[test]
 fn resource_observe_failure_example_runs_end_to_end() {
-    assert_resource_example_runs("resource_observe_failure.npt", "111");
+    assert_resource_example_runs("resource_observe_failure.npt", "125");
 }
 
 /// Moving the ancestor of an observed place is refused by `check`

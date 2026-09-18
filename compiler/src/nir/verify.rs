@@ -26934,6 +26934,191 @@ mod structural_ownership {
         }
 
         #[test]
+        fn using_the_observer_before_its_begin_is_rejected_by_dominance() {
+            // "begin dominates every observer use" needs no rule of its
+            // own: the observer is an ordinary SSA result, so a use
+            // ahead of it is the same use-before-definition every other
+            // value already gets.
+            let mut fx = fixture();
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::RecordField {
+                                base: ValueId(1),
+                                record: FILE,
+                                field: 0,
+                            },
+                        },
+                        observe_at(1, fx.file.clone(), 0, session_field(0)),
+                        end(0),
+                        drop_of(0),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            );
+            let found = all_codes(&mut fx, f);
+            assert!(
+                found.contains(&codes::USE_BEFORE_DEFINITION),
+                "got {found:?}"
+            );
+        }
+
+        #[test]
+        fn an_invoke_whose_two_edges_share_one_target_is_accepted() {
+            // The classic shape an ordinary predecessor list keyed only
+            // by target block cannot tell apart: both edges carry the
+            // same active set here, so the shared block must join to
+            // exactly that rather than to a disagreement.
+            let mut fx = fixture();
+            let raiser_name = fx.interner.intern("raiser");
+            let raiser = Function {
+                id: RAISER,
+                name: raiser_name,
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: vec![HOLDER],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction::Value {
+                        result: ValueId(1),
+                        ty: fx.holder.clone(),
+                        kind: ValueKind::VariantCreate {
+                            variant: HOLDER,
+                            case: 1,
+                            type_args: Vec::new(),
+                            payload: Vec::new(),
+                        },
+                    }],
+                    terminator: Terminator::Raise { value: ValueId(1) },
+                }],
+            };
+            let f = under_test(
+                take_session(&fx),
+                Ty::I64,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            Instruction::Value {
+                                result: ValueId(5),
+                                ty: Ty::I64,
+                                kind: ValueKind::Alloc,
+                            },
+                            Instruction::Value {
+                                result: ValueId(6),
+                                ty: fx.holder.clone(),
+                                kind: ValueKind::Alloc,
+                            },
+                        ],
+                        terminator: Terminator::Invoke {
+                            callee: RAISER,
+                            type_args: Vec::new(),
+                            args: Vec::new(),
+                            evidence: Vec::new(),
+                            ok_slot: ValueId(5),
+                            ok_target: BlockId(1),
+                            err_targets: vec![InvokeErrTarget {
+                                variant: HOLDER,
+                                slot: ValueId(6),
+                                target: BlockId(1),
+                            }],
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![end(0), int(2, 0), drop_of(0)],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    },
+                ],
+            );
+            let helpers = helpers(&mut fx);
+            let mut map = SourceMap::new();
+            let source = map.add_file("t.npt", "");
+            let mut functions = vec![f, raiser];
+            functions.extend(helpers);
+            let module = Module {
+                protocols: Vec::new(),
+                extends: Vec::new(),
+                functions,
+                records: fx.records.clone(),
+                variants: fx.variants.clone(),
+            };
+            let found: Vec<&'static str> =
+                verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                    .into_iter()
+                    .map(|d| d.code)
+                    .filter(|code| code.starts_with("V010"))
+                    .collect();
+            assert!(
+                found.is_empty(),
+                "both edges agree, so the shared target must too: {found:?}"
+            );
+        }
+
+        #[test]
+        fn the_function_vector_order_does_not_change_the_result() {
+            // Observations are per function, but the module's own
+            // function order must not reach any of it.
+            fn build(reversed: bool) -> (Fixture, Vec<Function>) {
+                let mut fx = fixture();
+                let f = under_test(
+                    take_session(&fx),
+                    Ty::I64,
+                    vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            observe_at(1, fx.file.clone(), 0, session_field(0)),
+                            drop_of(0),
+                            int(2, 0),
+                        ],
+                        terminator: Terminator::Return(Some(ValueId(2))),
+                    }],
+                );
+                let mut functions = vec![f];
+                functions.extend(helpers(&mut fx));
+                if reversed {
+                    functions.reverse();
+                }
+                (fx, functions)
+            }
+            let messages = |fx: &Fixture, functions: Vec<Function>| -> Vec<String> {
+                let mut map = SourceMap::new();
+                let source = map.add_file("t.npt", "");
+                let module = Module {
+                    protocols: Vec::new(),
+                    extends: Vec::new(),
+                    functions,
+                    records: fx.records.clone(),
+                    variants: fx.variants.clone(),
+                };
+                let mut out: Vec<String> =
+                    verify_module(&module, source, &fx.interner, &ItemRegistry::default())
+                        .into_iter()
+                        .map(|d| format!("{}: {}", d.code, d.message))
+                        .filter(|line| line.starts_with("V010"))
+                        .collect();
+                out.sort();
+                out
+            };
+            let (forward_fx, forward) = build(false);
+            let (reversed_fx, reversed) = build(true);
+            let forward_messages = messages(&forward_fx, forward);
+            assert!(
+                !forward_messages.is_empty(),
+                "the fixture must actually report something"
+            );
+            assert_eq!(forward_messages, messages(&reversed_fx, reversed));
+        }
+        #[test]
         fn a_deep_chain_of_blocks_reaches_a_fixed_point_without_a_pass_cap() {
             let mut fx = fixture();
             // Deep enough that any fixed guess at "enough passes" would

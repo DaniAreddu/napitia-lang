@@ -131,6 +131,54 @@ the reasoning and the open questions this raises.
   fallback to `Ty::Error`, `false`, or treating an argument as merely
   observing. This is a real memory-safety layer -- not the universal
   region-inference design sketched below, which remains unimplemented.
+- **Lexically scoped observations** (`rfcs/0013`, Alpha 0.1.9):
+  `observe <place> as <name> { ... }` opens a read-only observation of
+  an addressable, live, transitively affine place, active for exactly
+  the lexical block that follows. The alias has the observed place's
+  own ordinary type, is immutable, and carries observation capability
+  and never ownership; there is no reference type, no `&`, no lifetime
+  syntax, no lifetime parameter, and no inference of a non-lexical
+  extent anywhere in the design.
+
+  While an observation is active, no *overlapping* place may be moved,
+  dropped, overwritten, structurally reinitialized, passed to a `take`
+  parameter, decomposed by a `match`, returned, raised, or captured by
+  a consuming `defer` (`U0017`). Overlap is the shared structural
+  relation (`rfcs/0012`'s `Place::is_ancestor_of`, in both directions):
+  the exact place, any ancestor, and any descendant. A disjoint sibling
+  place is completely unaffected and stays freely ownable. Any number
+  of overlapping observations may be active at once -- they are all
+  read-only, so nothing needs ordering against anything else -- and
+  ownership becomes available again only once every one of them has
+  ended. Observing an observation yields another observation, never an
+  owner.
+
+  The alias can never escape: returning it, raising it, dropping it,
+  storing it in an aggregate or a longer-lived slot, passing it to a
+  `take` parameter, decomposing it, or capturing it in any `defer` is
+  `U0016`, transitively for every place reached through it. Ending an
+  observation performs no cleanup and no ownership transfer -- it is
+  purely the point at which the alias stops being readable and the
+  owner stops being frozen -- and it happens exactly once on every path
+  leaving the block (fallthrough, `return`, an implicit tail return,
+  `raise`, postfix `?`, a `handle` arm, `break`, `continue`, or a
+  diverging arm), always *before* the ownership cleanup on that same
+  edge.
+
+  NIR writes both boundaries down explicitly, as
+  `ValueKind::ObservePlace` and `Instruction::EndObserve`, and
+  `nir::verify` re-establishes every invariant from those instructions
+  alone (`V0102`-`V0110`): one begin per identity, an end only while
+  that exact observation is the innermost active one, no reachable
+  exit with one still active, no predecessor disagreement, no use of an
+  observer (or anything derived from one) once it has ended, and no
+  ownership operation on an overlapping place. The interpreter enforces
+  the same thing again as real runtime *leases*: a view's handles are
+  bound to the lease at every depth, reading through an ended lease is
+  a structured error, ending one twice or out of order is refused, and
+  every ownership boundary consults the active leases during its own
+  plan phase -- so a refused operation leaves every generation, status,
+  field, tombstone, lease and event exactly as it found them.
 
 ## Accepted design direction
 

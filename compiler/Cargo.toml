@@ -1,6 +1,6 @@
 [package]
 name = "compiler"
-version = "0.1.9-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2024"
 # `rust-version` is Cargo's MSRV field: it would claim a *guaranteed
 # minimum* rustc, which has never been established here (edition 2024
@@ -24,3 +24,31 @@ path = "src/main.rs"
 # itself (no `serde` derive, no schema magic) so every diagnostic stays
 # in Napitia's own error model.
 toml = "0.8"
+
+# The native AOT backend (`src/native`, `rfcs/0014`). Cranelift is a
+# code generator, not a compiler framework: it takes a typed CFG that
+# already looks very much like NIR and produces machine code for one
+# named target, with no IR-level language assumptions of its own and no
+# C++ toolchain to build. That is exactly the surface this milestone
+# needs, and no more -- `cranelift-jit` is deliberately absent, since
+# Alpha 0.2.0 compiles ahead of time and nothing here runs generated
+# code in this process.
+#
+# `x86` is requested explicitly rather than relying on `host-arch`:
+# `napitia build` always targets `x86_64-unknown-linux-gnu`, including
+# from a host that is not one (an aarch64 macOS CI runner, say), so the
+# backend that target needs has to be compiled in regardless of what
+# the host happens to be.
+cranelift-codegen = { version = "0.135.2", features = ["x86"] }
+# Builds Cranelift IR from a CFG that is not already in SSA form --
+# which NIR, whose locals are `alloc`/`load`/`store` slots, is not.
+cranelift-frontend = "0.135.2"
+# The `Module`/`Linkage` abstraction `cranelift-object` implements:
+# declaring every function before any body is emitted.
+cranelift-module = "0.135.2"
+# Writes the compiled functions out as a real ELF object file. No
+# `target-lexicon` dependency is declared alongside it: the one
+# supported triple is named as a string and looked up through
+# `cranelift_codegen::isa::lookup_by_name`, so nothing here needs to
+# parse a triple into its components.
+cranelift-object = "0.135.2"

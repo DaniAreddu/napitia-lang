@@ -12,6 +12,7 @@ pub mod hir;
 pub mod interpreter;
 pub mod lexer;
 pub(crate) mod limits;
+pub mod native;
 pub mod nir;
 pub mod place;
 pub mod project;

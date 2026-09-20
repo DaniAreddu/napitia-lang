@@ -1,0 +1,46 @@
+// Inside the Alpha 0.2.0 native subset (`rfcs/0014`): the control flow
+// half of it -- a finite loop with a real backedge, nested branches on
+// both arms, and scalar locals carried across all of them.
+//
+//   napitia run   examples/native_control_flow.npt       -> 55
+//   napitia build examples/native_control_flow.npt --output control_flow
+//   ./control_flow; echo $?                              -> 55
+//
+// 55 is the sum of 1..10, with the odd steps taking one branch and the
+// even steps the other, so neither arm is dead.
+
+func main() -> i64 {
+    mutable total = 0;
+    mutable index = 1;
+
+    while index <= 10 {
+        if even(index) {
+            total = total + index;
+        } else {
+            // The same contribution, reached the other way, so both
+            // arms of the branch actually execute.
+            total = total + step(index);
+        }
+        index = index + 1;
+    }
+
+    if total > 0 {
+        return total;
+    }
+    return 0;
+}
+
+// No `%` here: the native backend refuses `rem` rather than borrowing
+// the hardware's answer for a zero divisor (`rfcs/0014`), so evenness
+// is decided by a loop over what the subset does contain.
+func even(x: i64) -> bool {
+    mutable remaining = x;
+    while remaining >= 2 {
+        remaining = remaining - 2;
+    }
+    return remaining == 0;
+}
+
+func step(x: i64) -> i64 {
+    return x;
+}

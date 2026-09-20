@@ -16,8 +16,16 @@ divergence rather than a decision.
 This milestone removes the divergence. `i64` becomes a signed
 two's-complement 64-bit integer in every stage of the compiler, its
 arithmetic becomes checked, and every numeric construct the checker
-accepts is one the interpreter and the native backend genuinely
-implement.
+accepts is one *the interpreter* genuinely implements -- the
+interpreter being the complete execution path the language is defined
+by.
+
+That is deliberately not a claim about the native backend, which
+compiles one subset of the language and refuses the rest. `f64`,
+`div`, `rem` and the shifts are all accepted by the checker, executed
+by the interpreter, and refused by the backend. "Interpreter/native
+equivalence" below says exactly which constructs the two share, and
+this RFC claims parity for those and no others.
 
 It is a stabilization release. It adds no numeric type, no conversion,
 no cast, no literal suffix and no wrapping operator.
@@ -92,6 +100,42 @@ arithmetic", and no Napitia construct catches one.
 
 Their codes are `X0001` through `X0004`; the table near the end of this
 document lists every diagnostic this RFC introduces, at every stage.
+
+### A runtime failure is a fatal abort
+
+An X-class arithmetic failure is **not** a Napitia control-flow exit. It
+is not a `raise`, it does not unwind scopes, and it runs no cleanup:
+
+* execution stops at the failing operation;
+* no later statement in any enclosing scope runs;
+* no `defer` action registered before it runs;
+* no automatic or explicit `drop` after it runs;
+* a nested call propagates the original failure unchanged, and every
+  frame it passes through is abandoned the same way.
+
+A resource that was live when the failure happened is therefore **not
+destroyed**. The runtime does not pretend otherwise: it emits no
+destruction event for it, and reports nothing about it at all. Cleanup
+that had *already* completed before the failure stays completed and is
+never repeated.
+
+`rfcs/0011`'s deterministic-cleanup guarantee is about Napitia
+*control-flow* exits -- normal fallthrough, `return`, `break`,
+`continue`, `raise`, `?` and `handle`. A fatal abort is none of those,
+and is the one documented exception to it.
+
+Because the state a fatal abort leaves is the middle of a statement
+rather than any state the language describes, the interpreter that was
+running it is finished. A later attempt to start another execution on
+the same interpreter is refused with `X0004` -- an invalid operation on
+the engine, not a second arithmetic failure, which would wrongly claim
+the new call performed the failing operation. The ordinary compiler
+driver builds a fresh interpreter per execution, so this is reachable
+only by a caller that keeps one and reuses it.
+
+A structured refusal of malformed input (`X0004`) is the opposite case:
+it is decided before anything changes, leaves the interpreter exactly as
+it was, and does not terminate it.
 
 What a runtime failure is never allowed to be: wrapping without explicit
 syntax, saturation, a Rust panic, a Cranelift panic, undefined behavior,
@@ -179,7 +223,8 @@ numeric type they do not implement.
 | `X0001` | run time | `div` or `rem` by zero |
 | `X0002` | run time | integer overflow |
 | `X0003` | run time | a shift count outside `0..64` |
-| `X0004` | run time | an operation the interpreter refused to perform on malformed NIR |
+| `X0004` | run time | malformed or unverified NIR the interpreter refused to execute, **or** an invalid operation on the execution engine itself -- reusing one a fatal abort already ended |
+| `A0009` | native build | a construct outside the native backend's capability boundary: `div`, `rem`, `shl`, `shr` |
 
 `X` is a new namespace, allocated the way `A` (native) and `V`
 (verifier) each got one. Nothing existing is renumbered, and no `X`
@@ -199,11 +244,37 @@ tested:
   IEEE-754 double operations;
 * division by zero producing an infinity rather than `X0001` -- a zero
   divisor is only a failure for integers;
-* `==` and `!=`, which answer `false` for a NaN on either side;
-* ordered comparison, which has *no* answer for a NaN and is `X0004`
-  rather than a fabricated ordering;
+* the six comparisons, each evaluated with its own IEEE-754 predicate;
 * deterministic printing through Rust's shortest round-tripping
   `Display`.
+
+### NaN comparisons
+
+A NaN is unordered with every value, itself included. Each predicate is
+evaluated with the floating-point operator it names, so:
+
+| Comparison | Result |
+| --- | --- |
+| `nan < x`, `nan <= x`, `nan > x`, `nan >= x` | `false` |
+| `x < nan`, `x <= nan`, `x > nan`, `x >= nan` | `false` |
+| `nan < nan`, `nan <= nan`, `nan > nan`, `nan >= nan` | `false` |
+| `nan == x`, `x == nan`, `nan == nan` | `false` |
+| `nan != x`, `x != nan`, `nan != nan` | `true` |
+
+`false` here is an *answer*, not a failure. None of these produces a
+diagnostic of any kind, and in particular none produces `X0004`: that
+code means the interpreter was handed NIR it cannot execute, and a
+program comparing a value it legitimately computed is not that.
+
+`<=` and `>=` are the two that get this wrong if they are derived from a
+total ordering by negation -- "not greater" and "not less" are true of a
+NaN under any ordering that claims to have one. They are not derived
+that way.
+
+Napitia has no syntax naming a NaN, so the only way to obtain one is an
+operation that produces it, such as `0.0 / 0.0`. Infinities are the
+same, and compare normally: `1.0 / 0.0` is greater than every finite
+value, and `0.0 == -0.0` is `true`.
 
 What is not implemented: any syntax naming a NaN or an infinity
 directly, float conversions of any kind, float bitwise operations, and
@@ -238,8 +309,12 @@ function per overflow-producing operator, each of which writes a fixed
 diagnostic to file descriptor 2 and calls `exit`.
 
 ```text
-napitia: runtime failure: integer overflow in `add`
+napitia: error[X0002]: integer overflow in `add`
 ```
+
+That is exactly what `napitia run` prints for the same failure, with the
+program's own name in front of it. The code and the sentence come from
+the same table both paths read, so they cannot drift.
 
 The status is **70**, chosen once and documented here. It is the only
 status a Napitia runtime failure produces.
@@ -257,18 +332,40 @@ than papered over.
 
 ## Interpreter/native equivalence
 
-For every program in the native subset, `napitia run` and the built
+The two paths do not implement the same language. The interpreter is the
+complete execution path; the native backend compiles one subset and
+refuses everything else. Equivalence is a claim about that subset only,
+and it is worth stating exactly what is in it.
+
+**Natively compiled:** `i64`, `bool` and `unit`; constants, locals,
+parameters and results of those types; `add`, `sub`, `mul`, `neg`,
+bitwise `and`/`or`/`xor`/`not`, and the six comparisons; `if`, `while`,
+branches and loop backedges; direct calls within one non-recursive call
+graph; a single `main` returning `i64` or `unit`.
+
+**Refused by the backend, with `A0009` for an operator and its own code
+otherwise, while the interpreter runs them normally:** `div`, `rem`,
+`shl`, `shr`, every `f64` program, and everything outside the scalar
+subset (resources, `observe`, `defer`, typed failure, records, variants,
+strings, `char`, generics, protocols, recursion, multi-module builds).
+
+For every program *inside* that subset, `napitia run` and the built
 executable agree:
 
 * on the value `main` returns, modulo the documented 8-bit truncation;
 * on whether the program fails at run time;
-* on the failure's category when it does.
+* on the failure's category and its exact message when it does.
 
 They agree over the whole `i64` domain, both boundaries included,
-because both now compute in exactly 64 bits. Where they could not agree
--- `div`, `rem`, `shl`, `shr`, floats, and everything outside the scalar
-subset -- the backend refuses the program before code generation rather
-than approximating it.
+because both now compute in exactly 64 bits.
+
+Outside it there is no parity to claim, and this RFC claims none. In
+particular the division rows in the table above -- `x / 0`, `x % 0`,
+`i64::MIN / -1`, `i64::MIN % -1` -- and every shift row are
+**interpreter-only**: a program containing any of those operators is
+refused by the backend before code generation, so it has no native
+behaviour to agree or disagree with. Of the checked operations, exactly
+four are compiled: `add`, `sub`, `mul` and `neg`.
 
 Neither execution path depends on how the *compiler* was built. Rust's
 own debug-mode overflow checks are irrelevant, because no Napitia

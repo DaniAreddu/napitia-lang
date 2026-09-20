@@ -1350,6 +1350,198 @@ mod tests {
         assert_eq!(STDERR, 2);
     }
 
+    /// The Cranelift IR one function lowers to, as text.
+    ///
+    /// Emitted bytes prove the handlers *exist*; they cannot show that
+    /// anything branches to one, because every handler is emitted
+    /// whether or not the program uses it. The IR shows the branch
+    /// itself, and can be read on a host that could never run the
+    /// result.
+    fn lowered_ir(text: &str, function_name: &str) -> (String, RuntimeFailures) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("native.npt", text);
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, registry } = driver::ir(&map, source, &mut interner) else {
+            panic!("the fixture must compile")
+        };
+        let plan = capability::validate(&nir, source, &interner, &registry, TARGET_TRIPLE, &[])
+            .expect("the fixture is inside the native subset");
+
+        let mut flags = settings::builder();
+        set_flag(&mut flags, "opt_level", "none").expect("a known flag");
+        set_flag(&mut flags, "is_pic", "true").expect("a known flag");
+        let isa =
+            isa::lookup(target_lexicon::Triple::from_str(TARGET_TRIPLE).expect("a real triple"))
+                .expect("a backend for the one target")
+                .finish(settings::Flags::new(flags))
+                .expect("a configurable backend");
+        let frontend_config = isa.frontend_config();
+        let builder =
+            ObjectBuilder::new(isa, OBJECT_NAME, cranelift_module::default_libcall_names())
+                .expect("an object builder");
+        let mut object = ObjectModule::new(builder);
+
+        let functions = index_functions(&nir, &plan);
+        let mut context = object.make_context();
+        let mut frontend = FunctionBuilderContext::new();
+        let runtime = define_runtime(&mut object, &mut context, &mut frontend, frontend_config)
+            .expect("the runtime is emitted");
+
+        let mut declared: BTreeMap<ItemId, FuncId> = BTreeMap::new();
+        for id in plan.functions() {
+            let function = lookup(&functions, *id).expect("a planned function");
+            let signature = native_signature(&mut object, function).expect("a native signature");
+            let symbol = symbol_name(*id, interner.resolve(function.name));
+            declared.insert(
+                *id,
+                object
+                    .declare_function(&symbol, Linkage::Local, &signature)
+                    .expect("a declarable function"),
+            );
+        }
+
+        for id in plan.functions() {
+            let function = lookup(&functions, *id).expect("a planned function");
+            if interner.resolve(function.name) != function_name {
+                continue;
+            }
+            let reachable = plan.reachable_blocks(*id).expect("a block plan");
+            context.func.signature =
+                native_signature(&mut object, function).expect("a native signature");
+            define_body(
+                &mut object,
+                &mut context,
+                &mut frontend,
+                frontend_config,
+                &declared,
+                &functions,
+                &runtime,
+                function,
+                reachable,
+            )
+            .expect("the body lowers");
+            return (context.func.display().to_string(), runtime);
+        }
+        panic!("`{function_name}` is not in the plan")
+    }
+
+    /// How Cranelift's own text names a declared function: the module's
+    /// namespace and the declaration's index. The handler's symbol name
+    /// does not appear in the IR, so this is what a reference to it
+    /// looks like.
+    fn reference_to(runtime: &RuntimeFailures, op: IntOp) -> String {
+        format!(
+            "u0:{}",
+            runtime
+                .handler(op)
+                .expect("a handler for a checked op")
+                .as_u32()
+        )
+    }
+
+    #[test]
+    fn a_checked_operation_branches_to_its_own_failure_handler() {
+        for (operator, op) in [
+            ("a + b", IntOp::Add),
+            ("a - b", IntOp::Sub),
+            ("a * b", IntOp::Mul),
+        ] {
+            let (ir, runtime) = lowered_ir(
+                &format!(
+                    "func work(a: i64, b: i64) -> i64 {{ return {operator}; }} \
+                     func main() -> i64 {{ return work(1, 2); }}"
+                ),
+                "work",
+            );
+            assert!(
+                ir.contains("brif"),
+                "`{operator}` must branch on its own overflow test:\n{ir}"
+            );
+            assert!(
+                ir.contains(&reference_to(&runtime, op)),
+                "`{operator}` must reach `{}`'s handler and no other:\n{ir}",
+                op.as_str()
+            );
+            for other in CHECKED.iter().filter(|other| **other != op) {
+                assert!(
+                    !ir.contains(&reference_to(&runtime, *other)),
+                    "`{operator}` must not reach `{}`'s handler:\n{ir}",
+                    other.as_str()
+                );
+            }
+            assert!(
+                ir.contains("trap"),
+                "the failure block is terminated after the handler call:\n{ir}"
+            );
+        }
+    }
+
+    #[test]
+    fn negation_branches_to_the_negation_handler_on_the_minimum_alone() {
+        let (ir, runtime) = lowered_ir(
+            "func work(a: i64) -> i64 { return -a; } \
+             func main() -> i64 { return work(1); }",
+            "work",
+        );
+        assert!(ir.contains("brif"), "{ir}");
+        assert!(ir.contains(&reference_to(&runtime, IntOp::Neg)), "{ir}");
+        assert!(
+            ir.contains("-9223372036854775808"),
+            "the test compares against the one value whose negation is not an i64:\n{ir}"
+        );
+    }
+
+    /// An operator with no exceptional case gets no test, no branch and
+    /// no trap.
+    #[test]
+    fn an_operator_that_cannot_leave_the_domain_gets_no_failure_branch() {
+        for (operator, returns, entry) in [
+            ("a & b", "i64", "return work(1, 2);"),
+            ("a | b", "i64", "return work(1, 2);"),
+            ("a ^ b", "i64", "return work(1, 2);"),
+            ("~a", "i64", "return work(1, 2);"),
+            ("a < b", "bool", "if work(1, 2) { return 1; } return 0;"),
+            ("a == b", "bool", "if work(1, 2) { return 1; } return 0;"),
+        ] {
+            let (ir, runtime) = lowered_ir(
+                &format!(
+                    "func work(a: i64, b: i64) -> {returns} {{ return {operator}; }} \
+                     func main() -> i64 {{ {entry} }}"
+                ),
+                "work",
+            );
+            assert!(
+                !ir.contains("trap"),
+                "`{operator}` cannot leave the domain, so it needs no failure path:\n{ir}"
+            );
+            for op in CHECKED {
+                assert!(
+                    !ir.contains(&reference_to(&runtime, op)),
+                    "`{operator}` must reach no handler at all:\n{ir}"
+                );
+            }
+        }
+    }
+
+    /// Every value in the generated IR is 64 bits wide, not 128.
+    #[test]
+    fn an_i64_is_lowered_as_a_64_bit_value() {
+        let (ir, _) = lowered_ir(
+            "func work(a: i64, b: i64) -> i64 { return a + b; } \
+             func main() -> i64 { return work(1, 2); }",
+            "work",
+        );
+        assert!(ir.contains("i64"), "{ir}");
+        assert!(
+            !ir.contains("i128"),
+            "nothing is held in a 128-bit value any more:\n{ir}"
+        );
+        assert!(
+            !ir.contains("isplit") && !ir.contains("iconcat"),
+            "and nothing is assembled out of two halves any more:\n{ir}"
+        );
+    }
+
     // -- the backend refuses rather than panics ----------------------------
 
     #[test]

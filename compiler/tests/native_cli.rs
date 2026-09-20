@@ -608,6 +608,35 @@ fn help_lists_the_build_command() {
     assert!(stdout(&output).contains("x86_64-unknown-linux-gnu"));
 }
 
+/// A `unit` parameter occupies no ABI position at all, so the native
+/// signature and every call to it have to agree about a value that is
+/// not there. Getting that wrong would shift every later argument by
+/// one, which is the kind of mistake that produces a program that runs
+/// and is simply wrong -- so it is checked against the interpreter's
+/// own answer rather than against "it linked".
+#[test]
+fn a_unit_parameter_occupies_no_abi_position() {
+    let workspace = Workspace::new("unit-abi");
+    let source = workspace.source(
+        "unit_abi",
+        "
+        func nothing() -> unit { return; }
+        func consume(before: unit, n: i64, after: unit, m: i64) -> i64 {
+            return n + m;
+        }
+        func main() -> i64 {
+            return consume(nothing(), 40, nothing(), 2);
+        }
+        ",
+    );
+    let output = workspace.output("unit abi");
+
+    assert_eq!(interpreted(&source), "42");
+    if let Some(status) = build_and_run(&source, &output) {
+        assert_eq!(status, 42, "a `unit` argument must not shift the others");
+    }
+}
+
 /// Every `.npt` example, so a newly added one is swept in automatically
 /// rather than needing to be listed here.
 fn every_example() -> Vec<String> {

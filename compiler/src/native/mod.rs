@@ -771,6 +771,26 @@ mod link_tests {
         assert!(!output.exists());
     }
 
+    /// A build directory that cannot be created at all -- here because
+    /// the directory the output was asked for does not exist -- is an
+    /// I/O failure with its own code, not a panic and not a linker
+    /// error blamed on the linker.
+    #[test]
+    fn an_output_in_a_directory_that_does_not_exist_is_an_io_failure() {
+        let directory = TempDir::new("missing-parent");
+        let output = directory.join("no such directory").join("program");
+        let diagnostic = link_object(
+            b"not a real object",
+            &output,
+            OsStr::new(DEFAULT_LINKER),
+            a_source(),
+        )
+        .expect_err("there is nowhere to put a build directory");
+
+        assert_eq!(diagnostic.code, codes::BUILD_IO_FAILED);
+        assert!(!output.exists());
+    }
+
     #[test]
     fn the_host_gate_matches_the_target_this_backend_compiles_for() {
         assert_eq!(

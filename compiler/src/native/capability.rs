@@ -3020,4 +3020,64 @@ mod hand_built_tests {
         assert!(first.contains(codes::ENTRY_RETURN_TYPE));
         assert_eq!(first, render());
     }
+
+    // -- unsupported terminators ------------------------------------------
+    //
+    // None of these three is reachable from ordinary source: a program
+    // that could produce one always carries a variant or a fallible
+    // signature too, and the type or the signature is refused first, as
+    // the root cause it is. Hand-built NIR is the only way to put the
+    // terminator itself under test.
+
+    fn refused_terminator(terminator: Terminator, extra: Vec<BasicBlock>) -> Vec<&'static str> {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let mut blocks = vec![block(0, vec![int(0, 1)], terminator)];
+        blocks.extend(extra);
+        let built = module(vec![func(0, main, Vec::new(), Ty::I64, blocks)]);
+        codes_of(&built, &interner)
+    }
+
+    #[test]
+    fn a_switch_is_refused() {
+        let codes = refused_terminator(
+            Terminator::Switch {
+                scrutinee: ValueId(0),
+                variant: ItemId(9),
+                cases: vec![BlockId(1)],
+            },
+            vec![block(1, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        assert_eq!(codes, vec![codes::UNSUPPORTED_TERMINATOR]);
+    }
+
+    #[test]
+    fn an_invoke_is_refused() {
+        let codes = refused_terminator(
+            Terminator::Invoke {
+                callee: ItemId(9),
+                type_args: Vec::new(),
+                args: Vec::new(),
+                evidence: Vec::new(),
+                ok_slot: ValueId(5),
+                ok_target: BlockId(1),
+                err_targets: vec![crate::nir::InvokeErrTarget {
+                    variant: ItemId(8),
+                    slot: ValueId(6),
+                    target: BlockId(2),
+                }],
+            },
+            vec![
+                block(1, Vec::new(), Terminator::Return(Some(ValueId(0)))),
+                block(2, Vec::new(), Terminator::Return(Some(ValueId(0)))),
+            ],
+        );
+        assert_eq!(codes, vec![codes::UNSUPPORTED_TERMINATOR]);
+    }
+
+    #[test]
+    fn a_raise_is_refused() {
+        let codes = refused_terminator(Terminator::Raise { value: ValueId(0) }, Vec::new());
+        assert_eq!(codes, vec![codes::UNSUPPORTED_TERMINATOR]);
+    }
 }

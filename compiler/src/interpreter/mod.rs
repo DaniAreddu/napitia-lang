@@ -2,13 +2,24 @@
 //! (`spec/0006`), used to validate language semantics before any native
 //! backend exists.
 //!
-//! Every runtime value is represented uniformly as an `i128`/`f64` pair
-//! of kinds regardless of its declared width (`i8` and `i64` both
-//! execute as `Value::Int`); this milestone does not model
-//! width-specific overflow or truncation behavior. Integer arithmetic
-//! wraps on overflow (`wrapping_add` etc.) rather than panicking, since
-//! Rust's debug-mode overflow checks would otherwise crash the
-//! interpreter on ordinary, valid Napitia programs.
+//! # Numbers
+//!
+//! A Napitia `i64` executes as exactly one thing here: a Rust `i64`
+//! (`rfcs/0015`). There is no wider intermediate representation, and no
+//! type whose declared width and executed width differ -- `i64` is the
+//! only integer type NIR carries, because the checker refuses the others
+//! and the verifier refuses them again.
+//!
+//! Its arithmetic is checked. `add`, `sub`, `mul`, `neg` and the
+//! `i64::MIN / -1` case produce a structured [`InterpreterError`] when
+//! the exact mathematical result is outside the domain, never a wrapped
+//! or saturated value. The rules themselves live in
+//! [`crate::types::numeric`], which is also where the checker reads them
+//! from, so nothing here restates what an overflow is.
+//!
+//! No Napitia arithmetic is performed by a bare Rust operator, so how
+//! *this compiler* was built -- debug or release, overflow checks on or
+//! off -- cannot change what a Napitia program means.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -18,7 +29,8 @@ use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind};
 use crate::place::{Place, Projection};
 use crate::symbol::Interner;
-use crate::types::{Evidence, Ty};
+use crate::types::numeric;
+use crate::types::{ArithFailure, Evidence, Ty};
 
 /// A resource record's own identity within one [`Interpreter`]'s own
 /// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
@@ -706,7 +718,10 @@ struct StorePlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Int(i128),
+    /// A Napitia `i64`, and exactly 64 bits of one (`rfcs/0015`). Not a
+    /// wider carrier wearing an `i64` label: every operation below is
+    /// defined on this domain and refuses to leave it.
+    Int(i64),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -771,18 +786,88 @@ pub enum Value {
     Dropped,
 }
 
-/// A condition the interpreter detects and reports instead of crashing:
-/// division/remainder by zero, or an internal-invariant violation (a
+/// Stable codes for the conditions that stop execution (`rfcs/0015`).
+///
+/// A new namespace, allocated the way `A` (native) and `V` (verifier)
+/// each got one when those layers appeared. No existing code is
+/// renumbered, and nothing here overlaps a compile-time code: these
+/// describe a program that compiled and then failed while running.
+pub mod codes {
+    /// `div` or `rem` with a zero divisor.
+    pub const DIVISION_BY_ZERO: &str = "X0001";
+    /// A checked integer operation whose exact result is outside `i64`.
+    pub const INTEGER_OVERFLOW: &str = "X0002";
+    /// A shift count outside `0..64`.
+    pub const SHIFT_AMOUNT_OUT_OF_RANGE: &str = "X0003";
+    /// An operation the interpreter refused to perform on the values it
+    /// was given -- malformed NIR that `nir::verify` should already have
+    /// rejected, reported rather than executed.
+    pub const INVALID_OPERATION: &str = "X0004";
+}
+
+/// A condition the interpreter detects and reports instead of crashing.
+///
+/// Two kinds, kept apart on purpose. An [`InterpreterError::Arithmetic`]
+/// is a *Napitia runtime failure*: a well-formed program asked for a
+/// result that does not exist, and `spec/0005` already reserves that as
+/// unrecoverable -- nothing in the language catches one, and it is not a
+/// `raises` value. An [`InterpreterError::InvalidOperation`] is the
+/// opposite: NIR that should never have reached execution at all (a
 /// value read before it was computed, an operator applied to
-/// incompatible value kinds, an unknown function). The latter should
-/// never happen for NIR produced by `nir::lower`, but the interpreter
-/// still returns a structured error rather than panicking or invoking
-/// undefined behavior, per the project's no-panic-on-malformed-input
-/// rule.
+/// incompatible kinds, a constant outside its own type). That cannot
+/// happen for NIR that went through `nir::verify`, and it is still
+/// returned as a structured error rather than a panic, per this
+/// project's no-panic-on-malformed-input rule.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
-    DivisionByZero,
+    /// A checked integer operation with no result in `i64`.
+    Arithmetic(ArithFailure),
     InvalidOperation(String),
+}
+
+impl InterpreterError {
+    /// This failure's stable code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            InterpreterError::Arithmetic(ArithFailure::Overflow(_)) => codes::INTEGER_OVERFLOW,
+            InterpreterError::Arithmetic(ArithFailure::DivisionByZero(_)) => {
+                codes::DIVISION_BY_ZERO
+            }
+            InterpreterError::Arithmetic(ArithFailure::ShiftAmount(_)) => {
+                codes::SHIFT_AMOUNT_OUT_OF_RANGE
+            }
+            InterpreterError::InvalidOperation(_) => codes::INVALID_OPERATION,
+        }
+    }
+}
+
+/// One line, decided entirely by the failure itself.
+///
+/// Nothing here depends on a source position, a hash order or how the
+/// compiler was built, so the same failing program renders identically
+/// on every run -- which is what lets a test compare the interpreter's
+/// answer with a native executable's byte for byte.
+impl std::fmt::Display for InterpreterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterpreterError::Arithmetic(ArithFailure::Overflow(op)) => {
+                write!(f, "integer overflow in `{}`", op.as_str())
+            }
+            InterpreterError::Arithmetic(ArithFailure::DivisionByZero(op)) => {
+                write!(f, "`{}` by zero", op.as_str())
+            }
+            InterpreterError::Arithmetic(ArithFailure::ShiftAmount(count)) => {
+                write!(f, "shift amount {count} is outside 0..64")
+            }
+            InterpreterError::InvalidOperation(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl From<ArithFailure> for InterpreterError {
+    fn from(failure: ArithFailure) -> Self {
+        InterpreterError::Arithmetic(failure)
+    }
 }
 
 /// A function frame's own two possible ways to end (`rfcs/0010`) -- never
@@ -3890,7 +3975,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, InterpreterError> {
         match kind {
             ValueKind::Alloc => Ok(Value::Unit),
-            ValueKind::Const(c) => Ok(const_value(c)),
+            ValueKind::Const(c) => const_value(c),
             ValueKind::Load(id) => get(values, id),
             // Both explicitly transfer ownership (`rfcs/0011`): the
             // source's own handle is immediately stale (any later read
@@ -3918,28 +4003,23 @@ impl<'a> Interpreter<'a> {
             ValueKind::ObservePlace { .. } => Err(invalid(
                 "ValueKind::ObservePlace must be evaluated by call_function directly, never through eval",
             )),
-            ValueKind::Add(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_add,
-                |x, y| x + y,
-            ),
-            ValueKind::Sub(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_sub,
-                |x, y| x - y,
-            ),
-            ValueKind::Mul(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_mul,
-                |x, y| x * y,
-            ),
-            ValueKind::Div(a, b) => div(get(values, a)?, get(values, b)?, false),
-            ValueKind::Rem(a, b) => div(get(values, a)?, get(values, b)?, true),
+            ValueKind::Add(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::add, |x, y| x + y)
+            }
+            ValueKind::Sub(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::sub, |x, y| x - y)
+            }
+            ValueKind::Mul(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::mul, |x, y| x * y)
+            }
+            ValueKind::Div(a, b) => {
+                divide(get(values, a)?, get(values, b)?, numeric::div, |x, y| x / y)
+            }
+            ValueKind::Rem(a, b) => {
+                divide(get(values, a)?, get(values, b)?, numeric::rem, |x, y| x % y)
+            }
             ValueKind::Neg(a) => match get(values, a)? {
-                Value::Int(x) => Ok(Value::Int(x.wrapping_neg())),
+                Value::Int(x) => Ok(Value::Int(numeric::neg(x)?)),
                 Value::Float(x) => Ok(Value::Float(-x)),
                 other => Err(invalid(format!("cannot negate {}", kind_name(&other)))),
             },
@@ -3954,8 +4034,8 @@ impl<'a> Interpreter<'a> {
             ValueKind::And(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x & y),
             ValueKind::Or(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x | y),
             ValueKind::Xor(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x ^ y),
-            ValueKind::Shl(a, b) => shift(get(values, a)?, get(values, b)?, i128::checked_shl),
-            ValueKind::Shr(a, b) => shift(get(values, a)?, get(values, b)?, i128::checked_shr),
+            ValueKind::Shl(a, b) => shift(get(values, a)?, get(values, b)?, numeric::shl),
+            ValueKind::Shr(a, b) => shift(get(values, a)?, get(values, b)?, numeric::shr),
             ValueKind::Eq(a, b) => Ok(Value::Bool(eq(&get(values, a)?, &get(values, b)?)?)),
             ValueKind::Ne(a, b) => Ok(Value::Bool(!eq(&get(values, a)?, &get(values, b)?)?)),
             ValueKind::Lt(a, b) => Ok(Value::Bool(
@@ -4382,25 +4462,42 @@ fn kind_name(value: &Value) -> &'static str {
     }
 }
 
-fn const_value(c: &Const) -> Value {
-    match c {
-        Const::Int(v) => Value::Int(*v as i128),
+/// The runtime value one verified NIR constant denotes.
+///
+/// `nir::verify` has already checked every integer constant against the
+/// domain of its own declared type, so the narrowing below cannot fail
+/// for NIR that reached execution the supported way. It is still
+/// checked: a direct caller can hand the interpreter an unverified
+/// module, and the answer to that is a structured refusal, not a
+/// truncated value.
+fn const_value(c: &Const) -> Result<Value, InterpreterError> {
+    Ok(match c {
+        Const::Int(v) => Value::Int(i64::try_from(*v).map_err(|_| {
+            invalid(format!(
+                "the constant {v} is not an i64; verification must reject it before execution"
+            ))
+        })?),
         Const::Float(v) => Value::Float(*v),
         Const::Bool(v) => Value::Bool(*v),
         Const::Char(v) => Value::Char(*v),
         Const::Str(v) => Value::Str(v.clone()),
         Const::Unit => Value::Unit,
-    }
+    })
 }
 
+/// `add`, `sub` and `mul`.
+///
+/// The integer side is checked and the float side is not, because they
+/// are different arithmetics: leaving `i64` has no answer, while leaving
+/// `f64`'s finite range has one IEEE-754 already defines (`rfcs/0015`).
 fn arith(
     a: Value,
     b: Value,
-    int_op: impl Fn(i128, i128) -> i128,
+    int_op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y))),
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y)?)),
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(x, y))),
         (a, b) => Err(invalid(format!(
             "arithmetic between {} and {}",
@@ -4410,17 +4507,20 @@ fn arith(
     }
 }
 
-fn div(a: Value, b: Value, remainder: bool) -> Result<Value, InterpreterError> {
+/// `div` and `rem`.
+///
+/// A zero divisor is a failure for integers and an infinity or a NaN for
+/// floats. That asymmetry is IEEE-754's, not an oversight: `1.0 / 0.0`
+/// has a defined answer and `1 / 0` does not.
+fn divide(
+    a: Value,
+    b: Value,
+    int_op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
+    float_op: impl Fn(f64, f64) -> f64,
+) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(_), Value::Int(0)) => Err(InterpreterError::DivisionByZero),
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(if remainder {
-            x.wrapping_rem(y)
-        } else {
-            x.wrapping_div(y)
-        })),
-        (Value::Float(x), Value::Float(y)) => {
-            Ok(Value::Float(if remainder { x % y } else { x / y }))
-        }
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y)?)),
+        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(x, y))),
         (a, b) => Err(invalid(format!(
             "division between {} and {}",
             kind_name(&a),
@@ -4429,7 +4529,7 @@ fn div(a: Value, b: Value, remainder: bool) -> Result<Value, InterpreterError> {
     }
 }
 
-fn bitop(a: Value, b: Value, op: impl Fn(i128, i128) -> i128) -> Result<Value, InterpreterError> {
+fn bitop(a: Value, b: Value, op: impl Fn(i64, i64) -> i64) -> Result<Value, InterpreterError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(Value::Int(op(x, y))),
         (a, b) => Err(invalid(format!(
@@ -4440,18 +4540,16 @@ fn bitop(a: Value, b: Value, op: impl Fn(i128, i128) -> i128) -> Result<Value, I
     }
 }
 
+/// A shift, whose count is itself an ordinary `i64` value -- so it can
+/// be negative, and a negative count is a failure rather than something
+/// to reinterpret as a large positive one.
 fn shift(
     a: Value,
     b: Value,
-    op: impl Fn(i128, u32) -> Option<i128>,
+    op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
 ) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => {
-            let amount = u32::try_from(y).map_err(|_| invalid("shift amount out of range"))?;
-            op(x, amount)
-                .map(Value::Int)
-                .ok_or_else(|| invalid("shift amount out of range"))
-        }
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(op(x, y)?)),
         (a, b) => Err(invalid(format!(
             "shift between {} and {}",
             kind_name(&a),
@@ -4504,6 +4602,7 @@ mod tests {
     use crate::parser::Parser;
     use crate::source::SourceMap;
     use crate::typeck::check_module;
+    use crate::types::IntOp;
 
     pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
         let mut map = SourceMap::new();
@@ -4719,13 +4818,23 @@ mod tests {
     #[test]
     fn detects_division_by_zero() {
         let text = "func main() -> i64 { value z = 0; return 1 / z }";
-        assert_eq!(run(text), Err(InterpreterError::DivisionByZero));
+        assert_eq!(
+            run(text),
+            Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+                IntOp::Div,
+            )))
+        );
     }
 
     #[test]
     fn detects_remainder_by_zero() {
         let text = "func main() -> i64 { value z = 0; return 1 % z }";
-        assert_eq!(run(text), Err(InterpreterError::DivisionByZero));
+        assert_eq!(
+            run(text),
+            Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+                IntOp::Rem,
+            )))
+        );
     }
 
     #[test]
@@ -4815,14 +4924,22 @@ mod tests {
     }
 
     #[test]
-    fn integer_overflow_wraps_instead_of_panicking() {
+    fn integer_overflow_is_a_runtime_failure_not_a_wrapped_value() {
+        // This used to assert the opposite: that `i64::MAX + 1`
+        // succeeded, because every integer was held in an `i128` and
+        // wrapped at 128 bits. `i64` is now 64 bits wide and its
+        // arithmetic is checked (`rfcs/0015`), so the sum has no result
+        // and the program fails instead of producing one.
         let text = format!(
             "func main() -> i64 {{ value m = {}; return m + 1 }}",
             i64::MAX
         );
-        // Must not panic; wrapping semantics are a documented
-        // simplification of this milestone's interpreter.
-        assert!(run(&text).is_ok());
+        assert_eq!(
+            run(&text),
+            Err(InterpreterError::Arithmetic(ArithFailure::Overflow(
+                IntOp::Add
+            )))
+        );
     }
 
     #[test]
@@ -8205,7 +8322,7 @@ mod store_place_transfer {
             .construct(NEST, vec![Value::Resource(inner)])
     }
 
-    fn a_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn a_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -8845,7 +8962,7 @@ mod drop_transaction {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -9507,7 +9624,7 @@ mod value_shape {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -9859,7 +9976,7 @@ mod transitive_observation {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -10116,7 +10233,7 @@ mod leak_backstop {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -10433,7 +10550,7 @@ mod transfer_transaction {
         }
     }
 
-    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -13711,13 +13828,11 @@ mod runtime_construction_validation {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(
-                value.try_into().expect("a constant this helper can carry"),
-            )),
+            kind: ValueKind::Const(Const::Int(value)),
         }
     }
 
-    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -14231,9 +14346,7 @@ mod typed_boundaries {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(
-                value.try_into().expect("a constant this helper can carry"),
-            )),
+            kind: ValueKind::Const(Const::Int(value)),
         }
     }
 
@@ -15406,9 +15519,7 @@ mod observation_leases {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(
-                value.try_into().expect("a constant this helper can carry"),
-            )),
+            kind: ValueKind::Const(Const::Int(value)),
         }
     }
 

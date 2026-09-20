@@ -28,10 +28,10 @@
 //!   owns -- and where this module does notice such a violation anyway
 //!   (it is a public API, and a caller can hand it anything), it refuses
 //!   with [`codes::UNVERIFIED_NIR`] rather than guessing.
-//! * [`capability`] runs after verification and before Cranelift ever
+//! * `capability` runs after verification and before Cranelift ever
 //!   sees a function. It decides, exhaustively, whether the whole
 //!   reachable program is inside the supported subset. Everything after
-//!   it may therefore assume that subset, which is why [`lower`] has no
+//!   it may therefore assume that subset, which is why `lower` has no
 //!   "unsupported, give up" path buried inside code generation.
 //!
 //! # Diagnostic layers
@@ -64,7 +64,7 @@ use crate::symbol::Interner;
 use crate::types::Ty;
 
 /// The one target triple `napitia build` produces, and the only one
-/// [`capability::validate`] accepts. Alpha 0.2.0 adds a single target
+/// the capability validator accepts. Alpha 0.2.0 adds a single target
 /// on purpose: a second one would need its own ABI decisions, its own
 /// linker contract and its own end-to-end test matrix, none of which
 /// this milestone has.
@@ -112,8 +112,8 @@ pub mod codes {
     pub const UNSUPPORTED_TERMINATOR: &str = "A0008";
     /// A reachable operator whose *exceptional* behavior this backend
     /// cannot reproduce without a runtime facility Alpha 0.2.0 does not
-    /// have -- [`super::capability`] documents exactly which operators those
-    /// are, and why each one is on that list.
+    /// have -- the capability validator documents exactly which
+    /// operators those are, and why each one is on that list.
     pub const UNSUPPORTED_OPERATOR: &str = "A0009";
     /// A reachable function declares type parameters, or a reachable
     /// call supplies type arguments. There is no monomorphization here.
@@ -276,7 +276,7 @@ pub const DEFAULT_LINKER: &str = "cc";
 /// C runtime than the one `x86_64-unknown-linux-gnu` names.
 ///
 /// Passing this gate is necessary and not sufficient. It says the host
-/// could plausibly have such a toolchain; [`classify_probe`] then asks
+/// could plausibly have such a toolchain; the `-dumpmachine` probe then asks
 /// the toolchain itself.
 pub const fn host_can_link() -> bool {
     cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") && cfg!(target_env = "gnu")
@@ -502,7 +502,7 @@ fn linker_launch_failure(linker: &OsStr, error: &std::io::Error, source: SourceI
 /// fails therefore cannot leave a truncated file that looks like a
 /// build, and cannot disturb an executable an earlier build left
 /// there: if this returns a diagnostic, `output` is byte-for-byte what
-/// it was before the call. See [`resolve_outcome`] for the one place
+/// it was before the call. See `resolve_outcome` for the one place
 /// that guarantee is decided, including why a cleanup failure *after*
 /// the executable is in place is not allowed to undo it.
 ///

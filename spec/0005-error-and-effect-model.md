@@ -112,6 +112,19 @@ have caught instead. Where the type system *can* catch a failure mode
 statically (e.g. calling with the wrong argument count), it does, and no
 `raises` declaration is needed at all.
 
+Integer overflow is the first of those conditions to be *implemented*
+(Alpha 0.2.1, `rfcs/0015`). `add`, `sub`, `mul`, `neg` and
+`i64::MIN / -1` on `i64` produce a runtime failure rather than a value,
+in both the interpreter and a natively built executable, on exactly the
+same inputs. It is unrecoverable exactly as described above: no `raises`
+clause models it, `?` cannot propagate it and `handle` cannot catch it.
+
+"Unrecoverable" is not "unstructured". The failure carries a stable code
+in its own `X` namespace, renders as one deterministic line, and stops
+the program with a documented status — never a Rust panic, never a
+backtrace, and never a raw hardware signal presented as a language rule.
+`rfcs/0015` specifies the codes, the rendering and the status.
+
 ## Unresolved research questions
 
 - **Resolved by `rfcs/0010` (Alpha 0.1.6):** `raises` is checked

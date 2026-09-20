@@ -13707,11 +13707,13 @@ mod runtime_construction_validation {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(value)),
+            kind: ValueKind::Const(Const::Int(
+                value.try_into().expect("a constant this helper can carry"),
+            )),
         }
     }
 
@@ -13794,7 +13796,7 @@ mod runtime_construction_validation {
     /// Builds a valid `File` in `%result`, from a constant in
     /// `%result - 1`, as a prefix every "now feed it somewhere illegal"
     /// test shares.
-    fn valid_file(descriptor: u128, konst: u32, result: u32) -> Vec<Instruction> {
+    fn valid_file(descriptor: i128, konst: u32, result: u32) -> Vec<Instruction> {
         vec![
             int(konst, descriptor),
             Instruction::Value {
@@ -14225,11 +14227,13 @@ mod typed_boundaries {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(value)),
+            kind: ValueKind::Const(Const::Int(
+                value.try_into().expect("a constant this helper can carry"),
+            )),
         }
     }
 
@@ -15402,7 +15406,9 @@ mod observation_leases {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(value as u128)),
+            kind: ValueKind::Const(Const::Int(
+                value.try_into().expect("a constant this helper can carry"),
+            )),
         }
     }
 

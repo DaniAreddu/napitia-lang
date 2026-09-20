@@ -1165,11 +1165,15 @@ mod link_tests {
         }
     }
 
-    fn hand_built_int(result: u32, literal: u128) -> Instruction {
+    fn hand_built_int(result: u32, literal: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(literal)),
+            kind: ValueKind::Const(Const::Int(
+                literal
+                    .try_into()
+                    .expect("a constant this helper can carry"),
+            )),
         }
     }
 

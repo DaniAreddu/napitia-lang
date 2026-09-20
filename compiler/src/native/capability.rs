@@ -91,23 +91,56 @@ pub const ENTRY_NAME: &str = "main";
 /// What [`validate`] hands to code generation: the exact, ordered set
 /// of things to compile.
 ///
+/// This type is also the native backend's proof of validation. Its
+/// fields are private to this module, so [`validate`] is the only thing
+/// that can mint one -- and [`super::lower::emit_object`] takes one by
+/// reference, so there is no way to reach Cranelift, from inside this
+/// crate or outside it, without having gone through the capability
+/// check first. The seal is the type, not a comment.
+///
 /// Every order in here is derived from semantic identity
 /// ([`ItemId`]/[`BlockId`]), never from the position an item happened to
 /// occupy in a `Vec`, so reversing `Module::functions` or a function's
 /// own `blocks` changes nothing about what is emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativePlan {
+pub(crate) struct NativePlan {
+    entry: ItemId,
+    entry_result: Scalar,
+    functions: Vec<ItemId>,
+    reachable_blocks: BTreeMap<ItemId, Vec<BlockId>>,
+}
+
+impl NativePlan {
     /// The single `main` this build compiles an entry wrapper around.
-    pub entry: ItemId,
+    pub(super) fn entry(&self) -> ItemId {
+        self.entry
+    }
+
     /// `main`'s own result: [`Scalar::Int`] or [`Scalar::Unit`], never
     /// anything else.
-    pub entry_result: Scalar,
+    pub(super) fn entry_result(&self) -> Scalar {
+        self.entry_result
+    }
+
     /// Every function reachable from [`NativePlan::entry`] through
     /// direct calls, in ascending [`ItemId`] order, `entry` included.
-    pub functions: Vec<ItemId>,
-    /// For each entry of [`NativePlan::functions`], the blocks reachable
-    /// from that function's own `bb0`, in ascending [`BlockId`] order.
-    pub reachable_blocks: BTreeMap<ItemId, Vec<BlockId>>,
+    pub(super) fn functions(&self) -> &[ItemId] {
+        &self.functions
+    }
+
+    /// The blocks reachable from `id`'s own `bb0`, in ascending
+    /// [`BlockId`] order.
+    ///
+    /// `None` for an id that is not one of [`NativePlan::functions`],
+    /// which a plan this validator built never contains. Lowering
+    /// reports that rather than substituting an empty body: a function
+    /// with no blocks is not the same thing as a function whose blocks
+    /// went missing.
+    pub(super) fn reachable_blocks(&self, id: ItemId) -> Option<&[BlockId]> {
+        self.reachable_blocks
+            .get(&id)
+            .map(|blocks| blocks.as_slice())
+    }
 }
 
 /// Validates `module` against the native subset, targeting `target`.
@@ -244,7 +277,19 @@ pub fn validate(
         let Some(function) = validator.functions.get(id).copied() else {
             continue;
         };
-        let blocks = reachable_blocks.get(id).cloned().unwrap_or_default();
+        // Never a default. A reachable function with no block plan
+        // means the walk above and this loop disagree about what is
+        // reachable, and an empty plan would quietly validate a body
+        // nothing looked at -- so it is reported as the internal defect
+        // it would be.
+        let Some(blocks) = reachable_blocks.get(id).cloned() else {
+            validator.diagnostics.push(validator.unverified(
+                *id,
+                format!("no block plan was built for function id {}", id.0),
+                "missing validation metadata".to_string(),
+            ));
+            continue;
+        };
         validator.validate_function(function, *id == entry, &blocks);
     }
 
@@ -254,13 +299,22 @@ pub fn validate(
         return Err(validator.diagnostics);
     }
 
-    // Only ever read after the entry's own signature was accepted,
-    // which is exactly what makes this classification total.
+    // Only ever read after the entry's own signature was accepted, so
+    // this classification is total in practice -- and if it somehow is
+    // not, that is reported rather than answered with a fabricated
+    // `unit` result.
     let entry_result = validator
         .functions
         .get(&entry)
-        .and_then(|function| scalar_of(&function.return_type))
-        .unwrap_or(Scalar::Unit);
+        .and_then(|function| scalar_of(&function.return_type));
+    let Some(entry_result) = entry_result else {
+        return Err(vec![validator.unverified(
+            entry,
+            "the entry function's result type survived validation without a native representation"
+                .to_string(),
+            "missing validation metadata".to_string(),
+        )]);
+    };
 
     Ok(NativePlan {
         entry,
@@ -572,20 +626,52 @@ impl<'a> Validator<'a> {
         };
         let slots = self.alloc_slots(reachable, &blocks);
 
+        // Which values are defined on *every* path reaching each block.
+        // For SSA -- one definition per value, which `value_types`
+        // above already enforced -- that is exactly dominance, and it
+        // is what stops a use the verifier would have rejected from
+        // reaching Cranelift and coming back as a backend defect.
+        let parameters: BTreeSet<ValueId> =
+            function.params.iter().map(|param| param.value).collect();
+        let universe: BTreeSet<ValueId> = types.keys().copied().collect();
+        let available = must_reach(
+            reachable,
+            &blocks,
+            &universe,
+            parameters.clone(),
+            defines_after,
+        );
+
         for id in reachable {
             let Some(block) = blocks.get(id) else {
                 continue;
             };
+            // A parameter is defined before the entry block runs, so it
+            // is live everywhere; the rest accumulates as the block
+            // executes, which is also what makes a use-before-define
+            // inside one block a refusal rather than a lookup that
+            // happens to succeed.
+            let mut live = available.get(id).cloned().unwrap_or_default();
+            live.extend(parameters.iter().copied());
             for instruction in &block.instructions {
                 if let Some(diagnostic) =
-                    self.check_instruction(function, *id, instruction, &types, &slots)
+                    self.check_instruction(function, *id, instruction, &types, &slots, &live)
                 {
                     return Some(diagnostic);
                 }
+                if let Instruction::Value { result, .. } = instruction {
+                    live.insert(*result);
+                }
             }
-            if let Some(diagnostic) =
-                self.check_terminator(function, *id, &block.terminator, &types, &slots, &blocks)
-            {
+            if let Some(diagnostic) = self.check_terminator(
+                function,
+                *id,
+                &block.terminator,
+                &types,
+                &slots,
+                &blocks,
+                &live,
+            ) {
                 return Some(diagnostic);
             }
         }
@@ -663,6 +749,7 @@ impl<'a> Validator<'a> {
     }
 
     /// Classifies one operand used as an ordinary value.
+    #[allow(clippy::too_many_arguments)]
     fn operand(
         &self,
         function: &'a Function,
@@ -670,6 +757,7 @@ impl<'a> Validator<'a> {
         value: ValueId,
         types: &BTreeMap<ValueId, Ty>,
         slots: &BTreeSet<ValueId>,
+        live: &BTreeSet<ValueId>,
     ) -> Result<Scalar, Refusal> {
         let name = self.name(function.id);
         if slots.contains(&value) {
@@ -681,6 +769,16 @@ impl<'a> Validator<'a> {
                     block.0, value.0
                 ),
                 "a slot is only ever stored into or loaded from".to_string(),
+            )));
+        }
+        if !live.contains(&value) {
+            return Err(Box::new(self.unverified(
+                function.id,
+                format!(
+                    "function `{name}`: bb{} uses %{}, which is not defined on every path that reaches it",
+                    block.0, value.0
+                ),
+                "value used outside its definition's reach".to_string(),
             )));
         }
         let Some(ty) = types.get(&value) else {
@@ -703,6 +801,7 @@ impl<'a> Validator<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_instruction(
         &self,
         function: &'a Function,
@@ -710,11 +809,12 @@ impl<'a> Validator<'a> {
         instruction: &Instruction,
         types: &BTreeMap<ValueId, Ty>,
         slots: &BTreeSet<ValueId>,
+        live: &BTreeSet<ValueId>,
     ) -> Option<Diagnostic> {
         let name = self.name(function.id);
         match instruction {
             Instruction::Value { result, ty, kind } => {
-                self.check_value(function, block, *result, ty, kind, types, slots)
+                self.check_value(function, block, *result, ty, kind, types, slots, live)
             }
             Instruction::Store { slot, value, mode } => {
                 if !matches!(mode, OwnershipMode::Observe) {
@@ -738,7 +838,7 @@ impl<'a> Validator<'a> {
                         "unknown slot".to_string(),
                     ));
                 }
-                let stored = match self.operand(function, block, *value, types, slots) {
+                let stored = match self.operand(function, block, *value, types, slots, live) {
                     Ok(scalar) => scalar,
                     Err(diagnostic) => return Some(*diagnostic),
                 };
@@ -816,9 +916,10 @@ impl<'a> Validator<'a> {
         kind: &ValueKind,
         types: &BTreeMap<ValueId, Ty>,
         slots: &BTreeSet<ValueId>,
+        live: &BTreeSet<ValueId>,
     ) -> Option<Diagnostic> {
         let name = self.name(function.id);
-        let operand = |value: ValueId| self.operand(function, block, value, types, slots);
+        let operand = |value: ValueId| self.operand(function, block, value, types, slots, live);
         let mismatch = |what: &str| {
             Some(self.unverified(
                 function.id,
@@ -941,6 +1042,7 @@ impl<'a> Validator<'a> {
                 evidence,
                 types,
                 slots,
+                live,
             ),
             ValueKind::ProtocolCall { .. } => Some(
                 self.about(
@@ -1060,6 +1162,7 @@ impl<'a> Validator<'a> {
         evidence: &[crate::types::Evidence],
         types: &BTreeMap<ValueId, Ty>,
         slots: &BTreeSet<ValueId>,
+        live: &BTreeSet<ValueId>,
     ) -> Option<Diagnostic> {
         let name = self.name(function.id);
         if !type_args.is_empty() {
@@ -1113,7 +1216,7 @@ impl<'a> Validator<'a> {
             ));
         }
         for (index, (arg, param)) in args.iter().zip(&target.params).enumerate() {
-            let actual = match self.operand(function, block, *arg, types, slots) {
+            let actual = match self.operand(function, block, *arg, types, slots, live) {
                 Ok(scalar) => scalar,
                 Err(diagnostic) => return Some(*diagnostic),
             };
@@ -1157,6 +1260,7 @@ impl<'a> Validator<'a> {
         types: &BTreeMap<ValueId, Ty>,
         slots: &BTreeSet<ValueId>,
         blocks: &BTreeMap<BlockId, &'a BasicBlock>,
+        live: &BTreeSet<ValueId>,
     ) -> Option<Diagnostic> {
         let name = self.name(function.id);
         let dangling = |target: BlockId| {
@@ -1174,7 +1278,8 @@ impl<'a> Validator<'a> {
                 let declared = scalar_of(&function.return_type);
                 match value {
                     Some(value) => {
-                        let actual = match self.operand(function, block, *value, types, slots) {
+                        let actual = match self.operand(function, block, *value, types, slots, live)
+                        {
                             Ok(scalar) => scalar,
                             Err(diagnostic) => return Some(*diagnostic),
                         };
@@ -1219,7 +1324,7 @@ impl<'a> Validator<'a> {
                 then_block,
                 else_block,
             } => {
-                let scalar = match self.operand(function, block, *condition, types, slots) {
+                let scalar = match self.operand(function, block, *condition, types, slots, live) {
                     Ok(scalar) => scalar,
                     Err(diagnostic) => return Some(*diagnostic),
                 };
@@ -1304,72 +1409,19 @@ impl<'a> Validator<'a> {
         if slots.is_empty() {
             return None;
         }
-        // Membership is asked once per edge, so it is worth a set: a
-        // linear scan of `reachable` here would make this pass
-        // quadratic in the size of a function, which is the wrong shape
-        // for something whose job includes not hanging.
-        let live: BTreeSet<BlockId> = reachable.iter().copied().collect();
-        let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
-        for id in reachable {
-            let Some(block) = blocks.get(id) else {
-                continue;
-            };
-            for target in terminator_targets(&block.terminator) {
-                if live.contains(&target) {
-                    predecessors.entry(target).or_default().insert(*id);
-                }
-            }
-        }
-
-        let mut entry_state: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
-        for id in reachable {
-            let state = if *id == BlockId(0) {
-                BTreeSet::new()
-            } else {
-                slots.clone()
-            };
-            entry_state.insert(*id, state);
-        }
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for id in reachable {
-                if *id == BlockId(0) {
-                    continue;
-                }
-                let Some(preds) = predecessors.get(id) else {
-                    // Unreachable from `bb0` by definition, so it is not
-                    // in `reachable`; a block with no predecessor other
-                    // than the entry cannot occur here.
-                    continue;
-                };
-                let mut incoming: Option<BTreeSet<ValueId>> = None;
-                for pred in preds {
-                    let out = match entry_state.get(pred) {
-                        Some(state) => stores_after(state, blocks.get(pred).copied()),
-                        None => continue,
-                    };
-                    incoming = Some(match incoming {
-                        Some(current) => current.intersection(&out).copied().collect(),
-                        None => out,
-                    });
-                }
-                let incoming = incoming.unwrap_or_default();
-                if let Some(existing) = entry_state.get_mut(id)
-                    && *existing != incoming
-                {
-                    *existing = incoming;
-                    changed = true;
-                }
-            }
-        }
+        // The same must-analysis the dominance check uses, over stores
+        // rather than definitions: a slot counts as stored at a block's
+        // entry only when every predecessor agrees.
+        let entry_state = must_reach(reachable, blocks, slots, BTreeSet::new(), stores_after);
 
         let name = self.name(function.id);
         for id in reachable {
             let Some(block) = blocks.get(id) else {
                 continue;
             };
+            // Same bottom, same direction: a block with no computed
+            // state has stored nothing, so every load in it is refused
+            // rather than waved through.
             let mut stored = entry_state.get(id).cloned().unwrap_or_default();
             for instruction in &block.instructions {
                 match instruction {
@@ -1411,16 +1463,23 @@ impl<'a> Validator<'a> {
         let mut edges: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
         let present: BTreeSet<ItemId> = functions.iter().copied().collect();
         for id in functions {
-            let mut targets: Vec<ItemId> = callees
-                .get(id)
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .copied()
-                        .filter(|target| present.contains(target))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Not defaulted to "no callees": a missing edge list would
+            // drop real call edges, and dropping edges is the direction
+            // that *misses* a recursion cycle rather than over-reporting
+            // one. A reachable function always has one.
+            let Some(recorded) = callees.get(id) else {
+                self.diagnostics.push(self.unverified(
+                    *id,
+                    format!("no call edges were recorded for function id {}", id.0),
+                    "missing validation metadata".to_string(),
+                ));
+                continue;
+            };
+            let mut targets: Vec<ItemId> = recorded
+                .iter()
+                .copied()
+                .filter(|target| present.contains(target))
+                .collect();
             targets.sort_unstable();
             targets.dedup();
             edges.insert(*id, targets);
@@ -1456,6 +1515,104 @@ impl<'a> Validator<'a> {
             );
         }
     }
+}
+
+/// A forward must-analysis over sets of [`ValueId`]: for every
+/// reachable block, what is already true on *every* path from `bb0` to
+/// its start.
+///
+/// `universe` is the optimistic starting point for every block but the
+/// entry, and `generated` says what a block leaves behind given what it
+/// began with. Sets only ever shrink away from `universe`, so the
+/// fixpoint is reached in at most `blocks * universe` narrowing steps
+/// and cannot spin.
+fn must_reach(
+    reachable: &[BlockId],
+    blocks: &BTreeMap<BlockId, &BasicBlock>,
+    universe: &BTreeSet<ValueId>,
+    entry: BTreeSet<ValueId>,
+    generated: impl Fn(&BTreeSet<ValueId>, Option<&BasicBlock>) -> BTreeSet<ValueId>,
+) -> BTreeMap<BlockId, BTreeSet<ValueId>> {
+    // Membership is asked once per edge, so it is worth a set: a linear
+    // scan of `reachable` here would make this quadratic in the size of
+    // a function, which is the wrong shape for something whose job
+    // includes not hanging.
+    let live: BTreeSet<BlockId> = reachable.iter().copied().collect();
+    let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    for id in reachable {
+        let Some(block) = blocks.get(id) else {
+            continue;
+        };
+        for target in terminator_targets(&block.terminator) {
+            if live.contains(&target) {
+                predecessors.entry(target).or_default().insert(*id);
+            }
+        }
+    }
+
+    let mut state: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    for id in reachable {
+        let start = if *id == BlockId(0) {
+            entry.clone()
+        } else {
+            universe.clone()
+        };
+        state.insert(*id, start);
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for id in reachable {
+            if *id == BlockId(0) {
+                continue;
+            }
+            let Some(preds) = predecessors.get(id) else {
+                // Unreachable from `bb0` by definition, so it is not in
+                // `reachable`; a block with no predecessor other than
+                // the entry cannot occur here.
+                continue;
+            };
+            let mut incoming: Option<BTreeSet<ValueId>> = None;
+            for pred in preds {
+                let out = match state.get(pred) {
+                    Some(current) => generated(current, blocks.get(pred).copied()),
+                    None => continue,
+                };
+                incoming = Some(match incoming {
+                    Some(current) => current.intersection(&out).copied().collect(),
+                    None => out,
+                });
+            }
+            // The empty set is this analysis's own bottom -- "nothing is
+            // established yet" -- not a masked lookup, and it is the
+            // conservative direction: it can only make a caller reject
+            // something, never accept it.
+            let incoming = incoming.unwrap_or_default();
+            if let Some(existing) = state.get_mut(id)
+                && *existing != incoming
+            {
+                *existing = incoming;
+                changed = true;
+            }
+        }
+    }
+    state
+}
+
+/// The values `block` has definitely defined by the time it ends, given
+/// what was definitely defined when it began.
+fn defines_after(entry: &BTreeSet<ValueId>, block: Option<&BasicBlock>) -> BTreeSet<ValueId> {
+    let mut state = entry.clone();
+    let Some(block) = block else {
+        return state;
+    };
+    for instruction in &block.instructions {
+        if let Instruction::Value { result, .. } = instruction {
+            state.insert(*result);
+        }
+    }
+    state
 }
 
 /// The slots `block` has definitely stored by the time it ends, given

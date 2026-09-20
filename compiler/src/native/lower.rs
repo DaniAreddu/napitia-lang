@@ -86,7 +86,7 @@ enum Native {
 ///
 /// Returns the object's bytes, or the single reason this backend could
 /// not produce them.
-pub fn emit_object(
+pub(super) fn emit_object(
     module: &Module,
     interner: &Interner,
     plan: &NativePlan,
@@ -122,7 +122,7 @@ pub fn emit_object(
     // Every function is declared before any body is emitted, so a call
     // never has to care whether its callee has been compiled yet.
     let mut declared: BTreeMap<ItemId, FuncId> = BTreeMap::new();
-    for id in &plan.functions {
+    for id in plan.functions() {
         let function = lookup(&functions, *id)?;
         let signature = native_signature(&mut object, function)?;
         let symbol = symbol_name(*id, interner.resolve(function.name));
@@ -134,11 +134,10 @@ pub fn emit_object(
 
     let mut context = object.make_context();
     let mut frontend = FunctionBuilderContext::new();
-    for id in &plan.functions {
+    for id in plan.functions() {
         let function = lookup(&functions, *id)?;
         let reachable = plan
-            .reachable_blocks
-            .get(id)
+            .reachable_blocks(*id)
             .ok_or_else(|| format!("no block plan for function id {}", id.0))?;
         context.func.signature = native_signature(&mut object, function)?;
         define_body(
@@ -190,7 +189,7 @@ fn set_flag(flags: &mut settings::Builder, name: &str, value: &str) -> Result<()
 /// collision, because the id alone already separates every function.
 /// None of these names is a documented interface; only
 /// [`ENTRY_SYMBOL`] is.
-pub fn symbol_name(id: ItemId, declared: &str) -> String {
+pub(super) fn symbol_name(id: ItemId, declared: &str) -> String {
     let mut sanitized = String::with_capacity(declared.len());
     for character in declared.chars() {
         if character.is_ascii_alphanumeric() || character == '_' {
@@ -203,7 +202,7 @@ pub fn symbol_name(id: ItemId, declared: &str) -> String {
 }
 
 fn index_functions<'a>(module: &'a Module, plan: &NativePlan) -> BTreeMap<ItemId, &'a Function> {
-    let wanted: BTreeSet<ItemId> = plan.functions.iter().copied().collect();
+    let wanted: BTreeSet<ItemId> = plan.functions().iter().copied().collect();
     let mut functions: BTreeMap<ItemId, &Function> = BTreeMap::new();
     for function in &module.functions {
         if wanted.contains(&function.id) {
@@ -265,7 +264,7 @@ fn native_signature(object: &mut ObjectModule, function: &Function) -> Result<Si
 fn reverse_postorder(
     blocks: &BTreeMap<BlockId, &BasicBlock>,
     reachable: &[BlockId],
-) -> Vec<BlockId> {
+) -> Result<Vec<BlockId>, String> {
     let live: BTreeSet<BlockId> = reachable.iter().copied().collect();
     let mut postorder: Vec<BlockId> = Vec::new();
     let mut visited: BTreeSet<BlockId> = BTreeSet::new();
@@ -277,18 +276,24 @@ fn reverse_postorder(
         visited.insert(BlockId(0));
     }
     while let Some((id, next)) = work.pop() {
-        let successors: Vec<BlockId> = blocks
-            .get(&id)
-            .map(|block| {
-                let mut targets: Vec<BlockId> = successors_of(&block.terminator)
-                    .into_iter()
-                    .filter(|target| live.contains(target))
-                    .collect();
-                targets.sort_unstable();
-                targets.dedup();
-                targets
-            })
-            .unwrap_or_default();
+        // A block the plan calls reachable that the function does not
+        // declare is an inconsistency between validation and lowering,
+        // not a block with no successors. Reported, never defaulted.
+        let Some(block) = blocks.get(&id) else {
+            return Err(format!(
+                "bb{} is in the plan but the function does not declare it",
+                id.0
+            ));
+        };
+        let successors: Vec<BlockId> = {
+            let mut targets: Vec<BlockId> = successors_of(&block.terminator)
+                .into_iter()
+                .filter(|target| live.contains(target))
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            targets
+        };
         let mut descended = false;
         for position in next..successors.len() {
             let Some(successor) = successors.get(position).copied() else {
@@ -306,7 +311,7 @@ fn reverse_postorder(
         }
     }
     postorder.reverse();
-    postorder
+    Ok(postorder)
 }
 
 fn successors_of(terminator: &Terminator) -> Vec<BlockId> {
@@ -341,7 +346,7 @@ fn define_body(
     for block in &function.blocks {
         blocks.entry(block.id).or_insert(block);
     }
-    let order = reverse_postorder(&blocks, reachable);
+    let order = reverse_postorder(&blocks, reachable)?;
 
     let mut builder = FunctionBuilder::new(&mut context.func, frontend);
 
@@ -785,7 +790,7 @@ fn define_entry_wrapper(
     plan: &NativePlan,
 ) -> Result<(), String> {
     let entry = declared
-        .get(&plan.entry)
+        .get(&plan.entry())
         .copied()
         .ok_or_else(|| "the entry function was never declared".to_string())?;
 
@@ -802,7 +807,7 @@ fn define_entry_wrapper(
         builder.switch_to_block(block);
         let func_ref = object.declare_func_in_func(entry, builder.func);
         let call = builder.ins().call(func_ref, &[]);
-        let status = match plan.entry_result {
+        let status = match plan.entry_result() {
             Scalar::Unit => builder.ins().iconst(types::I32, 0),
             Scalar::Int => {
                 let result = builder

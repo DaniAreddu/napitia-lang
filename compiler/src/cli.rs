@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::diagnostics::{self, Diagnostic};
-use crate::driver::{self, IrOutput, ProjectIrOutput, ProjectRunOutput, RunOutput};
+use crate::driver::{self, IrOutput, NativeOutput, ProjectIrOutput, ProjectRunOutput, RunOutput};
 use crate::interpreter::Value;
 use crate::lexer::Token;
 use crate::source::{SourceId, SourceMap};
@@ -22,10 +22,18 @@ Commands:
     check [path]    Type-check a file or project and report every diagnostic
     ir [path]       Print the typed Napitia IR (NIR) for a file or project
     run [path]      Compile and execute a file's or project's `main` function
+    build <file> --output <exe>
+                    Compile a .npt file to a native executable
 
 For `check`, `ir`, and `run`: `path` may be a `.npt` file (single-file mode),
 a directory containing a `napitia.toml` manifest, or a manifest path
 directly. It defaults to the current directory when omitted.
+
+`build` takes a `.npt` file only, and always targets
+x86_64-unknown-linux-gnu. It compiles a small scalar subset of the
+language ahead of time and refuses everything outside it with a
+diagnostic; `run` remains the complete semantic execution path. See
+`rfcs/0014-native-aot-preview.md`.
 
 Options:
     -h, --help      Print this help message
@@ -110,6 +118,40 @@ fn dispatch(args: Vec<String>) -> ExitCode {
                         return unexpected_argument_error(&extra);
                     }
                     dispatch_check_ir_run(&command, &path)
+                }
+                "build" => {
+                    let Some(path) = args.next() else {
+                        eprintln!("error: missing <file> argument for `build`\n");
+                        eprint!("{USAGE}");
+                        return ExitCode::from(USAGE_ERROR);
+                    };
+                    // `--output` is required rather than defaulted: the
+                    // one thing a native build does that no other
+                    // command does is write a file the user will run,
+                    // and guessing where to put it is not this
+                    // compiler's decision to make.
+                    match args.next().as_deref() {
+                        Some("--output") => {}
+                        Some(other) => {
+                            eprintln!("error: expected `--output <executable>`, found `{other}`\n");
+                            eprint!("{USAGE}");
+                            return ExitCode::from(USAGE_ERROR);
+                        }
+                        None => {
+                            eprintln!("error: missing `--output <executable>` for `build`\n");
+                            eprint!("{USAGE}");
+                            return ExitCode::from(USAGE_ERROR);
+                        }
+                    }
+                    let Some(output) = args.next() else {
+                        eprintln!("error: `--output` needs a path\n");
+                        eprint!("{USAGE}");
+                        return ExitCode::from(USAGE_ERROR);
+                    };
+                    if let Some(extra) = args.next() {
+                        return unexpected_argument_error(&extra);
+                    }
+                    build_command(&path, Path::new(&output))
                 }
                 _ => {
                     eprintln!("error: unknown command `{command}`\n");
@@ -213,6 +255,39 @@ fn dispatch_project(command: &str, manifest_path: &Path) -> ExitCode {
             }
         },
         _ => unreachable!("validated by dispatch_check_ir_run's caller"),
+    }
+}
+
+/// `napitia build <file.npt> --output <executable>` (`rfcs/0014`).
+///
+/// Single-file only, and explicitly so: a native build spans exactly
+/// one module, and a project path here would have to be refused later
+/// anyway, with a worse message.
+fn build_command(path: &str, output: &Path) -> ExitCode {
+    if Path::new(path).extension().and_then(|ext| ext.to_str()) != Some("npt") {
+        eprintln!("error: `build` takes a `.npt` file, not a project path\n");
+        eprint!("{USAGE}");
+        return ExitCode::from(USAGE_ERROR);
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!("error: could not read `{path}`: {err}");
+            return ExitCode::from(USAGE_ERROR);
+        }
+    };
+
+    let mut map = SourceMap::new();
+    let source = map.add_file(path.to_string(), content);
+    let mut interner = Interner::new();
+
+    match driver::build_native(&map, source, &mut interner, output) {
+        NativeOutput::Built => ExitCode::SUCCESS,
+        NativeOutput::Diagnostics(diagnostics) => {
+            print_diagnostics(&diagnostics, &map);
+            exit_for(&diagnostics)
+        }
     }
 }
 

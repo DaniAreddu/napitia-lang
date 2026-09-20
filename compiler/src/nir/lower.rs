@@ -35,7 +35,9 @@ use crate::place::{FieldId, Place, Projection};
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
-use crate::types::{CapabilityRequirement, Evidence, Ty, is_numeric, primitive_from_name};
+use crate::types::{
+    CapabilityRequirement, Evidence, Ty, domain_of, is_integer, is_numeric, primitive_from_name,
+};
 
 use super::block::BlockId;
 
@@ -1239,6 +1241,66 @@ impl<'a> Lowering<'a> {
     /// Builds the diagnostic for a construct that reached lowering
     /// without the checker having already rejected it -- see
     /// `codes::UNSUPPORTED_IN_NIR`.
+    /// Emits the one validated constant an integer literal denotes in
+    /// `ty` (`rfcs/0015`).
+    ///
+    /// `magnitude` is unsigned and `negated` is a separate flag, because
+    /// that pair is the only one that can express the minimum: its
+    /// magnitude is one past the maximum, so it never exists as a
+    /// positive value of its own type, and no amount of negating
+    /// afterwards can recover what was never representable.
+    ///
+    /// The checker has already rejected a literal that does not fit
+    /// (`T0073`), and has already decided `ty`. A refusal here therefore
+    /// means this compiler disagrees with itself, which is reported as
+    /// an internal invariant violation -- never truncated, never
+    /// wrapped, never panicked on.
+    fn int_literal(
+        &mut self,
+        fb: &mut FnBuilder,
+        ty: &Ty,
+        magnitude: u128,
+        negated: bool,
+        span: Span,
+    ) -> LowerResult<ValueId> {
+        let value = domain_of(ty)
+            .and_then(|domain| domain.literal(magnitude, negated))
+            .ok_or_else(|| {
+                let sign = if negated { "-" } else { "" };
+                Box::new(Diagnostic::error(
+                    codes::INTERNAL_INVARIANT_VIOLATED,
+                    self.source,
+                    span,
+                    format!(
+                        "the integer literal `{sign}{magnitude}` reached lowering with type \
+                         `{}`, which cannot hold it; typeck should have already rejected this",
+                        crate::types::display_ty(ty, self.interner)
+                    ),
+                ))
+            })?;
+        Ok(fb.push_value(ty.clone(), ValueKind::Const(Const::Int(value))))
+    }
+
+    /// The constant one literal pattern tests against, in the
+    /// scrutinee's own type.
+    fn literal_const(
+        &mut self,
+        fb: &mut FnBuilder,
+        lit: &LiteralTest,
+        ty: &Ty,
+    ) -> LowerResult<ValueId> {
+        Ok(match lit {
+            // A pattern literal carries no sign: the pattern grammar has
+            // no unary operator to give it one.
+            LiteralTest::Int(v, span) => return self.int_literal(fb, ty, *v, false, *span),
+            LiteralTest::Str(s) => {
+                fb.push_value(ty.clone(), ValueKind::Const(Const::Str((*s).to_string())))
+            }
+            LiteralTest::Char(c) => fb.push_value(ty.clone(), ValueKind::Const(Const::Char(*c))),
+            LiteralTest::Bool(b) => fb.push_value(ty.clone(), ValueKind::Const(Const::Bool(*b))),
+        })
+    }
+
     fn unsupported(&self, span: Span, feature: &str) -> Box<Diagnostic> {
         Box::new(Diagnostic::error(
             codes::UNSUPPORTED_IN_NIR,
@@ -2331,9 +2393,15 @@ impl<'a> Lowering<'a> {
 
     fn lower_expr(&mut self, fb: &mut FnBuilder, expr: &HirExpr) -> LowerResult<LoweredExpr> {
         match expr {
-            HirExpr::Int { value, .. } => Ok(LoweredExpr::Value(
-                fb.push_value(Ty::I64, ValueKind::Const(Const::Int(*value))),
-            )),
+            HirExpr::Int { value, span, .. } => {
+                // The literal's own type, as the checker resolved it --
+                // not `i64` re-derived from the fact that `i64` is what
+                // an unconstrained integer literal defaults to.
+                let ty = self.expr_ty(expr)?;
+                Ok(LoweredExpr::Value(
+                    self.int_literal(fb, &ty, *value, false, *span)?,
+                ))
+            }
             HirExpr::Float { value, .. } => Ok(LoweredExpr::Value(
                 fb.push_value(Ty::F64, ValueKind::Const(Const::Float(*value))),
             )),
@@ -2513,8 +2581,8 @@ impl<'a> Lowering<'a> {
         hint: &Ty,
     ) -> LowerResult<LoweredExpr> {
         match expr {
-            HirExpr::Int { value, .. } if is_numeric(hint) => Ok(LoweredExpr::Value(
-                fb.push_value(hint.clone(), ValueKind::Const(Const::Int(*value))),
+            HirExpr::Int { value, span, .. } if is_integer(hint) => Ok(LoweredExpr::Value(
+                self.int_literal(fb, hint, *value, false, *span)?,
             )),
             HirExpr::Float { value, .. } if is_numeric(hint) => Ok(LoweredExpr::Value(
                 fb.push_value(hint.clone(), ValueKind::Const(Const::Float(*value))),
@@ -2530,6 +2598,19 @@ impl<'a> Lowering<'a> {
         operand: &HirExpr,
     ) -> LowerResult<LoweredExpr> {
         let ty = self.expr_ty(operand)?;
+        // A negation applied directly to an integer literal is one
+        // constant, not a checked `neg` of another one (`rfcs/0015`).
+        // It has to be: the minimum's magnitude is not a value of its
+        // own type, so `neg` of a constant holding it could never be
+        // built. For every other literal the folded form denotes the
+        // same number without an operation that can fail.
+        if let (UnaryOp::Neg, HirExpr::Int { value, span, .. }) = (op, operand)
+            && domain_of(&ty).is_some()
+        {
+            return Ok(LoweredExpr::Value(
+                self.int_literal(fb, &ty, *value, true, *span)?,
+            ));
+        }
         let v = match self.lower_expr_hinted(fb, operand, &ty)? {
             LoweredExpr::Value(v) => v,
             LoweredExpr::Diverged => return Ok(LoweredExpr::Diverged),
@@ -4553,7 +4634,7 @@ impl<'a> Lowering<'a> {
                 self.lower_decision(fb, new_rows, rest_occ, arms, sink, depth + 1)
             }
             Classified::Literal(lit) => {
-                let const_value = literal_const(fb, &lit, &occ.ty);
+                let const_value = self.literal_const(fb, &lit, &occ.ty)?;
                 let eq = fb.push_value(Ty::Bool, ValueKind::Eq(occ.value, const_value));
                 let then_block = fb.new_block();
                 let else_block = fb.new_block();
@@ -4661,7 +4742,9 @@ impl<'a> Lowering<'a> {
                     args,
                 },
             },
-            HirPattern::Int { value, .. } => Classified::Literal(LiteralTest::Int(*value)),
+            HirPattern::Int { value, span, .. } => {
+                Classified::Literal(LiteralTest::Int(*value, *span))
+            }
             HirPattern::Str { value, .. } => Classified::Literal(LiteralTest::Str(value)),
             HirPattern::Char { value, .. } => Classified::Literal(LiteralTest::Char(*value)),
             HirPattern::Bool { value, .. } => Classified::Literal(LiteralTest::Bool(*value)),
@@ -4940,7 +5023,11 @@ enum Classified<'h> {
 }
 
 enum LiteralTest<'h> {
-    Int(u128),
+    /// The literal's magnitude and its own span. The span travels with
+    /// it so the constant this test lowers to can be built against the
+    /// scrutinee's type and still point somewhere real if that type
+    /// cannot hold it.
+    Int(u128, Span),
     Str(&'h str),
     Char(char),
     Bool(bool),
@@ -4948,22 +5035,13 @@ enum LiteralTest<'h> {
 
 fn literal_eq(a: &LiteralTest, b: &LiteralTest) -> bool {
     match (a, b) {
-        (LiteralTest::Int(x), LiteralTest::Int(y)) => x == y,
+        // Two literal tests are the same test when they test the same
+        // number. Where each was written is not part of that.
+        (LiteralTest::Int(x, _), LiteralTest::Int(y, _)) => x == y,
         (LiteralTest::Str(x), LiteralTest::Str(y)) => x == y,
         (LiteralTest::Char(x), LiteralTest::Char(y)) => x == y,
         (LiteralTest::Bool(x), LiteralTest::Bool(y)) => x == y,
         _ => false,
-    }
-}
-
-fn literal_const(fb: &mut FnBuilder, lit: &LiteralTest, ty: &Ty) -> ValueId {
-    match lit {
-        LiteralTest::Int(v) => fb.push_value(ty.clone(), ValueKind::Const(Const::Int(*v))),
-        LiteralTest::Str(s) => {
-            fb.push_value(ty.clone(), ValueKind::Const(Const::Str((*s).to_string())))
-        }
-        LiteralTest::Char(c) => fb.push_value(ty.clone(), ValueKind::Const(Const::Char(*c))),
-        LiteralTest::Bool(b) => fb.push_value(ty.clone(), ValueKind::Const(Const::Bool(*b))),
     }
 }
 
@@ -8488,7 +8566,12 @@ mod tests {
             variants,
             other_items: vec![],
         };
-        let (local_types, expr_types, pattern_case) = empty_maps();
+        let (local_types, mut expr_types, pattern_case) = empty_maps();
+        // The tail is a literal, and lowering reads a literal's type
+        // from this map rather than assuming the `i64` an unconstrained
+        // one would default to (`rfcs/0015`). Hand-built HIR has to
+        // supply it, exactly as typeck would have.
+        expr_types.insert(ExprId(0), Ty::I64);
         let empty_affine = crate::resourceck::AffineContext {
             aggregate_field_types: &HashMap::new(),
             declared_resources: &HashSet::new(),

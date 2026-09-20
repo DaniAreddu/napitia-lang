@@ -27,6 +27,16 @@ expression that provably never produces a value (e.g. an unconditional
 `return`); it unifies with anything, since control never reaches the point
 where the mismatch would matter.
 
+Every name above parses and resolves. Only two of the twelve numeric
+names are *executed*: `i64`, everywhere, and `f64`, in the interpreter.
+Naming any of the other ten is a diagnostic saying this milestone does
+not implement it, rather than an acceptance followed by arithmetic of a
+different width under that name. `i64`'s domain, its checked
+arithmetic, the literal range rules, the status of each numeric name,
+and the float limitations are specified once, in
+`rfcs/0015-numeric-semantics.md`; this document does not restate that
+table.
+
 ### Function signatures
 
 Function parameter types and return types must be written explicitly.
@@ -56,6 +66,14 @@ a binary expression, or (failing all of those) a default of `i64`. The
 same applies to float literals defaulting to `f64`. This mirrors "untyped
 constant" inference in other statically typed languages with literal
 inference, without introducing a separate compile-time-only numeric type.
+
+A literal's *magnitude* is checked against the domain of whatever type
+it ends up with, once unification and defaulting have both finished —
+never where it is written, since its type is not decided there. A
+magnitude that does not fit is `T0073`, reported against the literal
+itself and before lowering runs. The sign is tracked separately from
+the magnitude, because `-9223372036854775808` is an `i64` and
+`9223372036854775808` is not (`rfcs/0015`).
 
 ### Checking rules implemented
 
@@ -351,12 +369,14 @@ signature being called against.
 
 ## Explicit non-goals of this milestone
 
-- **No implicit narrowing conversions.** `i64` is never implicitly used
-  where `i32` is expected, or vice versa, even when the literal value
-  would fit. Narrowing requires an explicit `as` cast (see `spec/0002`),
-  and `as` casts that can lose information are accepted syntax but are
-  themselves a deliberate, visible operation, never inserted by the
-  checker.
+- **No implicit conversions, narrowing or widening.** No numeric type is
+  ever implicitly used where another is expected, even when the literal
+  value would fit, and integers and floats never mix in an expression,
+  an argument, a return or a comparison. A conversion would require an
+  explicit `as` cast (see `spec/0002`), which parses and is rejected;
+  nothing is ever inserted by the checker. `rfcs/0015` records that no
+  cast, literal suffix, wrapping operator or saturating operator exists
+  or is reserved.
 - **No `null`.** There is no type-system-level "nullable" flag on any
   type; absence is represented by a Napitia-native `variant` type
   (provisionally `Maybe[T]`, see `spec/0005`) — now expressible directly

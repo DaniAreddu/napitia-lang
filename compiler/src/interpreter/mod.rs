@@ -18459,12 +18459,16 @@ mod unexecutable_numeric_nir {
     }
 }
 
-/// `rfcs/0015` -- what a fatal arithmetic abort does to an execution.
+/// `rfcs/0015` -- what a fatal abort does to an execution.
 ///
-/// An X-class arithmetic failure is not a Napitia control-flow exit. It
-/// is not a `raise`, it does not unwind scopes, and it runs no `drop`
-/// and no `defer`. Execution stops where it stood, and the interpreter
-/// that was running it is finished.
+/// This module covers the arithmetic half of the rule; the stateful
+/// half -- a failure found after a frame has already changed things --
+/// lives in `stateful_termination` below.
+///
+/// A failure that reaches a running frame is not a Napitia control-flow
+/// exit. It is not a `raise`, it does not unwind scopes, and it runs no
+/// `drop` and no `defer`. Execution stops where it stood, and the
+/// interpreter that was running it is finished.
 ///
 /// The deterministic event log is what makes this testable rather than
 /// asserted: it records every frame entered and every resource actually
@@ -18692,7 +18696,7 @@ mod fatal_abort {
     }
 
     /// A fresh interpreter per execution is unaffected: the termination
-    /// is a property of the engine that aborted, not of the module.
+    /// is a property of the engine whose frame failed, not of the module.
     #[test]
     fn a_fresh_interpreter_runs_the_same_module_normally() {
         let (nir, interner) = compiled(&format!(
@@ -18707,16 +18711,19 @@ mod fatal_abort {
         assert_eq!(
             Interpreter::new(&nir).run("ok", &interner),
             Ok(Value::Int(1)),
-            "a different interpreter never entered the aborted state"
+            "a different interpreter never entered the terminated state"
         );
     }
 
-    /// A refusal of malformed input is *not* a fatal abort: it is
-    /// checked before anything changes, so the engine stays usable. That
-    /// distinction is what keeps the transactional-refusal contract
-    /// meaningful.
+    /// A refusal decided *before any frame is entered* is not a fatal
+    /// abort: nothing ran and nothing changed, so the engine stays
+    /// usable.
+    ///
+    /// This is specifically about preflight refusals. A malformed-input
+    /// refusal found *during* execution does terminate the context, and
+    /// `stateful_termination` covers that case.
     #[test]
-    fn a_structured_refusal_does_not_terminate_the_engine() {
+    fn a_preflight_refusal_does_not_terminate_the_engine() {
         let (nir, interner) = compiled("func ok() -> i64 { return 1 }");
         let interpreter = Interpreter::new(&nir);
 

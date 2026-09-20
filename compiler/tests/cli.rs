@@ -1788,3 +1788,198 @@ fn every_example_produces_identical_output_at_every_stage_across_two_runs() {
         }
     }
 }
+
+// -- the numeric contract, through the real binary (`rfcs/0015`) ----------
+
+/// A directory of this section's own `.npt` fixtures, removed when the
+/// test that made it ends. The numeric contract needs programs written
+/// around exact boundary values, and a shared temporary name would let
+/// two of these tests overwrite each other's source mid-run.
+struct Fixtures {
+    path: std::path::PathBuf,
+}
+
+impl Fixtures {
+    fn new(tag: &str) -> Fixtures {
+        let path =
+            std::env::temp_dir().join(format!("napitia numeric {tag} {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("could not create a fixture directory");
+        Fixtures { path }
+    }
+
+    fn write(&self, name: &str, text: &str) -> String {
+        let path = self.path.join(name);
+        std::fs::write(&path, text).expect("could not write a fixture");
+        path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Fixtures {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn the_numeric_boundaries_example_answers_the_same_thing_every_time() {
+    let path = example("numeric_boundaries.npt");
+    let first = napitia(&["run", &path]);
+    assert!(
+        first.status.success(),
+        "the example must run:\n{}",
+        stderr(&first)
+    );
+    assert_eq!(stdout(&first).trim(), "42");
+    assert!(
+        stderr(&first).is_empty(),
+        "a successful run says nothing on stderr: {}",
+        stderr(&first)
+    );
+
+    let second = napitia(&["run", &path]);
+    assert_eq!(stdout(&first), stdout(&second));
+
+    // And its NIR is byte-identical across runs, since nothing about
+    // lowering may depend on a hash order.
+    let ir_first = napitia(&["ir", &path]);
+    let ir_second = napitia(&["ir", &path]);
+    assert!(ir_first.status.success());
+    assert_eq!(stdout(&ir_first), stdout(&ir_second));
+}
+
+#[test]
+fn the_out_of_range_literal_example_is_t0073_at_every_stage() {
+    assert_resource_example_rejected("numeric_literal_range_invalid.npt", "T0073");
+}
+
+/// Both boundaries are literals the compiler accepts; neither
+/// neighbour is. Exercised through the binary rather than the library,
+/// because the point is that the whole pipeline agrees.
+#[test]
+fn the_boundary_literals_are_accepted_and_their_neighbours_are_not() {
+    let directory = Fixtures::new("literal-boundaries");
+    for (name, literal, accepted) in [
+        ("min", "-9223372036854775808", true),
+        ("max", "9223372036854775807", true),
+        ("below_min", "-9223372036854775809", false),
+        ("above_max", "9223372036854775808", false),
+    ] {
+        let path = directory.write(
+            &format!("{name}.npt"),
+            &format!("func main() -> i64 {{ value x: i64 = {literal}; return 0 }}"),
+        );
+        let checked = napitia(&["check", &path]);
+        assert_eq!(
+            checked.status.success(),
+            accepted,
+            "`{literal}`:\n{}",
+            stderr(&checked)
+        );
+        if !accepted {
+            assert!(stderr(&checked).contains("error[T0073]"), "`{literal}`");
+        }
+    }
+}
+
+/// An overflow is a runtime failure with a stable code and a stable
+/// line, not a wrapped value and not a Rust panic.
+#[test]
+fn an_overflow_is_a_structured_runtime_failure() {
+    let directory = Fixtures::new("overflow");
+    for (name, body, code, text) in [
+        (
+            "add",
+            "value m: i64 = 9223372036854775807; return m + 1",
+            "X0002",
+            "integer overflow in `add`",
+        ),
+        (
+            "neg",
+            "value m: i64 = -9223372036854775808; return -m",
+            "X0002",
+            "integer overflow in `neg`",
+        ),
+        (
+            "div_by_zero",
+            "value z: i64 = 0; return 1 / z",
+            "X0001",
+            "`div` by zero",
+        ),
+        (
+            "shift",
+            "value n: i64 = 64; return 1 << n",
+            "X0003",
+            "shift amount 64 is outside 0..64",
+        ),
+    ] {
+        let path = directory.write(
+            &format!("{name}.npt"),
+            &format!("func main() -> i64 {{ {body} }}"),
+        );
+        let output = napitia(&["run", &path]);
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "`{name}`: {err}");
+        assert_eq!(err.trim(), format!("error[{code}]: {text}"), "`{name}`");
+        assert!(
+            stdout(&output).is_empty(),
+            "`{name}`: a failed run prints no value"
+        );
+        assert!(
+            !err.to_lowercase().contains("panic") && !err.contains("RUST_BACKTRACE"),
+            "`{name}`: {err}"
+        );
+        assert_eq!(
+            err,
+            stderr(&napitia(&["run", &path])),
+            "`{name}`: repeated runs differ"
+        );
+    }
+}
+
+/// A numeric type this milestone does not execute is refused by
+/// `check`, so it never reaches a stage that would have to invent
+/// behavior for it.
+#[test]
+fn an_unimplemented_numeric_type_is_t0074_at_every_stage() {
+    let directory = Fixtures::new("numeric-types");
+    for name in [
+        "i8", "i16", "i32", "isize", "u8", "u16", "u32", "u64", "usize", "f32",
+    ] {
+        let path = directory.write(
+            &format!("ty_{name}.npt"),
+            &format!("func f(x: {name}) -> i64 {{ return 0 }}\nfunc main() -> i64 {{ return 0 }}"),
+        );
+        for cmd in ["check", "ir", "run"] {
+            let output = napitia(&[cmd, &path]);
+            let err = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "`{name}`/{cmd}: {err}");
+            assert!(err.contains("error[T0074]"), "`{name}`/{cmd}: {err}");
+            assert!(
+                !err.contains("I0") && !err.contains("V0"),
+                "`{name}`/{cmd} leaked an internal diagnostic: {err}"
+            );
+        }
+    }
+}
+
+/// `i64` and `f64` are the two that do run.
+#[test]
+fn the_two_implemented_numeric_types_run() {
+    let directory = Fixtures::new("implemented-numerics");
+    let integer = directory.write(
+        "int.npt",
+        "func f(x: i64) -> i64 { return x + 1 }\nfunc main() -> i64 { return f(41) }",
+    );
+    let output = napitia(&["run", &integer]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "42");
+
+    let float = directory.write(
+        "float.npt",
+        "func f(x: f64) -> f64 { return x + 0.5 }\nfunc main() -> f64 { return f(41.5) }",
+    );
+    let output = napitia(&["run", &float]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "42");
+}

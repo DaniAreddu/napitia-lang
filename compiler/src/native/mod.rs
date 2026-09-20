@@ -43,6 +43,7 @@
 //! merely unsupported.
 
 pub mod capability;
+pub mod lower;
 
 use crate::types::Ty;
 

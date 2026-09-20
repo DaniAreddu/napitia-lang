@@ -519,6 +519,15 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   "operands of incompatible widths or signedness" reduces to while
   exactly one integer width exists: there is no second width for an
   operand to disagree about.
+
+  Verification is not the only guard. NIR is hand-buildable and can be
+  handed straight to the interpreter, so the interpreter enforces the
+  same rule again while executing: a runtime integer is a value of
+  `i64` and nothing else, a runtime float is a value of `f64` and
+  nothing else, and an instruction's declared result type is checked
+  *before* the instruction runs as well as against the value it
+  produced. A caller that skips verification gets a structured refusal
+  (`X0004`), never arithmetic performed under the wrong type's name.
 - **Aggregates** (Alpha 0.1.1): `record.create`/`variant.create`
   reference a declared record/variant and initialize every field/match
   their case's payload arity and types exactly once each;

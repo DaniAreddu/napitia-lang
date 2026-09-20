@@ -208,9 +208,23 @@ remove. It is now forbidden for `check` to accept a numeric construct
 that later reaches a fabricated value, a silent truncation, a
 `Ty::Error`, an internal diagnostic or a Rust panic.
 
-The NIR verifier enforces the same restriction independently, so
-hand-built NIR cannot reach the interpreter or the backend carrying a
-numeric type they do not implement.
+Three stages enforce this independently, so no single bypass is enough:
+
+* `check` refuses the name in source (`T0073` for a literal out of
+  range, `T0074` for the type);
+* `nir::verify` refuses it in NIR (`V0111`, `V0112`), including nested
+  inside a generic argument;
+* the interpreter refuses it again at run time (`X0004`), because NIR
+  can be hand-built and handed straight to it.
+
+The interpreter's own rule is exact: a runtime integer is a value of
+`i64` and nothing else, a runtime float is a value of `f64` and nothing
+else. An instruction's declared result type is checked under its
+frame's own instantiation *before* the instruction runs -- evaluating
+one can construct a resource, transfer ownership or enter a call -- and
+the value it produced is checked against that type afterwards. So a
+caller that skipped verification gets a structured refusal rather than
+`u8` arithmetic performed on an `i64`.
 
 ## The diagnostics this RFC introduces
 

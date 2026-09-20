@@ -98,13 +98,17 @@ Runtime failures are not `raises` values. They are the unrecoverable
 class `spec/0005` already reserves for "integer overflow in checked
 arithmetic", and no Napitia construct catches one.
 
-Their codes are `X0001` through `X0004`; the table near the end of this
+Arithmetic runtime failures carry `X0001`, `X0002` and `X0003`, and
+those three only. `X0004` is *not* one of them: it means malformed or
+unverified NIR, or an invalid operation on the execution engine, and a
+valid program never produces it. The table near the end of this
 document lists every diagnostic this RFC introduces, at every stage.
 
 ### A runtime failure is a fatal abort
 
-An X-class arithmetic failure is **not** a Napitia control-flow exit. It
-is not a `raise`, it does not unwind scopes, and it runs no cleanup:
+A failure that reaches a running frame is **not** a Napitia control-flow
+exit. It is not a `raise`, it does not unwind scopes, and it runs no
+cleanup:
 
 * execution stops at the failing operation;
 * no later statement in any enclosing scope runs;
@@ -128,14 +132,38 @@ Because the state a fatal abort leaves is the middle of a statement
 rather than any state the language describes, the interpreter that was
 running it is finished. A later attempt to start another execution on
 the same interpreter is refused with `X0004` -- an invalid operation on
-the engine, not a second arithmetic failure, which would wrongly claim
+the engine, not a repeat of the original code, which would wrongly claim
 the new call performed the failing operation. The ordinary compiler
 driver builds a fresh interpreter per execution, so this is reachable
-only by a caller that keeps one and reuses it.
+only by a caller that keeps one and reuses it. A fresh interpreter over
+the same module starts from fresh runtime state and is unaffected.
 
-A structured refusal of malformed input (`X0004`) is the opposite case:
-it is decided before anything changes, leaves the interpreter exactly as
-it was, and does not terminate it.
+### What terminates a context, and what does not
+
+The rule is about *when* a failure was found, not which code it carries.
+
+**Terminating.** Any error returned by a frame that has begun
+executing. That includes an arithmetic failure (`X0001`–`X0003`), an
+`X0004` from malformed NIR, an error propagated out of a nested call,
+and a runtime invariant failure such as exhausting the call-depth
+budget. An `X0004` is *not* necessarily discovered before anything has
+changed: hand-built NIR that skipped verification can construct a
+resource and write the event log before reaching an instruction the
+interpreter cannot execute, which leaves exactly the partial state an
+overflow leaves.
+
+**Not terminating.** A refusal completed *before* any frame is entered
+and before anything is mutated: an unknown function name, an unknown
+item id, or an attempt to use a context that is already terminated.
+Those change nothing, so the interpreter stays usable.
+
+**Not an error at all.** A Napitia `raise` is ordinary control flow, not
+an `InterpreterError`, so a fallible program that raises -- and one that
+handles a raise with `?` or `handle` -- never terminates anything.
+
+Terminating performs no Napitia cleanup and no rollback. Nothing is
+unwound, nothing is dropped, and a live resource is left live rather
+than reported as destroyed.
 
 What a runtime failure is never allowed to be: wrapping without explicit
 syntax, saturation, a Rust panic, a Cranelift panic, undefined behavior,
@@ -237,7 +265,7 @@ caller that skipped verification gets a structured refusal rather than
 | `X0001` | run time | `div` or `rem` by zero |
 | `X0002` | run time | integer overflow |
 | `X0003` | run time | a shift count outside `0..64` |
-| `X0004` | run time | malformed or unverified NIR the interpreter refused to execute, **or** an invalid operation on the execution engine itself -- reusing one a fatal abort already ended |
+| `X0004` | run time | malformed or unverified NIR the interpreter refused to execute, **or** an invalid operation on the execution engine itself -- reusing a context a failed execution already ended. Not an arithmetic failure, and never produced by a valid program |
 | `A0009` | native build | a construct outside the native backend's capability boundary: `div`, `rem`, `shl`, `shr` |
 
 `X` is a new namespace, allocated the way `A` (native) and `V`

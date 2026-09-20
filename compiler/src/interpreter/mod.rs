@@ -4010,18 +4010,26 @@ impl<'a> Interpreter<'a> {
             ValueKind::Shr(a, b) => shift(get(values, a)?, get(values, b)?, numeric::shr),
             ValueKind::Eq(a, b) => Ok(Value::Bool(eq(&get(values, a)?, &get(values, b)?)?)),
             ValueKind::Ne(a, b) => Ok(Value::Bool(!eq(&get(values, a)?, &get(values, b)?)?)),
-            ValueKind::Lt(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? == Ordering::Less,
-            )),
-            ValueKind::Le(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? != Ordering::Greater,
-            )),
-            ValueKind::Gt(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? == Ordering::Greater,
-            )),
-            ValueKind::Ge(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? != Ordering::Less,
-            )),
+            ValueKind::Lt(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Lt,
+            )?)),
+            ValueKind::Le(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Le,
+            )?)),
+            ValueKind::Gt(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Gt,
+            )?)),
+            ValueKind::Ge(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Ge,
+            )?)),
             // Generic type arguments are compile-time-only bookkeeping:
             // one parametric NIR function body is shared by every call
             // regardless of them (`rfcs/0008`), and a runtime `Value`
@@ -4548,12 +4556,57 @@ fn eq(a: &Value, b: &Value) -> Result<bool, InterpreterError> {
     })
 }
 
+/// Which ordered comparison is being asked for.
+///
+/// Carried as a predicate rather than derived from an [`Ordering`],
+/// because for floats there is not always an ordering to derive one
+/// from (`rfcs/0015`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OrderPredicate {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// One ordered comparison, answered by the predicate it names.
+///
+/// Floats are compared with the corresponding IEEE-754 operator, never
+/// through a total ordering. A NaN is unordered with everything,
+/// including itself, so all four predicates answer `false` for one --
+/// and `false` is an *answer*, not a failure. Deriving these from a
+/// `partial_cmp` that has no result turned an ordinary float comparison
+/// into a malformed-NIR report, which is what `X0004` is reserved for
+/// and this is not.
+///
+/// `<=` and `>=` are the reason a predicate has to be carried this far
+/// down: "not greater" and "not less" are correct readings of an
+/// ordering that exists, and exactly wrong for a NaN, which is neither.
+fn ordered(a: &Value, b: &Value, predicate: OrderPredicate) -> Result<bool, InterpreterError> {
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(match predicate {
+            OrderPredicate::Lt => x < y,
+            OrderPredicate::Le => x <= y,
+            OrderPredicate::Gt => x > y,
+            OrderPredicate::Ge => x >= y,
+        });
+    }
+    let ordering = ord(a, b)?;
+    Ok(match predicate {
+        OrderPredicate::Lt => ordering == Ordering::Less,
+        OrderPredicate::Le => ordering != Ordering::Greater,
+        OrderPredicate::Gt => ordering == Ordering::Greater,
+        OrderPredicate::Ge => ordering != Ordering::Less,
+    })
+}
+
+/// The total ordering of every value kind that has one.
+///
+/// Floats are deliberately absent: [`ordered`] answers them before this
+/// is reached, because they have no total order to report.
 fn ord(a: &Value, b: &Value) -> Result<Ordering, InterpreterError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
-        (Value::Float(x), Value::Float(y)) => x
-            .partial_cmp(y)
-            .ok_or_else(|| invalid("comparison involving NaN")),
         (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
@@ -17513,23 +17566,95 @@ mod numeric_semantics {
 
     /// Napitia has no syntax that names a NaN, so the only way one
     /// exists at all is as the result of an operation -- which makes
-    /// `0.0 / 0.0` the only fixture that can test what happens next.
+    /// `0.0 / 0.0` the only fixture that can produce one.
+    const NAN: &str = "value zero: f64 = 0.0; value nan: f64 = 0.0 / zero;";
+
+    /// Every ordered predicate answers `false` when a NaN is involved,
+    /// on either side or both (`rfcs/0015`). `false` is an answer: a
+    /// NaN is unordered, not malformed, so none of these may produce a
+    /// diagnostic of any kind.
     #[test]
-    fn a_nan_compares_unequal_to_itself_and_has_no_ordering() {
-        const NAN: &str = "value z: f64 = 0.0; value n: f64 = 0.0 / z;";
+    fn every_ordered_predicate_answers_false_for_a_nan() {
+        for (position, left, right) in [
+            ("left", "nan", "1.0"),
+            ("right", "1.0", "nan"),
+            ("both", "nan", "nan"),
+        ] {
+            for operator in ["<", "<=", ">", ">="] {
+                let body = format!("{NAN} return {left} {operator} {right}");
+                let outcome = run(&format!("func main() -> bool {{ {body} }}"));
+                assert_eq!(
+                    outcome,
+                    Ok(Value::Bool(false)),
+                    "NaN on the {position} of `{operator}` must answer false, not fail"
+                );
+            }
+        }
+    }
 
-        assert!(
-            !truth(&format!("{NAN} return n == n")),
-            "equality answers false for a NaN rather than failing"
-        );
-        assert!(truth(&format!("{NAN} return n != n")));
+    /// `<=` and `>=` are the two that a total-ordering implementation
+    /// gets backwards: "not greater" and "not less" are true of a NaN
+    /// under any ordering that claims to have one.
+    #[test]
+    fn the_inclusive_predicates_are_not_derived_from_a_negated_ordering() {
+        assert!(!truth(&format!("{NAN} return nan <= nan")));
+        assert!(!truth(&format!("{NAN} return nan >= nan")));
+        assert!(!truth(&format!("{NAN} return nan <= 1.0")));
+        assert!(!truth(&format!("{NAN} return 1.0 >= nan")));
+    }
 
-        // Ordering has no answer at all, and says so rather than
-        // inventing one.
-        let error = run(&format!("func main() -> bool {{ {NAN} return n < n }}"))
-            .expect_err("an ordered comparison of a NaN has no result");
-        assert_eq!(error.code(), codes::INVALID_OPERATION);
-        assert_eq!(error.to_string(), "comparison involving NaN");
+    #[test]
+    fn equality_follows_ieee_for_a_nan_and_is_never_a_failure() {
+        assert!(!truth(&format!("{NAN} return nan == nan")));
+        assert!(!truth(&format!("{NAN} return nan == 1.0")));
+        assert!(!truth(&format!("{NAN} return 1.0 == nan")));
+        assert!(truth(&format!("{NAN} return nan != nan")));
+        assert!(truth(&format!("{NAN} return nan != 1.0")));
+    }
+
+    /// The values nearest the NaN cases, which do have answers -- so a
+    /// fix for NaN cannot have been "make every float comparison
+    /// false".
+    #[test]
+    fn infinities_and_signed_zero_still_compare_normally() {
+        const INF: &str = "value zero: f64 = 0.0; value inf: f64 = 1.0 / zero; \
+                           value negative: f64 = -1.0 / zero;";
+        assert!(truth(&format!("{INF} return inf > 1.0")));
+        assert!(truth(&format!("{INF} return negative < 1.0")));
+        assert!(truth(&format!("{INF} return negative < inf")));
+        assert!(truth(&format!("{INF} return inf == inf")));
+        assert!(truth(&format!("{INF} return inf >= inf")));
+        assert!(!truth(&format!("{INF} return inf < inf")));
+        assert!(truth("return 0.0 == -0.0"));
+        assert!(truth("return 0.0 <= -0.0"));
+        assert!(truth("return 0.0 >= -0.0"));
+        assert!(!truth("return 0.0 < -0.0"));
+        assert!(!truth("return -0.0 < 0.0"));
+    }
+
+    /// `X0004` means the interpreter was handed something malformed. A
+    /// valid program comparing a valid value is not that, however
+    /// unusual the value is.
+    #[test]
+    fn a_nan_comparison_never_reports_a_malformed_operation() {
+        for operator in ["<", "<=", ">", ">=", "==", "!="] {
+            let outcome = run(&format!(
+                "func main() -> bool {{ {NAN} return nan {operator} nan }}"
+            ));
+            let value = outcome.unwrap_or_else(|error| {
+                panic!("`{operator}` on a NaN must not fail, got {}", error.code())
+            });
+            assert!(matches!(value, Value::Bool(_)), "`{operator}`");
+        }
+    }
+
+    #[test]
+    fn a_nan_comparison_answers_identically_on_every_run() {
+        let text = format!("func main() -> bool {{ {NAN} return nan < nan }}");
+        let first = run(&text);
+        for _ in 0..8 {
+            assert_eq!(run(&text), first);
+        }
     }
 
     #[test]

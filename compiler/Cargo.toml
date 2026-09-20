@@ -46,11 +46,10 @@ cranelift-frontend = "0.135.2"
 # The `Module`/`Linkage` abstraction `cranelift-object` implements:
 # declaring every function before any body is emitted.
 cranelift-module = "0.135.2"
-# Writes the compiled functions out as a real ELF object file. No
-# `target-lexicon` dependency is declared alongside it: the one
-# supported triple is named as a string and looked up through
-# `cranelift_codegen::isa::lookup_by_name`, so nothing here needs to
-# parse a triple into its components.
+# Writes the compiled functions out as a real ELF object file. It is
+# handed an ISA the backend has already selected, so the triple
+# parsing that selection needs is declared separately, below, rather
+# than reached through this crate.
 cranelift-object = "0.135.2"
 # Parses a target triple into the components `cranelift_codegen::isa`
 # selects a backend from. Declared directly, rather than reached

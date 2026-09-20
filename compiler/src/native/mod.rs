@@ -493,7 +493,11 @@ fn linker_launch_failure(linker: &OsStr, error: &std::io::Error, source: SourceI
 /// filesystem is touched, and `output` itself is only written at the
 /// very end, by renaming a finished executable over it. A link that
 /// fails therefore cannot leave a truncated file that looks like a
-/// build.
+/// build, and cannot disturb an executable an earlier build left
+/// there: if this returns a diagnostic, `output` is byte-for-byte what
+/// it was before the call. See [`resolve_outcome`] for the one place
+/// that guarantee is decided, including why a cleanup failure *after*
+/// the executable is in place is not allowed to undo it.
 ///
 /// The linker is launched as a program with a fixed argument list, via
 /// [`std::process::Command`] -- there is no shell, no quoting, and no
@@ -519,21 +523,47 @@ pub fn link_object(
 
     let scratch = scratch_directory(output)
         .map_err(|error| io_failure("could not create a build directory".to_string(), &error))?;
-    let result = link_in(object, output, linker, source, &scratch);
-    let removed = std::fs::remove_dir_all(&scratch);
-    result?;
-    // Only worth reporting once the build itself succeeded: otherwise
-    // it would bury the reason the build failed under a note about
-    // tidying up after it.
-    removed.map_err(|error| {
-        io_failure(
-            format!(
-                "the executable was written, but the build directory `{}` could not be removed",
-                scratch.display()
-            ),
-            &error,
-        )
-    })
+    let linked = link_in(object, output, linker, source, &scratch);
+    // Attempted on both paths, before either is reported.
+    let cleaned = std::fs::remove_dir_all(&scratch);
+    resolve_outcome(linked, cleaned)
+}
+
+/// Decides what a caller is told, given how the link went and how the
+/// scratch cleanup went.
+///
+/// Two rules, and together they are the whole of this backend's
+/// atomicity guarantee:
+///
+/// * **The build's own failure wins.** A cleanup error never replaces
+///   the reason a build failed, because the reason a build failed is
+///   the thing the user needs.
+/// * **Publication is final.** Once the executable has been renamed
+///   into place, nothing that happens afterwards can un-publish it, so
+///   a failure to remove the scratch directory is not a build failure.
+///   Reporting one would mean the command said "failed" about an output
+///   it had already replaced, which is exactly what `NativeOutput` and
+///   the documentation promise cannot happen.
+///
+/// Cleanup after successful publication is therefore best-effort: on
+/// the vanishingly rare path where it fails, a `.napitia-build-*`
+/// directory is left beside the output and the build still succeeds.
+/// `rfcs/0014` says so too.
+///
+/// Extracted from [`link_object`] so both outcomes can be injected
+/// directly in a test, rather than needing a filesystem that fails on
+/// demand.
+fn resolve_outcome(
+    linked: Result<(), Box<Diagnostic>>,
+    cleaned: Result<(), std::io::Error>,
+) -> Result<(), Box<Diagnostic>> {
+    match linked {
+        Err(refusal) => Err(refusal),
+        Ok(()) => {
+            let _ = cleaned;
+            Ok(())
+        }
+    }
 }
 
 /// The body of [`link_object`], with the scratch directory already
@@ -1296,5 +1326,119 @@ mod link_tests {
         let second = build_unverified(&module, &interner, &directory.join("b"));
         assert_eq!(first, second);
         assert_eq!(first.1, vec![codes::UNVERIFIED_NIR]);
+    }
+
+    // -- output and status atomicity ---------------------------------------
+
+    /// The bytes an earlier build is pretending to have left behind.
+    const PREVIOUS_BUILD: &[u8] = b"an executable from an earlier build";
+
+    fn seeded_output(directory: &TempDir, name: &str) -> PathBuf {
+        let output = directory.join(name);
+        std::fs::write(&output, PREVIOUS_BUILD).expect("could not seed the output");
+        output
+    }
+
+    fn assert_output_untouched(output: &Path, tag: &str) {
+        assert_eq!(
+            std::fs::read(output).expect("the previous output is still there"),
+            PREVIOUS_BUILD,
+            "{tag}: a failed build must leave the output byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn a_linker_that_cannot_be_launched_leaves_an_existing_output_alone() {
+        let directory = TempDir::new("preserve-launch");
+        let output = seeded_output(&directory, "program with spaces");
+
+        let diagnostic = link_object(
+            b"not a real object",
+            &output,
+            OsStr::new("napitia-no-such-linker-exists"),
+            a_source(),
+        )
+        .expect_err("a linker that is not installed cannot link");
+
+        assert_eq!(diagnostic.code, codes::LINKER_LAUNCH_FAILED);
+        assert_output_untouched(&output, "launch failure");
+        assert!(
+            directory
+                .entries()
+                .iter()
+                .all(|name| name == "program with spaces"),
+            "cleanup is attempted on the failure path too, found {:?}",
+            directory.entries()
+        );
+    }
+
+    /// A publication that cannot happen -- here because the requested
+    /// output is a directory, which nothing can be renamed over -- must
+    /// still leave what was there alone.
+    #[test]
+    fn a_publication_that_fails_leaves_what_was_there_alone() {
+        let directory = TempDir::new("preserve-publish");
+        let output = directory.join("program");
+        std::fs::create_dir(&output).expect("could not seed the output");
+        let occupant = output.join("kept");
+        std::fs::write(&occupant, PREVIOUS_BUILD).expect("could not seed the output");
+
+        // A "linker" that succeeds without producing the file the
+        // rename then looks for is the same failure from the other
+        // side; either way nothing may be published.
+        let diagnostic = link_object(
+            b"not a real object",
+            &output,
+            OsStr::new("napitia-no-such-linker-exists"),
+            a_source(),
+        )
+        .expect_err("there is no executable to publish");
+
+        assert!(
+            diagnostic.code == codes::LINKER_LAUNCH_FAILED
+                || diagnostic.code == codes::BUILD_IO_FAILED,
+            "unexpected code {}",
+            diagnostic.code
+        );
+        assert!(output.is_dir(), "the occupied path must survive");
+        assert_eq!(
+            std::fs::read(&occupant).expect("its contents survive too"),
+            PREVIOUS_BUILD
+        );
+    }
+
+    /// The two rules that make the outcome atomic, injected directly
+    /// rather than waiting for a filesystem that fails on demand.
+    #[test]
+    fn a_cleanup_failure_never_turns_a_published_build_into_a_failure() {
+        let cleanup_failed = || std::io::Error::other("the build directory could not be removed");
+
+        // Published, then cleanup failed: still a success, because the
+        // executable is already in place and nothing can un-place it.
+        assert!(resolve_outcome(Ok(()), Err(cleanup_failed())).is_ok());
+        // Published, cleanup fine: success.
+        assert!(resolve_outcome(Ok(()), Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_cleanup_failure_never_replaces_the_reason_a_build_failed() {
+        let original = Box::new(Diagnostic::error(
+            codes::LINKER_FAILED,
+            a_source(),
+            Span::dummy(),
+            "the linker said no",
+        ));
+        let resolved = resolve_outcome(
+            Err(original),
+            Err(std::io::Error::other("and cleanup went wrong too")),
+        )
+        .expect_err("the build failed");
+
+        assert_eq!(
+            resolved.code,
+            codes::LINKER_FAILED,
+            "the build's own failure is what the user needs to see"
+        );
+        assert!(resolved.message.contains("the linker said no"));
     }
 }

@@ -492,6 +492,10 @@ fn a_linker_that_exits_non_zero_is_reported_with_its_own_output() {
 
     let workspace = Workspace::new("failing-linker");
     let output = workspace.output("program with spaces");
+    // An executable an earlier build left behind. A failed link must
+    // not disturb it -- reporting failure about an output that was
+    // already replaced is exactly what must not happen.
+    std::fs::write(&output, PREVIOUS_BUILD).expect("could not seed the output");
     let mut map = compiler::source::SourceMap::new();
     let source = map.add_file("linker.npt", "\n");
 
@@ -504,12 +508,19 @@ fn a_linker_that_exits_non_zero_is_reported_with_its_own_output() {
     .expect_err("this `linker` cannot link anything");
 
     assert_eq!(diagnostic.code, codes::LINKER_FAILED);
-    assert!(!output.exists(), "a failed link writes no executable");
+    assert_eq!(
+        std::fs::read(&output).expect("the previous output is still there"),
+        PREVIOUS_BUILD,
+        "a failed link leaves the output byte-for-byte unchanged"
+    );
     assert!(
         workspace.leftover_build_directories().is_empty(),
         "the build directory must be removed even when the linker fails"
     );
 }
+
+/// The bytes an earlier build is pretending to have left behind.
+const PREVIOUS_BUILD: &[u8] = b"an executable from an earlier build";
 
 #[test]
 fn a_linker_that_cannot_be_launched_is_reported_separately() {
@@ -538,16 +549,48 @@ fn a_linker_that_cannot_be_launched_is_reported_separately() {
 #[test]
 fn a_failed_build_leaves_an_existing_output_untouched() {
     let workspace = Workspace::new("stale-output");
-    let output = workspace.output("program");
-    std::fs::write(&output, b"a previous build").expect("could not seed the output");
 
-    let source = workspace.source("bad", "func main() -> i64 { value a = 1; return a / a; }");
-    let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
-    assert_eq!(built.status.code(), Some(1));
-    assert_eq!(
-        std::fs::read(&output).expect("the previous output is still there"),
-        b"a previous build"
-    );
+    // Every stage that can refuse, each against an output an earlier
+    // build already wrote: the invariant is that a command reporting
+    // failure never changed the file it was pointed at, whichever stage
+    // did the refusing.
+    let refusals: [(&str, &str); 4] = [
+        // Capability: an operator outside the subset.
+        (
+            "division",
+            "func main() -> i64 { value a = 1; return a / a; }",
+        ),
+        // Capability: no entry point at all.
+        ("no_main", "func helper() -> i64 { return 1; }"),
+        // Capability: recursion.
+        (
+            "recursion",
+            "func down(n: i64) -> i64 { if n <= 0 { return 0; } return down(n - 1); } \
+             func main() -> i64 { return down(2); }",
+        ),
+        // Frontend: never even reaches the native backend.
+        ("broken", "func main() -> i64 { return "),
+    ];
+
+    for (name, text) in refusals {
+        let output = workspace.output(&format!("{name} program"));
+        std::fs::write(&output, PREVIOUS_BUILD).expect("could not seed the output");
+        let source = workspace.source(name, text);
+
+        let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(
+            built.status.code(),
+            Some(1),
+            "`{name}` must fail:\n{}",
+            stderr(&built)
+        );
+        assert_eq!(
+            std::fs::read(&output).expect("the previous output is still there"),
+            PREVIOUS_BUILD,
+            "`{name}`: a failed build must leave the output byte-for-byte unchanged"
+        );
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
 }
 
 // -- argument handling ---------------------------------------------------

@@ -1,14 +1,16 @@
 # Spec 0006: Napitia IR (NIR)
 
 - Status: Partially implemented (Alpha 0.1.5; `drop` instruction and
-  resource-state verification added in Alpha 0.1.7, `rfcs/0011`)
+  resource-state verification added in Alpha 0.1.7, `rfcs/0011`;
+  a subset lowered natively in Alpha 0.2.0, `rfcs/0014`)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
-(`spec/0003-type-system.md`). It is designed to be a reasonable input to a
-future LLVM (or other native) backend, while also being directly
-executable by the tree-walking interpreter shipped in this milestone
-(`compiler`'s `nir` module and its interpreter).
+(`spec/0003-type-system.md`). It is directly executable by the
+tree-walking interpreter, which remains the complete semantic execution
+path for the language, and -- as of Alpha 0.2.0 -- a scalar subset of it
+is also compiled ahead of time to a native executable (see "Native
+lowering" below).
 
 ## Implemented features
 
@@ -266,6 +268,29 @@ target (a wildcard/binding pattern that covers several cases simply
 repeats the same target for each of them), since exhaustiveness is
 already proven before this is ever built -- there is no "default" arm
 at the NIR level.
+
+### Native lowering (Alpha 0.2.0, `rfcs/0014`)
+
+A subset of the above is compiled ahead of time to an
+`x86_64-unknown-linux-gnu` executable by `napitia build`, through
+Cranelift. Roughly: `i64`/`bool`/`unit`, their constants and slots,
+scalar signatures, the arithmetic/bitwise/comparison instructions that
+do not need a runtime error facility, `br`/`condbr`/`ret`, and direct
+calls within one non-recursive call graph.
+
+`rfcs/0014-native-aot-preview.md` holds the authoritative table of what
+is and is not compiled, and the `Axxxx` diagnostic codes that name each
+refusal; it is not restated here. Two facts about the *pipeline* belong
+in this spec, though:
+
+- Verification is mandatory and runs first. The native backend never
+  sees NIR `nir::verify` has not accepted, so nothing in it re-derives
+  an invariant this document already assigns to the verifier.
+- A separate capability pass runs after verification and before any
+  code is generated, and decides exhaustively whether the reachable
+  program is inside that subset. NIR that is *valid but unsupported* is
+  refused there, with its own code family, rather than being lowered
+  approximately, erased, or handed back to the interpreter.
 
 ### Textual printer
 
@@ -657,11 +682,14 @@ interpreter partially lowered or unverified.
 - **SIMD/vector instructions** and **region-scoped allocation/free**
   instructions, once `spec/0004` is implemented — NIR's explicit
   basic-block structure is intended to remain the right shape for both.
-- **LLVM lowering**: NIR's block/instruction/terminator shapes are close
-  enough to LLVM IR's that a lowering pass is expected to be a relatively
-  direct translation rather than a redesign, once a native backend is in
-  scope (explicitly out of scope for Alpha 0.1 — see the top-level
-  milestone description).
+- **Native lowering beyond the Alpha 0.2.0 subset**: the expectation
+  that NIR's block/instruction/terminator shapes translate fairly
+  directly to a code generator's own IR held up — Alpha 0.2.0's
+  Cranelift backend (`rfcs/0014`) is a translation rather than a
+  redesign. Extending it past the scalar subset is a matter of giving
+  aggregates a layout, resources a native destruction order, and typed
+  failure a runtime representation; none of those exists yet, and each
+  is its own decision rather than more of the same lowering.
 
 ## Unresolved research questions
 
@@ -669,7 +697,11 @@ interpreter partially lowered or unverified.
   blocks, or keep mutable locals (`alloc`/`load`/`store`) as the primary
   mechanism and let a later optimization pass promote to SSA. The current
   implementation uses `alloc`/`load`/`store` for all mutable state and
-  does not yet construct phi nodes.
+  does not yet construct phi nodes. Alpha 0.2.0's native backend
+  reconstructs SSA itself while lowering, which is evidence the question
+  is still open rather than an answer to it: the reconstruction is
+  Cranelift's, not NIR's, and it also forced a rule NIR does not have
+  (`A0017`, a `load` with no `store` on some path — see `rfcs/0014`).
 - How calls to functions with effects should be represented once
   `spec/0005` effects exist — as plain `call` with effect metadata, or a
   distinct instruction family per effect class.

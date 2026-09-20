@@ -788,22 +788,11 @@ pub enum Value {
 
 /// Stable codes for the conditions that stop execution (`rfcs/0015`).
 ///
-/// A new namespace, allocated the way `A` (native) and `V` (verifier)
-/// each got one when those layers appeared. No existing code is
-/// renumbered, and nothing here overlaps a compile-time code: these
-/// describe a program that compiled and then failed while running.
-pub mod codes {
-    /// `div` or `rem` with a zero divisor.
-    pub const DIVISION_BY_ZERO: &str = "X0001";
-    /// A checked integer operation whose exact result is outside `i64`.
-    pub const INTEGER_OVERFLOW: &str = "X0002";
-    /// A shift count outside `0..64`.
-    pub const SHIFT_AMOUNT_OUT_OF_RANGE: &str = "X0003";
-    /// An operation the interpreter refused to perform on the values it
-    /// was given -- malformed NIR that `nir::verify` should already have
-    /// rejected, reported rather than executed.
-    pub const INVALID_OPERATION: &str = "X0004";
-}
+/// Owned by [`crate::types::numeric`], with the rules they describe, and
+/// re-exported here because this is where most callers meet them. The
+/// native backend reads the same table: an executable it emits must
+/// report a failure in exactly the words `napitia run` would.
+pub use crate::types::numeric::codes;
 
 /// A condition the interpreter detects and reports instead of crashing.
 ///
@@ -829,36 +818,19 @@ impl InterpreterError {
     /// This failure's stable code.
     pub fn code(&self) -> &'static str {
         match self {
-            InterpreterError::Arithmetic(ArithFailure::Overflow(_)) => codes::INTEGER_OVERFLOW,
-            InterpreterError::Arithmetic(ArithFailure::DivisionByZero(_)) => {
-                codes::DIVISION_BY_ZERO
-            }
-            InterpreterError::Arithmetic(ArithFailure::ShiftAmount(_)) => {
-                codes::SHIFT_AMOUNT_OUT_OF_RANGE
-            }
+            InterpreterError::Arithmetic(failure) => failure.code(),
             InterpreterError::InvalidOperation(_) => codes::INVALID_OPERATION,
         }
     }
 }
 
-/// One line, decided entirely by the failure itself.
-///
-/// Nothing here depends on a source position, a hash order or how the
-/// compiler was built, so the same failing program renders identically
-/// on every run -- which is what lets a test compare the interpreter's
-/// answer with a native executable's byte for byte.
+/// One line, decided entirely by the failure itself -- an arithmetic
+/// one renders exactly as [`ArithFailure`] does, which is the same text
+/// the native backend writes into an executable.
 impl std::fmt::Display for InterpreterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InterpreterError::Arithmetic(ArithFailure::Overflow(op)) => {
-                write!(f, "integer overflow in `{}`", op.as_str())
-            }
-            InterpreterError::Arithmetic(ArithFailure::DivisionByZero(op)) => {
-                write!(f, "`{}` by zero", op.as_str())
-            }
-            InterpreterError::Arithmetic(ArithFailure::ShiftAmount(count)) => {
-                write!(f, "shift amount {count} is outside 0..64")
-            }
+            InterpreterError::Arithmetic(failure) => write!(f, "{failure}"),
             InterpreterError::InvalidOperation(message) => write!(f, "{message}"),
         }
     }

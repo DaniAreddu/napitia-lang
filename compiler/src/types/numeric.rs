@@ -223,6 +223,32 @@ impl IntOp {
     ];
 }
 
+/// Stable codes for the ways a running Napitia program can fail
+/// (`rfcs/0015`).
+///
+/// A namespace of its own, allocated the way `A` (native) and `V`
+/// (verifier) each got one when those layers appeared, and separate
+/// from every compile-time namespace: these describe a program that
+/// compiled and then failed while running.
+///
+/// They live here, with the rules they describe, because two very
+/// different consumers need the same table -- the interpreter, which
+/// reports a failure it just detected, and the native backend, which
+/// must emit the identical text into an executable it will never run
+/// itself.
+pub mod codes {
+    /// `div` or `rem` with a zero divisor.
+    pub const DIVISION_BY_ZERO: &str = "X0001";
+    /// A checked integer operation whose exact result is outside `i64`.
+    pub const INTEGER_OVERFLOW: &str = "X0002";
+    /// A shift count outside `0..64`.
+    pub const SHIFT_AMOUNT_OUT_OF_RANGE: &str = "X0003";
+    /// An operation the interpreter refused to perform on the values it
+    /// was given -- malformed NIR that verification should already have
+    /// rejected, reported rather than executed.
+    pub const INVALID_OPERATION: &str = "X0004";
+}
+
 /// Why a checked integer operation produced no value.
 ///
 /// Every variant is a *Napitia* outcome with its own stable meaning,
@@ -237,6 +263,38 @@ pub enum ArithFailure {
     /// A shift count outside `0..64`, carried so a diagnostic can name
     /// the count that was actually asked for.
     ShiftAmount(i64),
+}
+
+impl ArithFailure {
+    /// This failure's stable code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            ArithFailure::Overflow(_) => codes::INTEGER_OVERFLOW,
+            ArithFailure::DivisionByZero(_) => codes::DIVISION_BY_ZERO,
+            ArithFailure::ShiftAmount(_) => codes::SHIFT_AMOUNT_OUT_OF_RANGE,
+        }
+    }
+}
+
+/// One line, decided entirely by the failure itself.
+///
+/// Nothing here depends on a source position, a hash order or how the
+/// compiler was built, so the same failure renders identically on every
+/// run -- and, more to the point, identically in the two places that
+/// report it: `napitia run`, which prints what it just detected, and a
+/// native executable, which carries this text as bytes the backend
+/// wrote into it at compile time. A differential test compares those
+/// two, so they cannot be allowed to drift.
+impl std::fmt::Display for ArithFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArithFailure::Overflow(op) => write!(f, "integer overflow in `{}`", op.as_str()),
+            ArithFailure::DivisionByZero(op) => write!(f, "`{}` by zero", op.as_str()),
+            ArithFailure::ShiftAmount(count) => {
+                write!(f, "shift amount {count} is outside 0..64")
+            }
+        }
+    }
 }
 
 /// The number of bits a shift count may name, exclusive.

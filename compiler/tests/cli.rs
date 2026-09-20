@@ -1983,3 +1983,163 @@ fn the_two_implemented_numeric_types_run() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
 }
+
+// -- NaN and fatal aborts, through the real binary (`rfcs/0015`) ----------
+
+/// A NaN comparison is an ordinary answer on stdout, not a diagnostic.
+/// This is the CLI-level half of the guarantee: no `X0004`, no
+/// diagnostic of any kind, and the same bytes twice.
+#[test]
+fn a_nan_comparison_is_an_ordinary_answer_at_the_command_line() {
+    let directory = Fixtures::new("nan-cli");
+    const NAN: &str = "value zero: f64 = 0.0; value nan: f64 = 0.0 / zero;";
+
+    for (name, operator, expected) in [
+        ("lt", "<", "false"),
+        ("le", "<=", "false"),
+        ("gt", ">", "false"),
+        ("ge", ">=", "false"),
+        ("eq", "==", "false"),
+        ("ne", "!=", "true"),
+    ] {
+        let path = directory.write(
+            &format!("nan_{name}.npt"),
+            &format!("func main() -> bool {{ {NAN} return nan {operator} nan }}"),
+        );
+        let first = napitia(&["run", &path]);
+        assert!(
+            first.status.success(),
+            "`{operator}` on a NaN must succeed:\n{}",
+            stderr(&first)
+        );
+        assert_eq!(stdout(&first).trim(), expected, "`{operator}`");
+        assert!(
+            stderr(&first).is_empty(),
+            "`{operator}` must produce no diagnostic: {}",
+            stderr(&first)
+        );
+        assert!(
+            !stderr(&first).contains("X0004"),
+            "`{operator}`: a valid NaN comparison is not malformed NIR"
+        );
+
+        let second = napitia(&["run", &path]);
+        assert_eq!(stdout(&first), stdout(&second), "`{operator}`");
+        assert_eq!(stderr(&first), stderr(&second), "`{operator}`");
+    }
+}
+
+/// A fatal abort with a live resource and a pending `defer`: the CLI
+/// reports the arithmetic failure, exits non-zero, prints nothing on
+/// stdout, and does not claim any cleanup happened.
+#[test]
+fn a_fatal_abort_with_live_cleanup_pending_reports_only_the_arithmetic_failure() {
+    let directory = Fixtures::new("fatal-abort-cli");
+    let path = directory.write(
+        "abort.npt",
+        "resource File { descriptor: i64 }\n\
+         func open(descriptor: i64) -> File { return File { descriptor: descriptor }; }\n\
+         func close(file: File) -> unit { }\n\
+         func main() -> i64 {\n\
+           value file = open(7);\n\
+           defer close(file);\n\
+           value m: i64 = 9223372036854775807;\n\
+           value bad: i64 = m + 1;\n\
+           return 0\n\
+         }\n",
+    );
+
+    let first = napitia(&["run", &path]);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr(&first));
+    assert_eq!(
+        stderr(&first).trim(),
+        "error[X0002]: integer overflow in `add`",
+        "the abort reports the arithmetic failure and nothing else"
+    );
+    assert!(
+        stdout(&first).is_empty(),
+        "a failed run prints no value: {}",
+        stdout(&first)
+    );
+    assert!(
+        !stderr(&first).to_lowercase().contains("panic")
+            && !stderr(&first).contains("RUST_BACKTRACE"),
+        "{}",
+        stderr(&first)
+    );
+
+    let second = napitia(&["run", &path]);
+    assert_eq!(stderr(&first), stderr(&second), "repeated runs differ");
+    assert_eq!(first.status.code(), second.status.code());
+}
+
+/// Every X-class boundary, through the binary, with its exact code and
+/// exit status.
+#[test]
+fn every_runtime_failure_code_is_reachable_and_exact() {
+    let directory = Fixtures::new("x-codes");
+    for (name, body, code, text) in [
+        (
+            "div_zero",
+            "value z: i64 = 0; return 1 / z",
+            "X0001",
+            "`div` by zero",
+        ),
+        (
+            "rem_zero",
+            "value z: i64 = 0; return 1 % z",
+            "X0001",
+            "`rem` by zero",
+        ),
+        (
+            "min_over_minus_one",
+            "value m: i64 = -9223372036854775808; value d: i64 = -1; return m / d",
+            "X0002",
+            "integer overflow in `div`",
+        ),
+        (
+            "shift_width",
+            "value n: i64 = 64; return 1 << n",
+            "X0003",
+            "shift amount 64 is outside 0..64",
+        ),
+        (
+            "shift_negative",
+            "value n: i64 = -1; return 1 >> n",
+            "X0003",
+            "shift amount -1 is outside 0..64",
+        ),
+        (
+            "shift_large",
+            "value n: i64 = 9223372036854775807; return 1 << n",
+            "X0003",
+            "shift amount 9223372036854775807 is outside 0..64",
+        ),
+    ] {
+        let path = directory.write(
+            &format!("{name}.npt"),
+            &format!("func main() -> i64 {{ {body} }}"),
+        );
+        let output = napitia(&["run", &path]);
+        assert_eq!(output.status.code(), Some(1), "`{name}`");
+        assert_eq!(
+            stderr(&output).trim(),
+            format!("error[{code}]: {text}"),
+            "`{name}`"
+        );
+    }
+}
+
+/// `i64::MIN % -1` is `0`, not a failure: the exact remainder is in
+/// range even though the exact quotient is not.
+#[test]
+fn the_minimum_remainder_by_minus_one_is_zero_at_the_command_line() {
+    let directory = Fixtures::new("min-rem");
+    let path = directory.write(
+        "min_rem.npt",
+        "func main() -> i64 { value m: i64 = -9223372036854775808; value d: i64 = -1; return m % d }",
+    );
+    let output = napitia(&["run", &path]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "0");
+}

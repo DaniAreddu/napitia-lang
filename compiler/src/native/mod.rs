@@ -42,8 +42,13 @@
 //! not malformed, and a program with a dangling block target is not
 //! merely unsupported.
 
-pub mod capability;
-pub mod lower;
+// Both are crate-private on purpose: the only supported way into the
+// native backend is `crate::driver::build_native`, which runs the whole
+// frontend and the NIR verifier first. Nothing outside this crate can
+// name the capability validator, name the lowering module, or mint the
+// plan that lowering requires.
+pub(crate) mod capability;
+pub(crate) mod lower;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -275,7 +280,7 @@ pub const fn host_can_link() -> bool {
 ///
 /// `imports` carries the span of every `import` the source declared
 /// (see [`capability::validate`]).
-pub fn build_executable(
+pub(crate) fn build_executable(
     module: &Module,
     source: SourceId,
     interner: &Interner,
@@ -799,5 +804,231 @@ mod link_tests {
         );
         assert!(TARGET_TRIPLE.starts_with("x86_64-"));
         assert!(TARGET_TRIPLE.contains("linux"));
+    }
+
+    // -- the sealed codegen boundary ---------------------------------------
+    //
+    // Nothing outside this crate can reach any of this: `capability`
+    // and `lower` are crate-private modules, `build_executable` is a
+    // crate-private function, and `NativePlan`'s fields are private to
+    // `capability`, so the plan `lower::emit_object` demands cannot be
+    // forged. What is left to test is the one question visibility does
+    // not answer by itself -- what the sealed pipeline does when a
+    // crate-internal caller hands it NIR the verifier would reject.
+
+    use crate::hir::ItemId;
+    use crate::nir::{
+        BasicBlock, BlockId, Const, Function, Instruction, Param, Terminator, ValueId, ValueKind,
+        verify_module,
+    };
+    use crate::types::Ty;
+
+    /// Builds a module by hand, skipping every frontend stage, and puts
+    /// it straight into [`build_executable`]. Reports what the verifier
+    /// says about it and what the native pipeline says about it.
+    fn build_unverified(
+        module: &Module,
+        interner: &Interner,
+        output: &Path,
+    ) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut map = SourceMap::new();
+        let source = map.add_file(
+            "sealed.npt",
+            "
+",
+        );
+        let registry = ItemRegistry::default();
+
+        let verifier: Vec<&str> = verify_module(module, source, interner, &registry)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        let native: Vec<&str> = build_executable(module, source, interner, &registry, &[], output)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        (verifier, native)
+    }
+
+    fn hand_built_block(
+        id: u32,
+        instructions: Vec<Instruction>,
+        terminator: Terminator,
+    ) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn hand_built_int(result: u32, literal: u128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(literal)),
+        }
+    }
+
+    fn hand_built_main(
+        interner: &mut Interner,
+        return_type: Ty,
+        blocks: Vec<BasicBlock>,
+    ) -> Module {
+        Module {
+            functions: vec![Function {
+                id: ItemId(0),
+                name: interner.intern("main"),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::<Param>::new(),
+                return_type,
+                raises: Vec::new(),
+                blocks,
+            }],
+            ..Module::default()
+        }
+    }
+
+    /// The shape every malformed case must have: the verifier objects,
+    /// the native pass refuses it in its *verifier* layer rather than
+    /// its backend layer, and nothing is written.
+    fn assert_refused_before_codegen(module: &Module, interner: &Interner, tag: &str) {
+        let directory = TempDir::new(tag);
+        let output = directory.join("program");
+        let (verifier, native) = build_unverified(module, interner, &output);
+
+        assert!(
+            !verifier.is_empty(),
+            "{tag}: this NIR must fail `nir::verify` in the first place"
+        );
+        assert_eq!(
+            native,
+            vec![codes::UNVERIFIED_NIR],
+            "{tag}: the native pass must refuse it as unverified NIR, not as a backend defect"
+        );
+        assert!(!output.exists(), "{tag}: nothing may be written");
+        assert!(
+            directory.entries().is_empty(),
+            "{tag}: no build directory may be left behind"
+        );
+    }
+
+    #[test]
+    fn a_non_dominating_ssa_use_never_reaches_cranelift() {
+        let mut interner = Interner::new();
+        // bb1 defines %3 and does not dominate bb3, which uses it.
+        let module = hand_built_main(
+            &mut interner,
+            Ty::I64,
+            vec![
+                hand_built_block(
+                    0,
+                    vec![
+                        hand_built_int(0, 1),
+                        Instruction::Value {
+                            result: ValueId(1),
+                            ty: Ty::Bool,
+                            kind: ValueKind::Const(Const::Bool(true)),
+                        },
+                    ],
+                    Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                ),
+                hand_built_block(
+                    1,
+                    vec![hand_built_int(3, 7)],
+                    Terminator::Branch(BlockId(3)),
+                ),
+                hand_built_block(2, Vec::new(), Terminator::Branch(BlockId(3))),
+                hand_built_block(3, Vec::new(), Terminator::Return(Some(ValueId(3)))),
+            ],
+        );
+        assert_refused_before_codegen(&module, &interner, "non-dominating-use");
+    }
+
+    #[test]
+    fn a_dangling_branch_target_never_reaches_cranelift() {
+        let mut interner = Interner::new();
+        let module = hand_built_main(
+            &mut interner,
+            Ty::I64,
+            vec![hand_built_block(
+                0,
+                vec![hand_built_int(0, 1)],
+                Terminator::Branch(BlockId(9)),
+            )],
+        );
+        assert_refused_before_codegen(&module, &interner, "dangling-target");
+    }
+
+    #[test]
+    fn a_function_with_no_entry_block_never_reaches_cranelift() {
+        let mut interner = Interner::new();
+        let module = hand_built_main(
+            &mut interner,
+            Ty::I64,
+            vec![hand_built_block(
+                4,
+                vec![hand_built_int(0, 1)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        assert_refused_before_codegen(&module, &interner, "no-entry-block");
+    }
+
+    /// The plan *is* the proof of validation: `lower::emit_object`
+    /// takes one by reference and only `capability::validate` can build
+    /// one, so a module validation refuses has nothing that could be
+    /// handed to Cranelift instead.
+    #[test]
+    fn a_refused_module_produces_diagnostics_where_a_plan_would_be() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("sealed.npt", "\n");
+        let mut interner = Interner::new();
+        let registry = ItemRegistry::default();
+        let module = hand_built_main(
+            &mut interner,
+            Ty::Str,
+            vec![hand_built_block(
+                0,
+                vec![Instruction::Value {
+                    result: ValueId(0),
+                    ty: Ty::Str,
+                    kind: ValueKind::Const(Const::Str("no".to_string())),
+                }],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+
+        let refused =
+            capability::validate(&module, source, &interner, &registry, TARGET_TRIPLE, &[])
+                .expect_err("a `str` result is outside the native subset");
+        assert_eq!(
+            refused.iter().map(|d| d.code).collect::<Vec<_>>(),
+            vec![codes::ENTRY_RETURN_TYPE]
+        );
+    }
+
+    #[test]
+    fn refusing_unverified_nir_is_deterministic_and_never_panics() {
+        let mut interner = Interner::new();
+        let module = hand_built_main(
+            &mut interner,
+            Ty::I64,
+            vec![hand_built_block(
+                0,
+                vec![hand_built_int(0, 1)],
+                Terminator::Branch(BlockId(9)),
+            )],
+        );
+        let directory = TempDir::new("deterministic-seal");
+        let first = build_unverified(&module, &interner, &directory.join("a"));
+        let second = build_unverified(&module, &interner, &directory.join("b"));
+        assert_eq!(first, second);
+        assert_eq!(first.1, vec![codes::UNVERIFIED_NIR]);
     }
 }

@@ -199,6 +199,10 @@ pub fn validate(
     // the output never depends on how the module was stored.
     let mut reachable_blocks: BTreeMap<ItemId, Vec<BlockId>> = BTreeMap::new();
     let mut callees: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
+    // A function whose blocks cannot even be keyed has already been
+    // reported, by the walk below, for the one reason that matters;
+    // validating a body nothing could index would only say it again.
+    let mut unkeyed: BTreeSet<ItemId> = BTreeSet::new();
     let mut reached: BTreeSet<ItemId> = BTreeSet::new();
     let mut queue: VecDeque<ItemId> = VecDeque::new();
     reached.insert(entry);
@@ -211,6 +215,7 @@ pub fn validate(
             Ok(blocks) => blocks,
             Err(diagnostic) => {
                 validator.diagnostics.push(*diagnostic);
+                unkeyed.insert(id);
                 reachable_blocks.insert(id, Vec::new());
                 callees.insert(id, Vec::new());
                 continue;
@@ -233,6 +238,9 @@ pub fn validate(
     let functions: Vec<ItemId> = reached.iter().copied().collect();
 
     for id in &functions {
+        if unkeyed.contains(id) {
+            continue;
+        }
         let Some(function) = validator.functions.get(id).copied() else {
             continue;
         };
@@ -2086,5 +2094,925 @@ mod tests {
         let second = compile(source).rendered();
         assert!(!first.is_empty());
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod hand_built_tests {
+    use super::*;
+    use crate::nir::{Param, verify_module};
+    use crate::source::SourceMap;
+    use crate::symbol::Symbol;
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, literal: u128) -> Instruction {
+        value(result, Ty::I64, ValueKind::Const(Const::Int(literal)))
+    }
+
+    fn boolean(result: u32, literal: bool) -> Instruction {
+        value(result, Ty::Bool, ValueKind::Const(Const::Bool(literal)))
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn func(
+        id: u32,
+        name: Symbol,
+        params: Vec<Ty>,
+        return_type: Ty,
+        blocks: Vec<BasicBlock>,
+    ) -> Function {
+        Function {
+            id: ItemId(id),
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: params
+                .into_iter()
+                .enumerate()
+                .map(|(index, ty)| Param {
+                    value: ValueId(index as u32),
+                    ty,
+                    take: false,
+                })
+                .collect(),
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn module(functions: Vec<Function>) -> Module {
+        Module {
+            functions,
+            ..Module::default()
+        }
+    }
+
+    /// Validates hand-built NIR the way a caller who skipped the
+    /// verifier would: nothing here has a registry entry, so every
+    /// diagnostic has to identify itself by NIR identity alone.
+    fn codes_of(module: &Module, interner: &Interner) -> Vec<&'static str> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        match validate(
+            module,
+            source,
+            interner,
+            &ItemRegistry::default(),
+            TARGET_TRIPLE,
+            &[],
+        ) {
+            Ok(_) => Vec::new(),
+            Err(diagnostics) => diagnostics.iter().map(|d| d.code).collect(),
+        }
+    }
+
+    /// What `nir::verify` makes of the same module. Used to prove which
+    /// layer owns a given defect: malformed NIR must be rejected here,
+    /// before the native backend is ever consulted.
+    fn verifier_codes(module: &Module, interner: &Interner) -> Vec<&'static str> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// `func main() -> i64 { return <literal> }`, the smallest thing the
+    /// native subset accepts, as a starting point to perturb.
+    fn minimal_main(interner: &mut Interner) -> Function {
+        let main = interner.intern("main");
+        func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 1)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )
+    }
+
+    #[test]
+    fn the_smallest_accepted_module_is_accepted_by_both_layers() {
+        let mut interner = Interner::new();
+        let built = module(vec![minimal_main(&mut interner)]);
+        assert!(verifier_codes(&built, &interner).is_empty());
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    // -- entry contract, unreachable from ordinary source -----------------
+
+    #[test]
+    fn a_main_declaring_parameters_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            vec![Ty::I64],
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        )]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::ENTRY_PARAMETERS]);
+    }
+
+    #[test]
+    fn two_functions_named_main_are_refused_once() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let first = func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 1)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let second = func(
+            1,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 2)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let built = module(vec![first, second]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::DUPLICATE_ENTRY]);
+    }
+
+    #[test]
+    fn a_take_parameter_is_refused_as_an_ownership_transfer() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let helper = interner.intern("helper");
+        let mut callee = func(
+            1,
+            helper,
+            vec![Ty::I64],
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        if let Some(param) = callee.params.first_mut() {
+            param.take = true;
+        }
+        let caller = func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    int(0, 1),
+                    value(
+                        1,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(1), Vec::new(), vec![ValueId(0)], Vec::new()),
+                    ),
+                ],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        let built = module(vec![caller, callee]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::UNSUPPORTED_INSTRUCTION]
+        );
+    }
+
+    // -- the direct-call contract -----------------------------------------
+
+    #[test]
+    fn a_call_to_a_function_this_module_does_not_define_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![value(
+                    0,
+                    Ty::I64,
+                    ValueKind::Call(ItemId(99), Vec::new(), Vec::new(), Vec::new()),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNKNOWN_CALLEE]);
+        assert!(
+            !verifier_codes(&built, &interner).is_empty(),
+            "the verifier owns this too, and runs first"
+        );
+    }
+
+    #[test]
+    fn a_call_passing_the_wrong_number_of_arguments_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let helper = interner.intern("helper");
+        let callee = func(
+            1,
+            helper,
+            vec![Ty::I64],
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        let caller = func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![value(
+                    0,
+                    Ty::I64,
+                    ValueKind::Call(ItemId(1), Vec::new(), Vec::new(), Vec::new()),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let built = module(vec![caller, callee]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::CALL_SIGNATURE_MISMATCH]
+        );
+    }
+
+    #[test]
+    fn a_call_passing_an_argument_of_the_wrong_type_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let helper = interner.intern("helper");
+        let callee = func(
+            1,
+            helper,
+            vec![Ty::I64],
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        let caller = func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    boolean(0, true),
+                    value(
+                        1,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(1), Vec::new(), vec![ValueId(0)], Vec::new()),
+                    ),
+                ],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        let built = module(vec![caller, callee]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::CALL_SIGNATURE_MISMATCH]
+        );
+    }
+
+    #[test]
+    fn a_call_taking_a_result_the_callee_does_not_return_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let helper = interner.intern("helper");
+        let callee = func(
+            1,
+            helper,
+            Vec::new(),
+            Ty::Bool,
+            vec![block(
+                0,
+                vec![boolean(0, true)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let caller = func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![value(
+                    0,
+                    Ty::I64,
+                    ValueKind::Call(ItemId(1), Vec::new(), Vec::new(), Vec::new()),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let built = module(vec![caller, callee]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::CALL_SIGNATURE_MISMATCH]
+        );
+    }
+
+    // -- malformed NIR belongs to the verifier ----------------------------
+
+    #[test]
+    fn a_branch_to_a_block_that_does_not_exist_fails_verification_and_never_reaches_codegen() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Branch(BlockId(7)))],
+        )]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0004"),
+            "a dangling target is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    #[test]
+    fn a_use_of_a_value_nothing_defines_fails_verification_and_never_reaches_codegen() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(3))))],
+        )]);
+        assert!(!verifier_codes(&built, &interner).is_empty());
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    #[test]
+    fn a_function_with_no_entry_block_is_refused_without_panicking() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                4,
+                vec![int(0, 1)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    // -- slots --------------------------------------------------------------
+
+    #[test]
+    fn a_load_with_no_store_on_some_path_is_refused_rather_than_invented() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        // bb0: alloc, branch on a constant into bb1 (stores) or bb2
+        // (does not); bb3 loads. One incoming edge never wrote the slot.
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![
+                block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        boolean(1, true),
+                        int(2, 5),
+                    ],
+                    Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                ),
+                block(
+                    1,
+                    vec![Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Observe,
+                    }],
+                    Terminator::Branch(BlockId(3)),
+                ),
+                block(2, Vec::new(), Terminator::Branch(BlockId(3))),
+                block(
+                    3,
+                    vec![value(3, Ty::I64, ValueKind::Load(ValueId(0)))],
+                    Terminator::Return(Some(ValueId(3))),
+                ),
+            ],
+        )]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::UNINITIALIZED_SLOT_LOAD]
+        );
+    }
+
+    #[test]
+    fn a_load_stored_on_every_path_is_accepted() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![
+                block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        boolean(1, true),
+                        int(2, 5),
+                    ],
+                    Terminator::CondBranch {
+                        condition: ValueId(1),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                ),
+                block(
+                    1,
+                    vec![Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Observe,
+                    }],
+                    Terminator::Branch(BlockId(3)),
+                ),
+                block(
+                    2,
+                    vec![Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(2),
+                        mode: OwnershipMode::Observe,
+                    }],
+                    Terminator::Branch(BlockId(3)),
+                ),
+                block(
+                    3,
+                    vec![value(3, Ty::I64, ValueKind::Load(ValueId(0)))],
+                    Terminator::Return(Some(ValueId(3))),
+                ),
+            ],
+        )]);
+        assert!(verifier_codes(&built, &interner).is_empty());
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    #[test]
+    fn a_slot_used_as_an_ordinary_value_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    value(0, Ty::I64, ValueKind::Alloc),
+                    int(1, 3),
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: OwnershipMode::Observe,
+                    },
+                    value(2, Ty::I64, ValueKind::Add(ValueId(0), ValueId(1))),
+                ],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        )]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::SLOT_USED_AS_VALUE]);
+    }
+
+    #[test]
+    fn a_store_that_transfers_ownership_is_refused() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    value(0, Ty::I64, ValueKind::Alloc),
+                    int(1, 3),
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: OwnershipMode::Transfer,
+                    },
+                    value(2, Ty::I64, ValueKind::Load(ValueId(0))),
+                ],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        )]);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::UNSUPPORTED_INSTRUCTION]
+        );
+    }
+
+    // -- control-flow shapes ------------------------------------------------
+
+    #[test]
+    fn a_diamond_and_a_loop_backedge_are_accepted_by_both_layers() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        // bb0 -> {bb1, bb2} -> bb3 -> (bb3 | bb4), a diamond whose join
+        // block loops back on itself before leaving.
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![
+                block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        int(1, 0),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: OwnershipMode::Observe,
+                        },
+                        boolean(2, true),
+                    ],
+                    Terminator::CondBranch {
+                        condition: ValueId(2),
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                ),
+                block(1, Vec::new(), Terminator::Branch(BlockId(3))),
+                block(2, Vec::new(), Terminator::Branch(BlockId(3))),
+                block(
+                    3,
+                    vec![
+                        value(3, Ty::I64, ValueKind::Load(ValueId(0))),
+                        int(4, 4),
+                        value(5, Ty::Bool, ValueKind::Lt(ValueId(3), ValueId(4))),
+                        value(6, Ty::I64, ValueKind::Add(ValueId(3), ValueId(4))),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(6),
+                            mode: OwnershipMode::Observe,
+                        },
+                    ],
+                    Terminator::CondBranch {
+                        condition: ValueId(5),
+                        then_block: BlockId(3),
+                        else_block: BlockId(4),
+                    },
+                ),
+                block(
+                    4,
+                    vec![value(7, Ty::I64, ValueKind::Load(ValueId(0)))],
+                    Terminator::Return(Some(ValueId(7))),
+                ),
+            ],
+        )]);
+        assert!(
+            verifier_codes(&built, &interner).is_empty(),
+            "{:?}",
+            verifier_codes(&built, &interner)
+        );
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    /// An unsupported instruction nothing can execute is dead code, not
+    /// an error -- and, crucially, the value it defines never enters the
+    /// map reachable code generation reads.
+    #[test]
+    fn an_unsupported_instruction_in_an_unreachable_block_is_ignored() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![
+                block(0, vec![int(0, 1)], Terminator::Return(Some(ValueId(0)))),
+                block(
+                    1,
+                    vec![value(
+                        1,
+                        Ty::Str,
+                        ValueKind::Const(Const::Str("unreachable".to_string())),
+                    )],
+                    Terminator::Return(Some(ValueId(1))),
+                ),
+            ],
+        )]);
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    /// Two unreachable blocks that only reach each other: the fixpoint
+    /// must not be entered for them at all, and must not spin.
+    #[test]
+    fn an_unreachable_cycle_neither_fails_nor_hangs() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![
+                block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        int(1, 1),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: OwnershipMode::Observe,
+                        },
+                        value(2, Ty::I64, ValueKind::Load(ValueId(0))),
+                    ],
+                    Terminator::Return(Some(ValueId(2))),
+                ),
+                block(1, Vec::new(), Terminator::Branch(BlockId(2))),
+                block(2, Vec::new(), Terminator::Branch(BlockId(1))),
+            ],
+        )]);
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    /// A deep chain of blocks, all reachable, each carrying a slot
+    /// store: nothing here recurses on the native stack, so depth is
+    /// just work, never a crash.
+    #[test]
+    fn a_deep_scalar_control_flow_graph_neither_overflows_nor_hangs() {
+        const DEPTH: u32 = 400;
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let mut blocks = vec![block(
+            0,
+            vec![
+                value(0, Ty::I64, ValueKind::Alloc),
+                int(1, 0),
+                Instruction::Store {
+                    slot: ValueId(0),
+                    value: ValueId(1),
+                    mode: OwnershipMode::Observe,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        )];
+        for index in 1..DEPTH {
+            blocks.push(block(
+                index,
+                vec![value(index + 1, Ty::I64, ValueKind::Load(ValueId(0)))],
+                Terminator::Branch(BlockId(index + 1)),
+            ));
+        }
+        blocks.push(block(
+            DEPTH,
+            vec![value(DEPTH + 1, Ty::I64, ValueKind::Load(ValueId(0)))],
+            Terminator::Return(Some(ValueId(DEPTH + 1))),
+        ));
+        let built = module(vec![func(0, main, Vec::new(), Ty::I64, blocks)]);
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    /// A long, strictly acyclic call chain: the component search is
+    /// iterative, so chain length costs time and nothing else.
+    #[test]
+    fn a_deep_acyclic_call_chain_is_accepted_without_overflowing() {
+        const LENGTH: u32 = 300;
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let step = interner.intern("step");
+        let mut functions = vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![value(
+                    0,
+                    Ty::I64,
+                    ValueKind::Call(ItemId(1), Vec::new(), Vec::new(), Vec::new()),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )];
+        for index in 1..LENGTH {
+            functions.push(func(
+                index,
+                step,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![value(
+                        0,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(index + 1), Vec::new(), Vec::new(), Vec::new()),
+                    )],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            ));
+        }
+        functions.push(func(
+            LENGTH,
+            step,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 1)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        ));
+        let built = module(functions);
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    /// Two independent cycles produce exactly two diagnostics, each at
+    /// its own cycle's smallest id, in ascending order -- never one per
+    /// edge and never one per member.
+    #[test]
+    fn each_recursion_cycle_is_reported_once_at_its_canonical_root() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let name = interner.intern("f");
+        let call = |target: u32| {
+            block(
+                0,
+                vec![value(
+                    0,
+                    Ty::I64,
+                    ValueKind::Call(ItemId(target), Vec::new(), Vec::new(), Vec::new()),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )
+        };
+        let two_calls = |first: u32, second: u32| {
+            block(
+                0,
+                vec![
+                    value(
+                        0,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(first), Vec::new(), Vec::new(), Vec::new()),
+                    ),
+                    value(
+                        1,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(second), Vec::new(), Vec::new(), Vec::new()),
+                    ),
+                    value(2, Ty::I64, ValueKind::Add(ValueId(0), ValueId(1))),
+                ],
+                Terminator::Return(Some(ValueId(2))),
+            )
+        };
+        let functions = vec![
+            // `main` reaches a self-recursive `f1` and a mutually
+            // recursive `f2`/`f3`.
+            func(0, main, Vec::new(), Ty::I64, vec![two_calls(1, 2)]),
+            func(1, name, Vec::new(), Ty::I64, vec![call(1)]),
+            func(2, name, Vec::new(), Ty::I64, vec![call(3)]),
+            func(3, name, Vec::new(), Ty::I64, vec![call(2)]),
+        ];
+        let built = module(functions);
+        assert_eq!(
+            codes_of(&built, &interner),
+            vec![codes::RECURSIVE_CALL_GRAPH, codes::RECURSIVE_CALL_GRAPH]
+        );
+
+        // The same graph, stored backwards, reports the same two cycles
+        // in the same order.
+        let mut reversed = built;
+        reversed.functions.reverse();
+        assert_eq!(
+            codes_of(&reversed, &interner),
+            vec![codes::RECURSIVE_CALL_GRAPH, codes::RECURSIVE_CALL_GRAPH]
+        );
+    }
+
+    /// A cycle only reachable through a function `main` never calls is
+    /// not this build's problem: it is never compiled.
+    #[test]
+    fn a_recursion_cycle_outside_the_reachable_graph_is_ignored() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let name = interner.intern("f");
+        let built = module(vec![
+            func(
+                0,
+                main,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(0, 1)],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            ),
+            func(
+                1,
+                name,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![value(
+                        0,
+                        Ty::I64,
+                        ValueKind::Call(ItemId(1), Vec::new(), Vec::new(), Vec::new()),
+                    )],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            ),
+        ]);
+        assert!(codes_of(&built, &interner).is_empty());
+    }
+
+    #[test]
+    fn hand_built_refusals_are_byte_identical_across_repeated_runs() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::Str,
+            vec![block(
+                0,
+                vec![value(
+                    0,
+                    Ty::Str,
+                    ValueKind::Const(Const::Str("nope".to_string())),
+                )],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )]);
+        let render = || {
+            let mut map = SourceMap::new();
+            let source = map.add_file("hand-built.npt", "\n");
+            match validate(
+                &built,
+                source,
+                &interner,
+                &ItemRegistry::default(),
+                TARGET_TRIPLE,
+                &[],
+            ) {
+                Ok(_) => String::new(),
+                Err(diagnostics) => diagnostics
+                    .iter()
+                    .map(|d| crate::diagnostics::render(d, &map))
+                    .collect::<String>(),
+            }
+        };
+        let first = render();
+        assert!(first.contains(codes::ENTRY_RETURN_TYPE));
+        assert_eq!(first, render());
     }
 }

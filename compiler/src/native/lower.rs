@@ -117,7 +117,7 @@ pub fn emit_object(
         .map_err(|error| format!("could not start an object for `{target}`: {error}"))?;
     let mut object = ObjectModule::new(builder);
 
-    let functions = index_functions(module, plan)?;
+    let functions = index_functions(module, plan);
 
     // Every function is declared before any body is emitted, so a call
     // never has to care whether its callee has been compiled yet.
@@ -202,10 +202,7 @@ pub fn symbol_name(id: ItemId, declared: &str) -> String {
     format!("napitia_{}_{}", id.0, sanitized)
 }
 
-fn index_functions<'a>(
-    module: &'a Module,
-    plan: &NativePlan,
-) -> Result<BTreeMap<ItemId, &'a Function>, String> {
+fn index_functions<'a>(module: &'a Module, plan: &NativePlan) -> BTreeMap<ItemId, &'a Function> {
     let wanted: BTreeSet<ItemId> = plan.functions.iter().copied().collect();
     let mut functions: BTreeMap<ItemId, &Function> = BTreeMap::new();
     for function in &module.functions {
@@ -213,7 +210,7 @@ fn index_functions<'a>(
             functions.insert(function.id, function);
         }
     }
-    Ok(functions)
+    functions
 }
 
 fn lookup<'a>(
@@ -384,7 +381,7 @@ fn define_body(
         for instruction in &block.instructions {
             lowerer.instruction(instruction)?;
         }
-        lowerer.terminator(function, &block.terminator)?;
+        lowerer.terminator(&block.terminator)?;
     }
 
     lowerer.builder.seal_all_blocks();
@@ -487,15 +484,22 @@ impl BodyLowerer<'_, '_> {
             }
             Instruction::Store { slot, value, .. } => {
                 let target = self.value(*slot)?;
-                let Native::Slot { variable, .. } = target else {
+                let Native::Slot { variable, scalar } = target else {
                     return Err(format!("%{} is not a slot", slot.0));
                 };
-                match (variable, self.value(*value)?) {
+                // Matched against the *slot's own* scalar rather than
+                // just "some variable, some value": `def_var` panics on
+                // a type mismatch, and this backend answers a mismatch
+                // with a diagnostic. Capability validation already
+                // excludes one, so this only ever guards a caller who
+                // reached this function another way.
+                match (variable, scalar, self.value(*value)?) {
                     // A `unit` slot holds nothing, so storing into it is
                     // a complete no-op rather than a zero written
                     // somewhere.
-                    (None, Native::Unit) => Ok(()),
-                    (Some(variable), Native::Int(value) | Native::Bool(value)) => {
+                    (None, Scalar::Unit, Native::Unit) => Ok(()),
+                    (Some(variable), Scalar::Int, Native::Int(value))
+                    | (Some(variable), Scalar::Bool, Native::Bool(value)) => {
                         self.builder.def_var(variable, value);
                         Ok(())
                     }
@@ -718,7 +722,7 @@ impl BodyLowerer<'_, '_> {
         }
     }
 
-    fn terminator(&mut self, function: &Function, terminator: &Terminator) -> Result<(), String> {
+    fn terminator(&mut self, terminator: &Terminator) -> Result<(), String> {
         match terminator {
             Terminator::Return(None) => {
                 self.builder.ins().return_(&[]);
@@ -735,7 +739,6 @@ impl BodyLowerer<'_, '_> {
                     }
                     Native::Slot { .. } => return Err(format!("%{} is a slot", value.0)),
                 };
-                let _ = function;
                 Ok(())
             }
             Terminator::Branch(target) => {

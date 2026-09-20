@@ -42,6 +42,8 @@
 //! not malformed, and a program with a dangling block target is not
 //! merely unsupported.
 
+pub mod capability;
+
 use crate::types::Ty;
 
 /// The one target triple `napitia build` produces, and the only one
@@ -275,7 +277,11 @@ mod tests {
             Ty::Named(ItemId(0), name),
             Ty::Applied(ItemId(0), vec![Ty::I64]),
         ] {
-            assert_eq!(scalar_of(&ty), None, "{ty:?} must not be natively supported");
+            assert_eq!(
+                scalar_of(&ty),
+                None,
+                "{ty:?} must not be natively supported"
+            );
         }
     }
 

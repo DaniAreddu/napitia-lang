@@ -16965,3 +16965,590 @@ mod observation_leases {
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "excessive nesting");
     }
 }
+
+/// `rfcs/0015` -- what `i64` and `f64` actually do at run time.
+///
+/// Every case is written as ordinary Napitia source and executed, so
+/// what is being tested is the language's behavior rather than a Rust
+/// helper's. The boundary values appear as literals, which is only
+/// possible because the checker accepts them and lowering folds the
+/// negated minimum into a single constant.
+#[cfg(test)]
+mod numeric_semantics {
+    use super::tests::run;
+    use super::{InterpreterError, Value};
+    use crate::types::{ArithFailure, IntOp};
+
+    const MIN: &str = "-9223372036854775808";
+    const MAX: &str = "9223372036854775807";
+
+    fn main_returning(body: &str) -> Result<Value, InterpreterError> {
+        run(&format!("func main() -> i64 {{ {body} }}"))
+    }
+
+    fn int(body: &str) -> i64 {
+        match main_returning(body) {
+            Ok(Value::Int(v)) => v,
+            other => panic!("`{body}` should produce an integer, got {other:?}"),
+        }
+    }
+
+    fn overflow(op: IntOp) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::Overflow(op)))
+    }
+
+    fn by_zero(op: IntOp) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+            op,
+        )))
+    }
+
+    fn shift_amount(count: i64) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::ShiftAmount(
+            count,
+        )))
+    }
+
+    // -- the domain --------------------------------------------------------
+
+    /// Every value the release contract names, round-tripped through a
+    /// literal, a binding and a return.
+    #[test]
+    fn every_boundary_value_survives_a_literal_a_binding_and_a_return() {
+        for (text, expected) in [
+            ("0", 0),
+            ("1", 1),
+            ("-1", -1),
+            (MIN, i64::MIN),
+            ("-9223372036854775807", i64::MIN + 1),
+            ("9223372036854775806", i64::MAX - 1),
+            (MAX, i64::MAX),
+        ] {
+            assert_eq!(
+                int(&format!("value x: i64 = {text}; return x")),
+                expected,
+                "`{text}`"
+            );
+        }
+    }
+
+    /// The minimum is the one value that could not exist if a literal
+    /// were a magnitude negated afterwards.
+    #[test]
+    fn the_minimum_is_a_value_not_a_negation_that_could_not_be_performed() {
+        assert_eq!(int(&format!("return {MIN}")), i64::MIN);
+    }
+
+    // -- checked arithmetic ------------------------------------------------
+
+    #[test]
+    fn arithmetic_that_stays_in_the_domain_produces_the_exact_result() {
+        assert_eq!(int(&format!("return {MAX} - 1")), i64::MAX - 1);
+        assert_eq!(int(&format!("return {MIN} + 1")), i64::MIN + 1);
+        assert_eq!(int(&format!("return {MAX} * 1")), i64::MAX);
+        assert_eq!(int(&format!("return -({MIN} + 1)")), i64::MAX);
+        assert_eq!(int("return 6 * 7"), 42);
+        assert_eq!(int("return 0 - 0"), 0);
+    }
+
+    #[test]
+    fn addition_past_the_maximum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m + 1")),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn addition_past_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m + -1")),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn subtraction_past_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m - 1")),
+            overflow(IntOp::Sub)
+        );
+    }
+
+    #[test]
+    fn subtraction_past_the_maximum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m - -1")),
+            overflow(IntOp::Sub)
+        );
+    }
+
+    #[test]
+    fn multiplication_past_either_boundary_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m * 2")),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m * 2")),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m * -1")),
+            overflow(IntOp::Mul)
+        );
+    }
+
+    /// The one value whose negation is not an `i64`.
+    #[test]
+    fn negating_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return -m")),
+            overflow(IntOp::Neg)
+        );
+    }
+
+    /// Written as two operators rather than one literal: the inner one
+    /// is applied directly to the literal and folds, the outer one is a
+    /// real negation of the minimum.
+    #[test]
+    fn the_outer_negation_of_a_negated_minimum_literal_overflows() {
+        assert_eq!(
+            main_returning(&format!("return - {MIN}")),
+            overflow(IntOp::Neg)
+        );
+    }
+
+    #[test]
+    fn negating_every_other_boundary_stays_in_the_domain() {
+        assert_eq!(int(&format!("value m: i64 = {MAX}; return -m")), -i64::MAX);
+        assert_eq!(int("return -0"), 0);
+        assert_eq!(int("value x: i64 = -1; return -x"), 1);
+    }
+
+    // -- division, remainder and shifts ------------------------------------
+
+    #[test]
+    fn division_or_remainder_by_zero_has_no_result() {
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 1 / z"),
+            by_zero(IntOp::Div)
+        );
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 1 % z"),
+            by_zero(IntOp::Rem)
+        );
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 0 / z"),
+            by_zero(IntOp::Div)
+        );
+    }
+
+    /// The quotient `9223372036854775808` is not an `i64`; the remainder
+    /// `0` is. Two different answers to the same pair of operands, and
+    /// both are the arithmetic ones.
+    #[test]
+    fn the_minimum_divided_by_minus_one_overflows_but_its_remainder_is_zero() {
+        assert_eq!(
+            main_returning(&format!(
+                "value m: i64 = {MIN}; value d: i64 = -1; return m / d"
+            )),
+            overflow(IntOp::Div)
+        );
+        assert_eq!(
+            int(&format!(
+                "value m: i64 = {MIN}; value d: i64 = -1; return m % d"
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn division_truncates_toward_zero_and_remainder_takes_the_dividends_sign() {
+        assert_eq!(int("return 7 / 2"), 3);
+        assert_eq!(int("return -7 / 2"), -3);
+        assert_eq!(int("return 7 / -2"), -3);
+        assert_eq!(int("return 7 % 2"), 1);
+        assert_eq!(int("return -7 % 2"), -1);
+        assert_eq!(int("return 7 % -2"), 1);
+    }
+
+    #[test]
+    fn a_shift_count_at_or_past_the_width_has_no_result() {
+        assert_eq!(
+            main_returning("value n: i64 = 64; return 1 << n"),
+            shift_amount(64)
+        );
+        assert_eq!(
+            main_returning("value n: i64 = 64; return 1 >> n"),
+            shift_amount(64)
+        );
+        assert_eq!(
+            main_returning(&format!("value n: i64 = {MAX}; return 1 << n")),
+            shift_amount(i64::MAX)
+        );
+    }
+
+    /// The count is an ordinary `i64`, so a negative one is expressible
+    /// -- and is a failure rather than a very large positive count.
+    #[test]
+    fn a_negative_shift_count_has_no_result() {
+        assert_eq!(
+            main_returning("value n: i64 = -1; return 1 << n"),
+            shift_amount(-1)
+        );
+        assert_eq!(
+            main_returning("value n: i64 = -1; return 1 >> n"),
+            shift_amount(-1)
+        );
+        assert_eq!(
+            main_returning(&format!("value n: i64 = {MIN}; return 1 >> n")),
+            shift_amount(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn shifts_inside_the_width_discard_bits_and_replicate_the_sign() {
+        assert_eq!(int("return 1 << 0"), 1);
+        assert_eq!(int("return 1 << 62"), 1i64 << 62);
+        assert_eq!(
+            int("return 1 << 63"),
+            i64::MIN,
+            "the top bit is the sign bit, and reaching it is not an overflow"
+        );
+        assert_eq!(int(&format!("value m: i64 = {MIN}; return m >> 63")), -1);
+        assert_eq!(int("value x: i64 = -8; return x >> 1"), -4);
+        assert_eq!(int("value x: i64 = -1; return x >> 63"), -1);
+        assert_eq!(int(&format!("value m: i64 = {MAX}; return m >> 62")), 1);
+    }
+
+    // -- comparisons and bitwise operations --------------------------------
+
+    fn truth(body: &str) -> bool {
+        match run(&format!("func main() -> bool {{ {body} }}")) {
+            Ok(Value::Bool(v)) => v,
+            other => panic!("`{body}` should produce a bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordering_is_signed_across_zero_and_at_both_boundaries() {
+        assert!(truth(&format!("value m: i64 = {MIN}; return m < 0")));
+        assert!(truth(&format!("value m: i64 = {MAX}; return 0 < m")));
+        assert!(truth(&format!(
+            "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo < hi"
+        )));
+        assert!(truth(&format!(
+            "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return hi > lo"
+        )));
+        assert!(truth("value a: i64 = -1; return a < 0"));
+        assert!(truth("value a: i64 = -1; return a <= -1"));
+        assert!(truth("value a: i64 = -1; return a >= -1"));
+        assert!(!truth("value a: i64 = -1; return a > 0"));
+    }
+
+    #[test]
+    fn equality_holds_at_both_boundaries_and_nowhere_near_them() {
+        assert!(truth(&format!("value m: i64 = {MIN}; return m == {MIN}")));
+        assert!(truth(&format!("value m: i64 = {MAX}; return m == {MAX}")));
+        assert!(truth(&format!("value m: i64 = {MIN}; return m != {MAX}")));
+        assert!(truth(&format!(
+            "value m: i64 = {MIN}; return m != {MIN} + 1"
+        )));
+    }
+
+    /// The high bit is where a narrower representation would quietly
+    /// disagree.
+    #[test]
+    fn bitwise_operations_reach_the_high_bit() {
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo & hi"
+            )),
+            0
+        );
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo | hi"
+            )),
+            -1
+        );
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo ^ hi"
+            )),
+            -1
+        );
+        assert_eq!(
+            int(&format!("value hi: i64 = {MAX}; return ~hi")),
+            i64::MIN,
+            "inverting the maximum is the minimum, in exactly 64 bits"
+        );
+        assert_eq!(int(&format!("value lo: i64 = {MIN}; return ~lo")), i64::MAX);
+        assert_eq!(int("return ~0"), -1);
+        assert_eq!(int("return ~-1"), 0);
+    }
+
+    // -- propagation -------------------------------------------------------
+
+    #[test]
+    fn a_failure_inside_a_call_reaches_the_caller_unchanged() {
+        assert_eq!(
+            run(&format!(
+                "func bump(n: i64) -> i64 {{ return n + 1 }} \
+                 func main() -> i64 {{ return bump({MAX}) }}"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_nested_call_reaches_the_outermost_caller() {
+        assert_eq!(
+            run(&format!(
+                "func inner(n: i64) -> i64 {{ return n + 1 }} \
+                 func middle(n: i64) -> i64 {{ return inner(n) }} \
+                 func main() -> i64 {{ return middle({MAX}) }}"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_loop_stops_the_loop() {
+        assert_eq!(
+            main_returning(&format!(
+                "mutable x: i64 = {MAX}; \
+                 mutable i: i64 = 0; \
+                 while i < 10 {{ x = x + 1; i = i + 1; }} \
+                 return x"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_on_the_taken_branch_only_happens_when_that_branch_runs() {
+        let program = |flag: &str| {
+            format!(
+                "value chosen: bool = {flag}; \
+                 value m: i64 = {MAX}; \
+                 if chosen {{ return m + 1; }} \
+                 return 7"
+            )
+        };
+        assert_eq!(main_returning(&program("true")), overflow(IntOp::Add));
+        assert_eq!(int(&program("false")), 7);
+    }
+
+    /// A slot keeps the last value successfully written to it. The
+    /// failing operation never produced one, so it never stored one.
+    #[test]
+    fn a_failed_operation_leaves_the_state_before_it_untouched() {
+        assert_eq!(
+            main_returning(&format!(
+                "mutable x: i64 = 5; \
+                 x = x + 1; \
+                 value m: i64 = {MAX}; \
+                 x = m + 1; \
+                 return x"
+            )),
+            overflow(IntOp::Add),
+            "the program fails rather than storing a wrapped value"
+        );
+        assert_eq!(
+            int("mutable x: i64 = 5; x = x + 1; return x"),
+            6,
+            "the same prefix without the failing step"
+        );
+    }
+
+    // -- arguments, returns, slots and arity -------------------------------
+
+    #[test]
+    fn boundary_values_cross_a_call_in_both_directions() {
+        for (text, expected) in [(MIN, i64::MIN), (MAX, i64::MAX)] {
+            assert_eq!(
+                run(&format!(
+                    "func echo(n: i64) -> i64 {{ return n }} \
+                     func main() -> i64 {{ return echo({text}) }}"
+                )),
+                Ok(Value::Int(expected)),
+                "`{text}` must survive both the argument and the return"
+            );
+        }
+    }
+
+    #[test]
+    fn a_high_arity_call_places_every_boundary_argument_correctly() {
+        assert_eq!(
+            run(&format!(
+                "func weigh(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {{ \
+                   return a + b + c + d + e + f + g + h \
+                 }} \
+                 func main() -> i64 {{ return weigh({MIN}, {MAX}, 1, 0, 0, 0, 0, 0) }}"
+            )),
+            Ok(Value::Int(0)),
+            "the minimum plus the maximum plus one is zero, in exactly 64 bits"
+        );
+    }
+
+    #[test]
+    fn a_unit_parameter_between_two_integers_shifts_neither() {
+        assert_eq!(
+            run("func nothing() -> unit { return } \
+                 func mixed(before: unit, x: i64, between: unit, y: i64) -> i64 { return x - y } \
+                 func main() -> i64 { return mixed(nothing(), 40, nothing(), 2) }"),
+            Ok(Value::Int(38))
+        );
+    }
+
+    #[test]
+    fn a_mutable_slot_holds_a_boundary_value_across_a_loop() {
+        assert_eq!(
+            int(&format!(
+                "mutable x: i64 = {MIN}; \
+                 mutable i: i64 = 0; \
+                 while i < 3 {{ x = x + 1; i = i + 1; }} \
+                 return x"
+            )),
+            i64::MIN + 3
+        );
+    }
+
+    // -- determinism -------------------------------------------------------
+
+    #[test]
+    fn repeated_execution_produces_the_identical_answer() {
+        let ok = format!("func main() -> i64 {{ return {MIN} + 1 }}");
+        let failing = format!("func main() -> i64 {{ value m: i64 = {MAX}; return m * 2 }}");
+        let first_ok = run(&ok);
+        let first_failing = run(&failing);
+        for _ in 0..16 {
+            assert_eq!(run(&ok), first_ok);
+            assert_eq!(run(&failing), first_failing);
+        }
+        assert_eq!(first_ok, Ok(Value::Int(i64::MIN + 1)));
+        assert_eq!(first_failing, overflow(IntOp::Mul));
+    }
+
+    /// The rendered failure is what a differential test compares, so it
+    /// is pinned exactly.
+    #[test]
+    fn a_failure_renders_to_one_stable_line_with_its_code() {
+        for (body, code, text) in [
+            (
+                format!("value m: i64 = {MAX}; return m + 1"),
+                "X0002",
+                "integer overflow in `add`",
+            ),
+            (
+                format!("value m: i64 = {MIN}; return -m"),
+                "X0002",
+                "integer overflow in `neg`",
+            ),
+            (
+                "value z: i64 = 0; return 1 / z".to_string(),
+                "X0001",
+                "`div` by zero",
+            ),
+            (
+                "value z: i64 = 0; return 1 % z".to_string(),
+                "X0001",
+                "`rem` by zero",
+            ),
+            (
+                "value n: i64 = 64; return 1 << n".to_string(),
+                "X0003",
+                "shift amount 64 is outside 0..64",
+            ),
+        ] {
+            let error = main_returning(&body).expect_err("this program must fail");
+            assert_eq!(error.code(), code, "`{body}`");
+            assert_eq!(error.to_string(), text, "`{body}`");
+        }
+    }
+
+    // -- floats: only what is actually implemented -------------------------
+
+    fn float(body: &str) -> f64 {
+        match run(&format!("func main() -> f64 {{ {body} }}")) {
+            Ok(Value::Float(v)) => v,
+            other => panic!("`{body}` should produce a float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_finite_float_arithmetic_works() {
+        assert_eq!(float("return 1.5 + 2.25"), 3.75);
+        assert_eq!(float("return 1.5 - 2.5"), -1.0);
+        assert_eq!(float("return 1.5 * 2.0"), 3.0);
+        assert_eq!(float("return 3.0 / 2.0"), 1.5);
+        assert_eq!(float("return 7.5 % 2.0"), 1.5);
+        assert_eq!(float("return -1.5"), -1.5);
+    }
+
+    /// Both zeroes exist and compare equal, which is IEEE-754's rule and
+    /// not an accident of how they are stored.
+    #[test]
+    fn positive_and_negative_zero_are_distinct_values_that_compare_equal() {
+        assert!(float("return -0.0").is_sign_negative());
+        assert!(float("return 0.0").is_sign_positive());
+        assert!(truth("return 0.0 == -0.0"));
+    }
+
+    /// A zero divisor is a failure for integers and an infinity for
+    /// floats. The asymmetry is the standard's.
+    #[test]
+    fn float_division_by_zero_is_an_infinity_rather_than_a_failure() {
+        assert!(float("value z: f64 = 0.0; return 1.0 / z").is_infinite());
+        assert!(float("value z: f64 = 0.0; return -1.0 / z").is_infinite());
+        assert!(float("value z: f64 = 0.0; return 0.0 / z").is_nan());
+    }
+
+    /// There is no implicit conversion in either direction, and no cast
+    /// to ask for one with.
+    /// Every diagnostic checking `text` reports. Used where the point is
+    /// that a program never runs at all.
+    fn check_codes(text: &str) -> Vec<&'static str> {
+        let mut map = crate::source::SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = crate::symbol::Interner::new();
+        crate::driver::check(&map, id, &mut interner)
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// There is no implicit conversion in either direction, and no cast
+    /// to ask for one with -- so a mixed expression never reaches the
+    /// interpreter.
+    #[test]
+    fn an_integer_and_a_float_never_mix() {
+        for text in [
+            "func main() -> f64 { return 1 }",
+            "func main() -> i64 { return 1.0 }",
+            "func main() -> f64 { value x: i64 = 1; value y: f64 = 1.0; return x + y }",
+            "func main() -> bool { value x: i64 = 1; value y: f64 = 1.0; return x == y }",
+        ] {
+            assert!(
+                !check_codes(text).is_empty(),
+                "`{text}` must be refused before it can run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_float_prints_the_same_way_every_time() {
+        let text = "func main() -> f64 { return 1.0 / 3.0 }";
+        let first = run(text);
+        for _ in 0..8 {
+            assert_eq!(run(text), first);
+        }
+        let Ok(Value::Float(v)) = first else {
+            panic!("expected a float")
+        };
+        assert_eq!(v.to_string(), "0.3333333333333333");
+    }
+}

@@ -31,7 +31,7 @@ toml = "0.8"
 # named target, with no IR-level language assumptions of its own and no
 # C++ toolchain to build. That is exactly the surface this milestone
 # needs, and no more -- `cranelift-jit` is deliberately absent, since
-# Alpha 0.2.0 compiles ahead of time and nothing here runs generated
+# `napitia build` compiles ahead of time and nothing here runs generated
 # code in this process.
 #
 # `x86` is requested explicitly rather than relying on `host-arch`:

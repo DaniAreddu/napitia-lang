@@ -26,8 +26,9 @@
 //!   generation never sees NIR the verifier has not accepted, so
 //!   nothing here re-derives structural invariants the verifier already
 //!   owns -- and where this module does notice such a violation anyway
-//!   (it is a public API, and a caller can hand it anything), it refuses
-//!   with [`codes::UNVERIFIED_NIR`] rather than guessing.
+//!   (`build_executable` is `pub(crate)`, and a crate-internal caller
+//!   can hand it anything), it refuses with
+//!   [`codes::UNVERIFIED_NIR`] rather than guessing.
 //! * `capability` runs after verification and before Cranelift ever
 //!   sees a function. It decides, exhaustively, whether the whole
 //!   reachable program is inside the supported subset. Everything after

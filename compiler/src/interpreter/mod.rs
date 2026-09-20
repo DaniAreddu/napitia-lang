@@ -17001,7 +17001,7 @@ mod observation_leases {
 #[cfg(test)]
 mod numeric_semantics {
     use super::tests::run;
-    use super::{InterpreterError, Value, codes};
+    use super::{InterpreterError, Value};
     use crate::types::{ArithFailure, IntOp};
 
     const MIN: &str = "-9223372036854775808";

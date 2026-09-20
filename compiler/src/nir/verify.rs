@@ -17,7 +17,10 @@ use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_G
 use crate::place::Place;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
+use crate::types::{
+    CapabilityRequirement, Evidence, Ty, domain_of, is_executable_numeric, is_integer, is_numeric,
+    substitute,
+};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
@@ -624,6 +627,27 @@ mod codes {
     /// disjoint sibling place is unaffected. Reported once per
     /// operation, against the innermost overlapping observation.
     pub const OWNERSHIP_WHILE_OBSERVED: &str = "V0110";
+    /// An integer constant outside the domain of the type its own
+    /// instruction declares (`rfcs/0015`).
+    ///
+    /// `Const::Int`'s payload is wider than any integer type Napitia
+    /// executes precisely so that this can be checked rather than made
+    /// unrepresentable: the verifier is the stage that decides a
+    /// constant is a valid value of its type, and everything downstream
+    /// -- the interpreter, the native backend -- relies on that having
+    /// happened rather than re-deciding it.
+    pub const INTEGER_CONSTANT_OUT_OF_RANGE: &str = "V0111";
+    /// A numeric type with no execution semantics in this milestone
+    /// appearing anywhere in NIR (`rfcs/0015`): any integer width other
+    /// than `i64`, any unsigned width, or `f32`.
+    ///
+    /// `typeck`'s `T0074` already refuses these in source, so no
+    /// compiled program reaches here carrying one. This is the
+    /// independent check that stops hand-built NIR from handing the
+    /// interpreter or the backend a type neither of them implements --
+    /// which is what "operands of incompatible widths or signedness"
+    /// reduces to when exactly one integer width exists.
+    pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "V0112";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -2521,8 +2545,14 @@ fn check_no_duplicate_type_params(
     }
 }
 
-fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut Vec<Diagnostic>) {
-    check_no_bad_type_at_depth(ty, source, context, diagnostics, 0);
+fn check_no_bad_type(
+    ty: &Ty,
+    source: SourceId,
+    interner: &Interner,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    check_no_bad_type_at_depth(ty, source, interner, context, diagnostics, 0);
 }
 
 /// `depth`-bounded the same way every other stage that walks a nested
@@ -2535,6 +2565,7 @@ fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut
 fn check_no_bad_type_at_depth(
     ty: &Ty,
     source: SourceId,
+    interner: &Interner,
     context: &str,
     diagnostics: &mut Vec<Diagnostic>,
     depth: usize,
@@ -2563,9 +2594,24 @@ fn check_no_bad_type_at_depth(
         )),
         Ty::Applied(_, args) => {
             for arg in args {
-                check_no_bad_type_at_depth(arg, source, context, diagnostics, depth + 1);
+                check_no_bad_type_at_depth(arg, source, interner, context, diagnostics, depth + 1);
             }
         }
+        // A numeric name this milestone does not execute (`rfcs/0015`).
+        // Rejected here rather than where each consumer would trip over
+        // it: the interpreter has one integer representation and the
+        // backend has one machine type, so anything else would have to
+        // be run as something other than what it says it is.
+        other if !is_executable_numeric(other) => diagnostics.push(Diagnostic::error(
+            codes::UNIMPLEMENTED_NUMERIC_TYPE,
+            source,
+            Span::dummy(),
+            format!(
+                "{context} names `{}`, which has no execution semantics in this milestone; \
+                 `i64` and `f64` are the numeric types NIR carries",
+                crate::types::display_ty(other, interner)
+            ),
+        )),
         _ => {}
     }
 }
@@ -2889,7 +2935,7 @@ fn check_type_root(
         ));
         return;
     }
-    check_no_bad_type(ty, source, context, diagnostics);
+    check_no_bad_type(ty, source, interner, context, diagnostics);
     check_named_type_identity(ty, agg, source, interner, registry, context, diagnostics);
     check_type_param_scope(ty, own_params, source, context, diagnostics);
 }
@@ -3174,6 +3220,32 @@ fn verify_value_kind(
     match kind {
         ValueKind::Alloc => {}
         ValueKind::Const(c) => {
+            // An integer constant's *value* is checked against its own
+            // declared type's domain, not merely its kind (`rfcs/0015`).
+            // This is the stage that decides a constant is a valid value
+            // of the type it claims; the interpreter and the backend
+            // both rely on that having happened here rather than
+            // re-deciding it, and a payload narrow enough to make an
+            // out-of-range constant unrepresentable would have left
+            // nothing to decide.
+            if let Const::Int(value) = c
+                && let Some(domain) = domain_of(result_ty)
+                && !domain.contains(*value)
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTEGER_CONSTANT_OUT_OF_RANGE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} is the constant {value}, which `{}` \
+                         cannot hold ({} through {})",
+                        result.0,
+                        domain.name(),
+                        domain.min(),
+                        domain.max()
+                    ),
+                ));
+            }
             let ok = match c {
                 Const::Int(_) => is_integer(result_ty),
                 Const::Float(_) => matches!(result_ty, Ty::F32 | Ty::F64),

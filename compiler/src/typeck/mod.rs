@@ -249,6 +249,13 @@ mod codes {
     /// than silently answering "not affine" and reporting `T0070`,
     /// which would be the wrong reason for the right rejection.
     pub const OBSERVATION_SOURCE_TYPE_UNRESOLVED: &str = "T0072";
+    /// An integer literal whose magnitude is outside the domain of the
+    /// type it resolved to (`rfcs/0015`). Reported against the literal
+    /// itself, never the enclosing statement or function, and always
+    /// before NIR lowering runs -- the literal is not truncated, not
+    /// defaulted to zero, and not turned into a `Ty::Error` for a later
+    /// stage to trip over.
+    pub const INTEGER_LITERAL_OUT_OF_RANGE: &str = "T0073";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -461,6 +468,8 @@ pub fn check_module_with_registry(
         capability_cache: HashMap::new(),
         field_projections: HashMap::new(),
         observation_aliases: HashSet::new(),
+        int_literals: Vec::new(),
+        negated_literals: HashSet::new(),
     };
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
@@ -479,6 +488,7 @@ pub fn check_module_with_registry(
         }
     }
     checker.finalize_defaults();
+    checker.check_integer_literal_ranges();
 
     let local_types = checker
         .locals
@@ -710,6 +720,48 @@ struct Checker<'a> {
     /// never be assigned to, rather than the generic
     /// "not declared `mutable`".
     observation_aliases: HashSet<LocalId>,
+    /// Every integer literal this module contains, in the order it was
+    /// checked, with the type variable it was given.
+    ///
+    /// A literal's range cannot be decided where it is written: its type
+    /// is a fresh inference variable that only becomes concrete once
+    /// unification and literal defaulting have both finished. So the
+    /// magnitude is recorded here and validated in one pass at the end
+    /// of `check_module`, against the type that variable actually
+    /// resolved to. A `Vec` rather than a map keyed by identity because
+    /// nothing ever looks one up -- the order diagnostics come out in is
+    /// the order the literals were checked in, which is the order they
+    /// appear in the module.
+    int_literals: Vec<IntLiteral>,
+    /// The identity of every integer literal that is the direct operand
+    /// of a unary `-` (`rfcs/0015`).
+    ///
+    /// Recorded by `check_unary` *before* it checks its operand, so the
+    /// literal's own arm can see the sign it is about to be given.
+    /// `-9223372036854775808` is the reason this exists: its magnitude
+    /// is one past `i64`'s maximum, and only the negation makes it a
+    /// valid literal. Consulted by identity, never iterated, so it
+    /// determines nothing about diagnostic order.
+    negated_literals: HashSet<ExprId>,
+}
+
+/// One integer literal, awaiting the type its inference variable
+/// settles on.
+struct IntLiteral {
+    /// The unsigned magnitude the lexer read. Never a signed value: a
+    /// literal carries no sign of its own (`rfcs/0015`).
+    magnitude: u128,
+    /// Whether a unary `-` is applied directly to this literal.
+    negated: bool,
+    /// The (possibly still unresolved) type this literal was given.
+    ty: Ty,
+    /// The literal's own span, so the diagnostic points at it rather
+    /// than at whatever encloses it.
+    span: Span,
+    /// The module this literal was written in -- captured here because
+    /// `Checker::source` moves on to the next function long before this
+    /// is validated.
+    source: SourceId,
 }
 
 #[derive(Clone)]
@@ -1590,7 +1642,12 @@ impl<'a> Checker<'a> {
 
     fn check_expr_kind(&mut self, expr: &HirExpr) -> Ty {
         match expr {
-            HirExpr::Int { .. } => self.fresh_default(Ty::I64, VarKind::Integer),
+            HirExpr::Int {
+                id, value, span, ..
+            } => {
+                let negated = self.negated_literals.contains(id);
+                self.integer_literal(*value, negated, *span)
+            }
             HirExpr::Float { .. } => self.fresh_default(Ty::F64, VarKind::Float),
             HirExpr::Str { .. } => Ty::Str,
             HirExpr::Char { .. } => Ty::Char,
@@ -1759,6 +1816,19 @@ impl<'a> Checker<'a> {
     }
 
     fn check_unary(&mut self, op: UnaryOp, operand: &HirExpr, span: Span) -> Ty {
+        // Recorded before the operand is checked, because the operand's
+        // own arm is what records the literal, and it has to know
+        // whether a `-` is being applied to it: `9223372036854775808` is
+        // not an `i64` and `-9223372036854775808` is (`rfcs/0015`).
+        // Only a literal *directly* under the operator counts.
+        // Parentheses are transparent by the time HIR exists, so
+        // `-(9223372036854775808)` is the same negated literal and is
+        // equally accepted; `- -9223372036854775808` is not, because the
+        // inner operator's operand is the only literal there and it has
+        // no sign of its own.
+        if let (UnaryOp::Neg, HirExpr::Int { id, .. }) = (op, operand) {
+            self.negated_literals.insert(*id);
+        }
         let ty = self.check_expr(operand);
         // Every unary operator strictly evaluates its operand first, so
         // an operand that provably never produces a value means the
@@ -3995,7 +4065,10 @@ impl<'a> Checker<'a> {
                 )
             }
             HirPattern::Int { value, span, .. } => {
-                let literal_ty = self.fresh_default(Ty::I64, VarKind::Integer);
+                // A pattern literal has no sign to carry: the pattern
+                // grammar has no unary `-`, so a magnitude is all there
+                // ever is here.
+                let literal_ty = self.integer_literal(*value, false, *span);
                 let valid = self.unify_report(
                     &resolved_scrutinee,
                     &literal_ty,
@@ -4057,10 +4130,75 @@ impl<'a> Checker<'a> {
     /// the time checking finishes (`spec/0003`'s literal inference). The
     /// kind stops the variable from unifying with something it was never
     /// compatible with in the first place (see [`VarKind`]).
+    /// Types one integer literal, and records its magnitude for the
+    /// range check `check_module` runs once everything is resolved.
+    ///
+    /// The literal's type is a fresh inference variable defaulting to
+    /// `i64` (`spec/0003`'s literal inference), which is why the range
+    /// cannot be decided here: `1` in `value x: u8 = 1` and `1` in
+    /// `value y = 1` are the same syntax and different domains, and
+    /// which one this is has not been decided yet.
+    fn integer_literal(&mut self, magnitude: u128, negated: bool, span: Span) -> Ty {
+        let ty = self.fresh_default(Ty::I64, VarKind::Integer);
+        self.int_literals.push(IntLiteral {
+            magnitude,
+            negated,
+            ty: ty.clone(),
+            span,
+            source: self.source,
+        });
+        ty
+    }
+
     fn fresh_default(&mut self, default: Ty, kind: VarKind) -> Ty {
         let var = self.ctx.fresh_var_with_kind(Some(kind));
         self.pending_defaults.push((var, default));
         Ty::Var(var)
+    }
+
+    /// Checks every integer literal against the domain of the type it
+    /// ended up with (`rfcs/0015`).
+    ///
+    /// Runs after `finalize_defaults`, because until then a literal's
+    /// type can still be an unresolved variable, and the answer depends
+    /// on it. Runs before anything reads `expr_types`, so a literal that
+    /// does not fit stops the pipeline here rather than reaching NIR
+    /// lowering as a truncated, defaulted or `Ty::Error` value.
+    ///
+    /// A literal whose type is still a variable after defaulting, or is
+    /// not an integer type at all, is not this pass's business: the
+    /// first cannot happen for an integer literal (it defaults to
+    /// `i64`), and the second is already a type mismatch someone else
+    /// reported.
+    fn check_integer_literal_ranges(&mut self) {
+        for literal in std::mem::take(&mut self.int_literals) {
+            let resolved = deep_resolve(&self.ctx, &literal.ty);
+            let Some(domain) = crate::types::domain_of(&resolved) else {
+                continue;
+            };
+            if domain.literal(literal.magnitude, literal.negated).is_some() {
+                continue;
+            }
+            let sign = if literal.negated { "-" } else { "" };
+            self.diagnostics.push(
+                Diagnostic::error(
+                    codes::INTEGER_LITERAL_OUT_OF_RANGE,
+                    literal.source,
+                    literal.span,
+                    format!(
+                        "`{sign}{}` is outside the range of `{}`",
+                        literal.magnitude,
+                        domain.name()
+                    ),
+                )
+                .with_primary_label(format!(
+                    "`{}` holds {} through {}",
+                    domain.name(),
+                    domain.min(),
+                    domain.max()
+                )),
+            );
+        }
     }
 
     fn finalize_defaults(&mut self) {
@@ -5236,6 +5374,8 @@ mod tests {
             capability_cache: HashMap::new(),
             field_projections: HashMap::new(),
             observation_aliases: HashSet::new(),
+            int_literals: Vec::new(),
+            negated_literals: HashSet::new(),
             pattern_budget: exhaustive::MAX_USEFULNESS_STEPS,
             entry_main: EntryMain::ByName,
         };
@@ -5296,6 +5436,8 @@ mod tests {
             capability_cache: HashMap::new(),
             field_projections: HashMap::new(),
             observation_aliases: HashSet::new(),
+            int_literals: Vec::new(),
+            negated_literals: HashSet::new(),
             pattern_budget: budget,
             entry_main: EntryMain::ByName,
         }

@@ -876,23 +876,29 @@ pub struct Interpreter<'a> {
     /// recursive function exhausts the native stack and aborts the
     /// process instead of producing an error anything can report.
     call_depth: std::cell::Cell<usize>,
-    /// Whether a fatal arithmetic abort has already ended an execution
-    /// on this interpreter (`rfcs/0015`).
+    /// Whether a running frame has already failed on this interpreter
+    /// (`rfcs/0015`).
     ///
-    /// An X-class arithmetic failure is not a Napitia control-flow exit:
-    /// it stops execution exactly where it stood. Slots written before
-    /// it keep what they hold, resources constructed before it are still
-    /// live, pending `defer` actions never run, and no `drop` after it
-    /// is reached. That is not a state any Napitia semantics describe --
-    /// it is the middle of a statement -- so nothing may be executed
-    /// against it afterwards.
+    /// A failure that reaches a running frame is not a Napitia
+    /// control-flow exit: it stops execution exactly where it stood.
+    /// Slots written before it keep what they hold, resources
+    /// constructed before it are still live, pending `defer` actions
+    /// never run, and no `drop` after it is reached. That is not a state
+    /// any Napitia semantics describe -- it is the middle of a statement
+    /// -- so nothing may be executed against it afterwards.
     ///
-    /// Set for arithmetic failures only. A structured refusal of
-    /// malformed input (`X0004`) is the opposite case: it is checked
-    /// *before* anything changes and is documented, and tested, as
-    /// leaving the interpreter exactly as it was, so those stay
-    /// repeatable.
-    aborted: std::cell::Cell<bool>,
+    /// Set for *every* error a frame returns, not only arithmetic. A
+    /// malformed instruction is often discovered after valid ones have
+    /// already run: hand-built NIR can construct a resource, write the
+    /// event log and only then reach a type this interpreter cannot
+    /// execute. That leaves exactly the same partial state an overflow
+    /// does, so it ends the context the same way.
+    ///
+    /// What does *not* set it is a refusal completed before any frame is
+    /// entered -- an unknown function or item, or an attempt to use an
+    /// interpreter already terminated. Those change nothing, so they
+    /// leave the interpreter usable.
+    terminated: std::cell::Cell<bool>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -903,21 +909,24 @@ impl<'a> Interpreter<'a> {
             #[cfg(test)]
             event_log: RefCell::new(Vec::new()),
             call_depth: std::cell::Cell::new(0),
-            aborted: std::cell::Cell::new(false),
+            terminated: std::cell::Cell::new(false),
         }
     }
 
-    /// Refuses to start an execution on an interpreter a fatal abort
-    /// already ended.
+    /// Refuses to start an execution on an interpreter whose previous
+    /// execution already failed.
     ///
     /// Reported as an invalid *operation on the engine* (`X0004`), never
-    /// as one of the arithmetic codes: the arithmetic failure already
-    /// happened and was already reported, and re-reporting it here would
-    /// claim this call performed the failing operation.
-    fn check_not_aborted(&self) -> Result<(), InterpreterError> {
-        if self.aborted.get() {
+    /// as the code the original failure carried: that failure already
+    /// happened and was already reported, and repeating its code here
+    /// would claim this call performed the failing operation.
+    ///
+    /// Checked before anything else, so the refusal enters no frame,
+    /// runs no cleanup, touches no resource and appends no event.
+    fn check_not_terminated(&self) -> Result<(), InterpreterError> {
+        if self.terminated.get() {
             return Err(invalid(
-                "this execution context ended in a fatal arithmetic abort and cannot be reused",
+                "this execution context ended in a failed execution and cannot be reused",
             ));
         }
         Ok(())
@@ -3190,7 +3199,7 @@ impl<'a> Interpreter<'a> {
         interner: &Interner,
         args: Vec<Value>,
     ) -> Result<Value, InterpreterError> {
-        self.check_not_aborted()?;
+        self.check_not_terminated()?;
         let function = self
             .module
             .functions
@@ -3214,7 +3223,7 @@ impl<'a> Interpreter<'a> {
     }
 
     pub fn call_item(&self, item: ItemId, args: Vec<Value>) -> Result<Value, InterpreterError> {
-        self.check_not_aborted()?;
+        self.check_not_terminated()?;
         let function = self
             .module
             .functions
@@ -3337,14 +3346,32 @@ impl<'a> Interpreter<'a> {
         if outcome.is_err() {
             self.resources.borrow_mut().abandon_leases_from(mark);
         }
-        // A fatal arithmetic abort ends this whole execution, not just
-        // this frame (`rfcs/0015`). Recorded here rather than at the
-        // public entry point so that every frame the failure passes
-        // through -- and any caller reaching the engine another way --
-        // sees the same terminal state. The failure itself travels on
-        // unchanged: nothing rewrites it into an engine-state error.
-        if matches!(outcome, Err(InterpreterError::Arithmetic(_))) {
-            self.aborted.set(true);
+        // Any failure a *running frame* produced ends this whole
+        // execution, not just this frame (`rfcs/0015`).
+        //
+        // The boundary is this call to `call_function_in_frame`: past
+        // it, a frame has been entered and may already have bound
+        // parameters, constructed resources, written slots, transferred
+        // ownership or entered further calls. Whatever stopped it, what
+        // is left behind is the middle of a statement rather than any
+        // state Napitia describes, so nothing may be executed against
+        // it again -- and that is true of an `InvalidOperation` found
+        // after ten valid instructions exactly as it is of an overflow.
+        // An earlier version terminated only on `Arithmetic`, which
+        // left malformed NIR able to mutate the resource table and then
+        // hand back a reusable interpreter.
+        //
+        // Recorded here rather than at the public entry point so every
+        // frame the failure passes through sees the same terminal
+        // state. The failure itself travels on unchanged: nothing
+        // rewrites it into an engine-state error, so a caller still
+        // learns what actually went wrong.
+        //
+        // A Napitia `raise` is not an error here at all -- it is
+        // `Ok(Outcome::Raised)`, ordinary control flow -- so a fallible
+        // program that raises and handles never reaches this.
+        if outcome.is_err() {
+            self.terminated.set(true);
         }
         self.call_depth.set(self.call_depth.get() - 1);
         outcome
@@ -16011,17 +16038,19 @@ mod observation_leases {
             "an observation the refused frame opened is still active"
         );
 
-        // The same refusal again, on the *same* interpreter: reported
-        // identically and still changing nothing, which is what proves
-        // that nothing accumulated between the two attempts.
+        // A frame that failed ends this execution context (`rfcs/0015`),
+        // so the retry on the *same* interpreter is refused for that
+        // reason rather than by running the fixture again. It must still
+        // change nothing -- and now for a stronger reason than before,
+        // since it never enters a frame at all.
         let retry = live_session(&interpreter);
         let carried = record_count(&interpreter);
         let midpoint = shape_snapshot(&interpreter, carried);
+        let before_retry_drops = drop_events(&interpreter);
         let repeat = interpreter.call_item(SELF, vec![Value::Resource(retry)]);
-        assert_eq!(
-            refusal_shape(&outcome),
-            refusal_shape(&repeat),
-            "a refusal must be deterministic on the same interpreter"
+        assert!(
+            is_terminated_refusal(&repeat),
+            "a retry after a failed frame must be refused as a terminated context, got {repeat:?}"
         );
         assert_eq!(
             midpoint,
@@ -16029,10 +16058,37 @@ mod observation_leases {
             "the retry destroyed, moved out of or wrote into a resource"
         );
         assert_eq!(
+            before_retry_drops,
+            drop_events(&interpreter),
+            "the retry reported a destruction it never performed"
+        );
+        assert_eq!(
             open_leases(&interpreter),
             0,
             "the retry left an observation open"
         );
+
+        // Determinism of the *original* refusal, which the retry above
+        // can no longer demonstrate: a second interpreter over the same
+        // fixture reports it identically.
+        let fresh = Interpreter::new(&module);
+        let fresh_session = live_session(&fresh);
+        let again = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
+        assert_eq!(
+            refusal_shape(&outcome),
+            refusal_shape(&again),
+            "the same fixture must be refused identically on a fresh interpreter"
+        );
+    }
+
+    /// Whether `outcome` is the refusal a terminated execution context
+    /// gives, as opposed to the fixture's own refusal.
+    fn is_terminated_refusal(outcome: &Result<Value, InterpreterError>) -> bool {
+        matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(message))
+                if message.contains("cannot be reused")
+        )
     }
 
     #[test]
@@ -16252,20 +16308,36 @@ mod observation_leases {
             "the session and both of its files were really destroyed"
         );
 
-        // And a later frame observing a fresh session still runs.
+        // A later frame is not run on this interpreter at all: the
+        // refused frame ended this execution context (`rfcs/0015`), so
+        // starting another is refused for that reason. The lease
+        // question is already answered above, by the caller's own
+        // successful destruction.
         let second = live_session(&interpreter);
         let again = interpreter.call_item(SELF, vec![Value::Resource(second)]);
-        assert_eq!(
-            refusal_shape(&refused),
-            refusal_shape(&again),
-            "a later frame must be refused for its own reason, not the first frame's"
+        assert!(
+            is_terminated_refusal(&again),
+            "a later frame on a terminated context must be refused as such, got {again:?}"
         );
         assert_eq!(open_leases(&interpreter), 0);
         assert_eq!(
             interpreter.drop_value(Value::Resource(second)),
             Ok(()),
-            "the second refusal froze its own session"
+            "the terminated refusal froze a session it never touched"
         );
+
+        // The "for its own reason, not the first frame's" half, where it
+        // can still be observed: a fresh interpreter running the same
+        // fixture reports the identical refusal.
+        let fresh = Interpreter::new(&module);
+        let fresh_session = live_session(&fresh);
+        let fresh_outcome = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
+        assert_eq!(
+            refusal_shape(&refused),
+            refusal_shape(&fresh_outcome),
+            "a frame must be refused for its own reason on every interpreter"
+        );
+        assert_eq!(open_leases(&fresh), 0);
     }
 
     #[test]
@@ -16810,9 +16882,13 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        // A failed frame ends its own execution context (`rfcs/0015`),
+        // so "repeatedly" is eight interpreters rather than eight calls
+        // on one. Each must abandon the observation its own frame
+        // opened, and report identically to the others.
         let mut first: Option<String> = None;
-        for _ in 0..8 {
+        for attempt in 0..8 {
+            let interpreter = Interpreter::new(&module);
             let session = live_session(&interpreter);
             let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
             let rendered = refusal_shape(&outcome);
@@ -16820,21 +16896,44 @@ mod observation_leases {
                 None => first = Some(rendered),
                 Some(expected) => assert_eq!(
                     *expected, rendered,
-                    "repeated failures stopped reporting identically"
+                    "attempt {attempt} stopped reporting identically"
                 ),
             }
             assert_eq!(
                 open_leases(&interpreter),
                 0,
-                "a failed frame accumulated an open observation"
+                "a failed frame left an open observation"
             );
+            assert_eq!(
+                interpreter.resources.borrow().leases.len(),
+                1,
+                "exactly the one observation this frame opened"
+            );
+            assert!(every_lease_ended(&interpreter));
         }
+
+        // And the same interpreter does not run a second frame at all,
+        // so nothing can accumulate across failures by construction.
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        assert!(
+            interpreter
+                .call_item(SELF, vec![Value::Resource(session)])
+                .is_err()
+        );
+        let after_first = interpreter.resources.borrow().leases.len();
+        let retry = live_session(&interpreter);
+        let repeat = interpreter.call_item(SELF, vec![Value::Resource(retry)]);
+        assert!(
+            is_terminated_refusal(&repeat),
+            "a second frame must be refused as a terminated context, got {repeat:?}"
+        );
         assert_eq!(
             interpreter.resources.borrow().leases.len(),
-            8,
-            "one observation per call was opened and then abandoned"
+            after_first,
+            "the refused retry opened an observation"
         );
-        assert!(every_lease_ended(&interpreter));
+        assert_eq!(open_leases(&interpreter), 0);
     }
 
     // -- invalid observation sources, refused by the runtime itself -----
@@ -18664,5 +18763,398 @@ mod fatal_abort {
         let error = outcome.expect_err("negating the minimum has no result");
         assert_eq!(error.code(), codes::INTEGER_OVERFLOW);
         assert_eq!(error.to_string(), "integer overflow in `neg`");
+    }
+}
+
+/// `rfcs/0015` -- a failure found *after* a frame has already changed
+/// things ends the execution context, exactly as an overflow does.
+///
+/// This is the case an earlier implementation got wrong. It terminated
+/// only on an arithmetic failure, on the theory that a malformed-NIR
+/// refusal is always decided before anything happens. It is not:
+/// hand-built NIR that skipped verification can construct a resource,
+/// write the event log, and only then reach an instruction this
+/// interpreter cannot execute. What is left behind is the same partial
+/// state an overflow leaves, so it ends the context the same way.
+#[cfg(test)]
+mod stateful_termination {
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(10);
+    const MAIN: ItemId = ItemId(11);
+    const HELPER: ItemId = ItemId(12);
+
+    /// The symbols these fixtures use, in the order an [`Interner`]
+    /// hands them out. Interned for real rather than assumed, so a name
+    /// lookup through `run`/`call` can actually resolve one.
+    const MAIN_NAME: Symbol = Symbol(0);
+    const FILE_NAME: Symbol = Symbol(1);
+    const HELPER_NAME: Symbol = Symbol(3);
+
+    fn fixture_interner() -> Interner {
+        let mut interner = Interner::new();
+        assert_eq!(interner.intern("main"), MAIN_NAME);
+        assert_eq!(interner.intern("File"), FILE_NAME);
+        assert_eq!(interner.intern("descriptor"), Symbol(2));
+        assert_eq!(interner.intern("helper"), HELPER_NAME);
+        interner
+    }
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, FILE_NAME)
+    }
+
+    /// `resource File { descriptor: i64 }` -- affine, so constructing
+    /// one really does enter the runtime resource table.
+    fn layouts() -> Vec<(ItemId, RecordLayout)> {
+        vec![(
+            FILE,
+            RecordLayout {
+                name: FILE_NAME,
+                type_params: Vec::new(),
+                fields: vec![(Symbol(2), Ty::I64)],
+                affine: true,
+            },
+        )]
+    }
+
+    fn function(
+        id: ItemId,
+        name: Symbol,
+        return_type: Ty,
+        instructions: Vec<Instruction>,
+        result: u32,
+    ) -> Function {
+        Function {
+            id,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::<Param>::new(),
+            return_type,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(result))),
+            }],
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, ty: Ty, literal: i128) -> Instruction {
+        value(result, ty, ValueKind::Const(Const::Int(literal)))
+    }
+
+    /// `main` constructs a live `File`, performs another valid
+    /// instruction, and only then reaches one declared `u8`.
+    ///
+    /// The resource is deliberately never dropped: the frame cannot
+    /// reach a `drop`, which is the whole point -- a fatal failure runs
+    /// no cleanup, and this fixture leaves a genuinely leaked resource
+    /// behind for the assertions to find.
+    fn stateful_module() -> Module {
+        let main = function(
+            MAIN,
+            MAIN_NAME,
+            Ty::I64,
+            vec![
+                int(0, Ty::I64, 7),
+                value(
+                    1,
+                    file_ty(),
+                    ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
+                ),
+                int(2, Ty::I64, 1),
+                // Malformed: `u8` has no runtime representation here.
+                int(3, Ty::U8, 1),
+                int(4, Ty::I64, 0),
+            ],
+            4,
+        );
+        let helper = function(HELPER, HELPER_NAME, Ty::I64, vec![int(0, Ty::I64, 42)], 0);
+        Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![main, helper],
+            records: layouts(),
+            variants: Vec::new(),
+        }
+    }
+
+    fn live_records(interpreter: &Interpreter<'_>) -> usize {
+        interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .filter(|record| record.status == ResourceStatus::Alive)
+            .count()
+    }
+
+    fn drop_events(interpreter: &Interpreter<'_>) -> Vec<String> {
+        interpreter
+            .event_log()
+            .into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_malformed_instruction_after_real_work_terminates_the_context() {
+        let module = stateful_module();
+        let interpreter = Interpreter::new(&module);
+
+        // 1. The first call is refused, structurally.
+        let first = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the `u8` instruction must be refused");
+        assert_eq!(first.code(), codes::INVALID_OPERATION);
+        assert!(
+            first.to_string().contains("u8"),
+            "the refusal must name what it could not execute: {first}"
+        );
+
+        // 2/3. The valid prefix really ran: the resource exists and is
+        // still alive, because nothing cleaned it up.
+        assert_eq!(
+            live_records(&interpreter),
+            1,
+            "the frame must have constructed its resource before failing"
+        );
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the frame was entered and no other frame was"
+        );
+
+        // 4. No cleanup was performed, and none was reported.
+        assert!(
+            drop_events(&interpreter).is_empty(),
+            "a fatal failure ran no cleanup and must claim none: {:?}",
+            interpreter.event_log()
+        );
+
+        // 6/7. The context is over, and a valid function is refused for
+        // that reason rather than run.
+        let reused = interpreter
+            .call_item(HELPER, Vec::new())
+            .expect_err("a terminated context must refuse a later execution");
+        assert_eq!(reused.code(), codes::INVALID_OPERATION);
+        assert!(
+            reused.to_string().contains("cannot be reused"),
+            "the refusal must say the context ended: {reused}"
+        );
+
+        // 5. And it did not overwrite or repeat the original failure.
+        assert_ne!(
+            first.to_string(),
+            reused.to_string(),
+            "the termination refusal must not impersonate the original failure"
+        );
+
+        // 8/10. The helper was never entered, and nothing changed.
+        let after = interpreter.event_log();
+        assert_eq!(
+            after,
+            vec![format!("call:{}", MAIN.0)],
+            "the refused reuse entered a frame: {after:?}"
+        );
+        assert_eq!(
+            live_records(&interpreter),
+            1,
+            "the refused reuse mutated resources"
+        );
+
+        // 9. Repeated attempts are equal, and still change nothing.
+        for _ in 0..4 {
+            let again = interpreter.call_item(HELPER, Vec::new());
+            assert_eq!(again, Err(reused.clone()), "reuse refusals must be equal");
+        }
+        assert_eq!(interpreter.event_log(), after);
+        assert_eq!(live_records(&interpreter), 1);
+
+        // 11. A fresh interpreter runs the same valid function normally.
+        let fresh = Interpreter::new(&module);
+        assert_eq!(fresh.call_item(HELPER, Vec::new()), Ok(Value::Int(42)));
+        assert!(drop_events(&fresh).is_empty());
+    }
+
+    /// The same fixture, twice, on two interpreters: identical.
+    #[test]
+    fn the_stateful_refusal_is_deterministic_across_fresh_interpreters() {
+        let module = stateful_module();
+        let first = Interpreter::new(&module).call_item(MAIN, Vec::new());
+        for _ in 0..4 {
+            assert_eq!(Interpreter::new(&module).call_item(MAIN, Vec::new()), first);
+        }
+    }
+
+    /// Reaching the malformed instruction through a nested call
+    /// terminates the whole context, not just the callee's frame.
+    #[test]
+    fn a_malformed_instruction_in_a_nested_call_terminates_the_whole_context() {
+        let inner = function(
+            HELPER,
+            HELPER_NAME,
+            Ty::I64,
+            vec![int(0, Ty::U8, 1), int(1, Ty::I64, 0)],
+            1,
+        );
+        let outer = function(
+            MAIN,
+            MAIN_NAME,
+            Ty::I64,
+            vec![value(
+                0,
+                Ty::I64,
+                ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+            )],
+            0,
+        );
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![outer, inner],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+
+        let failure = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the nested `u8` instruction must be refused");
+        assert_eq!(failure.code(), codes::INVALID_OPERATION);
+        assert!(
+            failure.to_string().contains("u8"),
+            "the caller must see the callee's own failure: {failure}"
+        );
+
+        let reused = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the outer context must be terminated too");
+        assert!(reused.to_string().contains("cannot be reused"));
+    }
+
+    // -- what does *not* terminate ----------------------------------------
+
+    /// An unknown function is refused before any frame is entered and
+    /// changes nothing, so the interpreter stays usable.
+    #[test]
+    fn an_unknown_item_refusal_does_not_terminate_the_context() {
+        let module = stateful_module();
+        let interpreter = Interpreter::new(&module);
+
+        let missing = interpreter
+            .call_item(ItemId(999), Vec::new())
+            .expect_err("an unknown item is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+        assert!(
+            interpreter.event_log().is_empty(),
+            "a pre-entry refusal entered a frame"
+        );
+
+        assert_eq!(
+            interpreter.call_item(HELPER, Vec::new()),
+            Ok(Value::Int(42)),
+            "a refusal that ran no frame must leave the interpreter usable"
+        );
+    }
+
+    /// The same for a name lookup through the other public entry point.
+    #[test]
+    fn an_unknown_name_refusal_does_not_terminate_the_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+        let interpreter = Interpreter::new(&module);
+
+        let missing = interpreter
+            .call("no_such_function", &interner, Vec::new())
+            .expect_err("an unknown name is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+        assert!(interpreter.event_log().is_empty());
+
+        assert_eq!(
+            interpreter.call_item(HELPER, Vec::new()),
+            Ok(Value::Int(42)),
+            "a name lookup that ran no frame must leave the interpreter usable"
+        );
+    }
+
+    // -- every public execution entry point is guarded --------------------
+
+    /// `run`, `call`, `run_item` and `call_item` are the four routes
+    /// that start execution. Each must refuse a terminated context, and
+    /// each must be able to terminate one.
+    #[test]
+    fn every_public_entry_point_refuses_a_terminated_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+
+        // Terminate through `call_item`, then try all four.
+        let interpreter = Interpreter::new(&module);
+        assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
+        for (route, outcome) in [
+            ("call_item", interpreter.call_item(HELPER, Vec::new())),
+            ("run_item", interpreter.run_item(HELPER)),
+            ("call", interpreter.call("\u{0}", &interner, Vec::new())),
+            ("run", interpreter.run("\u{0}", &interner)),
+        ] {
+            let error = outcome.expect_err("a terminated context refuses every route");
+            assert!(
+                error.to_string().contains("cannot be reused"),
+                "`{route}` did not report the terminated context: {error}"
+            );
+        }
+    }
+
+    /// And each route can itself terminate the context, so none of them
+    /// is a way in that skips the rule.
+    #[test]
+    fn every_public_entry_point_can_terminate_the_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+
+        let by_call_item = Interpreter::new(&module);
+        assert!(by_call_item.call_item(MAIN, Vec::new()).is_err());
+        assert!(
+            by_call_item
+                .call_item(HELPER, Vec::new())
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
+
+        let by_run_item = Interpreter::new(&module);
+        assert!(by_run_item.run_item(MAIN).is_err());
+        assert!(
+            by_run_item
+                .run_item(HELPER)
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
+
+        // `run`/`call` resolve by name; both fixtures share `Symbol(0)`,
+        // so the lookup finds `main` -- which is the failing one.
+        let by_run = Interpreter::new(&module);
+        let name = interner.resolve(Symbol(0)).to_string();
+        assert!(by_run.run(&name, &interner).is_err());
+        assert!(
+            by_run
+                .run(&name, &interner)
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
     }
 }

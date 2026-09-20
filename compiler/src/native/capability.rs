@@ -1304,13 +1304,18 @@ impl<'a> Validator<'a> {
         if slots.is_empty() {
             return None;
         }
+        // Membership is asked once per edge, so it is worth a set: a
+        // linear scan of `reachable` here would make this pass
+        // quadratic in the size of a function, which is the wrong shape
+        // for something whose job includes not hanging.
+        let live: BTreeSet<BlockId> = reachable.iter().copied().collect();
         let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
         for id in reachable {
             let Some(block) = blocks.get(id) else {
                 continue;
             };
             for target in terminator_targets(&block.terminator) {
-                if reachable.contains(&target) {
+                if live.contains(&target) {
                     predecessors.entry(target).or_default().insert(*id);
                 }
             }

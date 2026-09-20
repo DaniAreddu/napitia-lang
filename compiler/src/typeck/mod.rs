@@ -1820,12 +1820,14 @@ impl<'a> Checker<'a> {
         // own arm is what records the literal, and it has to know
         // whether a `-` is being applied to it: `9223372036854775808` is
         // not an `i64` and `-9223372036854775808` is (`rfcs/0015`).
-        // Only a literal *directly* under the operator counts.
-        // Parentheses are transparent by the time HIR exists, so
-        // `-(9223372036854775808)` is the same negated literal and is
-        // equally accepted; `- -9223372036854775808` is not, because the
-        // inner operator's operand is the only literal there and it has
-        // no sign of its own.
+        // Only a literal *directly* under the operator counts, which is
+        // why this reads the operand rather than tracking a sign down
+        // through arbitrary expressions. Parentheses are transparent by
+        // the time HIR exists, so `-(9223372036854775808)` is the same
+        // negated literal; `-x` is not, whatever `x` was initialized
+        // with, and neither is the outer operator of
+        // `- -9223372036854775808` -- that one negates the minimum at
+        // run time, where it is an overflow.
         if let (UnaryOp::Neg, HirExpr::Int { id, .. }) = (op, operand) {
             self.negated_literals.insert(*id);
         }
@@ -8920,5 +8922,185 @@ mod generic_affinity {
                         }";
         assert_eq!(codes(forward), codes(reversed));
         assert!(codes(forward).is_empty());
+    }
+}
+
+/// `rfcs/0015` -- every integer literal against the domain of the type
+/// it resolved to.
+#[cfg(test)]
+mod integer_literal_ranges {
+    use super::codes;
+    use super::tests::check;
+
+    /// The magnitude of `i64`'s minimum. Not an `i64` on its own: only
+    /// a negation applied directly to it makes a valid literal.
+    const MIN_MAGNITUDE: &str = "9223372036854775808";
+    const MAX: &str = "9223372036854775807";
+
+    fn codes_of(text: &str) -> Vec<&'static str> {
+        check(text).iter().map(|d| d.code).collect()
+    }
+
+    fn in_main(body: &str) -> Vec<&'static str> {
+        codes_of(&format!("func main() -> i64 {{ {body} }}"))
+    }
+
+    #[test]
+    fn both_boundaries_of_the_default_integer_type_are_accepted() {
+        assert!(
+            in_main(&format!(
+                "value low: i64 = -{MIN_MAGNITUDE}; value high: i64 = {MAX}; return 0"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn one_past_either_boundary_is_out_of_range() {
+        assert_eq!(
+            in_main("value too_high: i64 = 9223372036854775808; return 0"),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+        assert_eq!(
+            in_main("value too_low: i64 = -9223372036854775809; return 0"),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+    }
+
+    /// The minimum's own magnitude is not an `i64`. Only the negation
+    /// makes the literal valid, so writing the magnitude alone must
+    /// still be refused.
+    #[test]
+    fn the_minimums_magnitude_is_out_of_range_without_the_negation() {
+        assert_eq!(
+            in_main(&format!("value x: i64 = {MIN_MAGNITUDE}; return 0")),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+    }
+
+    /// Parentheses are transparent by the time HIR exists, so the
+    /// operator is still applied directly to the literal.
+    #[test]
+    fn a_parenthesized_negated_minimum_is_still_a_negated_literal() {
+        assert!(
+            in_main(&format!("value x: i64 = -({MIN_MAGNITUDE}); return 0")).is_empty(),
+            "`-(magnitude)` is the same negated literal"
+        );
+    }
+
+    /// `- -9223372036854775808` is two operators: the inner one is
+    /// applied directly to the literal, which makes the minimum, and
+    /// the outer one negates that value at run time. So it is a
+    /// well-typed program, and the failure it has belongs to execution
+    /// (`neg` of the minimum overflows), not to this pass.
+    #[test]
+    fn a_doubly_negated_minimum_is_a_runtime_negation_not_a_range_error() {
+        assert!(in_main(&format!("value x: i64 = - -{MIN_MAGNITUDE}; return 0")).is_empty());
+    }
+
+    /// A negation applied to anything but a literal is an ordinary
+    /// runtime operation, so the literal under it is checked on its own
+    /// terms.
+    #[test]
+    fn negating_a_binding_does_not_make_its_literal_a_negated_one() {
+        assert_eq!(
+            in_main(&format!("value x: i64 = {MIN_MAGNITUDE}; return -x")),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+    }
+
+    #[test]
+    fn an_unannotated_literal_is_checked_against_the_i64_default() {
+        assert_eq!(
+            in_main("value x = 9223372036854775808; return 0"),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+        assert!(in_main(&format!("value x = {MAX}; return x")).is_empty());
+    }
+
+    /// A literal is checked wherever it appears, not only in a `value`
+    /// initializer.
+    #[test]
+    fn every_literal_position_is_checked() {
+        for body in [
+            "return 9223372036854775808",
+            "value x: i64 = 0; return x + 9223372036854775808",
+            "return double(9223372036854775808)",
+            "mutable x: i64 = 0; x = 9223372036854775808; return x",
+            "if 9223372036854775808 == 0 { return 1; } return 0",
+        ] {
+            assert_eq!(
+                codes_of(&format!(
+                    "func double(n: i64) -> i64 {{ return n; }} \
+                     func main() -> i64 {{ {body} }}"
+                )),
+                vec![codes::INTEGER_LITERAL_OUT_OF_RANGE],
+                "`{body}`"
+            );
+        }
+    }
+
+    /// A pattern literal has no sign to carry, and is checked against
+    /// the scrutinee's own type.
+    #[test]
+    fn a_pattern_literal_is_checked_too() {
+        assert_eq!(
+            codes_of(
+                "func main() -> i64 { \
+                   value x: i64 = 1; \
+                   match x { 9223372036854775808 => { return 1 } _ => { return 0 } } \
+                 }"
+            ),
+            vec![codes::INTEGER_LITERAL_OUT_OF_RANGE]
+        );
+    }
+
+    /// The diagnostic underlines the literal, not the statement, the
+    /// initializer or the function.
+    #[test]
+    fn the_diagnostic_points_at_the_literal_itself() {
+        let text = "func main() -> i64 { value x: i64 = 9223372036854775808; return 0 }";
+        let diagnostics = check(text);
+        assert_eq!(diagnostics.len(), 1);
+        let span = diagnostics[0].primary_span;
+        assert_eq!(
+            &text[span.as_range()],
+            "9223372036854775808",
+            "the span must cover exactly the literal"
+        );
+    }
+
+    /// Two literals, two diagnostics, in the order they were written --
+    /// and identically on every run.
+    #[test]
+    fn out_of_range_literals_are_reported_once_each_in_source_order() {
+        let text = "func main() -> i64 { \
+                      value a: i64 = 9223372036854775808; \
+                      value b: i64 = 9223372036854775809; \
+                      return 0 \
+                    }";
+        let first = check(text);
+        assert_eq!(
+            first.len(),
+            2,
+            "each literal is reported on its own: {first:?}"
+        );
+        assert!(
+            first[0].message.contains("9223372036854775808")
+                && first[1].message.contains("9223372036854775809"),
+            "reported in source order: {first:?}"
+        );
+        assert_eq!(first, check(text), "repeated checks are identical");
+    }
+
+    /// A literal that never resolves to an integer type at all is
+    /// someone else's diagnostic, not this pass's.
+    #[test]
+    fn a_literal_in_an_ill_typed_position_is_not_also_a_range_error() {
+        let found = in_main("value x: bool = 1; return 0");
+        assert!(
+            !found.contains(&codes::INTEGER_LITERAL_OUT_OF_RANGE),
+            "a type mismatch is not a range error: {found:?}"
+        );
     }
 }

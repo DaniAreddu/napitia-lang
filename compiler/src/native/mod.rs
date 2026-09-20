@@ -52,6 +52,9 @@ pub(crate) mod lower;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use target_lexicon::Triple;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::ItemRegistry;
@@ -78,7 +81,7 @@ pub const ENTRY_SYMBOL: &str = "main";
 ///
 /// `A0001`-`A0019` are the capability layer: reasons this backend will
 /// not compile a program that is otherwise perfectly valid Napitia.
-/// `A0020`-`A0024` are the backend layer: something went wrong while
+/// `A0020`-`A0025` are the backend layer: something went wrong while
 /// actually producing the executable.
 ///
 /// The `A` prefix is a new namespace, allocated the same way `V`
@@ -161,6 +164,11 @@ pub mod codes {
     /// The build could not create its scratch directory, write the
     /// object, or move the finished executable into place.
     pub const BUILD_IO_FAILED: &str = "A0024";
+    /// The system linker is installed and runnable, but targets
+    /// something other than [`super::TARGET_TRIPLE`] -- a musl
+    /// environment, another architecture, another operating system --
+    /// or would not say what it targets at all.
+    pub const LINKER_TARGET_MISMATCH: &str = "A0025";
 }
 
 /// Every Napitia type the native subset can represent, and nothing
@@ -262,12 +270,87 @@ pub const DEFAULT_LINKER: &str = "cc";
 ///
 /// Object generation is host-independent -- Cranelift writes an ELF
 /// object for the target from anywhere -- but linking one needs a
-/// toolchain that targets it, which a non-Linux or non-x86-64 host does
-/// not have. Saying so up front produces a deterministic, structured
-/// refusal instead of whatever error a foreign linker would give for an
-/// object it cannot read.
+/// toolchain that targets it. All three components of the target have
+/// to hold, *including the environment*: a musl host is Linux on
+/// x86-64 and its `cc` still produces executables against a different
+/// C runtime than the one `x86_64-unknown-linux-gnu` names.
+///
+/// Passing this gate is necessary and not sufficient. It says the host
+/// could plausibly have such a toolchain; [`classify_probe`] then asks
+/// the toolchain itself.
 pub const fn host_can_link() -> bool {
-    cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")
+    cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") && cfg!(target_env = "gnu")
+}
+
+/// What a `-dumpmachine` probe established about a linker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinkerTarget {
+    /// It targets [`TARGET_TRIPLE`]'s architecture, operating system
+    /// and environment.
+    Native,
+    /// It targets something else, spelled the way it spelled it.
+    Other(String),
+    /// It would not say, or said something that is not a target triple.
+    Unreadable(String),
+}
+
+/// Classifies one `-dumpmachine` probe from its observable result.
+///
+/// Pure on purpose: the spellings a real toolchain reports are a table,
+/// and a table is worth testing without needing every toolchain
+/// installed to do it.
+///
+/// Comparison is by *component*, through `target_lexicon`, never by
+/// substring. `-dumpmachine` answers in whichever spelling its
+/// environment prefers -- `x86_64-linux-gnu` on Debian,
+/// `x86_64-pc-linux-gnu` elsewhere, `x86_64-unknown-linux-gnu` from a
+/// Rust-shaped toolchain -- and those differ in exactly the component
+/// that carries no meaning here, the vendor. Architecture, operating
+/// system and environment are the three that do.
+pub(crate) fn classify_linker_target(succeeded: bool, reported: &str) -> LinkerTarget {
+    let reported = reported.trim();
+    if !succeeded {
+        return LinkerTarget::Unreadable(format!(
+            "`-dumpmachine` failed{}",
+            if reported.is_empty() {
+                String::new()
+            } else {
+                format!(": {reported}")
+            }
+        ));
+    }
+    let Ok(probed) = Triple::from_str(reported) else {
+        return LinkerTarget::Unreadable(format!("`{reported}` is not a target triple"));
+    };
+    let Ok(wanted) = Triple::from_str(TARGET_TRIPLE) else {
+        return LinkerTarget::Unreadable(format!("`{TARGET_TRIPLE}` is not a target triple"));
+    };
+    if probed.architecture == wanted.architecture
+        && probed.operating_system == wanted.operating_system
+        && probed.environment == wanted.environment
+    {
+        LinkerTarget::Native
+    } else {
+        LinkerTarget::Other(reported.to_string())
+    }
+}
+
+/// Asks `linker` what it targets.
+///
+/// `Err` only when the linker could not be launched at all; a linker
+/// that ran and answered unusably is a [`LinkerTarget::Unreadable`],
+/// which is a different problem with a different diagnostic.
+fn probe_linker_target(linker: &OsStr) -> Result<LinkerTarget, std::io::Error> {
+    let probe = std::process::Command::new(linker)
+        .arg("-dumpmachine")
+        .output()?;
+    let reported = String::from_utf8_lossy(&probe.stdout);
+    let reported = if reported.trim().is_empty() {
+        String::from_utf8_lossy(&probe.stderr).into_owned()
+    } else {
+        reported.into_owned()
+    };
+    Ok(classify_linker_target(probe.status.success(), &reported))
 }
 
 /// Runs the whole native pipeline for one already-verified module:
@@ -334,10 +417,71 @@ pub(crate) fn build_executable(
         ];
     }
 
-    match link_object(&object, output, OsStr::new(DEFAULT_LINKER), source) {
+    // Asked before anything is written, and asked of the toolchain
+    // rather than assumed from the host: a GNU x86-64 Linux machine can
+    // still have a `cc` that cross-compiles somewhere else, and an
+    // executable for somewhere else is not the executable that was
+    // requested.
+    let linker = OsStr::new(DEFAULT_LINKER);
+    match probe_linker_target(linker) {
+        Err(error) => {
+            return vec![linker_launch_failure(linker, &error, source)];
+        }
+        Ok(LinkerTarget::Native) => {}
+        Ok(LinkerTarget::Other(reported)) => {
+            return vec![
+                Diagnostic::error(
+                    codes::LINKER_TARGET_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "the system linker `{}` targets `{reported}`, not `{TARGET_TRIPLE}`",
+                        linker.to_string_lossy()
+                    ),
+                )
+                .with_note("`cc -dumpmachine` was asked, and its answer compared by architecture, operating system and environment")
+                .with_help("install a C toolchain that targets `x86_64-unknown-linux-gnu`, or put one earlier on PATH"),
+            ];
+        }
+        Ok(LinkerTarget::Unreadable(detail)) => {
+            return vec![
+                Diagnostic::error(
+                    codes::LINKER_TARGET_MISMATCH,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "the system linker `{}` would not say what it targets: {detail}",
+                        linker.to_string_lossy()
+                    ),
+                )
+                .with_note(
+                    "a linker whose target cannot be established is not one this backend will publish an executable from",
+                ),
+            ];
+        }
+    }
+
+    match link_object(&object, output, linker, source) {
         Ok(()) => Vec::new(),
         Err(diagnostic) => vec![*diagnostic],
     }
+}
+
+/// The one diagnostic for "this linker could not be launched", shared
+/// by the target probe and the link itself so both say the same thing.
+fn linker_launch_failure(linker: &OsStr, error: &std::io::Error, source: SourceId) -> Diagnostic {
+    Diagnostic::error(
+        codes::LINKER_LAUNCH_FAILED,
+        source,
+        Span::dummy(),
+        format!(
+            "could not run the system linker `{}`: {error}",
+            linker.to_string_lossy()
+        ),
+    )
+    .with_help(format!(
+        "`napitia build` links with `{DEFAULT_LINKER}`; install a C toolchain, or put one on PATH"
+    ))
 }
 
 /// Writes `object` out and links it into `output` with `linker`.
@@ -428,20 +572,7 @@ fn link_in(
     let linked = match linked {
         Ok(linked) => linked,
         Err(error) => {
-            return Err(Box::new(
-                Diagnostic::error(
-                    codes::LINKER_LAUNCH_FAILED,
-                    source,
-                    Span::dummy(),
-                    format!(
-                        "could not run the system linker `{}`: {error}",
-                        linker.to_string_lossy()
-                    ),
-                )
-                .with_help(format!(
-                    "`napitia build` links with `{DEFAULT_LINKER}`; install a C toolchain, or put one on PATH"
-                )),
-            ));
+            return Err(Box::new(linker_launch_failure(linker, &error, source)));
         }
     };
 
@@ -734,21 +865,45 @@ mod link_tests {
         );
 
         let diagnostics = build_executable(&module, source, &interner, &registry, &[], &output);
+        let observed: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
 
-        if host_can_link() {
-            assert!(
-                diagnostics.is_empty(),
-                "this host can link, so the build must succeed: {:?}",
-                diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
-            );
-            assert!(output.is_file(), "the executable must exist");
-        } else {
-            let observed: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
-            assert_eq!(observed, vec![codes::UNSUPPORTED_HOST]);
-            assert!(
-                !output.exists(),
-                "nothing is written on a host that cannot link"
-            );
+        // Four genuinely different situations, and the test asserts the
+        // right one for whichever this host is rather than assuming
+        // that "Linux on x86-64" implies "a usable GNU `cc`".
+        match (
+            host_can_link(),
+            probe_linker_target(OsStr::new(DEFAULT_LINKER)),
+        ) {
+            (true, Ok(LinkerTarget::Native)) => {
+                assert!(
+                    diagnostics.is_empty(),
+                    "a GNU host with a matching linker must build: {observed:?}"
+                );
+                assert!(output.is_file(), "the executable must exist");
+            }
+            (true, Ok(_)) => {
+                assert_eq!(
+                    observed,
+                    vec![codes::LINKER_TARGET_MISMATCH],
+                    "a linker targeting something else must be refused as such"
+                );
+                assert!(!output.exists());
+            }
+            (true, Err(_)) => {
+                assert_eq!(
+                    observed,
+                    vec![codes::LINKER_LAUNCH_FAILED],
+                    "a GNU host with no `cc` installed must say exactly that"
+                );
+                assert!(!output.exists());
+            }
+            (false, _) => {
+                assert_eq!(observed, vec![codes::UNSUPPORTED_HOST]);
+                assert!(
+                    !output.exists(),
+                    "nothing is written on a host that cannot link"
+                );
+            }
         }
         assert_eq!(
             directory
@@ -797,13 +952,124 @@ mod link_tests {
     }
 
     #[test]
-    fn the_host_gate_matches_the_target_this_backend_compiles_for() {
-        assert_eq!(
-            host_can_link(),
-            cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")
+    fn the_host_gate_requires_the_environment_too_not_just_linux_on_x86_64() {
+        // The regression this replaces: the gate used to ask only for
+        // Linux on x86-64, which a musl host answers yes to -- while
+        // its `cc` builds against a different C runtime than the one
+        // `x86_64-unknown-linux-gnu` names.
+        let gate = host_can_link();
+        let components = (
+            cfg!(target_os = "linux"),
+            cfg!(target_arch = "x86_64"),
+            cfg!(target_env = "gnu"),
         );
-        assert!(TARGET_TRIPLE.starts_with("x86_64-"));
-        assert!(TARGET_TRIPLE.contains("linux"));
+        assert_eq!(
+            gate,
+            components == (true, true, true),
+            "the gate holds exactly when every component of the native target does"
+        );
+        assert!(
+            !(gate && cfg!(target_env = "musl")),
+            "a musl host is Linux on x86-64 and still not a GNU host"
+        );
+    }
+
+    /// The target this backend names must classify as its own target.
+    /// If that ever stops holding, every probe below is measuring the
+    /// wrong thing.
+    #[test]
+    fn the_supported_triple_classifies_as_native() {
+        assert_eq!(
+            classify_linker_target(true, TARGET_TRIPLE),
+            LinkerTarget::Native
+        );
+    }
+
+    #[test]
+    fn every_gnu_spelling_a_real_toolchain_reports_is_accepted() {
+        for reported in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-linux-gnu",
+            "x86_64-pc-linux-gnu",
+            // `-dumpmachine` output arrives with its newline attached.
+            "x86_64-linux-gnu\n",
+            "  x86_64-pc-linux-gnu  ",
+        ] {
+            assert_eq!(
+                classify_linker_target(true, reported),
+                LinkerTarget::Native,
+                "`{reported}` is this target, spelled differently"
+            );
+        }
+    }
+
+    #[test]
+    fn another_environment_architecture_or_os_is_not_this_target() {
+        for reported in [
+            // The case the host gate alone used to wave through.
+            "x86_64-unknown-linux-musl",
+            "x86_64-linux-musl",
+            "i686-linux-gnu",
+            "aarch64-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "riscv64-linux-gnu",
+        ] {
+            assert_eq!(
+                classify_linker_target(true, reported),
+                LinkerTarget::Other(reported.to_string()),
+                "`{reported}` is not this target"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_that_fails_or_answers_nonsense_is_unreadable_not_a_match() {
+        // Ran, but said no.
+        assert!(matches!(
+            classify_linker_target(false, "cc: error: unrecognized option '-dumpmachine'"),
+            LinkerTarget::Unreadable(_)
+        ));
+        // Ran, said nothing at all.
+        assert!(matches!(
+            classify_linker_target(false, ""),
+            LinkerTarget::Unreadable(_)
+        ));
+        // Ran, succeeded, and answered something that is not a triple.
+        for reported in ["", "not a triple", "gcc version 12.2.0"] {
+            assert!(
+                matches!(
+                    classify_linker_target(true, reported),
+                    LinkerTarget::Unreadable(_)
+                ),
+                "`{reported}` is not a target triple"
+            );
+        }
+    }
+
+    #[test]
+    fn probing_a_linker_that_is_not_installed_is_a_launch_failure() {
+        let error = probe_linker_target(OsStr::new("napitia-no-such-linker-exists"))
+            .expect_err("a linker that is not installed cannot be probed");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Whatever this host's `cc` is, the probe has to reach a verdict
+    /// about it without panicking -- and if it reaches `Native`, the
+    /// host gate must agree that this is a GNU x86-64 Linux machine.
+    #[test]
+    fn probing_this_hosts_own_linker_reaches_a_verdict() {
+        let Ok(verdict) = probe_linker_target(OsStr::new(DEFAULT_LINKER)) else {
+            // No `cc` here at all; that is a launch failure, covered
+            // above, not a target question.
+            return;
+        };
+        if verdict == LinkerTarget::Native {
+            assert!(
+                host_can_link(),
+                "a linker targeting `{TARGET_TRIPLE}` means this host is one"
+            );
+        }
     }
 
     // -- the sealed codegen boundary ---------------------------------------

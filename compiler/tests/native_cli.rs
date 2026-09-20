@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use compiler::native::{codes, host_can_link};
+use compiler::native::codes;
 
 fn napitia(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_napitia"))
@@ -36,37 +36,50 @@ fn example(name: &str) -> String {
     format!("{}/../examples/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Whether a C compiler driver is actually installed. A Linux host
-/// without one is a real configuration, and the build says so with its
-/// own code rather than pretending it linked.
-fn linker_installed() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+/// What this host actually does with a native build.
+///
+/// Established by *asking the compiler* -- building a program that is
+/// certainly inside the native subset and reading the answer off the
+/// result -- rather than by re-deriving its host and linker rules here.
+/// A test that reimplements the rule it is checking cannot catch the
+/// rule being wrong.
+fn classify_host(workspace: &Workspace) -> Host {
+    let source = workspace.source("host_probe", "func main() -> i64 { return 0; }");
+    let output = workspace.output("host probe");
+    let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+    let err = stderr(&built);
+    let _ = std::fs::remove_file(&output);
+
+    if built.status.success() {
+        return Host::Links;
+    }
+    for (code, host) in [
+        (codes::UNSUPPORTED_HOST, Host::Unsupported),
+        (codes::LINKER_LAUNCH_FAILED, Host::NoLinker),
+        (codes::LINKER_TARGET_MISMATCH, Host::WrongLinkerTarget),
+    ] {
+        if err.contains(code) {
+            return host;
+        }
+    }
+    panic!("a program inside the native subset must build or say why it cannot:\n{err}")
 }
 
 /// What this host can do with a native build, so each test can assert
 /// the one right outcome instead of skipping.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Host {
-    /// x86_64 Linux with a C toolchain: builds produce executables.
+    /// A GNU x86-64 Linux host whose `cc` targets the same thing:
+    /// builds produce executables.
     Links,
-    /// x86_64 Linux with no `cc` on PATH.
+    /// The host qualifies, but no `cc` could be launched at all.
     NoLinker,
-    /// Anything else: the object is generated, linking is not possible.
-    WrongTarget,
-}
-
-fn host() -> Host {
-    if !host_can_link() {
-        Host::WrongTarget
-    } else if linker_installed() {
-        Host::Links
-    } else {
-        Host::NoLinker
-    }
+    /// The host qualifies and `cc` runs, but targets something else --
+    /// a musl environment, another architecture, another OS.
+    WrongLinkerTarget,
+    /// The host itself is not `x86_64-unknown-linux-gnu`. The object is
+    /// still generated; only linking it is unavailable.
+    Unsupported,
 }
 
 /// A directory of this test's own, created exclusively. The name
@@ -133,42 +146,36 @@ fn as_str(path: &Path) -> &str {
 /// Builds `source` to `output` and reports the built program's exit
 /// status, or `None` when this host cannot produce one -- having first
 /// asserted the exact refusal it must give instead.
-fn build_and_run(source: &Path, output: &Path) -> Option<i32> {
+fn build_and_run(workspace: &Workspace, source: &Path, output: &Path) -> Option<i32> {
     let built = napitia(&["build", as_str(source), "--output", as_str(output)]);
-    match host() {
+    let expected = match classify_host(workspace) {
         Host::Links => {
             assert!(
                 built.status.success(),
-                "the build must succeed on this host:\n{}",
+                "a GNU host with a matching linker must build:\n{}",
                 stderr(&built)
             );
             assert!(output.is_file(), "the executable must exist");
             let run = Command::new(output)
                 .output()
                 .expect("the built executable must be runnable");
-            Some(run.status.code().expect("the program exits normally"))
+            return Some(run.status.code().expect("the program exits normally"));
         }
-        Host::NoLinker => {
-            assert_eq!(built.status.code(), Some(1));
-            assert!(
-                stderr(&built).contains(codes::LINKER_LAUNCH_FAILED),
-                "{}",
-                stderr(&built)
-            );
-            assert!(!output.exists());
-            None
-        }
-        Host::WrongTarget => {
-            assert_eq!(built.status.code(), Some(1));
-            assert!(
-                stderr(&built).contains(codes::UNSUPPORTED_HOST),
-                "{}",
-                stderr(&built)
-            );
-            assert!(!output.exists());
-            None
-        }
-    }
+        Host::NoLinker => codes::LINKER_LAUNCH_FAILED,
+        Host::WrongLinkerTarget => codes::LINKER_TARGET_MISMATCH,
+        Host::Unsupported => codes::UNSUPPORTED_HOST,
+    };
+    assert_eq!(built.status.code(), Some(1));
+    assert!(
+        stderr(&built).contains(expected),
+        "this host must refuse with {expected}:\n{}",
+        stderr(&built)
+    );
+    assert!(
+        !output.exists(),
+        "a host that cannot link writes no executable"
+    );
+    None
 }
 
 /// What `napitia run` prints for the same program: the interpreter's
@@ -209,7 +216,7 @@ fn a_scalar_program_with_a_loop_and_direct_calls_matches_the_interpreter() {
 
     // 2 * (0 + 1 + 2 + 3 + 4) = 20.
     assert_eq!(interpreted(&source), "20");
-    if let Some(status) = build_and_run(&source, &output) {
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 20, "the native result must match the interpreter");
     }
     assert!(workspace.leftover_build_directories().is_empty());
@@ -225,7 +232,7 @@ fn a_unit_returning_main_exits_successfully() {
     let output = workspace.output("unit program");
 
     assert_eq!(interpreted(&source), "()");
-    if let Some(status) = build_and_run(&source, &output) {
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 0, "`main() -> unit` exits 0");
     }
 }
@@ -264,7 +271,7 @@ fn every_accepted_operator_agrees_with_the_interpreter() {
             expected.to_string(),
             "the interpreter disagrees about `{name}`"
         );
-        if let Some(status) = build_and_run(&source, &output) {
+        if let Some(status) = build_and_run(&workspace, &source, &output) {
             assert_eq!(
                 status, expected,
                 "the native build disagrees about `{name}`"
@@ -289,7 +296,7 @@ fn functions_declared_in_reverse_order_still_compile_and_agree() {
     let output = workspace.output("reversed");
 
     assert_eq!(interpreted(&source), "41");
-    if let Some(status) = build_and_run(&source, &output) {
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 41);
     }
 }
@@ -304,7 +311,7 @@ fn an_i64_result_larger_than_a_byte_is_reduced_the_way_the_docs_say() {
     let output = workspace.output("wide");
 
     assert_eq!(interpreted(&source), "300");
-    if let Some(status) = build_and_run(&source, &output) {
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 300 % 256, "300 is reported as 44");
     }
 }
@@ -318,10 +325,10 @@ fn building_the_same_program_twice_produces_identical_executables() {
     let first = workspace.output("first build");
     let second = workspace.output("second build");
 
-    if build_and_run(&source, &first).is_none() {
+    if build_and_run(&workspace, &source, &first).is_none() {
         return;
     }
-    build_and_run(&source, &second).expect("the second build must also link");
+    build_and_run(&workspace, &source, &second).expect("the second build must also link");
 
     let first_bytes = std::fs::read(&first).expect("the first executable is readable");
     let second_bytes = std::fs::read(&second).expect("the second executable is readable");
@@ -632,7 +639,7 @@ fn a_unit_parameter_occupies_no_abi_position() {
     let output = workspace.output("unit abi");
 
     assert_eq!(interpreted(&source), "42");
-    if let Some(status) = build_and_run(&source, &output) {
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 42, "a `unit` argument must not shift the others");
     }
 }

@@ -313,12 +313,21 @@ the capability layer's business. A program that uses a resource is not
 malformed, and a program with a dangling block target is not merely
 unsupported.
 
-At most one diagnostic is reported per function: this pass is a gate,
-not an incremental checker, and listing every instruction that touches
-a resource would bury the one reason that matters. Diagnostic order is
-fixed -- target, then module-level facts, then the entry contract, then
-each reachable function in ascending item order, then call-graph cycles
--- so repeated builds produce byte-identical output.
+At most one diagnostic is reported per reachable function, plus one per
+call-graph cycle, plus the module-level ones (target, `import`): this
+pass is a gate, not an incremental checker, and listing every
+instruction that touches a resource would bury the one reason that
+matters. A function that fails for its signature is not then reported
+again for its body. Diagnostic order is fixed -- target, then
+module-level facts, then the entry contract, then each reachable
+function in ascending item order, then call-graph cycles -- so repeated
+builds produce byte-identical output.
+
+A program does commonly draw more than one diagnostic, because more
+than one *function* is outside the subset: a three-function resource
+program reports the constructor's result type, the reader's parameter
+type and `main`'s own use of the value, which are three functions, not
+three symptoms of one.
 
 ## Two slot rules worth naming
 

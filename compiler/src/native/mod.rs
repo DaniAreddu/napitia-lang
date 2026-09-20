@@ -104,7 +104,7 @@ pub mod codes {
     pub const UNSUPPORTED_TERMINATOR: &str = "A0008";
     /// A reachable operator whose *exceptional* behavior this backend
     /// cannot reproduce without a runtime facility Alpha 0.2.0 does not
-    /// have -- [`capability`] documents exactly which operators those
+    /// have -- [`super::capability`] documents exactly which operators those
     /// are, and why each one is on that list.
     pub const UNSUPPORTED_OPERATOR: &str = "A0009";
     /// A reachable function declares type parameters, or a reachable

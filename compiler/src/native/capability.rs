@@ -14,7 +14,7 @@
 //! NIR has. Where this pass notices such a violation anyway -- it is a
 //! public function and a caller may hand it hand-built NIR that never
 //! went through the verifier -- it reports
-//! [`codes::UNVERIFIED_NIR`][super::codes::UNVERIFIED_NIR] and refuses,
+//! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is
 //! *malformed*; the two never share a code.

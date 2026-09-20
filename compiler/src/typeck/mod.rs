@@ -22,8 +22,8 @@ use crate::symbol::{Interner, Symbol};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::generics::GenericInstanceKey;
 use crate::types::{
-    CapabilityRequirement, Evidence, Ty, TyVar, display_ty, is_integer, is_numeric,
-    primitive_from_name, substitute,
+    CapabilityRequirement, Evidence, Ty, TyVar, display_ty, is_executable_numeric, is_integer,
+    is_numeric, primitive_from_name, substitute,
 };
 
 mod capability;
@@ -256,6 +256,15 @@ mod codes {
     /// defaulted to zero, and not turned into a `Ty::Error` for a later
     /// stage to trip over.
     pub const INTEGER_LITERAL_OUT_OF_RANGE: &str = "T0073";
+    /// A numeric type name this milestone parses and resolves but does
+    /// not execute (`rfcs/0015`). Every integer width other than `i64`,
+    /// every unsigned width, and `f32`: nothing downstream narrows to a
+    /// declared width or rounds to single precision, so accepting one
+    /// would mean running it as something else under its own name --
+    /// which is exactly what Alpha 0.2.1 exists to stop doing. Refused
+    /// here, in checking, rather than left to surface as an internal
+    /// lowering diagnostic or a fabricated runtime value.
+    pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "T0074";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -1226,6 +1235,27 @@ impl<'a> Checker<'a> {
             HirType::Unresolved { name, span } => {
                 let text = self.interner.resolve(*name);
                 if let Some(prim) = primitive_from_name(text) {
+                    // The name resolves, and its type is returned even
+                    // when it is refused: the diagnostic below already
+                    // stops this compilation, and handing back the real
+                    // type keeps every later message about this
+                    // declaration accurate instead of cascading from a
+                    // `Ty::Error` that unifies with everything.
+                    if !is_executable_numeric(&prim) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                codes::UNIMPLEMENTED_NUMERIC_TYPE,
+                                self.source,
+                                *span,
+                                format!("`{text}` has no execution semantics in this milestone"),
+                            )
+                            .with_primary_label(format!("`{text}` is reserved, not implemented"))
+                            .with_help(
+                                "`i64` and `f64` are the numeric types Alpha 0.2.1 executes \
+                                 (see rfcs/0015)",
+                            ),
+                        );
+                    }
                     return prim;
                 }
                 self.diagnostics.push(
@@ -5028,8 +5058,53 @@ mod tests {
 
     #[test]
     fn integer_literal_infers_from_parameter_type() {
-        let diags = check("func f(x: i32) -> i32 { return x + 1 }");
+        let diags = check("func f(x: i64) -> i64 { return x + 1 }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// Naming a numeric type this milestone does not execute is a
+    /// diagnostic, wherever it is named (`rfcs/0015`).
+    #[test]
+    fn a_numeric_type_without_execution_semantics_is_refused() {
+        for name in [
+            "i8", "i16", "i32", "isize", "u8", "u16", "u32", "u64", "usize", "f32",
+        ] {
+            assert_eq!(
+                check(&format!("func f(x: {name}) -> i64 {{ return 0 }}"))
+                    .iter()
+                    .map(|d| d.code)
+                    .collect::<Vec<_>>(),
+                vec![codes::UNIMPLEMENTED_NUMERIC_TYPE],
+                "`{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_numeric_types_this_milestone_executes_are_accepted() {
+        for name in ["i64", "f64"] {
+            let diags = check(&format!("func f(x: {name}) -> {name} {{ return x }}"));
+            assert!(diags.is_empty(), "`{name}`: {diags:?}");
+        }
+    }
+
+    /// Refused in every position a type can be written, not only in a
+    /// parameter.
+    #[test]
+    fn an_unimplemented_numeric_type_is_refused_wherever_it_is_named() {
+        for text in [
+            "func f() -> u8 { return 0 }",
+            "func f() -> i64 { value x: u8 = 0; return 0 }",
+            "record Holder { field: u8 }\nfunc f() -> i64 { return 0 }",
+            "variant Maybe { Some(u8), None }\nfunc f() -> i64 { return 0 }",
+            "func f() -> i64 { mutable x: u8 = 0; return 0 }",
+        ] {
+            let found: Vec<&str> = check(text).iter().map(|d| d.code).collect();
+            assert!(
+                found.contains(&codes::UNIMPLEMENTED_NUMERIC_TYPE),
+                "`{text}` must be refused, got {found:?}"
+            );
+        }
     }
 
     #[test]
@@ -6595,7 +6670,7 @@ mod tests {
     #[test]
     fn expr_types_records_a_literals_type_as_unified_with_its_context() {
         let mut map = SourceMap::new();
-        let id = map.add_file("t.npt", "func f(x: i32) -> i32 { return x + 1 }");
+        let id = map.add_file("t.npt", "func f(x: i64) -> i64 { return x + 1 }");
         let mut interner = Interner::new();
         let (tokens, _) = tokenize(map.get(id).content(), id, &mut interner);
         let (module, _) = Parser::new(tokens, id, &mut interner).parse_module();
@@ -6613,11 +6688,19 @@ mod tests {
         let HirExpr::Binary { right, .. } = value.as_deref().unwrap() else {
             panic!("expected binary")
         };
-        // `1`'s own recorded type must be i32 -- what it was unified
-        // with via `x` -- not the bare i64 default a literal takes with
-        // no surrounding context. This is exactly what lets NIR lowering
-        // read the literal's real type instead of re-deriving it.
-        assert_eq!(result.expr_types.get(&right.id()), Some(&Ty::I32));
+        // `1`'s own recorded type must be the one it was unified with
+        // via `x`. This is what lets NIR lowering read a literal's real
+        // type instead of re-deriving it.
+        //
+        // This used to be written with an `i32` parameter, so the
+        // unified type and the literal's own default were visibly
+        // different types. `i64` is now the only integer type with
+        // execution semantics (`rfcs/0015`), so no source program can
+        // make those two differ any more; the distinction is held
+        // instead by `nir::lower`'s own
+        // `literal_takes_its_type_from_typeck_not_a_re_derived_default`,
+        // which hands lowering a type map the source could not produce.
+        assert_eq!(result.expr_types.get(&right.id()), Some(&Ty::I64));
     }
 
     #[test]

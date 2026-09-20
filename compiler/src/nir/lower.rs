@@ -4978,6 +4978,17 @@ mod tests {
     use crate::typeck::check_module;
 
     fn lower(text: &str) -> Module {
+        lower_remapped(text, Clone::clone)
+    }
+
+    /// `lower`, with one hook: `remap` rewrites every type the checker
+    /// recorded before lowering is handed it.
+    ///
+    /// `expr_types`/`local_types` are parameters of `lower_module`, not
+    /// something it derives, so replacing them is the only way to tell
+    /// "lowering read the map" apart from "lowering guessed the same
+    /// answer the map happened to hold".
+    fn lower_remapped(text: &str, remap: impl Fn(&Ty) -> Ty) -> Module {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -5013,10 +5024,20 @@ mod tests {
             "unexpected resource errors: {:?}",
             resourceck_result.diagnostics
         );
+        let local_types: HashMap<_, _> = result
+            .local_types
+            .iter()
+            .map(|(id, ty)| (*id, remap(ty)))
+            .collect();
+        let expr_types: HashMap<_, _> = result
+            .expr_types
+            .iter()
+            .map(|(id, ty)| (*id, remap(ty)))
+            .collect();
         lower_module(
             &hir,
-            &result.local_types,
-            &result.expr_types,
+            &local_types,
+            &expr_types,
             &result.pattern_case,
             &result.call_type_args,
             &HashMap::new(),
@@ -7144,9 +7165,20 @@ mod tests {
 
     #[test]
     fn literal_takes_its_type_from_typeck_not_a_re_derived_default() {
-        // `1`'s type comes from expr_types (typeck already unified it
-        // with `x: i32`), not NIR re-inferring it as i64 by default.
-        let module = lower("func f(x: i32) -> i32 { return x + 1 }");
+        // Lowering must read `expr_types`, not re-derive `i64` because
+        // that is what an integer literal defaults to. The source says
+        // `i64` everywhere and the map is rewritten to say `i32`, so
+        // only a lowering that actually reads the map can produce an
+        // `i32` instruction. `i32` has no execution semantics of its own
+        // in this milestone (`rfcs/0015`), which is precisely why it can
+        // reach lowering only as caller-supplied data like this.
+        let module = lower_remapped("func f(x: i64) -> i64 { return x + 1 }", |ty| {
+            if matches!(ty, Ty::I64) {
+                Ty::I32
+            } else {
+                ty.clone()
+            }
+        });
         let add_ty = module.functions[0]
             .blocks
             .iter()

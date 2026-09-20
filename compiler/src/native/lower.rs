@@ -5,7 +5,7 @@
 //! give up" path threaded through code generation. What it does have is
 //! a refusal for its own defects: a Cranelift error, or an NIR shape
 //! validation should have excluded, becomes a
-//! [`codes::CODEGEN_FAILED`][super::codes::CODEGEN_FAILED] diagnostic
+//! [`super::codes::CODEGEN_FAILED`] diagnostic
 //! rather than a panic.
 //!
 //! # Determinism

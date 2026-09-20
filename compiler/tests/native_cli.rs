@@ -759,3 +759,152 @@ fn no_example_that_checks_cleanly_leaks_an_internal_native_diagnostic() {
     }
     assert!(workspace.leftover_build_directories().is_empty());
 }
+
+// -- the scalar ABI at its boundaries -------------------------------------
+//
+// `i64` is held in a Cranelift `I128`, because the interpreter holds
+// every Napitia integer in an `i128` and wraps at 128 bits. That is the
+// most unusual decision in this release, so it is checked where it
+// actually matters -- at the edges of that width, not on small positive
+// numbers where every plausible representation agrees.
+//
+// Each program decides for itself whether it is correct and returns a
+// small marker, so the answer never travels through the exit status'
+// own 8-bit narrowing. Every one is run through the interpreter as
+// well: the assertion is that the two agree, not that the native side
+// produced some number.
+
+/// The literals for `i128::MAX` and `i128::MIN`. Napitia's lexer parses
+/// an integer literal as `u128` and the interpreter reinterprets it as
+/// `i128`, so both edges are writable directly and neither needs
+/// hand-built NIR.
+const I128_MAX: &str = "170141183460469231731687303715884105727";
+const I128_MIN: &str = "-170141183460469231731687303715884105728";
+
+#[test]
+fn the_scalar_abi_agrees_with_the_interpreter_at_its_boundaries() {
+    let cases: [(&str, String); 9] = [
+        // Addition wrapping at the top of the width.
+        (
+            "add_wraps",
+            format!("if {I128_MAX} + 1 == {I128_MIN} {{ return 42; }} return 0;"),
+        ),
+        // Subtraction wrapping at the bottom.
+        (
+            "sub_wraps",
+            format!("if {I128_MIN} - 1 == {I128_MAX} {{ return 42; }} return 0;"),
+        ),
+        // Multiplication wrapping: (2^127 - 1) * 2 is -2.
+        (
+            "mul_wraps",
+            format!("if {I128_MAX} * 2 == -2 {{ return 42; }} return 0;"),
+        ),
+        // The one value whose negation is itself.
+        (
+            "neg_of_min",
+            format!("if -({I128_MIN}) == {I128_MIN} {{ return 42; }} return 0;"),
+        ),
+        // Ordering has to be signed across the sign boundary, not
+        // unsigned over the same bits.
+        (
+            "signed_order",
+            format!(
+                "value min = {I128_MIN}; value max = {I128_MAX}; \
+                 if min < 0 {{ if 0 < max {{ if min < max {{ if max > min {{ return 42; }} }} }} }} \
+                 return 0;"
+            ),
+        ),
+        // Bitwise work on the high half, where a 64-bit representation
+        // would quietly drop the bits that matter.
+        (
+            "high_bits",
+            format!(
+                "value min = {I128_MIN}; value max = {I128_MAX}; \
+                 if (min & max) == 0 {{ if (min | max) == -1 {{ \
+                 if (min ^ max) == -1 {{ if ~max == min {{ return 42; }} }} }} }} \
+                 return 0;"
+            ),
+        ),
+        // A boundary value crossing a call, in and back out again.
+        (
+            "call_carries_boundaries",
+            format!("if wrap({I128_MAX}, 1) == {I128_MIN} {{ return 42; }} return 0;"),
+        ),
+        // Eight `i64` arguments. Each one is an `I128`, so this is well
+        // past what the platform passes in registers and exercises the
+        // stack half of the argument sequence.
+        (
+            "high_arity_call",
+            format!(
+                "if many({I128_MAX}, 1, 0, 0, 0, 0, 0, {I128_MIN}) == 0 {{ \
+                 if many(1, 2, 3, 4, 5, 6, 7, 8) == 36 {{ return 42; }} }} return 0;"
+            ),
+        ),
+        // `unit` occupies no ABI position, so a `unit` parameter in the
+        // middle of a signature must not shift the ones after it.
+        (
+            "mixed_scalars",
+            "if mixed(nothing(), true, 40, nothing(), 2) == 42 { \
+             if mixed(nothing(), false, 40, nothing(), 2) == 0 { return 42; } } return 0;"
+                .to_string(),
+        ),
+    ];
+
+    const HELPERS: &str = "
+        func wrap(a: i64, b: i64) -> i64 { return a + b; }
+        func many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+            return a + b + c + d + e + f + g + h;
+        }
+        func nothing() -> unit { return; }
+        func mixed(before: unit, flag: bool, x: i64, between: unit, y: i64) -> i64 {
+            if flag { return x + y; }
+            return 0;
+        }
+    ";
+
+    let workspace = Workspace::new("abi-boundaries");
+    for (name, body) in cases {
+        let source = workspace.source(name, &format!("{HELPERS}\nfunc main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+
+        assert_eq!(
+            interpreted(&source),
+            "42",
+            "`{name}`: the interpreter must agree the program is correct"
+        );
+        if let Some(status) = build_and_run(&workspace, &source, &output) {
+            assert_eq!(
+                status, 42,
+                "`{name}`: the native build must reach the same answer as the interpreter"
+            );
+        }
+    }
+}
+
+/// The high-arity case again, but with the arguments arriving in an
+/// order only a correct sequence can reproduce: each parameter
+/// contributes a distinct power, so a shifted or dropped argument
+/// changes the sum.
+#[test]
+fn a_high_arity_call_places_every_argument_where_the_callee_expects_it() {
+    let workspace = Workspace::new("abi-arity");
+    let source = workspace.source(
+        "positions",
+        "
+        func weigh(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64) -> i64 {
+            return a * 1 + b * 10 + c * 100 + d * 1000 + e * 10000
+                 + f * 100000 + g * 1000000 + h * 10000000 + i * 100000000;
+        }
+        func main() -> i64 {
+            if weigh(1, 2, 3, 4, 5, 6, 7, 8, 9) == 987654321 { return 42; }
+            return 0;
+        }
+        ",
+    );
+    let output = workspace.output("positions");
+
+    assert_eq!(interpreted(&source), "42");
+    if let Some(status) = build_and_run(&workspace, &source, &output) {
+        assert_eq!(status, 42);
+    }
+}

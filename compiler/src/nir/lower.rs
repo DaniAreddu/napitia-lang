@@ -7008,7 +7008,7 @@ mod tests {
                     result,
                     kind: ValueKind::Const(Const::Int(v)),
                     ..
-                } => Some((*result, *v as i128)),
+                } => Some((*result, *v)),
                 _ => None,
             })
             .collect();

@@ -86,7 +86,7 @@ type Refusal = Box<Diagnostic>;
 /// `typeck::EntryMain::ByName`, which is how single-file compilation --
 /// the only mode `napitia build` accepts -- already identifies the
 /// entry point.
-pub const ENTRY_NAME: &str = "main";
+pub(crate) const ENTRY_NAME: &str = "main";
 
 /// What [`validate`] hands to code generation: the exact, ordered set
 /// of things to compile.
@@ -155,7 +155,7 @@ impl NativePlan {
 /// the subset, in a deterministic order: target, then module-level
 /// facts, then the entry contract, then each reachable function in
 /// ascending [`ItemId`] order, then call-graph cycles.
-pub fn validate(
+pub(crate) fn validate(
     module: &Module,
     source: SourceId,
     interner: &Interner,
@@ -651,6 +651,12 @@ impl<'a> Validator<'a> {
             // executes, which is also what makes a use-before-define
             // inside one block a refusal rather than a lookup that
             // happens to succeed.
+            //
+            // The empty set is the analysis's own bottom rather than a
+            // masked lookup -- `must_reach` computes a state for every
+            // reachable block -- and it is the conservative direction:
+            // a block with no computed state has nothing available, so
+            // every use in it is refused rather than waved through.
             let mut live = available.get(id).cloned().unwrap_or_default();
             live.extend(parameters.iter().copied());
             for instruction in &block.instructions {

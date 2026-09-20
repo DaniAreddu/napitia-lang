@@ -486,6 +486,13 @@ fn linker_launch_failure(linker: &OsStr, error: &std::io::Error, source: SourceI
 
 /// Writes `object` out and links it into `output` with `linker`.
 ///
+/// Public, and not a way around the sealed codegen path: this takes
+/// opaque bytes, never NIR, and the only thing that produces those
+/// bytes -- `lower::emit_object` -- is internal to the crate. A caller
+/// can link bytes it already had; it cannot obtain bytes from this
+/// compiler without having gone through verification and capability
+/// validation first.
+///
 /// The scratch directory this needs is created *beside* `output`, with
 /// [`std::fs::create_dir`], which fails rather than succeeding on a
 /// path that already exists -- so this only ever writes to, and only

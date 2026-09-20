@@ -1274,6 +1274,82 @@ mod tests {
         assert!(contains("napitia_"), "internal symbols stay mangled");
     }
 
+    // -- the internal runtime ----------------------------------------------
+
+    /// Object generation is host-independent, so the failure path can be
+    /// inspected anywhere -- including on a host that could never link
+    /// or run the result.
+    fn object_contains(object: &[u8], needle: &str) -> bool {
+        object
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    #[test]
+    fn every_checked_operation_gets_its_own_handler_and_its_own_message() {
+        let built = build(SCALAR_PROGRAM);
+        for op in CHECKED {
+            assert!(
+                object_contains(&built.object, &format!("napitia_fail_{}", op.as_str())),
+                "`{}` must have a failure handler in the object",
+                op.as_str()
+            );
+            let message = failure_message(op);
+            assert!(
+                object_contains(&built.object, message.trim_end()),
+                "`{}`'s message must be in the object as bytes: {message:?}",
+                op.as_str()
+            );
+        }
+    }
+
+    /// The words an executable reports are the words `napitia run`
+    /// reports. Read from the same table, never copied.
+    #[test]
+    fn a_failure_message_is_the_shared_rendering_with_this_backends_prefix() {
+        for op in CHECKED {
+            let failure = ArithFailure::Overflow(op);
+            assert_eq!(
+                failure_message(op),
+                format!("napitia: error[{}]: {failure}\n", failure.code())
+            );
+            assert!(failure_message(op).ends_with('\n'), "one complete line");
+        }
+        assert_eq!(
+            failure_message(IntOp::Add),
+            "napitia: error[X0002]: integer overflow in `add`\n"
+        );
+    }
+
+    /// The four operators the capability validator refuses have no
+    /// handler, because no code can branch to one.
+    #[test]
+    fn the_operators_outside_the_subset_have_no_failure_handler() {
+        let built = build(SCALAR_PROGRAM);
+        for op in [IntOp::Div, IntOp::Rem, IntOp::Shl, IntOp::Shr] {
+            assert!(
+                !object_contains(&built.object, &format!("napitia_fail_{}", op.as_str())),
+                "`{}` is refused before code generation, so it needs no handler",
+                op.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_runtime_imports_exactly_the_two_libc_entry_points_it_uses() {
+        let built = build(SCALAR_PROGRAM);
+        assert!(object_contains(&built.object, "write"));
+        assert!(object_contains(&built.object, "exit"));
+    }
+
+    /// The exit status is part of the documented contract, not an
+    /// implementation detail to be changed quietly.
+    #[test]
+    fn the_runtime_failure_status_is_the_one_the_rfc_documents() {
+        assert_eq!(RUNTIME_FAILURE_STATUS, 70);
+        assert_eq!(STDERR, 2);
+    }
+
     // -- the backend refuses rather than panics ----------------------------
 
     #[test]

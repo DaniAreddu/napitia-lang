@@ -64,21 +64,40 @@ maximum =  9223372036854775807
 interpreter, and the native backend, which represents it as Cranelift's
 `I64`.
 
-Its arithmetic is **checked**. `add`, `sub`, `mul`, `neg` and
-`i64::MIN / -1` produce a structured runtime failure rather than a
-wrapped value, in both execution paths, on exactly the same inputs. A
-literal outside the range is rejected by `check` before lowering runs,
-pointing at the literal. `-9223372036854775808` is accepted and
+Its arithmetic is **checked**. `add`, `sub`, `mul`, `neg`, division by
+zero and `i64::MIN / -1` produce a structured runtime failure rather
+than a wrapped value. Of those, the four the native backend compiles —
+`add`, `sub`, `mul`, `neg` — fail identically in both execution paths,
+on exactly the same inputs; `div`, `rem` and the shifts are
+interpreter-only, because the backend refuses them (`A0009`) rather
+than approximating them.
+
+A runtime failure is a **fatal abort**, not a `raise`: it stops
+execution where it stands, runs no `defer` and no `drop`, and cannot be
+caught. A resource that was live is genuinely not destroyed, and the
+runtime does not pretend otherwise. `rfcs/0011`'s deterministic-cleanup
+guarantee covers Napitia control-flow exits — fallthrough, `return`,
+`break`, `continue`, `raise`, `?`, `handle` — and a fatal abort is its
+one documented exception.
+
+A literal outside the range is rejected by `check` before lowering
+runs, pointing at the literal. `-9223372036854775808` is accepted and
 `9223372036854775808` is not, which is a distinction the compiler now
 carries through every stage rather than losing at the first one.
 
 Two numeric types are actually implemented: `i64` everywhere, and `f64`
-in the interpreter. The other ten names in `spec/0003` — `i8`, `i16`,
-`i32`, `isize`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32` — are now
-**refused by `check`** with a diagnostic saying this milestone does not
-implement them. They used to be accepted and then executed as 128-bit
-arithmetic wearing someone else's name. They remain reserved names, not
-removed ones.
+in the interpreter only. The other ten names in `spec/0003` — `i8`,
+`i16`, `i32`, `isize`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32` — are
+now **refused by `check`** with a diagnostic saying this milestone does
+not implement them. They used to be accepted and then executed as
+something else under their own name: the nine integer widths as
+128-bit integer arithmetic, and `f32` as an `f64` that was never
+rounded to single precision. They remain reserved names, not removed
+ones.
+
+Floats compare by IEEE-754 predicate, so every ordered comparison
+involving a NaN is `false`, `nan == nan` is `false` and `nan != nan` is
+`true` — answers, not diagnostics.
 
 This is not complete numeric support, and it is not complete IEEE-754
 support. `rfcs/0015` states exactly what is and is not implemented,

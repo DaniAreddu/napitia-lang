@@ -1525,25 +1525,40 @@ fn operations_outside_native_capability_are_a0009_and_still_interpret() {
 }
 
 /// `f64` is outside the native subset too, and is refused for its type
-/// rather than silently compiled as something else.
+/// rather than silently compiled as something else. Which code depends
+/// on where the float is: `main`'s own result is the entry point's
+/// business, a float anywhere else is the type rule's.
 #[test]
 fn a_float_program_is_refused_by_the_native_backend_but_still_interprets() {
     let workspace = Workspace::new("float-boundary");
-    let source = workspace.source(
-        "floats",
-        "func main() -> f64 { value x: f64 = 1.5; return x + 0.5 }",
-    );
-    let output = workspace.output("floats");
+    for (name, program, answer, expected) in [
+        (
+            "float_result",
+            "func main() -> f64 { value x: f64 = 1.5; return x + 0.5 }",
+            "2",
+            codes::ENTRY_RETURN_TYPE,
+        ),
+        (
+            "float_local",
+            "func main() -> i64 { value x: f64 = 1.5; if x > 1.0 { return 42; } return 0 }",
+            "42",
+            codes::UNSUPPORTED_TYPE,
+        ),
+    ] {
+        let source = workspace.source(name, program);
+        let output = workspace.output(name);
 
-    assert_eq!(interpreted(&source), "2");
+        // The interpreter is the complete execution path and runs it.
+        assert_eq!(interpreted(&source), answer, "`{name}`");
 
-    let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
-    assert_eq!(built.status.code(), Some(1));
-    assert!(
-        stderr(&built).contains(codes::ENTRY_RETURN_TYPE)
-            || stderr(&built).contains(codes::UNSUPPORTED_TYPE),
-        "a float program must be refused for its type:\n{}",
-        stderr(&built)
-    );
-    assert!(!output.exists());
+        let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(built.status.code(), Some(1), "`{name}`");
+        assert!(
+            stderr(&built).contains(expected),
+            "`{name}`: must be refused with {expected}:\n{}",
+            stderr(&built)
+        );
+        assert!(!output.exists(), "`{name}`");
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
 }

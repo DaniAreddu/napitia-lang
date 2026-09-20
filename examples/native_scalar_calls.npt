@@ -1,0 +1,41 @@
+// Inside the Alpha 0.2.0 native subset (`rfcs/0014`): scalar values and
+// a chain of direct, non-recursive calls, and nothing else.
+//
+//   napitia run   examples/native_scalar_calls.npt       -> 42
+//   napitia build examples/native_scalar_calls.npt --output scalar
+//   ./scalar; echo $?                                    -> 42
+//
+// Every callee is declared *after* the function that calls it, on
+// purpose: the native backend orders what it emits by item identity,
+// never by where a declaration happens to sit in the file.
+
+func main() -> i64 {
+    return answer();
+}
+
+func answer() -> i64 {
+    value base = scale(4, 10);
+    value adjusted = add(base, 2);
+    return adjusted;
+}
+
+// `bool` is a native scalar too, and a comparison is one of the
+// operators this backend reproduces exactly as the interpreter does.
+func scale(value_to_scale: i64, factor: i64) -> i64 {
+    if positive(factor) {
+        return multiply(value_to_scale, factor);
+    }
+    return 0;
+}
+
+func positive(x: i64) -> bool {
+    return x > 0;
+}
+
+func multiply(a: i64, b: i64) -> i64 {
+    return a * b;
+}
+
+func add(a: i64, b: i64) -> i64 {
+    return a + b;
+}

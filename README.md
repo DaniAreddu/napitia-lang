@@ -40,9 +40,79 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.1.9
+## Current status: Alpha 0.2.0
 
-This milestone adds one construct: a lexically scoped, read-only
+This milestone adds a **native AOT preview**: a Cranelift path from
+already-verified NIR to a real `x86_64-unknown-linux-gnu` executable.
+
+```bash
+napitia build examples/native_scalar_calls.npt --output scalar
+./scalar; echo $?    # 42
+```
+
+Every stage before that one is the stage `napitia ir` already ran —
+parse, resolve, type-check, resource-check, lower, verify — so `check`,
+`ir`, `run` and `build` agree by construction about what a program
+means. Two new stages follow it: a native *capability validator*, which
+decides exhaustively whether the reachable program is inside the
+compiled subset, and then Cranelift plus the system linker. A stage
+that fails stops the pipeline and nothing is written.
+
+**The interpreter is still the complete semantic execution path.** The
+native backend compiles one small subset and refuses everything else
+with a diagnostic naming what it refused. Refused means refused: no
+construct is lowered approximately, erased, replaced with a unit value,
+or quietly handed back to the interpreter.
+
+Natively compiled: `i64`, `bool`, `unit`; their constants and locals;
+scalar parameters and results; `add`, `sub`, `mul`, `neg`, bitwise
+`and`/`or`/`xor`/`not`, and all six comparisons; `if`, `while`,
+branches and loop backedges; direct calls within one non-recursive call
+graph; exactly one `main`, returning `unit` or `i64`.
+
+Not natively compiled, and **unchanged** under `check`, `ir` and `run`:
+resources, `observe`, `defer`, typed errors (`raise`/`?`/`handle`),
+records, variants, strings, `char`, floats, integer widths other than
+`i64`, `import` and multi-module builds, generics, protocols and
+evidence dispatch, recursion, and `div`/`rem`/`shl`/`shr`. There is no
+native heap, no garbage collector, no reference counting, no borrowing
+or lifetime system, no FFI, no threads, no native typed-failure
+runtime, no JIT, and no second target.
+
+Two of those deserve their reasons stated here. `div`, `rem`, `shl` and
+`shr` are refused because the interpreter answers each one's
+exceptional case with a runtime *error* value, and Alpha 0.2.0 has no
+native runtime that can raise one — emitting a hardware trap instead
+would be different behavior, not the same behavior implemented
+differently. And `i64` is represented natively as a 128-bit integer,
+because the interpreter holds every Napitia integer in an `i128` and
+wraps at 128 bits; matching the reference implementation over the whole
+input domain was worth two registers, and settling the language's own
+integer width later makes the choice go away.
+
+`main() -> unit` exits `0`. `main() -> i64` is observed by a waiting
+parent as the returned value modulo 256. Two builds of one program on
+one toolchain are byte-identical.
+
+Linking needs a **GNU** x86-64 Linux host with a C toolchain (`cc`) —
+all three components, so a musl host does not qualify — and `cc` itself
+is asked what it targets (`cc -dumpmachine`) before anything is
+written, so a toolchain that cross-compiles elsewhere is refused rather
+than trusted. Object generation works anywhere; a host or linker that
+cannot produce this target says exactly that, with its own diagnostic
+code.
+
+A build that fails changes nothing: if the command reports an error,
+the requested output is byte-for-byte what it was before, whichever
+stage did the refusing.
+
+`rfcs/0014-native-aot-preview.md` holds the authoritative table of what
+is and is not compiled, the `Axxxx` diagnostic codes, the ABI, the
+determinism guarantees and the honest remaining limitations.
+
+### Alpha 0.1.9: scoped observations
+
+That milestone added one construct: a lexically scoped, read-only
 *observation* of a place another binding still owns.
 
 ```napitia
@@ -574,8 +644,9 @@ resource-typed `match`/`handle`/non-tail `if`, the indirection that
 would lift the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
-aliases that do exist — see above), incremental/cached compilation, an
-LLVM (or any native) backend, native-code generic
+aliases that do exist — see above), incremental/cached compilation,
+native compilation of anything outside Alpha 0.2.0's scalar subset (see
+"Current status" above and `rfcs/0014`), native-code generic
 specialization/monomorphization, garbage collection, and any
 domain-specific library (REST, ORM, tensors, GPU). Design direction for
 most of these exists in `rfcs/`; none of it is faked in the
@@ -607,8 +678,23 @@ cargo run --manifest-path compiler/Cargo.toml -- ir examples/hello.npt
 cargo run --manifest-path compiler/Cargo.toml -- run examples/hello.npt
 ```
 
+Compiling to a native executable (`rfcs/0014`):
+
+```bash
+cargo run --manifest-path compiler/Cargo.toml -- \
+  build examples/native_scalar_calls.npt --output scalar
+./scalar; echo $?    # 42
+```
+
+`build` takes a single `.npt` file — never a directory or a manifest —
+and always targets `x86_64-unknown-linux-gnu`. `--output` is required.
+It refuses anything outside the compiled subset with an `Axxxx`
+diagnostic and a non-zero exit status, writing no executable; the same
+program still runs under `run`.
+
 See `examples/` for sample `.npt` programs, including intentionally invalid
-ones used to exercise diagnostics.
+ones used to exercise diagnostics, and `native_scalar_calls.npt` /
+`native_control_flow.npt` for two that build natively.
 
 ## Repository layout
 

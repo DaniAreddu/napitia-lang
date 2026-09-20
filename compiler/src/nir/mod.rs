@@ -1,10 +1,17 @@
 //! The Napitia IR (NIR): a typed control-flow graph.
 //!
-//! NIR is lower-level than HIR and is designed to be a reasonable input
-//! to a future native backend (`spec/0006`). This milestone lowers HIR
-//! to NIR (`lower.rs`), prints NIR as text for debugging (`printer.rs`),
-//! and executes it directly with a tree-walking interpreter
-//! (`crate::driver`'s `run` support, built on this module).
+//! NIR is lower-level than HIR and was designed to be a reasonable
+//! input to a native backend (`spec/0006`). This module lowers HIR to
+//! NIR (`lower.rs`), prints NIR as text for debugging (`printer.rs`),
+//! and checks it independently of how it was built (`verify.rs`).
+//!
+//! Verified NIR has two consumers, and neither is this module's
+//! business: the tree-walking interpreter (`crate::driver`'s `run`
+//! support), which remains the complete semantic execution path, and
+//! [`crate::native`] (`rfcs/0014`), which compiles a small scalar
+//! subset of it ahead of time. Nothing here is aware of either -- a
+//! rule the native backend needs and NIR itself does not is a native
+//! rule, and lives there.
 
 pub mod block;
 pub mod instruction;

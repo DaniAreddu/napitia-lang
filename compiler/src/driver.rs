@@ -14,7 +14,7 @@ use crate::lexer::{self, Token};
 use crate::nir::{self, Module as NirModule};
 use crate::parser::Parser;
 use crate::project::{self, CompiledProject};
-use crate::source::{SourceId, SourceMap};
+use crate::source::{SourceId, SourceMap, Span};
 use crate::symbol::Interner;
 use crate::syntax::ast;
 use crate::typeck;
@@ -75,6 +75,15 @@ pub struct CheckOutput {
     /// See [`crate::resourceck::ResourceCheckResult::observation_exits`].
     pub observation_exits:
         std::collections::BTreeMap<hir::ExprId, Vec<crate::resourceck::ObservationExit>>,
+    /// The span of every `import` this source declared, in source order.
+    ///
+    /// Single-file compilation resolves no imports at all --
+    /// `hir::lower_module` drops them, and nothing downstream records
+    /// that one was ever written. The native backend still has to refuse
+    /// a source that declares one (`rfcs/0014`) rather than compiling a
+    /// program whose author expected another module to be part of it,
+    /// and this is the only place that evidence survives.
+    pub import_spans: Vec<Span>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -98,6 +107,15 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         },
     );
     diagnostics.extend(resourceck_result.diagnostics);
+    let import_spans = parsed
+        .module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Import(import) => Some(import.span),
+            _ => None,
+        })
+        .collect();
     CheckOutput {
         hir,
         local_types: typeck_result.local_types,
@@ -111,6 +129,7 @@ pub fn check(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Chec
         defer_plans: resourceck_result.defer_plans,
         observations: resourceck_result.observations,
         observation_exits: resourceck_result.observation_exits,
+        import_spans,
         diagnostics,
     }
 }
@@ -135,9 +154,23 @@ pub enum IrOutput {
 }
 
 pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutput {
-    let checked = check(map, source, interner);
+    ir_with_imports(map, source, interner).0
+}
+
+/// Exactly [`ir`], plus the one piece of evidence neither NIR nor HIR
+/// carries: where the source declared each `import`. Only
+/// [`build_native`] needs it, and only to refuse a native build that
+/// spans more than one module; nothing about `ir`'s own behavior
+/// changes.
+fn ir_with_imports(
+    map: &SourceMap,
+    source: SourceId,
+    interner: &mut Interner,
+) -> (IrOutput, Vec<Span>) {
+    let mut checked = check(map, source, interner);
+    let imports = std::mem::take(&mut checked.import_spans);
     if !checked.diagnostics.is_empty() {
-        return IrOutput::Diagnostics(checked.diagnostics);
+        return (IrOutput::Diagnostics(checked.diagnostics), imports);
     }
     let nir_module = match nir::lower_module(
         &checked.hir,
@@ -156,7 +189,7 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
         source,
     ) {
         Ok(nir_module) => nir_module,
-        Err(diagnostics) => return IrOutput::Diagnostics(diagnostics),
+        Err(diagnostics) => return (IrOutput::Diagnostics(diagnostics), imports),
     };
     let registry = hir::registry::build(&checked.hir, &HashMap::new());
     // A module lowering itself considers well-formed is still checked
@@ -166,11 +199,55 @@ pub fn ir(map: &SourceMap, source: SourceId, interner: &mut Interner) -> IrOutpu
     // misbehavior in the interpreter.
     let verify_diagnostics = nir::verify_module(&nir_module, source, interner, &registry);
     if !verify_diagnostics.is_empty() {
-        return IrOutput::Diagnostics(verify_diagnostics);
+        return (IrOutput::Diagnostics(verify_diagnostics), imports);
     }
-    IrOutput::Ready {
-        nir: nir_module,
-        registry,
+    (
+        IrOutput::Ready {
+            nir: nir_module,
+            registry,
+        },
+        imports,
+    )
+}
+
+pub enum NativeOutput {
+    /// The executable was written to the requested path, and every
+    /// stage before that succeeded.
+    Built,
+    /// Nothing was written. Some stage -- any stage, from lexing to the
+    /// system linker -- refused, and every later one was skipped.
+    Diagnostics(Vec<Diagnostic>),
+}
+
+/// Compiles `source` to a native executable at `output`
+/// (`rfcs/0014`).
+///
+/// This is [`ir`]'s pipeline with two more stages on the end: native
+/// capability validation, then Cranelift and the system linker. It
+/// shares those earlier stages rather than repeating them, so `check`,
+/// `ir`, `run` and `build` all agree by construction about what a
+/// program means.
+///
+/// There is no interpreter fallback. A program the native backend
+/// cannot compile is refused with a diagnostic naming why; running it
+/// is still `napitia run`'s job, and that path is unchanged.
+pub fn build_native(
+    map: &SourceMap,
+    source: SourceId,
+    interner: &mut Interner,
+    output: &Path,
+) -> NativeOutput {
+    let (compiled, imports) = ir_with_imports(map, source, interner);
+    let (nir, registry) = match compiled {
+        IrOutput::Diagnostics(diagnostics) => return NativeOutput::Diagnostics(diagnostics),
+        IrOutput::Ready { nir, registry } => (nir, registry),
+    };
+    let diagnostics =
+        crate::native::build_executable(&nir, source, interner, &registry, &imports, output);
+    if diagnostics.is_empty() {
+        NativeOutput::Built
+    } else {
+        NativeOutput::Diagnostics(diagnostics)
     }
 }
 

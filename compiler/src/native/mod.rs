@@ -177,18 +177,15 @@ pub mod codes {
 /// The mapping to machine representation is recorded here, once, rather
 /// than rediscovered at each use:
 ///
-/// * [`Scalar::Int`] (`i64`) is represented by Cranelift's `I128`. That
-///   is not an oversight and not future-proofing. The interpreter holds
-///   every Napitia integer in an `i128` and performs *128-bit* wrapping
-///   arithmetic on it (`Value::Int(i128)`, `i128::wrapping_add` and
-///   friends), so 64-bit machine arithmetic would disagree with the
-///   reference implementation for every operation whose mathematical
-///   result leaves `i64`'s range. Matching the interpreter exactly, over
-///   the whole input domain, is worth two registers. `rfcs/0014` records
-///   this as the limitation it is: Napitia's declared `i64` width and
-///   its interpreter's actual integer width are not yet the same thing,
-///   and reconciling them (`spec/0005` wants overflow to be a panic) is
-///   a language decision, not a backend one.
+/// * [`Scalar::Int`] (`i64`) is represented by Cranelift's `I64`: the
+///   declared width and the machine width are the same width
+///   (`rfcs/0015`). Alpha 0.2.0 used `I128` here, because the
+///   interpreter of that release held every Napitia integer in an
+///   `i128` and wrapped at 128 bits, and matching the reference
+///   implementation mattered more than matching the type's own name.
+///   Both sides are 64 bits now, and the operation that used to
+///   disagree -- one whose mathematical result leaves `i64` -- has no
+///   result at all in either.
 /// * [`Scalar::Bool`] is represented by `I8`, always normalized to `0`
 ///   or `1` -- never "whatever nonzero value a comparison happened to
 ///   leave behind".
@@ -226,9 +223,9 @@ pub fn scalar_of(ty: &Ty) -> Option<Scalar> {
         Ty::Bool => Some(Scalar::Bool),
         Ty::Unit => Some(Scalar::Unit),
         // Other integer widths are genuinely absent, not merely
-        // untested: the interpreter gives every integer the same `i128`
-        // representation and never narrows to a declared width, so an
-        // `i32` would need semantics this milestone has not decided.
+        // untested: nothing in the language executes them at all
+        // (`rfcs/0015`), so the checker refuses one in source and the
+        // verifier refuses one in NIR long before this is asked.
         Ty::I8
         | Ty::I16
         | Ty::I32
@@ -1169,11 +1166,7 @@ mod link_tests {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(
-                literal
-                    .try_into()
-                    .expect("a constant this helper can carry"),
-            )),
+            kind: ValueKind::Const(Const::Int(literal)),
         }
     }
 

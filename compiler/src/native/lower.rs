@@ -26,8 +26,9 @@
 //!
 //! # Representation
 //!
-//! [`super::Scalar`] documents *why* `i64` is an `I128` here; this
-//! module is where that choice is spent. `unit` is represented by no
+//! [`super::Scalar`] records the machine type each Napitia scalar is
+//! held in; this module is where those choices are spent. `unit` is
+//! represented by no
 //! value at all: a `unit` parameter is absent from a native signature,
 //! a `unit` result makes the signature return nothing, and a `unit`
 //! slot holds no variable. Nothing fabricates a placeholder for it.
@@ -67,8 +68,7 @@ const OBJECT_NAME: &str = "napitia";
 /// A native value, or the deliberate absence of one.
 #[derive(Copy, Clone, Debug)]
 enum Native {
-    /// An `i64`, held in an `I128` so that every accepted operator
-    /// agrees with the interpreter's own `i128` arithmetic exactly.
+    /// An `i64`, held in an `I64` (`rfcs/0015`).
     Int(Value),
     /// A `bool`, held in an `I8` that is always `0` or `1`.
     Bool(Value),
@@ -99,10 +99,6 @@ pub(super) fn emit_object(
     // interpreter meaningful.
     set_flag(&mut flags, "opt_level", "none")?;
     set_flag(&mut flags, "is_pic", "true")?;
-    // Without this, Cranelift's x86-64 ABI refuses `I128` in a
-    // parameter or a result -- and `I128` is exactly how this backend
-    // represents `i64` (see `super::Scalar`).
-    set_flag(&mut flags, "enable_llvm_abi_extensions", "true")?;
 
     // Parsed here rather than through `isa::lookup_by_name`, which
     // panics on a triple it cannot parse.
@@ -228,7 +224,7 @@ fn lookup<'a>(
 /// which occupies no ABI position at all.
 fn abi_type(scalar: Scalar) -> Option<types::Type> {
     match scalar {
-        Scalar::Int => Some(types::I128),
+        Scalar::Int => Some(types::I64),
         Scalar::Bool => Some(types::I8),
         Scalar::Unit => None,
     }
@@ -467,12 +463,8 @@ impl BodyLowerer<'_, '_> {
         }
     }
 
-    /// An `i128` literal, built from its two halves: Cranelift has no
-    /// 128-bit `iconst`.
-    fn int_const(&mut self, bits: i128) -> Value {
-        let low = self.builder.ins().iconst(types::I64, bits as i64);
-        let high = self.builder.ins().iconst(types::I64, (bits >> 64) as i64);
-        self.builder.ins().iconcat(low, high)
+    fn int_const(&mut self, bits: i64) -> Value {
+        self.builder.ins().iconst(types::I64, bits)
     }
 
     fn bool_const(&mut self, literal: bool) -> Value {
@@ -538,10 +530,17 @@ impl BodyLowerer<'_, '_> {
                 Ok(Native::Slot { variable, scalar })
             }
             ValueKind::Const(constant) => match constant {
-                // Exactly the interpreter's own conversion
-                // (`Value::Int(*v as i128)`), so a literal means the
-                // same number in both execution paths.
-                Const::Int(literal) => Ok(Native::Int(self.int_const(*literal as i128))),
+                // Narrowed through a checked conversion, exactly as the
+                // interpreter narrows the same constant. `nir::verify`
+                // has already rejected one outside `i64`, so this only
+                // ever guards a caller that reached code generation
+                // another way.
+                Const::Int(literal) => {
+                    let bits = i64::try_from(*literal).map_err(|_| {
+                        format!("the constant {literal} is not an i64; verification must reject it before code generation")
+                    })?;
+                    Ok(Native::Int(self.int_const(bits)))
+                }
                 Const::Bool(literal) => Ok(Native::Bool(self.bool_const(*literal))),
                 Const::Unit => Ok(Native::Unit),
                 Const::Float(_) | Const::Char(_) | Const::Str(_) => {
@@ -780,7 +779,7 @@ impl BodyLowerer<'_, '_> {
 /// * `main() -> i64` hands back the low 32 bits of the returned value
 ///   as the C `int` result, which the kernel then reports to a waiting
 ///   parent as its low 8 bits -- so the observable exit status is the
-///   Napitia value taken modulo 256.
+///   Napitia value taken modulo 256 (`rfcs/0015`).
 fn define_entry_wrapper(
     object: &mut ObjectModule,
     context: &mut Context,
@@ -815,8 +814,7 @@ fn define_entry_wrapper(
                     .first()
                     .copied()
                     .ok_or_else(|| "`main` returned nothing".to_string())?;
-                let (low, _high) = builder.ins().isplit(result);
-                builder.ins().ireduce(types::I32, low)
+                builder.ins().ireduce(types::I32, result)
             }
             Scalar::Bool => {
                 return Err("`main` may only return `i64` or `unit`".to_string());

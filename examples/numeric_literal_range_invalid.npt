@@ -1,0 +1,18 @@
+// Rejected on purpose (`rfcs/0015`): both literals below are one step
+// outside `i64`, and `check`, `ir`, `run` and `build` all stop at the
+// same diagnostic, pointing at the literal rather than at the binding
+// or the function.
+//
+//   napitia check examples/numeric_literal_range_invalid.npt   -> T0073
+//
+// The interesting one is the second. `9223372036854775808` is exactly
+// the magnitude of `i64`'s minimum, so `-9223372036854775808` is a
+// valid literal and the same digits without the sign are not. A
+// compiler that represented the magnitude as a positive value of the
+// target type before negating it could not tell those two apart.
+
+func main() -> i64 {
+    value too_high: i64 = 9223372036854775808;
+    value too_low: i64 = -9223372036854775809;
+    return too_high + too_low;
+}

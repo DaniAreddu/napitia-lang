@@ -113,11 +113,26 @@ statically (e.g. calling with the wrong argument count), it does, and no
 `raises` declaration is needed at all.
 
 Integer overflow is the first of those conditions to be *implemented*
-(Alpha 0.2.1, `rfcs/0015`). `add`, `sub`, `mul`, `neg` and
-`i64::MIN / -1` on `i64` produce a runtime failure rather than a value,
-in both the interpreter and a natively built executable, on exactly the
-same inputs. It is unrecoverable exactly as described above: no `raises`
+(Alpha 0.2.1, `rfcs/0015`). `add`, `sub`, `mul`, `neg`, a zero divisor
+and `i64::MIN / -1` on `i64` produce a runtime failure rather than a
+value. It is unrecoverable exactly as described above: no `raises`
 clause models it, `?` cannot propagate it and `handle` cannot catch it.
+
+Of those, `add`, `sub`, `mul` and `neg` behave identically in the
+interpreter and in a natively built executable. `div`, `rem` and the
+shifts are interpreter-only — the native backend refuses a program
+containing one (`A0009`) rather than compiling it, so there is no
+native behaviour for them to agree with.
+
+It is also a **fatal abort**, and that is a stronger statement than
+"unrecoverable". It is not a control-flow exit at all: execution stops
+at the failing operation, no later statement runs, no `defer` action
+runs, and no `drop` after it runs. A resource that was live is not
+destroyed, and nothing claims it was. `rfcs/0011`'s guarantee that every
+owned resource is destroyed on every exit path is about Napitia
+*control-flow* exits — fallthrough, `return`, `break`, `continue`,
+`raise`, `?` and `handle` — and a fatal abort is its one documented
+exception.
 
 "Unrecoverable" is not "unstructured". The failure carries a stable code
 in its own `X` namespace, renders as one deterministic line, and stops

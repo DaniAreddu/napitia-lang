@@ -2311,6 +2311,14 @@ impl<'a> Interpreter<'a> {
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
+        // Refused before the value is looked at at all: no value of any
+        // kind can satisfy a position whose declared numeric type this
+        // interpreter has no representation for (`rfcs/0015`).
+        if let Some(ty) = expected
+            && unexecutable_numeric_name(ty).is_some()
+        {
+            return Err(unexecutable_numeric(ty));
+        }
         // A tombstone stands where ownership *was*. A position that
         // never owned anything has nothing that could have moved out of
         // it, so a tombstone there is a malformed value, not an empty
@@ -2334,22 +2342,16 @@ impl<'a> Interpreter<'a> {
             }
         };
         match value {
-            Value::Int(_) => primitive_ok(matches!(
-                expected,
-                None | Some(
-                    Ty::I8
-                        | Ty::I16
-                        | Ty::I32
-                        | Ty::I64
-                        | Ty::Isize
-                        | Ty::U8
-                        | Ty::U16
-                        | Ty::U32
-                        | Ty::U64
-                        | Ty::Usize
-                )
-            )),
-            Value::Float(_) => primitive_ok(matches!(expected, None | Some(Ty::F32 | Ty::F64))),
+            // Exactly `i64`, and exactly `f64` -- not "some integer
+            // type" and not "some float type" (`rfcs/0015`). The
+            // interpreter has one integer representation and one float
+            // representation, so accepting a declared `u8` or `f32`
+            // here would run it as something else under its own name.
+            // The checker (`T0074`) and the verifier (`V0112`) each
+            // refuse those first; this is what stops a caller that
+            // bypassed both.
+            Value::Int(_) => primitive_ok(matches!(expected, None | Some(Ty::I64))),
+            Value::Float(_) => primitive_ok(matches!(expected, None | Some(Ty::F64))),
             Value::Bool(_) => primitive_ok(matches!(expected, None | Some(Ty::Bool))),
             Value::Char(_) => primitive_ok(matches!(expected, None | Some(Ty::Char))),
             Value::Str(_) => primitive_ok(matches!(expected, None | Some(Ty::Str))),
@@ -2550,17 +2552,22 @@ impl<'a> Interpreter<'a> {
                 };
                 Ok(actual_item == *expected_item)
             }
+            Ty::I64 => Ok(matches!(value, Value::Int(_))),
+            Ty::F64 => Ok(matches!(value, Value::Float(_))),
+            // A numeric name with no runtime representation here. Not
+            // `Ok(false)`: that would read as "the value is of the
+            // wrong kind", when the real problem is that no value of
+            // any kind could satisfy this position (`rfcs/0015`).
             Ty::I8
             | Ty::I16
             | Ty::I32
-            | Ty::I64
             | Ty::Isize
             | Ty::U8
             | Ty::U16
             | Ty::U32
             | Ty::U64
-            | Ty::Usize => Ok(matches!(value, Value::Int(_))),
-            Ty::F32 | Ty::F64 => Ok(matches!(value, Value::Float(_))),
+            | Ty::Usize
+            | Ty::F32 => Err(unexecutable_numeric(declared)),
             Ty::Bool => Ok(matches!(value, Value::Bool(_))),
             Ty::Char => Ok(matches!(value, Value::Char(_))),
             Ty::Str => Ok(matches!(value, Value::Str(_))),
@@ -3517,6 +3524,19 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, ty, kind } => {
+                        // The declared result type, under this frame's
+                        // own instantiation, is checked *before* the
+                        // instruction runs: evaluating one can
+                        // construct a resource, transfer ownership,
+                        // enter a call or write the event log, and a
+                        // type this interpreter cannot execute must not
+                        // get that far (`rfcs/0015`). Verified NIR
+                        // never reaches this; a caller that bypassed
+                        // the verifier does.
+                        let declared = crate::types::substitute(ty, &frame_subst);
+                        if unexecutable_numeric_name(&declared).is_some() {
+                            return Err(unexecutable_numeric(&declared));
+                        }
                         let value = match kind {
                             ValueKind::PlaceRead { place, mode } => {
                                 self.access_place(&mut values, &load_origin, place, *mode)?
@@ -3538,10 +3558,32 @@ impl<'a> Interpreter<'a> {
                                 &mut active_leases,
                                 *observation,
                                 place,
-                                &crate::types::substitute(ty, &frame_subst),
+                                &declared,
                             )?,
                             _ => self.eval(kind, &values, &evidence, &frame_subst)?,
                         };
+                        // And the value it produced really is one of
+                        // that type. An `alloc` names the slot itself
+                        // rather than a value of the slot's type, so it
+                        // is the one kind excluded here.
+                        //
+                        // This compares the value against its declared
+                        // type without re-walking the whole value
+                        // graph: an aggregate's internals are validated
+                        // where ownership actually crosses a boundary,
+                        // by `validate_argument` on arguments and
+                        // returns, and repeating that walk once per
+                        // instruction would make every frame quadratic
+                        // in the size of the values it handles for a
+                        // check those boundaries already own.
+                        if !matches!(kind, ValueKind::Alloc)
+                            && !self.argument_matches_declared(&value, &declared)?
+                        {
+                            return Err(invalid(format!(
+                                "%{} produced a value that disagrees with its declared type",
+                                result.0
+                            )));
+                        }
                         values.insert(*result, value);
                     }
                     // Ending one (`rfcs/0013`). Refused unless it is
@@ -4379,6 +4421,36 @@ fn get(values: &HashMap<ValueId, Value>, id: &ValueId) -> Result<Value, Interpre
 
 fn invalid(message: impl Into<String>) -> InterpreterError {
     InterpreterError::InvalidOperation(message.into())
+}
+
+/// The Napitia spelling of a numeric type this interpreter has no
+/// representation for, or `None` for one it executes (`rfcs/0015`).
+///
+/// The integer names come from the shared numeric layer rather than
+/// being restated; `f32` is the only numeric name that is not an
+/// integer domain, so it is the one literal here.
+fn unexecutable_numeric_name(ty: &Ty) -> Option<&'static str> {
+    if crate::types::is_executable_numeric(ty) {
+        return None;
+    }
+    Some(match crate::types::domain_of(ty) {
+        Some(domain) => domain.name(),
+        None => "f32",
+    })
+}
+
+/// The refusal a declared numeric type with no runtime representation
+/// earns. `X0004`: NIR the interpreter was handed but cannot execute.
+fn unexecutable_numeric(ty: &Ty) -> InterpreterError {
+    match unexecutable_numeric_name(ty) {
+        Some(name) => invalid(format!(
+            "a runtime position declares `{name}`, which this interpreter does not execute"
+        )),
+        // Unreachable for every caller, which each reach this only
+        // after matching one of the names above. Reported rather than
+        // asserted, matching this module's no-panic rule.
+        None => invalid("a runtime position declares a type this interpreter does not execute"),
+    }
 }
 
 /// Converts a top-level call's own [`Outcome`] to this module's public
@@ -17668,5 +17740,566 @@ mod numeric_semantics {
             panic!("expected a float")
         };
         assert_eq!(v.to_string(), "0.3333333333333333");
+    }
+}
+
+/// `rfcs/0015` -- the interpreter's own refusal of numeric types it has
+/// no representation for, independently of the verifier.
+///
+/// Every module here is built by hand and handed straight to
+/// `Interpreter`, bypassing `nir::verify` entirely. That is the only way
+/// to reach these paths: source using one of these names is refused by
+/// the checker (`T0074`), and NIR carrying one is refused by the
+/// verifier (`V0112`). Each fixture asserts *both* -- that the verifier
+/// would have caught it, and that the interpreter refuses it anyway --
+/// so the stage boundary and the backstop are tested as separate facts.
+#[cfg(test)]
+mod unexecutable_numeric_nir {
+    use super::*;
+    use crate::hir::ItemRegistry;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, Terminator, verify_module};
+    use crate::source::SourceMap;
+    use crate::symbol::{Interner, Symbol};
+
+    const MAIN: ItemId = ItemId(0);
+    const HELPER: ItemId = ItemId(1);
+
+    /// The verifier code these modules must also earn.
+    const UNIMPLEMENTED_IN_NIR: &str = "V0112";
+
+    /// Every numeric name with no runtime representation here.
+    fn unexecutable() -> Vec<Ty> {
+        vec![
+            Ty::I8,
+            Ty::I16,
+            Ty::I32,
+            Ty::Isize,
+            Ty::U8,
+            Ty::U16,
+            Ty::U32,
+            Ty::U64,
+            Ty::Usize,
+            Ty::F32,
+        ]
+    }
+
+    fn function(
+        id: ItemId,
+        params: Vec<Param>,
+        return_type: Ty,
+        blocks: Vec<BasicBlock>,
+    ) -> Function {
+        Function {
+            id,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn module(functions: Vec<Function>) -> Module {
+        Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: Vec::new(),
+            variants: Vec::new(),
+        }
+    }
+
+    fn param(value: u32, ty: Ty) -> Param {
+        Param {
+            value: ValueId(value),
+            ty,
+            take: false,
+        }
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, ty: Ty, literal: i128) -> Instruction {
+        value(result, ty, ValueKind::Const(Const::Int(literal)))
+    }
+
+    /// The interpreter refuses `module`, deterministically, with the
+    /// malformed-operation code -- and never by panicking.
+    fn assert_interpreter_refuses(module: &Module, args: Vec<Value>, case: &str) {
+        let first = Interpreter::new(module).call_item(MAIN, args.clone());
+        let error = match first {
+            Err(error) => error,
+            Ok(produced) => panic!(
+                "`{case}`: executed a type it has no representation for, producing {produced:?}"
+            ),
+        };
+        assert_eq!(
+            error.code(),
+            codes::INVALID_OPERATION,
+            "`{case}`: malformed NIR is X0004, never an arithmetic code"
+        );
+        assert!(
+            !error.to_string().to_lowercase().contains("panic"),
+            "`{case}`: {error}"
+        );
+        let again = Interpreter::new(module).call_item(MAIN, args);
+        assert_eq!(
+            Err(error),
+            again,
+            "`{case}`: the same malformed module must be refused identically"
+        );
+    }
+
+    /// And the verifier would have stopped the same module first, so
+    /// nothing reaches the interpreter's backstop through the driver.
+    fn assert_verifier_refuses(module: &Module, case: &str) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let interner = Interner::new();
+        let found: Vec<&str> = verify_module(module, source, &interner, &ItemRegistry::default())
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            found.contains(&UNIMPLEMENTED_IN_NIR),
+            "`{case}`: the verifier must refuse this first, got {found:?}"
+        );
+    }
+
+    fn assert_refused_by_both(module: &Module, args: Vec<Value>, case: &str) {
+        assert_verifier_refuses(module, case);
+        assert_interpreter_refuses(module, args, case);
+    }
+
+    // -- one unexecutable type in each position ---------------------------
+
+    #[test]
+    fn a_constant_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(0, ty.clone(), 1), int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("const {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_parameter_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            // The argument is an ordinary `i64` value: the defect is
+            // the parameter's declared type, not what was passed.
+            assert_refused_by_both(
+                &module(vec![main]),
+                vec![Value::Int(1)],
+                &format!("param {ty:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_return_type_that_is_unexecutable_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                ty.clone(),
+                vec![block(
+                    0,
+                    vec![int(0, Ty::I64, 7)],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("return {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_unary_operation_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(1, ty.clone(), ValueKind::Neg(ValueId(0))),
+                        int(2, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("neg {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_binary_operation_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        int(1, Ty::I64, 2),
+                        value(2, ty.clone(), ValueKind::Add(ValueId(0), ValueId(1))),
+                        int(3, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(3))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("add {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_slot_and_store_of_an_unexecutable_type_are_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(0, ty.clone(), ValueKind::Alloc),
+                        int(1, Ty::I64, 1),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
+                        },
+                        int(2, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("slot {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_load_of_an_unexecutable_slot_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        int(1, Ty::I64, 1),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
+                        },
+                        value(2, ty.clone(), ValueKind::Load(ValueId(0))),
+                        int(3, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(3))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("load {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_call_argument_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let helper = function(
+                HELPER,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(
+                            1,
+                            Ty::I64,
+                            ValueKind::Call(HELPER, Vec::new(), vec![ValueId(0)], Vec::new()),
+                        ),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(
+                &module(vec![main, helper]),
+                Vec::new(),
+                &format!("call argument {ty:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_result_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let helper = function(
+                HELPER,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(0, Ty::I64, 7)],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(
+                            0,
+                            ty.clone(),
+                            ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+                        ),
+                        int(1, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(
+                &module(vec![main, helper]),
+                Vec::new(),
+                &format!("call result {ty:?}"),
+            );
+        }
+    }
+
+    // -- the value must match its declared type ---------------------------
+
+    /// A declared type this interpreter *does* execute, holding a value
+    /// of the wrong kind, is refused too -- the check is against the
+    /// value, not only against the name.
+    #[test]
+    fn a_value_that_disagrees_with_its_executable_declared_type_is_refused() {
+        for (declared, wrong) in [
+            (Ty::I64, Value::Float(1.0)),
+            (Ty::F64, Value::Int(1)),
+            (Ty::I64, Value::Bool(true)),
+            (Ty::Bool, Value::Int(1)),
+        ] {
+            let main = function(
+                MAIN,
+                vec![param(0, declared.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_interpreter_refuses(
+                &module(vec![main]),
+                vec![wrong.clone()],
+                &format!("{declared:?} holding {wrong:?}"),
+            );
+        }
+    }
+
+    /// No silent widening: an `i64` value does not satisfy a narrower
+    /// declared integer type just because both are integers.
+    #[test]
+    fn an_integer_value_never_satisfies_a_narrower_declared_integer() {
+        for ty in [Ty::I8, Ty::I16, Ty::I32, Ty::U8, Ty::U32] {
+            let main = function(
+                MAIN,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_interpreter_refuses(
+                &module(vec![main]),
+                vec![Value::Int(1)],
+                &format!("i64 value in a {ty:?} position"),
+            );
+        }
+    }
+
+    /// And a float value does not satisfy `f32` just because both are
+    /// floats.
+    #[test]
+    fn a_float_value_never_satisfies_f32() {
+        let main = function(
+            MAIN,
+            vec![param(0, Ty::F32)],
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(1, Ty::I64, 0)],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        assert_interpreter_refuses(
+            &module(vec![main]),
+            vec![Value::Float(1.0)],
+            "f32 parameter",
+        );
+    }
+
+    // -- nothing runs before the refusal ----------------------------------
+
+    /// The declared result type is checked *before* the instruction is
+    /// evaluated, so a call whose result type is unexecutable never
+    /// enters its callee. Proved by the frame log: the callee's own
+    /// entry is absent.
+    #[test]
+    fn an_unexecutable_result_type_refuses_before_the_callee_runs() {
+        let helper = function(
+            HELPER,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, Ty::I64, 7)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let main = function(
+            MAIN,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    value(
+                        0,
+                        Ty::U8,
+                        ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+                    ),
+                    int(1, Ty::I64, 0),
+                ],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        let module = module(vec![main, helper]);
+        let interpreter = Interpreter::new(&module);
+        assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the callee must never have been entered"
+        );
+    }
+
+    /// The same module, with its two functions stored in the other
+    /// order: storage order decides nothing about the refusal.
+    #[test]
+    fn function_storage_order_does_not_change_the_refusal() {
+        let build = |reversed: bool| {
+            let helper = function(
+                HELPER,
+                vec![param(0, Ty::U8)],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(
+                            1,
+                            Ty::I64,
+                            ValueKind::Call(HELPER, Vec::new(), vec![ValueId(0)], Vec::new()),
+                        ),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            if reversed {
+                module(vec![helper, main])
+            } else {
+                module(vec![main, helper])
+            }
+        };
+        let forward = Interpreter::new(&build(false)).call_item(MAIN, Vec::new());
+        let reversed = Interpreter::new(&build(true)).call_item(MAIN, Vec::new());
+        assert!(forward.is_err());
+        assert_eq!(forward, reversed);
+    }
+
+    /// The names this module tests are exactly the ones the shared
+    /// numeric layer calls unexecutable, so neither list can drift.
+    #[test]
+    fn this_module_covers_every_unexecutable_numeric_name() {
+        for ty in unexecutable() {
+            assert!(
+                !crate::types::is_executable_numeric(&ty),
+                "{ty:?} is executable, so it does not belong in this list"
+            );
+            assert!(
+                super::unexecutable_numeric_name(&ty).is_some(),
+                "{ty:?} must have a spelling to report"
+            );
+        }
+        for ty in [Ty::I64, Ty::F64, Ty::Bool, Ty::Str, Ty::Unit] {
+            assert_eq!(super::unexecutable_numeric_name(&ty), None, "{ty:?}");
+        }
+        assert_eq!(super::unexecutable_numeric_name(&Ty::F32), Some("f32"));
+        assert_eq!(super::unexecutable_numeric_name(&Ty::U8), Some("u8"));
     }
 }

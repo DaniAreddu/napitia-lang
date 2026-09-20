@@ -43,6 +43,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "target-lexicon",
  "toml",
 ]
 

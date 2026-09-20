@@ -1,6 +1,7 @@
 # RFC 0015: Fixed-Width Numeric Semantics (Alpha 0.2.1)
 
-- Status: Proposed
+- Status: Accepted, implemented in Alpha 0.2.1
+- Supersedes the integer-width parts of `rfcs/0014-native-aot-preview.md`
 
 ## Summary
 
@@ -70,9 +71,13 @@ without special-casing the source text:
   as one `i64` constant and never as a negation of a value that could
   not exist.
 
-A negation applied to anything else -- a variable, a call, a
-parenthesized expression -- is an ordinary checked `neg`, and negating
-`-9223372036854775808` is an overflow at run time.
+"Directly" means directly in the HIR, where parentheses no longer
+exist: `-(9223372036854775808)` is the same negated literal and is
+equally accepted. A negation applied to anything else -- a variable, a
+call, another negation -- is an ordinary checked `neg`. So
+`- -9223372036854775808` checks cleanly, because its *inner* operator is
+the one applied to the literal, and then fails at run time when the
+outer one negates the minimum.
 
 ## Checked arithmetic
 
@@ -85,12 +90,8 @@ Runtime failures are not `raises` values. They are the unrecoverable
 class `spec/0005` already reserves for "integer overflow in checked
 arithmetic", and no Napitia construct catches one.
 
-```text
-X0001  division or remainder by zero
-X0002  integer overflow
-X0003  shift amount outside 0..64
-X0004  a malformed-NIR operation the interpreter refused to perform
-```
+Their codes are `X0001` through `X0004`; the table near the end of this
+document lists every diagnostic this RFC introduces, at every stage.
 
 What a runtime failure is never allowed to be: wrapping without explicit
 syntax, saturation, a Rust panic, a Cranelift panic, undefined behavior,
@@ -166,6 +167,27 @@ that later reaches a fabricated value, a silent truncation, a
 The NIR verifier enforces the same restriction independently, so
 hand-built NIR cannot reach the interpreter or the backend carrying a
 numeric type they do not implement.
+
+## The diagnostics this RFC introduces
+
+| Code | Stage | Meaning |
+| --- | --- | --- |
+| `T0073` | checking | an integer literal outside the domain of the type it resolved to |
+| `T0074` | checking | a numeric type name this milestone does not execute |
+| `V0111` | NIR verification | an integer constant outside the domain of its own declared type |
+| `V0112` | NIR verification | a numeric type with no execution semantics, anywhere in NIR |
+| `X0001` | run time | `div` or `rem` by zero |
+| `X0002` | run time | integer overflow |
+| `X0003` | run time | a shift count outside `0..64` |
+| `X0004` | run time | an operation the interpreter refused to perform on malformed NIR |
+
+`X` is a new namespace, allocated the way `A` (native) and `V`
+(verifier) each got one. Nothing existing is renumbered, and no `X`
+code overlaps a compile-time one: they describe a program that compiled
+and then failed while running.
+
+A verifier code is not reachable from `.npt` source -- checking rejects
+the same programs first -- and exists because NIR is hand-buildable.
 
 ## Floats
 

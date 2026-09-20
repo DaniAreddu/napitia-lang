@@ -138,7 +138,18 @@ exception.
 in its own `X` namespace, renders as one deterministic line, and stops
 the program with a documented status — never a Rust panic, never a
 backtrace, and never a raw hardware signal presented as a language rule.
-`rfcs/0015` specifies the codes, the rendering and the status.
+Arithmetic failures are `X0001`, `X0002` and `X0003`; `X0004` is a
+different thing entirely — malformed or unverified NIR, or an invalid
+operation on the execution engine — and a valid program never produces
+one. `rfcs/0015` specifies the codes, the rendering and the status.
+
+Aborting also ends the execution context it happened in: the state it
+left is the middle of a statement, so nothing is executed against it
+again, and a later attempt is refused as an invalid engine operation
+rather than by repeating the original failure. That applies to any
+failure a running frame produces, not only an arithmetic one. A refusal
+decided before a frame is entered — an unknown function, say — changes
+nothing and leaves the engine usable.
 
 ## Unresolved research questions
 

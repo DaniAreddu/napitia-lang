@@ -16,13 +16,18 @@ deterministic order, on every exit path -- normal fallthrough, `return`,
 `handle` arm.
 
 > **One exception (Alpha 0.2.1, `rfcs/0015`).** Those are Napitia
-> *control-flow* exits. A fatal X-class arithmetic abort -- an integer
-> overflow, a zero divisor, an invalid shift count -- is not one: it
-> stops execution at the failing operation, and no `defer` action and no
-> `drop` after that point runs. A resource that was live is genuinely
-> leaked, and the runtime reports no destruction it did not perform.
-> This is the only way a Napitia program reaches an exit that does not
-> clean up, and it is not catchable.
+> *control-flow* exits. A fatal abort is not one: it stops execution at
+> the failing operation, and no `defer` action and no `drop` after that
+> point runs. A resource that was live is genuinely leaked, and the
+> runtime reports no destruction it did not perform. This is the only
+> way a Napitia program reaches an exit that does not clean up, and it
+> is not catchable.
+>
+> For a valid program that means a checked arithmetic failure -- an
+> overflow, a zero divisor, an invalid shift count (`X0001`–`X0003`).
+> The same is true of any failure a running frame produces, including
+> the `X0004` that malformed, unverified NIR earns, since one of those
+> can be found after the frame has already constructed resources.
 
 ```napitia
 resource File {

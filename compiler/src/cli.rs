@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use crate::diagnostics::{self, Diagnostic};
 use crate::driver::{self, IrOutput, NativeOutput, ProjectIrOutput, ProjectRunOutput, RunOutput};
-use crate::interpreter::Value;
+use crate::interpreter::{InterpreterError, Value};
 use crate::lexer::Token;
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
@@ -249,10 +249,7 @@ fn dispatch_project(command: &str, manifest_path: &Path) -> ExitCode {
                 println!("{}", format_value(&value));
                 ExitCode::SUCCESS
             }
-            ProjectRunOutput::Result(Err(err)) => {
-                eprintln!("error: runtime error: {err:?}");
-                ExitCode::from(1)
-            }
+            ProjectRunOutput::Result(Err(err)) => runtime_failure(&err),
         },
         _ => unreachable!("validated by dispatch_check_ir_run's caller"),
     }
@@ -341,11 +338,21 @@ fn run_command(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Ex
             println!("{}", format_value(&value));
             ExitCode::SUCCESS
         }
-        RunOutput::Result(Err(err)) => {
-            eprintln!("error: runtime error: {err:?}");
-            ExitCode::from(1)
-        }
+        RunOutput::Result(Err(err)) => runtime_failure(&err),
     }
+}
+
+/// Reports a Napitia runtime failure and decides the process's status.
+///
+/// One line on standard error, built from nothing but the failure
+/// itself: its stable code and its own rendering (`rfcs/0015`). A
+/// successful run writes nothing here at all, which is what makes this
+/// line the discriminator between "the program failed" and "the program
+/// returned a number" -- under `run`, a returned value is printed on
+/// standard output and is never a process status.
+fn runtime_failure(error: &InterpreterError) -> ExitCode {
+    eprintln!("error[{}]: {error}", error.code());
+    ExitCode::from(1)
 }
 
 fn format_token(token: &Token, interner: &Interner) -> String {

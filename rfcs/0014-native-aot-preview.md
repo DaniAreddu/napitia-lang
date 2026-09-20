@@ -1,6 +1,14 @@
 # RFC 0014: Native AOT Preview (Alpha 0.2.0)
 
 - Status: Accepted, implemented in Alpha 0.2.0
+- Superseded in part by `rfcs/0015-numeric-semantics.md` (Alpha 0.2.1)
+
+> **Superseded sections.** This RFC describes Alpha 0.2.0 and is kept as
+> the record of it. Two of its decisions no longer hold: `i64` is no
+> longer represented as Cranelift's `I128`, and the reason given for
+> refusing `div`, `rem`, `shl` and `shr` is no longer the operative one.
+> Each is marked where it appears. `rfcs/0015` is authoritative for
+> everything numeric; nothing else in this document changed.
 
 ## Summary
 
@@ -166,9 +174,17 @@ symbol that is documented is the exported `main`.
 
 | Napitia | Cranelift | notes |
 | --- | --- | --- |
-| `i64` | `I128` | see below |
+| `i64` | `I128` | **superseded**: `I64` since Alpha 0.2.1 (`rfcs/0015`) |
 | `bool` | `I8` | canonically `0` or `1`, always normalized |
 | `unit` | *nothing* | no register, no slot, no ABI position |
+
+> **Superseded by `rfcs/0015` (Alpha 0.2.1).** The premise of the next
+> two paragraphs -- that the interpreter wraps at 128 bits -- stopped
+> being true. Both sides are 64 bits now, and an operation whose exact
+> result leaves `i64` has no result in either rather than a wrapped one,
+> so there is nothing left for a wider native representation to match.
+> The paragraphs are kept as written because the limitation they admit
+> to is the one Alpha 0.2.1 exists to remove.
 
 `i64` being 128 bits wide natively is the one surprising choice in this
 release, and it is deliberate. **The interpreter holds every Napitia
@@ -224,14 +240,20 @@ input, with no exceptional case. Four are refused rather than
 approximated:
 
 - **`div` and `rem`**, because the interpreter answers a zero divisor
-  with `InterpreterError::DivisionByZero` -- a runtime error *value* --
-  and Alpha 0.2.0 has no native runtime facility to raise, report or
-  carry one. A hardware trap is a different behavior, not the same one
-  implemented differently.
+  with a runtime error *value*, and Alpha 0.2.0 has no native runtime
+  facility to raise, report or carry one. A hardware trap is a different
+  behavior, not the same one implemented differently.
 - **`shl` and `shr`**, for the same reason: the interpreter rejects an
-  out-of-range shift amount with a runtime error
-  (`i128::checked_shl`/`checked_shr` plus an explicit `u32`
-  conversion), where the hardware would silently mask the amount.
+  out-of-range shift amount with a runtime error, where the hardware
+  would silently mask the amount.
+
+> **Superseded by `rfcs/0015` (Alpha 0.2.1).** The facility described as
+> missing above now exists -- checked `add`/`sub`/`mul`/`neg` branch to
+> it. These four operators are still refused, for a different and
+> narrower reason: each needs its own native failure path and its own
+> differential coverage per exceptional input, and a stabilization
+> release makes the existing subset correct rather than a larger one
+> approximately so. The refusal, its code and its timing are unchanged.
 
 These are refused with `A0009`, by name, at the instruction that uses
 them. The alternative -- emitting a machine instruction whose
@@ -423,15 +445,16 @@ target other than `x86_64-unknown-linux-gnu`.
 
 ## Unresolved research questions
 
-- **Integer width.** The interpreter's `i128` and the language's `i64`
-  need to become the same thing, with `spec/0005`'s overflow panic or
-  an explicit wrapping rule. Whichever is chosen, the native
-  representation narrows to `I64` and this release's `I128` choice goes
-  away with it.
-- **`div`/`rem`/`shl`/`shr`.** These need a native runtime facility
-  that can report a runtime error -- the same facility a future native
-  typed-failure or panic mechanism needs. They are refused rather than
-  approximated until one exists.
+- **Resolved by `rfcs/0015` (Alpha 0.2.1) -- integer width.** The
+  interpreter's integer and the language's `i64` are the same thing now,
+  settled `spec/0005`'s way: overflow is a checked failure, not a
+  wrapping rule. The native representation narrowed to `I64` and the
+  `I128` choice went away with it, exactly as predicted here.
+- **`div`/`rem`/`shl`/`shr`.** Alpha 0.2.1 built the native runtime
+  facility these were waiting on, and deliberately did not spend it
+  here. What each still needs is its own failure path and its own
+  differential coverage per exceptional input. They remain refused
+  rather than approximated.
 - **Executable determinism across toolchains.** Object determinism is
   this backend's own property and is tested directly. Executable
   determinism additionally depends on the system linker and the C

@@ -607,3 +607,76 @@ fn help_lists_the_build_command() {
     assert!(stdout(&output).contains("build <file> --output <exe>"));
     assert!(stdout(&output).contains("x86_64-unknown-linux-gnu"));
 }
+
+/// Every `.npt` example, so a newly added one is swept in automatically
+/// rather than needing to be listed here.
+fn every_example() -> Vec<String> {
+    let dir = format!("{}/../examples", env!("CARGO_MANIFEST_DIR"));
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the examples directory must exist")
+        .map(|entry| entry.expect("a readable directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".npt"))
+        .collect();
+    // Sorted so a failure names the same example run to run.
+    names.sort();
+    assert!(
+        names.len() > 20,
+        "the sweep must actually be finding the examples, found {}",
+        names.len()
+    );
+    names
+}
+
+/// The seam an over-strict, or merely buggy, native pass would break:
+/// a program `check` accepted must never be told it is malformed, and
+/// must never be shown a code that describes a defect in the compiler
+/// rather than a limit of the subset.
+///
+/// `A0019` means "this NIR never went through the verifier" and `A0020`
+/// means "the backend broke"; ordinary compilation can produce neither,
+/// and a user who wrote a perfectly good program must never see either.
+/// The build must also never panic, and never exit with anything but
+/// success or the ordinary diagnostic status.
+#[test]
+fn no_example_that_checks_cleanly_leaks_an_internal_native_diagnostic() {
+    let workspace = Workspace::new("example-sweep");
+    for name in every_example() {
+        let path = example(&name);
+        if !napitia(&["check", &path]).status.success() {
+            continue;
+        }
+        let output = workspace.output(&name);
+        let built = napitia(&["build", &path, "--output", as_str(&output)]);
+        let err = stderr(&built);
+
+        assert!(
+            matches!(built.status.code(), Some(0) | Some(1)),
+            "`{name}`: build exited {:?}\n{err}",
+            built.status.code()
+        );
+        assert!(
+            !err.contains("panicked") && !err.contains("RUST_BACKTRACE"),
+            "`{name}`: the build panicked\n{err}"
+        );
+        assert!(
+            !err.contains(codes::UNVERIFIED_NIR),
+            "`{name}` passes `check`, so it must never be called unverified NIR\n{err}"
+        );
+        assert!(
+            !err.contains(codes::CODEGEN_FAILED),
+            "`{name}` passes `check`, so a backend defect must not be blamed on it\n{err}"
+        );
+        if built.status.code() == Some(1) {
+            assert!(
+                err.contains("error[A"),
+                "`{name}`: a failed build must say why\n{err}"
+            );
+            assert!(
+                !output.exists(),
+                "`{name}`: a failed build must leave no executable"
+            );
+        }
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}

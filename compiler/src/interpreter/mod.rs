@@ -876,6 +876,23 @@ pub struct Interpreter<'a> {
     /// recursive function exhausts the native stack and aborts the
     /// process instead of producing an error anything can report.
     call_depth: std::cell::Cell<usize>,
+    /// Whether a fatal arithmetic abort has already ended an execution
+    /// on this interpreter (`rfcs/0015`).
+    ///
+    /// An X-class arithmetic failure is not a Napitia control-flow exit:
+    /// it stops execution exactly where it stood. Slots written before
+    /// it keep what they hold, resources constructed before it are still
+    /// live, pending `defer` actions never run, and no `drop` after it
+    /// is reached. That is not a state any Napitia semantics describe --
+    /// it is the middle of a statement -- so nothing may be executed
+    /// against it afterwards.
+    ///
+    /// Set for arithmetic failures only. A structured refusal of
+    /// malformed input (`X0004`) is the opposite case: it is checked
+    /// *before* anything changes and is documented, and tested, as
+    /// leaving the interpreter exactly as it was, so those stay
+    /// repeatable.
+    aborted: std::cell::Cell<bool>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -886,7 +903,24 @@ impl<'a> Interpreter<'a> {
             #[cfg(test)]
             event_log: RefCell::new(Vec::new()),
             call_depth: std::cell::Cell::new(0),
+            aborted: std::cell::Cell::new(false),
         }
+    }
+
+    /// Refuses to start an execution on an interpreter a fatal abort
+    /// already ended.
+    ///
+    /// Reported as an invalid *operation on the engine* (`X0004`), never
+    /// as one of the arithmetic codes: the arithmetic failure already
+    /// happened and was already reported, and re-reporting it here would
+    /// claim this call performed the failing operation.
+    fn check_not_aborted(&self) -> Result<(), InterpreterError> {
+        if self.aborted.get() {
+            return Err(invalid(
+                "this execution context ended in a fatal arithmetic abort and cannot be reused",
+            ));
+        }
+        Ok(())
     }
 
     /// `true` iff `item` names a declared `resource` (`rfcs/0011`) --
@@ -3156,6 +3190,7 @@ impl<'a> Interpreter<'a> {
         interner: &Interner,
         args: Vec<Value>,
     ) -> Result<Value, InterpreterError> {
+        self.check_not_aborted()?;
         let function = self
             .module
             .functions
@@ -3179,6 +3214,7 @@ impl<'a> Interpreter<'a> {
     }
 
     pub fn call_item(&self, item: ItemId, args: Vec<Value>) -> Result<Value, InterpreterError> {
+        self.check_not_aborted()?;
         let function = self
             .module
             .functions
@@ -3300,6 +3336,15 @@ impl<'a> Interpreter<'a> {
         let outcome = self.call_function_in_frame(function, type_args, args, evidence);
         if outcome.is_err() {
             self.resources.borrow_mut().abandon_leases_from(mark);
+        }
+        // A fatal arithmetic abort ends this whole execution, not just
+        // this frame (`rfcs/0015`). Recorded here rather than at the
+        // public entry point so that every frame the failure passes
+        // through -- and any caller reaching the engine another way --
+        // sees the same terminal state. The failure itself travels on
+        // unchanged: nothing rewrites it into an engine-state error.
+        if matches!(outcome, Err(InterpreterError::Arithmetic(_))) {
+            self.aborted.set(true);
         }
         self.call_depth.set(self.call_depth.get() - 1);
         outcome
@@ -4701,7 +4746,13 @@ mod tests {
     use crate::typeck::check_module;
     use crate::types::IntOp;
 
-    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
+    /// The verified NIR for `text`, and the interner its symbols live
+    /// in -- for a test that drives an `Interpreter` itself rather than
+    /// taking the one [`run`] builds and discards. Every stage before
+    /// the interpreter is asserted clean, so a fixture that stops
+    /// compiling fails as a broken fixture rather than as a runtime
+    /// result.
+    pub(super) fn compiled(text: &str) -> (crate::nir::Module, Interner) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -4754,6 +4805,11 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
+        (nir, interner)
+    }
+
+    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
+        let (nir, interner) = compiled(text);
         Interpreter::new(&nir).run("main", &interner)
     }
 
@@ -18301,5 +18357,312 @@ mod unexecutable_numeric_nir {
         }
         assert_eq!(super::unexecutable_numeric_name(&Ty::F32), Some("f32"));
         assert_eq!(super::unexecutable_numeric_name(&Ty::U8), Some("u8"));
+    }
+}
+
+/// `rfcs/0015` -- what a fatal arithmetic abort does to an execution.
+///
+/// An X-class arithmetic failure is not a Napitia control-flow exit. It
+/// is not a `raise`, it does not unwind scopes, and it runs no `drop`
+/// and no `defer`. Execution stops where it stood, and the interpreter
+/// that was running it is finished.
+///
+/// The deterministic event log is what makes this testable rather than
+/// asserted: it records every frame entered and every resource actually
+/// destroyed, in the order those really happened, so "no cleanup ran
+/// after the failure" is a fact about the run and not about the wording
+/// of a doc comment.
+#[cfg(test)]
+mod fatal_abort {
+    use super::tests::{compiled, run, run_with_log};
+    use super::{Interpreter, InterpreterError, Value, codes};
+    use crate::types::{ArithFailure, IntOp};
+
+    const MAX: &str = "9223372036854775807";
+
+    /// A `resource` whose destruction is visible in the event log, plus
+    /// the helpers the fixtures below share.
+    const RESOURCE: &str = "
+        resource File { descriptor: i64 }
+        func open(descriptor: i64) -> File { return File { descriptor: descriptor }; }
+        func peek(file: File) -> i64 { return file.descriptor; }
+    ";
+
+    fn overflow() -> InterpreterError {
+        InterpreterError::Arithmetic(ArithFailure::Overflow(IntOp::Add))
+    }
+
+    /// Every `drop:` entry the run produced, in order.
+    fn drops(log: &[String]) -> Vec<&String> {
+        log.iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    // -- where the failure happens ----------------------------------------
+
+    #[test]
+    fn a_failure_in_main_stops_the_program() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ value m: i64 = {MAX}; value bad: i64 = m + 1; return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            drops(&log).is_empty(),
+            "nothing may be destroyed after a fatal abort: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_nested_call_propagates_unchanged() {
+        let (outcome, log) = run_with_log(&format!(
+            "func inner(n: i64) -> i64 {{ return n + 1 }} \
+             func middle(n: i64) -> i64 {{ return inner(n) }} \
+             func main() -> i64 {{ return middle({MAX}) }}"
+        ));
+        assert_eq!(
+            outcome,
+            Err(overflow()),
+            "the caller must report the failure the callee had, not one of its own"
+        );
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    #[test]
+    fn a_failure_inside_a_loop_stops_the_loop() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ \
+               mutable x: i64 = {MAX}; mutable i: i64 = 0; \
+               while i < 10 {{ x = x + 1; i = i + 1; }} \
+               return x }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    #[test]
+    fn a_failure_inside_a_conditional_branch_stops_the_program() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ \
+               value chosen: bool = true; value m: i64 = {MAX}; \
+               if chosen {{ return m + 1; }} \
+               return 7 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    // -- what does not happen afterwards ----------------------------------
+
+    /// The statements after the failure never run. If they had, the
+    /// program would have returned a value instead of failing.
+    #[test]
+    fn no_statement_after_the_failure_executes() {
+        let (outcome, log) = run_with_log(&format!(
+            "func marker() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ \
+               value m: i64 = {MAX}; value bad: i64 = m + 1; \
+               return marker() }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert_eq!(
+            log,
+            vec!["call:main".to_string()],
+            "only `main` was ever entered: the call after the failure never ran"
+        );
+    }
+
+    /// A live resource is *not* destroyed by a fatal abort. This is the
+    /// honest half of the contract: the resource leaks, and the runtime
+    /// does not pretend otherwise by emitting a destruction event it
+    /// never performed.
+    #[test]
+    fn a_live_resource_is_not_destroyed_by_a_fatal_abort() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value file = open(9); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               drop file; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            drops(&log).is_empty(),
+            "a fatal abort ran cleanup it should not have: {log:?}"
+        );
+    }
+
+    /// The same, with the failure sitting between the resource and the
+    /// explicit `drop` that would have destroyed it.
+    #[test]
+    fn a_failure_before_an_explicit_drop_skips_that_drop() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value file = open(1); \
+               value seen: i64 = peek(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + seen; \
+               drop file; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    /// A pending `defer` does not run either.
+    #[test]
+    fn a_pending_defer_does_not_run_after_a_fatal_abort() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func close(file: File) -> unit {{ }} \
+             func main() -> i64 {{ \
+               value file = open(3); \
+               defer close(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            !log.iter().any(|event| event.starts_with("drop:")),
+            "a deferred action or destruction ran after the abort: {log:?}"
+        );
+    }
+
+    /// One cleanup that already completed stays completed, and is not
+    /// repeated. The abort changes nothing about what already happened.
+    #[test]
+    fn a_cleanup_that_already_ran_is_neither_undone_nor_repeated() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value first = open(1); \
+               drop first; \
+               value second = open(2); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               drop second; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        let destroyed = drops(&log);
+        assert_eq!(
+            destroyed.len(),
+            1,
+            "exactly the one cleanup that ran before the failure: {log:?}"
+        );
+    }
+
+    // -- the engine is finished -------------------------------------------
+
+    /// The public API refuses to start anything else on an interpreter a
+    /// fatal abort already ended, and says so as an engine-state error
+    /// rather than by repeating the arithmetic code.
+    #[test]
+    fn a_terminated_interpreter_refuses_to_run_again() {
+        let (nir, interner) = compiled(&format!(
+            "func ok() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ value m: i64 = {MAX}; return m + 1 }}"
+        ));
+        let interpreter = Interpreter::new(&nir);
+
+        assert_eq!(interpreter.run("main", &interner), Err(overflow()));
+
+        let reused = interpreter
+            .run("ok", &interner)
+            .expect_err("a terminated interpreter must refuse");
+        assert_eq!(
+            reused.code(),
+            codes::INVALID_OPERATION,
+            "reuse is an invalid operation on the engine, not a second overflow"
+        );
+        assert_ne!(
+            reused,
+            overflow(),
+            "the arithmetic failure must not be reported twice"
+        );
+
+        // And it stays refused, identically, however many times it is
+        // asked.
+        for _ in 0..4 {
+            assert_eq!(interpreter.run("ok", &interner), Err(reused.clone()));
+        }
+    }
+
+    /// A fresh interpreter per execution is unaffected: the termination
+    /// is a property of the engine that aborted, not of the module.
+    #[test]
+    fn a_fresh_interpreter_runs_the_same_module_normally() {
+        let (nir, interner) = compiled(&format!(
+            "func ok() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ value m: i64 = {MAX}; return m + 1 }}"
+        ));
+
+        assert_eq!(
+            Interpreter::new(&nir).run("main", &interner),
+            Err(overflow())
+        );
+        assert_eq!(
+            Interpreter::new(&nir).run("ok", &interner),
+            Ok(Value::Int(1)),
+            "a different interpreter never entered the aborted state"
+        );
+    }
+
+    /// A refusal of malformed input is *not* a fatal abort: it is
+    /// checked before anything changes, so the engine stays usable. That
+    /// distinction is what keeps the transactional-refusal contract
+    /// meaningful.
+    #[test]
+    fn a_structured_refusal_does_not_terminate_the_engine() {
+        let (nir, interner) = compiled("func ok() -> i64 { return 1 }");
+        let interpreter = Interpreter::new(&nir);
+
+        let missing = interpreter
+            .run("no_such_function", &interner)
+            .expect_err("an unknown function is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+
+        assert_eq!(
+            interpreter.run("ok", &interner),
+            Ok(Value::Int(1)),
+            "a refusal that changed nothing must not end the engine"
+        );
+    }
+
+    // -- determinism -------------------------------------------------------
+
+    #[test]
+    fn repeated_fresh_executions_produce_identical_results_and_logs() {
+        let text = format!(
+            "{RESOURCE} \
+             func close(file: File) -> unit {{ }} \
+             func main() -> i64 {{ \
+               value file = open(5); \
+               defer close(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               return 0 }}"
+        );
+        let first = run_with_log(&text);
+        assert_eq!(first.0, Err(overflow()));
+        for _ in 0..8 {
+            assert_eq!(run_with_log(&text), first);
+        }
+    }
+
+    /// The failure a fatal abort reports is the arithmetic one, with its
+    /// own code and rendering -- never rewritten into an engine-state
+    /// error on the way out.
+    #[test]
+    fn the_original_failure_is_what_the_caller_sees() {
+        let outcome = run("func inner(n: i64) -> i64 { return -n } \
+             func main() -> i64 { return inner(-9223372036854775808) }");
+        let error = outcome.expect_err("negating the minimum has no result");
+        assert_eq!(error.code(), codes::INTEGER_OVERFLOW);
+        assert_eq!(error.to_string(), "integer overflow in `neg`");
     }
 }

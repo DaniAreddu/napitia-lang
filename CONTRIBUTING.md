@@ -75,7 +75,7 @@ compiler logic — they should only parse arguments and call into
 Compiler stages, in pipeline order:
 
 ```text
-source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> (interpreter | future backend)
+source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> (interpreter | native)
 ```
 
 Each `.npt` file goes through that pipeline once. A multi-file project
@@ -91,6 +91,16 @@ unchanged, into the same `typeck`/`nir` stages single-file compilation
 already uses. Anything that needs to know "which file did this come from"
 belongs in `project::mod`'s orchestration, never smuggled into
 `typeck`/`nir` as project-awareness they don't otherwise need.
+
+`native/` (`rfcs/0014`) is the other consumer of verified NIR, and is a
+layer *behind* the pipeline in the same sense `project/` is a layer in
+front of it: it adds two stages after `nir::verify` — a capability
+validator, then Cranelift and the system linker — and changes nothing
+before them. It is single-file only and compiles a deliberately small
+scalar subset; anything outside it is refused with an `Axxxx`
+diagnostic, never lowered approximately and never handed back to the
+interpreter. Work on it belongs in `native/`, not in `nir`: a rule the
+native backend needs and NIR does not is a native rule.
 
 Each stage lives in its own module and communicates failure through
 `diagnostics`, never through panics. A panic in any stage given arbitrary

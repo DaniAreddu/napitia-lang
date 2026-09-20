@@ -16948,7 +16948,7 @@ mod observation_leases {
 #[cfg(test)]
 mod numeric_semantics {
     use super::tests::run;
-    use super::{InterpreterError, Value};
+    use super::{InterpreterError, Value, codes};
     use crate::types::{ArithFailure, IntOp};
 
     const MIN: &str = "-9223372036854775808";
@@ -17509,6 +17509,27 @@ mod numeric_semantics {
                 "`{text}` must be refused before it can run"
             );
         }
+    }
+
+    /// Napitia has no syntax that names a NaN, so the only way one
+    /// exists at all is as the result of an operation -- which makes
+    /// `0.0 / 0.0` the only fixture that can test what happens next.
+    #[test]
+    fn a_nan_compares_unequal_to_itself_and_has_no_ordering() {
+        const NAN: &str = "value z: f64 = 0.0; value n: f64 = 0.0 / z;";
+
+        assert!(
+            !truth(&format!("{NAN} return n == n")),
+            "equality answers false for a NaN rather than failing"
+        );
+        assert!(truth(&format!("{NAN} return n != n")));
+
+        // Ordering has no answer at all, and says so rather than
+        // inventing one.
+        let error = run(&format!("func main() -> bool {{ {NAN} return n < n }}"))
+            .expect_err("an ordered comparison of a NaN has no result");
+        assert_eq!(error.code(), codes::INVALID_OPERATION);
+        assert_eq!(error.to_string(), "comparison involving NaN");
     }
 
     #[test]

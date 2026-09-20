@@ -94,9 +94,17 @@ integer width later makes the choice go away.
 parent as the returned value modulo 256. Two builds of one program on
 one toolchain are byte-identical.
 
-Linking needs an x86-64 Linux host with a C toolchain (`cc`). Object
-generation works anywhere; a host that cannot link says exactly that,
-with its own diagnostic code.
+Linking needs a **GNU** x86-64 Linux host with a C toolchain (`cc`) —
+all three components, so a musl host does not qualify — and `cc` itself
+is asked what it targets (`cc -dumpmachine`) before anything is
+written, so a toolchain that cross-compiles elsewhere is refused rather
+than trusted. Object generation works anywhere; a host or linker that
+cannot produce this target says exactly that, with its own diagnostic
+code.
+
+A build that fails changes nothing: if the command reports an error,
+the requested output is byte-for-byte what it was before, whichever
+stage did the refusing.
 
 `rfcs/0014-native-aot-preview.md` holds the authoritative table of what
 is and is not compiled, the `Axxxx` diagnostic codes, the ABI, the

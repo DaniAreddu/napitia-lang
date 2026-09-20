@@ -58,9 +58,23 @@ test matrix, none of which this milestone has.
 
 Object generation is host-independent: Cranelift writes an ELF object
 for that target from a Windows or macOS host just as well. *Linking*
-one is not, so a host that is not x86-64 Linux receives a structured
-refusal (`A0021`) naming the host, rather than a confusing error from a
-linker handed an object it cannot read.
+one is not, and the requirement is all three components of the target,
+environment included. A musl host is Linux on x86-64, and its `cc`
+still builds against a different C runtime than the one
+`x86_64-unknown-linux-gnu` names, so it does not qualify; it receives a
+structured refusal (`A0021`) naming the host rather than a confusing
+error from a linker handed an object it cannot use.
+
+Qualifying as a host is necessary and not sufficient. A GNU x86-64
+Linux machine can still have a `cc` that cross-compiles somewhere else,
+so before anything is written the toolchain is asked directly, with
+`cc -dumpmachine`. Its answer is compared by architecture, operating
+system and environment through `target-lexicon` -- never by substring
+-- which is what makes the spellings real toolchains report
+(`x86_64-linux-gnu` on Debian, `x86_64-pc-linux-gnu` elsewhere) the
+same target while musl, i686, aarch64 and darwin are not. A linker that
+targets something else, or will not say what it targets, is refused
+with `A0025` and no executable is published.
 
 ## The pipeline
 
@@ -86,6 +100,20 @@ Two properties of the ordering are load-bearing:
   inside the subset, which is why lowering contains no "unsupported,
   give up" path: by the time it runs, there is nothing left to give up
   on.
+
+That ordering is enforced by the types, not by convention. The
+capability validator's own output -- the compilation plan -- has
+private fields, so it is the only thing that can produce one, and
+Cranelift lowering takes one by reference. There is no way to reach
+code generation without having gone through the capability check, from
+inside the compiler or outside it.
+
+The public surface is `napitia build` and, for anything embedding the
+compiler, `driver::build_native` -- the entry that runs the whole
+frontend and the verifier. Raw code generation is not a supported entry
+point: the capability validator, the lowering module and the
+NIR-to-executable function are all internal to the crate. There is no
+callable path from arbitrary NIR to Cranelift.
 
 ## The native subset
 
@@ -149,7 +177,14 @@ integer in an `i128` and wraps at 128 bits** -- `Value::Int(i128)`,
 width. Compiling `i64` to 64-bit machine arithmetic would therefore
 disagree with the reference implementation for every operation whose
 mathematical result leaves `i64`'s range. Matching the interpreter
-exactly, over the whole input domain, is worth two registers.
+exactly, over the whole input domain, is worth two registers. The edges
+of that width are tested against the interpreter directly -- wrapping
+addition, subtraction and multiplication, the one value whose negation
+is itself, ordering across the sign boundary, and bitwise work on the
+high half a 64-bit representation would drop -- along with the two ABI
+shapes those boundaries travel through: a call with more `i64`
+arguments than the platform passes in registers, and a `unit` parameter
+in the middle of a signature, which must shift nothing after it.
 
 This is an honest limitation rather than a design: Napitia's declared
 `i64` width and its interpreter's actual integer width are not yet the
@@ -261,9 +296,21 @@ user chose ever reaches its argument vector; a path containing spaces
 is a non-issue for the same reason the argument vector is constant.
 
 The output itself is written exactly once, at the end, by renaming a
-finished executable over it. A link that fails cannot leave a truncated
-file that looks like a build, and an executable an earlier build left
-there is not replaced by a broken one.
+finished executable over it. This is the atomicity rule, and it holds
+for every stage: **if the command reports failure, the requested output
+is byte-for-byte what it was before.** A link that fails cannot leave a
+truncated file that looks like a build, and an executable an earlier
+build left there is never replaced by a broken one.
+
+Two consequences follow, and both are deliberate. A cleanup failure
+never replaces the reason a build failed, because that reason is what
+the user needs. And publication is final: once the executable is in
+place, nothing afterwards can turn the build into a failure, since
+reporting one would mean saying "failed" about an output that was
+already replaced. Removing the scratch directory after successful
+publication is therefore **best-effort** -- on the rare path where it
+fails, a `.napitia-build-*` directory is left beside the output and the
+build still succeeds. Cleanup is attempted on every path either way.
 
 Launch failure, a non-zero exit, the linker's stdout and its stderr are
 all captured and turned into one structured diagnostic. Nothing panics.
@@ -271,7 +318,7 @@ all captured and turned into one structured diagnostic. Nothing panics.
 ## Diagnostics
 
 `A0001`-`A0019` are the capability layer: reasons a perfectly valid
-Napitia program is outside the native subset. `A0020`-`A0024` are the
+Napitia program is outside the native subset. `A0020`-`A0025` are the
 backend layer: something went wrong producing the executable.
 
 | code | meaning |
@@ -300,6 +347,7 @@ backend layer: something went wrong producing the executable.
 | `A0022` | the system linker could not be launched |
 | `A0023` | the system linker exited non-zero |
 | `A0024` | the build could not write or move a file |
+| `A0025` | the system linker targets something else, or would not say |
 
 The `A` prefix is a new namespace, allocated the way `V` (verifier) and
 `U` (ownership) each got one when those layers appeared. No existing

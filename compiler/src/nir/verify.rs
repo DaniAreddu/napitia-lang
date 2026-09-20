@@ -18027,11 +18027,13 @@ mod structural_ownership {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(value)),
+            kind: ValueKind::Const(Const::Int(
+                value.try_into().expect("a constant this helper can carry"),
+            )),
         }
     }
 

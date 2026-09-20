@@ -2280,8 +2280,16 @@ mod hand_built_tests {
         }
     }
 
-    fn int(result: u32, literal: u128) -> Instruction {
-        value(result, Ty::I64, ValueKind::Const(Const::Int(literal)))
+    fn int(result: u32, literal: i128) -> Instruction {
+        value(
+            result,
+            Ty::I64,
+            ValueKind::Const(Const::Int(
+                literal
+                    .try_into()
+                    .expect("a constant this helper can carry"),
+            )),
+        )
     }
 
     fn boolean(result: u32, literal: bool) -> Instruction {

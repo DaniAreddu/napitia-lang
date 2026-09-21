@@ -40,9 +40,43 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.2.1
+## Current status: Alpha 0.2.2
 
-This milestone is **numeric semantics stabilization**
+This milestone is the **verified execution boundary**
+(`rfcs/0016-verified-execution-boundary.md`). It adds no feature, no
+diagnostic and no syntax, and changes no program's meaning. It makes an
+existing guarantee structural.
+
+Every release up to Alpha 0.2.1 ran the NIR verifier in the right place
+and then handed its *input* to the executor. The interpreter and the
+native backend both took a raw `nir::Module`, and both documented — in
+prose — that they were only ever given verified NIR.
+
+Now verification **consumes** the module it checked and returns an
+opaque `VerifiedModule`, and that is the type both executors accept:
+
+```text
+source -> parse -> resolve -> typecheck -> resource checking
+       -> NIR lowering -> NIR verification -> VerifiedModule
+       -> interpreter or native backend
+```
+
+A sealed module has no mutable accessor, no unsealing conversion and no
+public constructor, so nothing can substitute, reorder or edit the
+module between the check and the run. Raw `nir::Module` stays public
+and unchanged, because lowering builds one and the verifier's own tests
+need hand-built malformed ones — they simply cannot be executed any
+more.
+
+The runtime's own defence in depth is unchanged and stays under test:
+`X0001`–`X0004` still refuse what the verifier would have caught, via a
+`#[cfg(test)]`-only unchecked path the production library never
+compiles. `rfcs/0016` states the sealing invariant, which components
+take a `VerifiedModule`, and what the seal does not cover.
+
+### Numeric semantics (from Alpha 0.2.1)
+
+That milestone was **numeric semantics stabilization**
 (`rfcs/0015-numeric-semantics.md`). It adds no feature. It makes `i64`
 mean what its name says.
 

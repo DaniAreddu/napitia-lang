@@ -2,7 +2,8 @@
 
 - Status: Partially implemented (Alpha 0.1.5; `drop` instruction and
   resource-state verification added in Alpha 0.1.7, `rfcs/0011`;
-  a subset lowered natively in Alpha 0.2.0, `rfcs/0014`)
+  a subset lowered natively in Alpha 0.2.0, `rfcs/0014`; verified NIR
+  sealed behind `VerifiedModule` in Alpha 0.2.2, `rfcs/0016`)
 
 NIR is a typed, explicit control-flow-graph intermediate representation,
 lower-level than HIR, produced by lowering type-checked HIR
@@ -299,9 +300,11 @@ is and is not compiled, and the `Axxxx` diagnostic codes that name each
 refusal; it is not restated here. Two facts about the *pipeline* belong
 in this spec, though:
 
-- Verification is mandatory and runs first. The native backend never
-  sees NIR `nir::verify` has not accepted, so nothing in it re-derives
-  an invariant this document already assigns to the verifier.
+- Verification is mandatory and runs first, and since Alpha 0.2.2
+  (`rfcs/0016`) the backend's own entry points say so: `build_executable`
+  and the capability pass take a `VerifiedModule`. The native backend
+  never sees NIR `nir::verify` has not accepted, so nothing in it
+  re-derives an invariant this document already assigns to the verifier.
 - A separate capability pass runs after verification and before any
   code is generated, and decides exhaustively whether the reachable
   program is inside that subset. NIR that is *valid but unsupported* is
@@ -485,6 +488,15 @@ Between lowering and interpretation, a verifier pass re-checks the
 produced NIR independently of how it was built — it does not trust the
 lowerer, and re-derives every invariant from the `Module` value itself:
 
+As of Alpha 0.2.2 (`rfcs/0016`) that pass is also the boundary between
+raw and executable NIR. `nir::verify` consumes the `Module` it checked
+and returns an opaque `VerifiedModule`; the interpreter, the native
+backend and its capability pass all accept that type and not a bare
+`Module`. A sealed module has no mutable accessor and no unsealing
+conversion, so what an executor receives is exactly what the verifier
+accepted. Raw `Module` remains the lowerer's working representation and
+the verifier's own test input.
+
 - **Structure**: every function/block id is unique; every branch target
   and called function exists; call argument counts match.
 - **Entry block**: every function has exactly one block with id
@@ -520,14 +532,16 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   exactly one integer width exists: there is no second width for an
   operand to disagree about.
 
-  Verification is not the only guard. NIR is hand-buildable and can be
-  handed straight to the interpreter, so the interpreter enforces the
-  same rule again while executing: a runtime integer is a value of
-  `i64` and nothing else, a runtime float is a value of `f64` and
-  nothing else, and an instruction's declared result type is checked
-  *before* the instruction runs as well as against the value it
-  produced. A caller that skips verification gets a structured refusal
-  (`X0004`), never arithmetic performed under the wrong type's name.
+  Verification is not the only guard. The verifier is itself a pass
+  that can have bugs, so the interpreter enforces the same rule again
+  while executing: a runtime integer is a value of `i64` and nothing
+  else, a runtime float is a value of `f64` and nothing else, and an
+  instruction's declared result type is checked *before* the
+  instruction runs as well as against the value it produced. Since
+  Alpha 0.2.2 no production caller can skip verification at all
+  (`rfcs/0016`), and the `#[cfg(test)]` unchecked path that can still
+  gets a structured refusal (`X0004`) and a terminated execution
+  context, never arithmetic performed under the wrong type's name.
 - **Aggregates** (Alpha 0.1.1): `record.create`/`variant.create`
   reference a declared record/variant and initialize every field/match
   their case's payload arity and types exactly once each;
@@ -684,9 +698,11 @@ lowerer, and re-derives every invariant from the `Module` value itself:
 
 It reports structured diagnostics (`V0001`–`V0082` as of this milestone)
 and never panics; a module that fails verification is never handed to
-the interpreter, and the interpreter's normal entry point
-(`Interpreter::run`) only ever receives a verified module — there is no
-path through the driver that skips verification. `Interpreter::call`
+the interpreter, and since Alpha 0.2.2 that is enforced by the type
+system rather than by convention: `Interpreter::new` takes a
+`VerifiedModule`, so no production path — through the driver or
+anywhere else — can construct an interpreter over unverified NIR.
+`Interpreter::call`
 additionally validates argument count against the function's declared
 parameter count and starts execution explicitly at `BlockId(0)`, never
 at whatever happens to be first in the block vector.

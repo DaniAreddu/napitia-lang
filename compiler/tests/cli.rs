@@ -2143,3 +2143,163 @@ fn the_minimum_remainder_by_minus_one_is_zero_at_the_command_line() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "0");
 }
+
+// -- The verified execution boundary (`rfcs/0016`) --------------------
+//
+// `check`, `ir`, `run` and `build` all share one pipeline, and since
+// Alpha 0.2.2 everything downstream of NIR lowering takes a sealed
+// module. That must change none of their documented acceptance
+// boundaries, and must never turn a refusal into a panic, a backtrace
+// or an internal code reaching a user.
+
+/// Every diagnostic code a run reported, in the order it reported them.
+fn codes_of(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.split_once("error["))
+        .filter_map(|(_, rest)| rest.split_once(']'))
+        .map(|(code, _)| code.to_string())
+        .collect()
+}
+
+/// Nothing a user can reach may panic or print a Rust backtrace.
+fn assert_no_panic(output: &Output, what: &str) {
+    let err = stderr(output);
+    for marker in [
+        "panicked at",
+        "RUST_BACKTRACE",
+        "stack backtrace",
+        "note: run with",
+    ] {
+        assert!(!err.contains(marker), "`{what}` leaked `{marker}`:\n{err}");
+    }
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "`{what}` exited with the panic status:\n{err}"
+    );
+}
+
+#[test]
+fn check_ir_and_run_all_accept_a_valid_program_through_the_seal() {
+    let path = example("hello.npt");
+
+    let checked = napitia(&["check", &path]);
+    assert_no_panic(&checked, "check");
+    assert!(checked.status.success());
+    assert!(stdout(&checked).contains("no errors"));
+
+    // `ir` is where verification runs and where the seal is printed.
+    let ired = napitia(&["ir", &path]);
+    assert_no_panic(&ired, "ir");
+    assert!(ired.status.success(), "{}", stderr(&ired));
+    assert!(
+        stdout(&ired).contains("func @main"),
+        "`ir` must print the verified module: {}",
+        stdout(&ired)
+    );
+    assert!(stderr(&ired).is_empty(), "{}", stderr(&ired));
+
+    // And `run` executes that same sealed module.
+    let ran = napitia(&["run", &path]);
+    assert_no_panic(&ran, "run");
+    assert!(ran.status.success(), "{}", stderr(&ran));
+    assert_eq!(stdout(&ran).trim(), "42");
+    assert!(stderr(&ran).is_empty(), "{}", stderr(&ran));
+}
+
+#[test]
+fn check_ir_run_and_build_refuse_an_invalid_program_with_the_same_codes() {
+    let path = example("invalid_types.npt");
+
+    let checked = napitia(&["check", &path]);
+    assert_no_panic(&checked, "check");
+    assert_eq!(checked.status.code(), Some(1));
+    let expected = codes_of(&stderr(&checked));
+    assert!(
+        expected.iter().any(|code| code.starts_with('T')),
+        "the fixture must fail type checking, got {expected:?}"
+    );
+
+    // Every later command refuses the same program for the same
+    // reasons: nothing is lowered, nothing is sealed, nothing runs and
+    // nothing is compiled.
+    for command in ["ir", "run"] {
+        let output = napitia(&[command, &path]);
+        assert_no_panic(&output, command);
+        assert_eq!(output.status.code(), Some(1), "`{command}` must refuse");
+        assert_eq!(
+            codes_of(&stderr(&output)),
+            expected,
+            "`{command}` must report exactly what `check` reported"
+        );
+        assert!(
+            stdout(&output).is_empty(),
+            "`{command}` must produce no output for a refused program: {}",
+            stdout(&output)
+        );
+    }
+
+    // `build` fails at the same stage, before the native backend is
+    // consulted at all: no `Axxxx` code, no executable.
+    let output = std::env::temp_dir().join(format!("napitia boundary {}", std::process::id()));
+    let _ = std::fs::remove_file(&output);
+    let built = napitia(&[
+        "build",
+        &path,
+        "--output",
+        output.to_str().expect("a printable path"),
+    ]);
+    assert_no_panic(&built, "build");
+    assert_eq!(built.status.code(), Some(1));
+    assert_eq!(codes_of(&stderr(&built)), expected);
+    assert!(
+        !stderr(&built).contains("error[A0"),
+        "the native backend must never be reached: {}",
+        stderr(&built)
+    );
+    assert!(!output.exists(), "a refused build must write no executable");
+}
+
+#[test]
+fn ir_and_run_are_byte_identical_across_repeated_invocations() {
+    for name in ["hello.npt", "invalid_types.npt"] {
+        let path = example(name);
+        for command in ["ir", "run"] {
+            let first = napitia(&[command, &path]);
+            for _ in 0..2 {
+                let again = napitia(&[command, &path]);
+                assert_eq!(
+                    stdout(&first),
+                    stdout(&again),
+                    "`{command} {name}` stdout is not deterministic"
+                );
+                assert_eq!(
+                    stderr(&first),
+                    stderr(&again),
+                    "`{command} {name}` stderr is not deterministic"
+                );
+                assert_eq!(first.status.code(), again.status.code());
+            }
+        }
+    }
+}
+
+/// A user can never be shown a `V` code for a program the frontend
+/// accepted -- the verifier only ever sees NIR this compiler built
+/// itself. This sweeps every example rather than one fixture, so a
+/// newly added one is covered automatically.
+#[test]
+fn no_command_ever_leaks_a_verifier_code_or_a_panic() {
+    for name in every_example() {
+        let path = example(&name);
+        for command in ["check", "ir", "run"] {
+            let output = napitia(&[command, &path]);
+            assert_no_panic(&output, &format!("{command} {name}"));
+            assert!(
+                !stderr(&output).contains("error[V0"),
+                "`{command} {name}` leaked a verifier diagnostic: {}",
+                stderr(&output)
+            );
+        }
+    }
+}

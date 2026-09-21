@@ -11,7 +11,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{self, HirModule, ItemRegistry, LocalId};
 use crate::interpreter::{Interpreter, InterpreterError, Value};
 use crate::lexer::{self, Token};
-use crate::nir::{self, Module as NirModule};
+use crate::nir::{self, VerifiedModule};
 use crate::parser::Parser;
 use crate::project::{self, CompiledProject};
 use crate::source::{SourceId, SourceMap, Span};
@@ -143,7 +143,7 @@ pub enum IrOutput {
     /// so every item's canonical qualified name is just its own
     /// declared name (`rfcs/0007`).
     Ready {
-        nir: NirModule,
+        nir: VerifiedModule,
         registry: ItemRegistry,
     },
     /// Lexing, parsing, resolution, or type-checking failed (NIR
@@ -197,17 +197,17 @@ fn ir_with_imports(
     // does not trust lowering's own bookkeeping, so a bug in `lower.rs`
     // surfaces as a diagnostic here rather than a panic or silent
     // misbehavior in the interpreter.
-    let verify_diagnostics = nir::verify_module(&nir_module, source, interner, &registry);
-    if !verify_diagnostics.is_empty() {
-        return (IrOutput::Diagnostics(verify_diagnostics), imports);
-    }
-    (
-        IrOutput::Ready {
-            nir: nir_module,
-            registry,
-        },
-        imports,
-    )
+    //
+    // This is also where single-file compilation crosses the verified
+    // boundary, exactly once: `nir::verify` consumes the module it
+    // checked and hands back the seal every executor demands, so no
+    // later stage can substitute a different module or reach one that
+    // was never checked.
+    let nir = match nir::verify(nir_module, source, interner, &registry) {
+        Ok(nir) => nir,
+        Err(diagnostics) => return (IrOutput::Diagnostics(diagnostics), imports),
+    };
+    (IrOutput::Ready { nir, registry }, imports)
 }
 
 pub enum NativeOutput {
@@ -281,7 +281,7 @@ pub fn check_project(
 
 pub enum ProjectIrOutput {
     Ready {
-        nir: NirModule,
+        nir: VerifiedModule,
         registry: ItemRegistry,
     },
     Diagnostics(Vec<Diagnostic>),

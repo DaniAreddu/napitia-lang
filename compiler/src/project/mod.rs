@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{self, HirModule, ItemId};
-use crate::nir::{self, Module as NirModule};
+use crate::nir::{self, VerifiedModule};
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
 use crate::syntax::ast;
@@ -35,9 +35,12 @@ pub(crate) mod codes {
 }
 
 /// A fully compiled, verified project, ready to print or execute.
+///
+/// `nir` is sealed: it is the exact module `nir::verify` accepted, and
+/// there is no way from here back to a raw, unverified one.
 #[derive(Debug)]
 pub struct CompiledProject {
-    pub nir: NirModule,
+    pub nir: VerifiedModule,
     /// The entry module's own `main`, resolved by identity -- never a
     /// name lookup over the merged module, which a project with more
     /// than one module could make ambiguous.
@@ -276,14 +279,14 @@ pub fn compile_project(
         &module_path_of,
     )?;
 
-    let verify_diagnostics =
-        nir::verify_module(&nir_module, loaded.manifest_source, interner, &registry);
-    if !verify_diagnostics.is_empty() {
-        return Err(verify_diagnostics);
-    }
+    // Where a project crosses the verified boundary -- once, over the
+    // single merged module, never once per source module: the merged
+    // module is what runs, so it is the module that has to be checked
+    // and sealed.
+    let nir = nir::verify(nir_module, loaded.manifest_source, interner, &registry)?;
 
     Ok(CompiledProject {
-        nir: nir_module,
+        nir,
         entry_item,
         registry,
     })

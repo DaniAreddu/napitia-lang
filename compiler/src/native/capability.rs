@@ -1787,6 +1787,7 @@ fn strongly_connected_components(
 mod tests {
     use super::*;
     use crate::driver::{self, IrOutput};
+    use crate::nir::Module;
     use crate::source::SourceMap;
 
     /// One compiled, verified single-file program, kept together so a
@@ -1823,6 +1824,25 @@ mod tests {
     impl Compiled {
         fn validate(&self) -> Result<NativePlan, Vec<Diagnostic>> {
             self.validate_for(TARGET_TRIPLE, &[])
+        }
+
+        /// The same compiled program with its NIR storage rearranged.
+        ///
+        /// A sealed module cannot be reordered in place -- that is the
+        /// boundary working as intended -- so this rebuilds the raw
+        /// module and seals it again through the `#[cfg(test)]`
+        /// unchecked path. Moving already-verified functions and blocks
+        /// around in their own vectors cannot make them unverifiable:
+        /// nothing the verifier checks depends on storage position,
+        /// which is the very claim these tests exist to hold the
+        /// validator to.
+        fn rearranged(self, rearrange: impl FnOnce(&mut Module)) -> Compiled {
+            let mut raw = self.module.module().clone();
+            rearrange(&mut raw);
+            Compiled {
+                module: VerifiedModule::seal_unchecked(raw),
+                ..self
+            }
         }
 
         fn validate_for(
@@ -1947,11 +1967,12 @@ mod tests {
     #[test]
     fn reversed_function_and_block_storage_produce_an_identical_plan() {
         let forward = compile(EVERY_SUPPORTED_CONSTRUCT);
-        let mut reversed = compile(EVERY_SUPPORTED_CONSTRUCT);
-        reversed.module.functions.reverse();
-        for function in &mut reversed.module.functions {
-            function.blocks.reverse();
-        }
+        let reversed = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            module.functions.reverse();
+            for function in &mut module.functions {
+                function.blocks.reverse();
+            }
+        });
 
         let expected = forward.validate().expect("the forward module validates");
         let actual = reversed
@@ -1964,12 +1985,13 @@ mod tests {
     /// at `bb0`.
     #[test]
     fn an_entry_block_stored_last_is_still_the_entry_block() {
-        let mut compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
-        for function in &mut compiled.module.functions {
-            if function.blocks.len() > 1 {
-                function.blocks.rotate_left(1);
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            for function in &mut module.functions {
+                if function.blocks.len() > 1 {
+                    function.blocks.rotate_left(1);
+                }
             }
-        }
+        });
         compiled
             .validate()
             .expect("the entry block is bb0 wherever it is stored");

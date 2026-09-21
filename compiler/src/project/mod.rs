@@ -1778,4 +1778,64 @@ mod tests {
             "stale version-specific wording leaked: {diags:?}"
         );
     }
+
+    /// A project crosses the verified boundary exactly once, and over
+    /// the merged module that will actually run -- never once per
+    /// source module, which could not have checked a cross-module call
+    /// at all.
+    #[test]
+    fn a_project_crosses_the_verified_boundary_exactly_once() {
+        let project = TempProject::new("verified_boundary_once");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add(20, 22) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+
+        // One seal, holding both modules' functions: the call across
+        // the module boundary was inside what the verifier saw.
+        let names: Vec<&str> = compiled
+            .nir
+            .module()
+            .functions
+            .iter()
+            .map(|function| interner.resolve(function.name))
+            .collect();
+        assert!(
+            names.contains(&"main") && names.contains(&"add"),
+            "the sealed module must be the merged one, got {names:?}"
+        );
+
+        // Asking the verifier about that same module again reports
+        // nothing, which is exactly why no later stage does: `ir` and
+        // `run` take the seal as it stands rather than checking it a
+        // second time.
+        let mut again = SourceMap::new();
+        let anchor = again.add_file("recheck.npt", "\n");
+        assert!(
+            crate::nir::verify_module(
+                compiled.nir.module(),
+                anchor,
+                &interner,
+                &compiled.registry,
+            )
+            .is_empty(),
+            "an already-sealed project module must still verify clean"
+        );
+
+        // And that one seal is what executes.
+        assert_eq!(
+            Interpreter::new(&compiled.nir).run_item(compiled.entry_item),
+            Ok(crate::interpreter::Value::Int(42))
+        );
+    }
 }

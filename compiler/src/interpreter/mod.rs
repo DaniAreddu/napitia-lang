@@ -18819,6 +18819,7 @@ mod fatal_abort {
 mod stateful_termination {
     use super::*;
     use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
     const FILE: ItemId = ItemId(10);
@@ -19198,5 +19199,81 @@ mod stateful_termination {
                 .to_string()
                 .contains("cannot be reused")
         );
+    }
+
+    /// The whole reason the unchecked path exists only under
+    /// `cfg(test)`: the production pipeline never reaches any of the
+    /// state the fixtures above observe.
+    ///
+    /// The same module, run unchecked, really does enter a frame,
+    /// construct a live resource and only then refuse. Offered to
+    /// `nir::verify` instead -- which is the only way a production
+    /// caller can obtain the `VerifiedModule` `Interpreter::new`
+    /// demands -- it produces structured `V` diagnostics and no seal,
+    /// so no interpreter, no frame, no resource table and no event ever
+    /// come into existence.
+    #[test]
+    fn verification_refuses_the_stateful_module_before_any_frame_is_entered() {
+        let interner = fixture_interner();
+
+        // What the runtime does when nothing checked the module first.
+        let raw = stateful_module();
+        let unchecked = Interpreter::unchecked(&raw);
+        let refused = unchecked
+            .call_item(MAIN, Vec::new())
+            .expect_err("the `u8` instruction must be refused");
+        assert_eq!(refused.code(), codes::INVALID_OPERATION);
+        assert_eq!(
+            live_records(&unchecked),
+            1,
+            "the unchecked path really does construct a resource before failing"
+        );
+        assert_eq!(
+            unchecked.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the unchecked path really does enter a frame"
+        );
+
+        // What the production path does with the identical module.
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        let diagnostics = crate::nir::verify(
+            stateful_module(),
+            source,
+            &interner,
+            &crate::hir::ItemRegistry::default(),
+        )
+        .err()
+        .expect("a module the runtime cannot execute must never seal");
+        assert_eq!(
+            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+            vec!["V0112", "V0077"]
+        );
+    }
+
+    /// Repeating that refusal changes nothing about it: same codes,
+    /// same order, byte-identical rendering.
+    #[test]
+    fn the_refusal_of_the_stateful_module_is_byte_identical_across_runs() {
+        let interner = fixture_interner();
+        let rendered = || {
+            let mut map = SourceMap::new();
+            let source = map.add_file("hand-built.npt", "\n");
+            crate::nir::verify(
+                stateful_module(),
+                source,
+                &interner,
+                &crate::hir::ItemRegistry::default(),
+            )
+            .err()
+            .expect("the module never seals")
+            .iter()
+            .map(|d| crate::diagnostics::render(d, &map))
+            .collect::<String>()
+        };
+        let first = rendered();
+        assert!(first.contains("V0112"), "{first}");
+        assert_eq!(first, rendered());
+        assert_eq!(first, rendered());
     }
 }

@@ -17,7 +17,10 @@ use crate::limits::{MAX_CAPABILITY_DEPTH, MAX_CAPABILITY_RESOLUTION_STEPS, MAX_G
 use crate::place::Place;
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
-use crate::types::{CapabilityRequirement, Evidence, Ty, is_integer, is_numeric, substitute};
+use crate::types::{
+    CapabilityRequirement, Evidence, Ty, domain_of, is_executable_numeric, is_integer, is_numeric,
+    substitute,
+};
 
 use super::block::{BasicBlock, BlockId, Terminator};
 use super::instruction::{Const, Instruction, ValueId, ValueKind};
@@ -624,6 +627,27 @@ mod codes {
     /// disjoint sibling place is unaffected. Reported once per
     /// operation, against the innermost overlapping observation.
     pub const OWNERSHIP_WHILE_OBSERVED: &str = "V0110";
+    /// An integer constant outside the domain of the type its own
+    /// instruction declares (`rfcs/0015`).
+    ///
+    /// `Const::Int`'s payload is wider than any integer type Napitia
+    /// executes precisely so that this can be checked rather than made
+    /// unrepresentable: the verifier is the stage that decides a
+    /// constant is a valid value of its type, and everything downstream
+    /// -- the interpreter, the native backend -- relies on that having
+    /// happened rather than re-deciding it.
+    pub const INTEGER_CONSTANT_OUT_OF_RANGE: &str = "V0111";
+    /// A numeric type with no execution semantics in this milestone
+    /// appearing anywhere in NIR (`rfcs/0015`): any integer width other
+    /// than `i64`, any unsigned width, or `f32`.
+    ///
+    /// `typeck`'s `T0074` already refuses these in source, so no
+    /// compiled program reaches here carrying one. This is the
+    /// independent check that stops hand-built NIR from handing the
+    /// interpreter or the backend a type neither of them implements --
+    /// which is what "operands of incompatible widths or signedness"
+    /// reduces to when exactly one integer width exists.
+    pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "V0112";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -2521,8 +2545,14 @@ fn check_no_duplicate_type_params(
     }
 }
 
-fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut Vec<Diagnostic>) {
-    check_no_bad_type_at_depth(ty, source, context, diagnostics, 0);
+fn check_no_bad_type(
+    ty: &Ty,
+    source: SourceId,
+    interner: &Interner,
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    check_no_bad_type_at_depth(ty, source, interner, context, diagnostics, 0);
 }
 
 /// `depth`-bounded the same way every other stage that walks a nested
@@ -2535,6 +2565,7 @@ fn check_no_bad_type(ty: &Ty, source: SourceId, context: &str, diagnostics: &mut
 fn check_no_bad_type_at_depth(
     ty: &Ty,
     source: SourceId,
+    interner: &Interner,
     context: &str,
     diagnostics: &mut Vec<Diagnostic>,
     depth: usize,
@@ -2563,9 +2594,24 @@ fn check_no_bad_type_at_depth(
         )),
         Ty::Applied(_, args) => {
             for arg in args {
-                check_no_bad_type_at_depth(arg, source, context, diagnostics, depth + 1);
+                check_no_bad_type_at_depth(arg, source, interner, context, diagnostics, depth + 1);
             }
         }
+        // A numeric name this milestone does not execute (`rfcs/0015`).
+        // Rejected here rather than where each consumer would trip over
+        // it: the interpreter has one integer representation and the
+        // backend has one machine type, so anything else would have to
+        // be run as something other than what it says it is.
+        other if !is_executable_numeric(other) => diagnostics.push(Diagnostic::error(
+            codes::UNIMPLEMENTED_NUMERIC_TYPE,
+            source,
+            Span::dummy(),
+            format!(
+                "{context} names `{}`, which has no execution semantics in this milestone; \
+                 `i64` and `f64` are the numeric types NIR carries",
+                crate::types::display_ty(other, interner)
+            ),
+        )),
         _ => {}
     }
 }
@@ -2889,7 +2935,7 @@ fn check_type_root(
         ));
         return;
     }
-    check_no_bad_type(ty, source, context, diagnostics);
+    check_no_bad_type(ty, source, interner, context, diagnostics);
     check_named_type_identity(ty, agg, source, interner, registry, context, diagnostics);
     check_type_param_scope(ty, own_params, source, context, diagnostics);
 }
@@ -3174,6 +3220,32 @@ fn verify_value_kind(
     match kind {
         ValueKind::Alloc => {}
         ValueKind::Const(c) => {
+            // An integer constant's *value* is checked against its own
+            // declared type's domain, not merely its kind (`rfcs/0015`).
+            // This is the stage that decides a constant is a valid value
+            // of the type it claims; the interpreter and the backend
+            // both rely on that having happened here rather than
+            // re-deciding it, and a payload narrow enough to make an
+            // out-of-range constant unrepresentable would have left
+            // nothing to decide.
+            if let Const::Int(value) = c
+                && let Some(domain) = domain_of(result_ty)
+                && !domain.contains(*value)
+            {
+                diagnostics.push(Diagnostic::error(
+                    codes::INTEGER_CONSTANT_OUT_OF_RANGE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}`: %{} is the constant {value}, which `{}` \
+                         cannot hold ({} through {})",
+                        result.0,
+                        domain.name(),
+                        domain.min(),
+                        domain.max()
+                    ),
+                ));
+            }
             let ok = match c {
                 Const::Int(_) => is_integer(result_ty),
                 Const::Float(_) => matches!(result_ty, Ty::F32 | Ty::F64),
@@ -18027,7 +18099,7 @@ mod structural_ownership {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
@@ -27615,6 +27687,574 @@ mod structural_ownership {
             });
             let f = under_test(take_session(&fx), Ty::I64, blocks);
             assert!(all_codes(&mut fx, f).is_empty());
+        }
+    }
+}
+
+/// `rfcs/0015` -- adversarial numeric NIR, built by hand.
+///
+/// None of it is reachable from `.npt` source: the checker refuses an
+/// out-of-range literal (`T0073`) and a numeric type with no execution
+/// semantics (`T0074`) before lowering runs at all. Building the modules
+/// directly is therefore the only way to ask whether the verifier is
+/// independently load-bearing, or merely agreeing with the stage before
+/// it.
+///
+/// Each shape is also run through the CFG permutations that have caught
+/// order dependence elsewhere in this file -- the entry block stored
+/// last, the block vector reversed, a diamond join, a loop backedge, a
+/// deep chain, an unreachable predecessor, an unreachable cycle -- so a
+/// numeric rule cannot quietly depend on storage order either.
+#[cfg(test)]
+mod numeric_ir {
+    use super::*;
+    use crate::nir::Param;
+    use crate::source::SourceMap;
+
+    const SELF: ItemId = ItemId(0);
+
+    fn verify(function: Function) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let interner = Interner::new();
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![function],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        verify_module(&module, source, &interner, &ItemRegistry::default())
+    }
+
+    fn codes_of(function: Function) -> Vec<&'static str> {
+        let mut found: Vec<&'static str> = verify(function).into_iter().map(|d| d.code).collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// Every diagnostic as `code: message`, in emission order, so two
+    /// runs can be compared exactly rather than as a set.
+    fn rendered(function: Function) -> Vec<String> {
+        verify(function)
+            .into_iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
+    fn function(params: Vec<Param>, return_type: Ty, blocks: Vec<BasicBlock>) -> Function {
+        Function {
+            id: SELF,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn param(value: u32, ty: Ty) -> Param {
+        Param {
+            value: ValueId(value),
+            ty,
+            take: false,
+        }
+    }
+
+    fn konst(result: u32, ty: Ty, value: i128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::Const(Const::Int(value)),
+        }
+    }
+
+    fn binary(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    /// One block: a constant, returned.
+    fn returns_constant(ty: Ty, value: i128) -> Function {
+        function(
+            Vec::new(),
+            ty.clone(),
+            vec![block(
+                0,
+                vec![konst(0, ty, value)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )
+    }
+
+    // -- out-of-range typed constants -------------------------------------
+
+    #[test]
+    fn a_constant_inside_its_own_types_domain_is_accepted() {
+        for value in [
+            0,
+            1,
+            -1,
+            i64::MIN as i128,
+            i64::MIN as i128 + 1,
+            i64::MAX as i128 - 1,
+            i64::MAX as i128,
+        ] {
+            assert!(
+                codes_of(returns_constant(Ty::I64, value)).is_empty(),
+                "{value} is an i64"
+            );
+        }
+    }
+
+    #[test]
+    fn a_constant_one_past_either_boundary_is_rejected() {
+        for value in [i64::MAX as i128 + 1, i64::MIN as i128 - 1] {
+            assert_eq!(
+                codes_of(returns_constant(Ty::I64, value)),
+                vec![codes::INTEGER_CONSTANT_OUT_OF_RANGE],
+                "{value} is not an i64"
+            );
+        }
+    }
+
+    /// The payload can hold far more than the type can, which is the
+    /// point of it being wider than anything Napitia executes.
+    #[test]
+    fn a_constant_far_outside_the_domain_is_rejected_rather_than_wrapped() {
+        for value in [i128::MAX, i128::MIN, 1i128 << 100] {
+            assert!(
+                codes_of(returns_constant(Ty::I64, value))
+                    .contains(&codes::INTEGER_CONSTANT_OUT_OF_RANGE),
+                "{value} is not an i64"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_value_the_type_and_the_domain() {
+        let found = rendered(returns_constant(Ty::I64, i64::MAX as i128 + 1));
+        assert_eq!(found.len(), 1);
+        let message = &found[0];
+        assert!(message.contains("9223372036854775808"), "{message}");
+        assert!(message.contains("i64"), "{message}");
+        assert!(message.contains("-9223372036854775808"), "{message}");
+        assert!(message.contains("9223372036854775807"), "{message}");
+    }
+
+    /// An integer constant declared with a non-integer type is a
+    /// *different* defect from one outside its domain, and keeps its own
+    /// code.
+    #[test]
+    fn an_integer_constant_with_a_non_integer_type_is_an_operand_mismatch() {
+        assert_eq!(
+            codes_of(returns_constant(Ty::Bool, 1)),
+            vec![codes::OPERAND_TYPE_MISMATCH]
+        );
+    }
+
+    // -- numeric types with no execution semantics ------------------------
+
+    /// Every numeric name the milestone reserves but does not run.
+    const UNIMPLEMENTED: [Ty; 10] = [
+        Ty::I8,
+        Ty::I16,
+        Ty::I32,
+        Ty::Isize,
+        Ty::U8,
+        Ty::U16,
+        Ty::U32,
+        Ty::U64,
+        Ty::Usize,
+        Ty::F32,
+    ];
+
+    #[test]
+    fn an_unimplemented_numeric_return_type_is_rejected() {
+        for ty in UNIMPLEMENTED {
+            assert!(
+                codes_of(returns_constant(ty.clone(), 0))
+                    .contains(&codes::UNIMPLEMENTED_NUMERIC_TYPE),
+                "{ty:?} has no execution semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_numeric_parameter_type_is_rejected() {
+        for ty in UNIMPLEMENTED {
+            let f = function(
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![konst(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert!(
+                codes_of(f).contains(&codes::UNIMPLEMENTED_NUMERIC_TYPE),
+                "{ty:?} has no execution semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_numeric_slot_type_is_rejected() {
+        let f = function(
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    binary(0, Ty::U8, ValueKind::Alloc),
+                    konst(1, Ty::U8, 0),
+                    Instruction::Store {
+                        slot: ValueId(0),
+                        value: ValueId(1),
+                        mode: crate::nir::OwnershipMode::Observe,
+                    },
+                    konst(2, Ty::I64, 0),
+                ],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        );
+        assert!(codes_of(f).contains(&codes::UNIMPLEMENTED_NUMERIC_TYPE));
+    }
+
+    #[test]
+    fn the_two_numeric_types_this_milestone_executes_are_accepted() {
+        assert!(codes_of(returns_constant(Ty::I64, 0)).is_empty());
+        let f = function(
+            vec![param(0, Ty::F64)],
+            Ty::F64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        assert!(codes_of(f).is_empty());
+    }
+
+    // -- integer operations and their operands ----------------------------
+
+    /// An `add` of two `i64`s producing an `i64` is the shape every
+    /// operand test below perturbs.
+    fn add_of(left_ty: Ty, right_ty: Ty, result_ty: Ty) -> Function {
+        function(
+            vec![param(0, left_ty), param(1, right_ty)],
+            result_ty.clone(),
+            vec![block(
+                0,
+                vec![binary(2, result_ty, ValueKind::Add(ValueId(0), ValueId(1)))],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        )
+    }
+
+    #[test]
+    fn an_add_of_two_i64s_is_accepted() {
+        assert!(codes_of(add_of(Ty::I64, Ty::I64, Ty::I64)).is_empty());
+    }
+
+    #[test]
+    fn an_integer_operation_with_a_non_integer_operand_is_rejected() {
+        for ty in [Ty::Bool, Ty::Char, Ty::Str, Ty::Unit] {
+            assert!(
+                !codes_of(add_of(ty.clone(), Ty::I64, Ty::I64)).is_empty(),
+                "{ty:?} is not an integer operand"
+            );
+            assert!(
+                !codes_of(add_of(Ty::I64, ty.clone(), Ty::I64)).is_empty(),
+                "{ty:?} is not an integer operand"
+            );
+        }
+    }
+
+    /// With one executable integer width, "operands of incompatible
+    /// widths or signedness" is the same rule as "a width this milestone
+    /// does not implement": there is no second width to disagree about.
+    #[test]
+    fn an_operand_of_another_width_or_signedness_is_rejected() {
+        for ty in UNIMPLEMENTED {
+            assert!(
+                codes_of(add_of(ty.clone(), Ty::I64, Ty::I64))
+                    .contains(&codes::UNIMPLEMENTED_NUMERIC_TYPE),
+                "{ty:?} is not an operand this milestone can execute"
+            );
+        }
+    }
+
+    #[test]
+    fn an_integer_operation_declaring_a_non_integer_result_is_rejected() {
+        assert!(!codes_of(add_of(Ty::I64, Ty::I64, Ty::Bool)).is_empty());
+        assert!(!codes_of(add_of(Ty::I64, Ty::I64, Ty::Str)).is_empty());
+    }
+
+    #[test]
+    fn a_comparison_of_two_i64s_must_produce_a_bool() {
+        let ok = function(
+            vec![param(0, Ty::I64), param(1, Ty::I64)],
+            Ty::Bool,
+            vec![block(
+                0,
+                vec![binary(2, Ty::Bool, ValueKind::Lt(ValueId(0), ValueId(1)))],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        );
+        assert!(codes_of(ok).is_empty());
+
+        let wrong = function(
+            vec![param(0, Ty::I64), param(1, Ty::I64)],
+            Ty::I64,
+            vec![block(
+                0,
+                vec![binary(2, Ty::I64, ValueKind::Lt(ValueId(0), ValueId(1)))],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        );
+        assert!(!codes_of(wrong).is_empty());
+    }
+
+    #[test]
+    fn a_return_of_the_wrong_numeric_type_is_rejected() {
+        let f = function(
+            vec![param(0, Ty::F64)],
+            Ty::I64,
+            vec![block(0, Vec::new(), Terminator::Return(Some(ValueId(0))))],
+        );
+        assert!(codes_of(f).contains(&codes::RETURN_TYPE_MISMATCH));
+    }
+
+    // -- the same rules under every CFG shape -----------------------------
+
+    /// `bb0` branches on a parameter, both arms produce a constant, and
+    /// the join returns one that was defined in `bb0`. `bad` is the
+    /// constant the `then` arm produces.
+    fn diamond(bad: i128) -> Vec<BasicBlock> {
+        vec![
+            block(
+                0,
+                vec![konst(1, Ty::I64, 7)],
+                Terminator::CondBranch {
+                    condition: ValueId(0),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![konst(2, Ty::I64, bad)],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![konst(3, Ty::I64, 0)],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(3, Vec::new(), Terminator::Return(Some(ValueId(1)))),
+        ]
+    }
+
+    fn with_blocks(blocks: Vec<BasicBlock>) -> Function {
+        function(vec![param(0, Ty::Bool)], Ty::I64, blocks)
+    }
+
+    #[test]
+    fn a_diamond_whose_arms_are_all_in_range_is_accepted() {
+        assert!(codes_of(with_blocks(diamond(0))).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_constant_in_one_arm_of_a_diamond_is_rejected() {
+        assert_eq!(
+            codes_of(with_blocks(diamond(i64::MAX as i128 + 1))),
+            vec![codes::INTEGER_CONSTANT_OUT_OF_RANGE]
+        );
+    }
+
+    #[test]
+    fn the_entry_block_stored_last_reports_the_identical_diagnostics() {
+        let forward = diamond(i64::MAX as i128 + 1);
+        let mut entry_last = forward.clone();
+        entry_last.rotate_left(1);
+        assert_eq!(
+            entry_last.last().map(|b| b.id),
+            Some(BlockId(0)),
+            "the entry block must actually be stored last"
+        );
+        assert_eq!(
+            rendered(with_blocks(forward)),
+            rendered(with_blocks(entry_last))
+        );
+    }
+
+    #[test]
+    fn a_reversed_block_vector_reports_the_identical_diagnostics() {
+        let forward = diamond(i64::MAX as i128 + 1);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        assert_eq!(
+            rendered(with_blocks(forward)),
+            rendered(with_blocks(reversed))
+        );
+    }
+
+    /// `bb1` branches back to itself, so the out-of-range constant sits
+    /// on a backedge rather than on a straight path.
+    #[test]
+    fn an_out_of_range_constant_behind_a_loop_backedge_is_rejected() {
+        let blocks = vec![
+            block(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![konst(1, Ty::I64, i64::MIN as i128 - 1)],
+                Terminator::CondBranch {
+                    condition: ValueId(0),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                vec![konst(2, Ty::I64, 0)],
+                Terminator::Return(Some(ValueId(2))),
+            ),
+        ];
+        assert!(
+            codes_of(with_blocks(blocks)).contains(&codes::INTEGER_CONSTANT_OUT_OF_RANGE),
+            "a backedge does not exempt a constant from its own type"
+        );
+    }
+
+    /// A long straight chain, with the defect at the far end.
+    #[test]
+    fn an_out_of_range_constant_at_the_end_of_a_deep_chain_is_rejected() {
+        const DEPTH: u32 = 64;
+        let mut blocks: Vec<BasicBlock> = (0..DEPTH)
+            .map(|i| block(i, Vec::new(), Terminator::Branch(BlockId(i + 1))))
+            .collect();
+        blocks.push(block(
+            DEPTH,
+            vec![konst(1, Ty::I64, i64::MAX as i128 + 1)],
+            Terminator::Return(Some(ValueId(1))),
+        ));
+        assert!(codes_of(with_blocks(blocks)).contains(&codes::INTEGER_CONSTANT_OUT_OF_RANGE));
+    }
+
+    /// The verifier types every block a function declares, reachable or
+    /// not: an unreachable block is still NIR, and an interpreter or a
+    /// backend that later decided to look at one must not find something
+    /// the verifier never checked. What unreachable code must never do
+    /// is contribute *state* to reachable code, which the structural
+    /// tests elsewhere in this file own.
+    #[test]
+    fn an_out_of_range_constant_in_an_unreachable_block_is_still_rejected() {
+        let blocks = vec![
+            block(
+                0,
+                vec![konst(1, Ty::I64, 0)],
+                Terminator::Return(Some(ValueId(1))),
+            ),
+            block(
+                7,
+                vec![konst(2, Ty::I64, i64::MAX as i128 + 1)],
+                Terminator::Return(Some(ValueId(2))),
+            ),
+        ];
+        assert!(codes_of(with_blocks(blocks)).contains(&codes::INTEGER_CONSTANT_OUT_OF_RANGE));
+    }
+
+    /// Two unreachable blocks that only reach each other.
+    #[test]
+    fn an_out_of_range_constant_inside_an_unreachable_cycle_is_still_rejected() {
+        let blocks = vec![
+            block(
+                0,
+                vec![konst(1, Ty::I64, 0)],
+                Terminator::Return(Some(ValueId(1))),
+            ),
+            block(
+                7,
+                vec![konst(2, Ty::I64, i64::MIN as i128 - 1)],
+                Terminator::Branch(BlockId(8)),
+            ),
+            block(8, Vec::new(), Terminator::Branch(BlockId(7))),
+        ];
+        assert!(codes_of(with_blocks(blocks)).contains(&codes::INTEGER_CONSTANT_OUT_OF_RANGE));
+    }
+
+    /// A value defined in only one arm, used after the merge: the
+    /// numeric rules do not displace the dominance rule.
+    #[test]
+    fn a_value_defined_in_one_arm_and_used_after_the_merge_is_still_rejected() {
+        let blocks = vec![
+            block(
+                0,
+                Vec::new(),
+                Terminator::CondBranch {
+                    condition: ValueId(0),
+                    then_block: BlockId(1),
+                    else_block: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![konst(1, Ty::I64, 1)],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(2, Vec::new(), Terminator::Branch(BlockId(3))),
+            block(3, Vec::new(), Terminator::Return(Some(ValueId(1)))),
+        ];
+        assert!(codes_of(with_blocks(blocks)).contains(&codes::NON_DOMINATING_DEFINITION));
+    }
+
+    #[test]
+    fn a_duplicate_definition_of_the_same_constant_id_is_rejected() {
+        let blocks = vec![block(
+            0,
+            vec![konst(1, Ty::I64, 1), konst(1, Ty::I64, 2)],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        assert!(codes_of(with_blocks(blocks)).contains(&codes::DUPLICATE_VALUE_DEFINITION));
+    }
+
+    // -- determinism -------------------------------------------------------
+
+    /// Several numeric defects at once, so the comparison is about order
+    /// as well as membership.
+    fn several_defects() -> Function {
+        function(
+            vec![param(0, Ty::U8), param(1, Ty::I64)],
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    konst(2, Ty::I64, i64::MAX as i128 + 1),
+                    konst(3, Ty::I32, 5),
+                    konst(4, Ty::I64, i64::MIN as i128 - 1),
+                ],
+                Terminator::Return(Some(ValueId(2))),
+            )],
+        )
+    }
+
+    #[test]
+    fn repeated_verifier_runs_produce_identical_diagnostics() {
+        let first = rendered(several_defects());
+        assert!(first.len() > 2, "the fixture must diagnose several things");
+        for _ in 0..8 {
+            assert_eq!(rendered(several_defects()), first);
         }
     }
 }

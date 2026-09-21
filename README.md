@@ -40,10 +40,74 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.2.0
+## Current status: Alpha 0.2.1
 
-This milestone adds a **native AOT preview**: a Cranelift path from
-already-verified NIR to a real `x86_64-unknown-linux-gnu` executable.
+This milestone is **numeric semantics stabilization**
+(`rfcs/0015-numeric-semantics.md`). It adds no feature. It makes `i64`
+mean what its name says.
+
+Up to Alpha 0.2.0, Napitia spelled its default integer type `i64` and
+executed it as a 128-bit one: the interpreter held every integer in an
+`i128` and wrapped at 128 bits, the native backend copied that choice
+into Cranelift's `I128` so the two would agree, and nothing anywhere
+compared a literal against a range. `i64` was a label on a 128-bit
+machine.
+
+It is now a signed two's-complement 64-bit integer —
+
+```text
+minimum = -9223372036854775808
+maximum =  9223372036854775807
+```
+
+— in literal checking, type inference, HIR, NIR, NIR verification, the
+interpreter, and the native backend, which represents it as Cranelift's
+`I64`.
+
+Its arithmetic is **checked**. `add`, `sub`, `mul`, `neg`, division by
+zero and `i64::MIN / -1` produce a structured runtime failure rather
+than a wrapped value. Of those, the four the native backend compiles —
+`add`, `sub`, `mul`, `neg` — fail identically in both execution paths,
+on exactly the same inputs; `div`, `rem` and the shifts are
+interpreter-only, because the backend refuses them (`A0009`) rather
+than approximating them.
+
+A runtime failure is a **fatal abort**, not a `raise`: it stops
+execution where it stands, runs no `defer` and no `drop`, and cannot be
+caught. A resource that was live is genuinely not destroyed, and the
+runtime does not pretend otherwise. `rfcs/0011`'s deterministic-cleanup
+guarantee covers Napitia control-flow exits — fallthrough, `return`,
+`break`, `continue`, `raise`, `?`, `handle` — and a fatal abort is its
+one documented exception.
+
+A literal outside the range is rejected by `check` before lowering
+runs, pointing at the literal. `-9223372036854775808` is accepted and
+`9223372036854775808` is not, which is a distinction the compiler now
+carries through every stage rather than losing at the first one.
+
+Two numeric types are actually implemented: `i64` everywhere, and `f64`
+in the interpreter only. The other ten names in `spec/0003` — `i8`,
+`i16`, `i32`, `isize`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32` — are
+now **refused by `check`** with a diagnostic saying this milestone does
+not implement them. They used to be accepted and then executed as
+something else under their own name: the nine integer widths as
+128-bit integer arithmetic, and `f32` as an `f64` that was never
+rounded to single precision. They remain reserved names, not removed
+ones.
+
+Floats compare by IEEE-754 predicate, so every ordered comparison
+involving a NaN is `false`, `nan == nan` is `false` and `nan != nan` is
+`true` — answers, not diagnostics.
+
+This is not complete numeric support, and it is not complete IEEE-754
+support. `rfcs/0015` states exactly what is and is not implemented,
+including the float limitations and the absence of any conversion,
+cast, wrapping operator or saturating operator.
+
+### Native AOT preview (from Alpha 0.2.0)
+
+A Cranelift path from already-verified NIR to a real
+`x86_64-unknown-linux-gnu` executable.
 
 ```bash
 napitia build examples/native_scalar_calls.npt --output scalar
@@ -72,27 +136,38 @@ graph; exactly one `main`, returning `unit` or `i64`.
 
 Not natively compiled, and **unchanged** under `check`, `ir` and `run`:
 resources, `observe`, `defer`, typed errors (`raise`/`?`/`handle`),
-records, variants, strings, `char`, floats, integer widths other than
-`i64`, `import` and multi-module builds, generics, protocols and
+records, variants, strings, `char`, `f64`, `import` and multi-module
+builds, generics, protocols and
 evidence dispatch, recursion, and `div`/`rem`/`shl`/`shr`. There is no
 native heap, no garbage collector, no reference counting, no borrowing
 or lifetime system, no FFI, no threads, no native typed-failure
 runtime, no JIT, and no second target.
 
-Two of those deserve their reasons stated here. `div`, `rem`, `shl` and
-`shr` are refused because the interpreter answers each one's
-exceptional case with a runtime *error* value, and Alpha 0.2.0 has no
-native runtime that can raise one — emitting a hardware trap instead
-would be different behavior, not the same behavior implemented
-differently. And `i64` is represented natively as a 128-bit integer,
-because the interpreter holds every Napitia integer in an `i128` and
-wraps at 128 bits; matching the reference implementation over the whole
-input domain was worth two registers, and settling the language's own
-integer width later makes the choice go away.
+`div`, `rem`, `shl` and `shr` are refused because each has an
+exceptional case — a zero divisor, the minimum over minus one, a shift
+count outside `0..64` — that this release does not emit a native
+failure path for. It emits one for the four checked arithmetic
+operators, and expanding that to four more operators means four more
+failure paths and a differential test per exceptional input; a
+stabilization release makes the existing subset correct rather than
+making a larger one approximately so.
 
 `main() -> unit` exits `0`. `main() -> i64` is observed by a waiting
 parent as the returned value modulo 256. Two builds of one program on
 one toolchain are byte-identical.
+
+A checked operation that overflows writes one line to standard error
+and exits **70**:
+
+```text
+napitia: error[X0002]: integer overflow in `add`
+```
+
+That is the same sentence `napitia run` prints for the same program.
+The status alone cannot distinguish a failure from a `main` that
+returned 70, because every byte is reachable through the modulo-256
+rule; standard error can, and a successful program writes nothing to
+it. `rfcs/0015` states this limitation rather than working around it.
 
 Linking needs a **GNU** x86-64 Linux host with a C toolchain (`cc`) —
 all three components, so a musl host does not qualify — and `cc` itself
@@ -319,7 +394,10 @@ identity and import aliases (`rfcs/0007`).
   name resolution (`resolve/`), including nominal record/variant
   structure, qualified/unambiguous-unqualified variant constructor
   resolution, and stable pattern identity.
-- A primitive type system (`types/`) and a local type checker (`typeck/`)
+- A primitive type system (`types/`), including the one authoritative
+  numeric layer (`types/numeric.rs`) every stage reads integer domains,
+  literal range rules and checked-arithmetic rules from, and a local
+  type checker (`typeck/`)
   performing constraint-based, monomorphic unification for integer/float
   literal inference, argument/return checking, and assignment
   compatibility — not full Hindley-Milner-style polymorphism; every
@@ -645,7 +723,7 @@ would lift the recursive-aggregate restriction, structured concurrency,
 remote packages/dependency declarations, wildcard/grouped imports,
 re-exports, package/module aliases (as opposed to the per-item import
 aliases that do exist — see above), incremental/cached compilation,
-native compilation of anything outside Alpha 0.2.0's scalar subset (see
+native compilation of anything outside the scalar subset (see
 "Current status" above and `rfcs/0014`), native-code generic
 specialization/monomorphization, garbage collection, and any
 domain-specific library (REST, ORM, tensors, GPU). Design direction for

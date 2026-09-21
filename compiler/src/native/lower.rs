@@ -26,8 +26,9 @@
 //!
 //! # Representation
 //!
-//! [`super::Scalar`] documents *why* `i64` is an `I128` here; this
-//! module is where that choice is spent. `unit` is represented by no
+//! [`super::Scalar`] records the machine type each Napitia scalar is
+//! held in; this module is where those choices are spent. `unit` is
+//! represented by no
 //! value at all: a `unit` parameter is absent from a native signature,
 //! a `unit` result makes the signature return nothing, and a `unit`
 //! slot holds no variable. Nothing fabricates a placeholder for it.
@@ -44,11 +45,11 @@ use std::str::FromStr;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, Signature, Value, types};
+use cranelift_codegen::ir::{AbiParam, Block, InstBuilder, Signature, TrapCode, Value, types};
 use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{FuncId, Linkage, Module as _};
+use cranelift_module::{DataDescription, FuncId, Linkage, Module as _};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::hir::ItemId;
@@ -56,6 +57,7 @@ use crate::nir::{
     BasicBlock, BlockId, Const, Function, Instruction, Module, Terminator, ValueId, ValueKind,
 };
 use crate::symbol::Interner;
+use crate::types::{ArithFailure, IntOp};
 
 use super::capability::NativePlan;
 use super::{ENTRY_SYMBOL, Scalar, scalar_of};
@@ -64,11 +66,19 @@ use super::{ENTRY_SYMBOL, Scalar, scalar_of};
 /// the emitted file and a build must not depend on where it ran.
 const OBJECT_NAME: &str = "napitia";
 
+/// The trap that terminates a block control cannot leave any other way,
+/// because the call just before it does not return. See
+/// [`BodyLowerer::guard`] for why a trap is the terminator here and
+/// never the failure itself.
+///
+/// A `const`, so an invalid code would be a compile error in this
+/// compiler rather than anything a Napitia program could reach.
+const UNREACHABLE_AFTER_EXIT: TrapCode = TrapCode::unwrap_user(1);
+
 /// A native value, or the deliberate absence of one.
 #[derive(Copy, Clone, Debug)]
 enum Native {
-    /// An `i64`, held in an `I128` so that every accepted operator
-    /// agrees with the interpreter's own `i128` arithmetic exactly.
+    /// An `i64`, held in an `I64` (`rfcs/0015`).
     Int(Value),
     /// A `bool`, held in an `I8` that is always `0` or `1`.
     Bool(Value),
@@ -99,10 +109,6 @@ pub(super) fn emit_object(
     // interpreter meaningful.
     set_flag(&mut flags, "opt_level", "none")?;
     set_flag(&mut flags, "is_pic", "true")?;
-    // Without this, Cranelift's x86-64 ABI refuses `I128` in a
-    // parameter or a result -- and `I128` is exactly how this backend
-    // represents `i64` (see `super::Scalar`).
-    set_flag(&mut flags, "enable_llvm_abi_extensions", "true")?;
 
     // Parsed here rather than through `isa::lookup_by_name`, which
     // panics on a triple it cannot parse.
@@ -119,6 +125,12 @@ pub(super) fn emit_object(
 
     let functions = index_functions(module, plan);
 
+    let mut context = object.make_context();
+    let mut frontend = FunctionBuilderContext::new();
+    // Emitted before anything that branches to it, so a checked
+    // operation always has a failure path to name.
+    let runtime = define_runtime(&mut object, &mut context, &mut frontend, frontend_config)?;
+
     // Every function is declared before any body is emitted, so a call
     // never has to care whether its callee has been compiled yet.
     let mut declared: BTreeMap<ItemId, FuncId> = BTreeMap::new();
@@ -132,8 +144,6 @@ pub(super) fn emit_object(
         declared.insert(*id, func_id);
     }
 
-    let mut context = object.make_context();
-    let mut frontend = FunctionBuilderContext::new();
     for id in plan.functions() {
         let function = lookup(&functions, *id)?;
         let reachable = plan
@@ -147,6 +157,7 @@ pub(super) fn emit_object(
             frontend_config,
             &declared,
             &functions,
+            &runtime,
             function,
             reachable,
         )?;
@@ -173,6 +184,158 @@ pub(super) fn emit_object(
         .finish()
         .emit()
         .map_err(|error| format!("could not write the object file: {error}"))
+}
+
+/// The internal runtime this backend emits beside the program: the
+/// deterministic failure path a checked operation branches to
+/// (`rfcs/0015`).
+///
+/// It is genuinely internal. Every symbol in it is `Linkage::Local`, no
+/// Napitia code can name one, and it exists only because a native
+/// executable has nowhere else to report a failure to. There is no
+/// runtime library to link against and no interpreter behind it.
+struct RuntimeFailures {
+    /// One handler per operation that can overflow, so the message is a
+    /// constant rather than something selected at run time -- no
+    /// branching, no table lookup, and one relocation per operation.
+    handlers: BTreeMap<IntOp, FuncId>,
+}
+
+impl RuntimeFailures {
+    fn handler(&self, op: IntOp) -> Result<FuncId, String> {
+        self.handlers.get(&op).copied().ok_or_else(|| {
+            format!(
+                "no runtime failure handler was emitted for `{}`",
+                op.as_str()
+            )
+        })
+    }
+}
+
+/// The operations this backend checks. `div`, `rem`, `shl` and `shr`
+/// are not here because the capability validator refuses them before
+/// code generation (they are interpreter-only in this milestone), and
+/// every other accepted operator -- the comparisons, the bitwise
+/// operations, `not` -- cannot leave the domain at all.
+const CHECKED: [IntOp; 4] = [IntOp::Add, IntOp::Sub, IntOp::Mul, IntOp::Neg];
+
+/// The status a Napitia runtime failure exits with.
+///
+/// One number, chosen once (`rfcs/0015`). It cannot be a status no
+/// successful program produces, because a built executable's status is
+/// the low 8 bits of whatever `main` returned and every byte is
+/// reachable that way. The discriminator is standard error: a
+/// successful run writes nothing there, and a failure writes exactly
+/// one line.
+const RUNTIME_FAILURE_STATUS: i64 = 70;
+
+/// The file descriptor a failure reports on.
+const STDERR: i64 = 2;
+
+/// The exact bytes a native runtime failure writes.
+///
+/// The tail is [`ArithFailure`]'s own rendering -- the same text
+/// `napitia run` prints for the same failure -- prefixed so a reader
+/// can tell the executable itself is speaking rather than the compiler.
+fn failure_message(op: IntOp) -> String {
+    let failure = ArithFailure::Overflow(op);
+    format!("napitia: error[{}]: {failure}\n", failure.code())
+}
+
+/// Emits one failure handler per checked operation.
+///
+/// Each is `fn() -> ()` and never returns: it writes its own fixed
+/// message to standard error and calls `exit`. Emitting one per
+/// operation rather than one that selects a message keeps the generated
+/// code branchless and the message a plain relocation.
+fn define_runtime(
+    object: &mut ObjectModule,
+    context: &mut Context,
+    frontend: &mut FunctionBuilderContext,
+    frontend_config: isa::TargetFrontendConfig,
+) -> Result<RuntimeFailures, String> {
+    let pointer = object.target_config().pointer_type();
+
+    // `write` and `exit` are the two libc entry points this runtime
+    // needs. They are imported, not defined: the executable is linked
+    // against the system C runtime already, because that is what
+    // provides the `main` the entry wrapper exports.
+    let mut write_signature = object.make_signature();
+    write_signature.params.push(AbiParam::new(types::I32));
+    write_signature.params.push(AbiParam::new(pointer));
+    write_signature.params.push(AbiParam::new(pointer));
+    write_signature.returns.push(AbiParam::new(pointer));
+    let write = object
+        .declare_function("write", Linkage::Import, &write_signature)
+        .map_err(|error| format!("could not declare `write`: {error}"))?;
+
+    let mut exit_signature = object.make_signature();
+    exit_signature.params.push(AbiParam::new(types::I32));
+    let exit = object
+        .declare_function("exit", Linkage::Import, &exit_signature)
+        .map_err(|error| format!("could not declare `exit`: {error}"))?;
+
+    let mut handlers = BTreeMap::new();
+    for op in CHECKED {
+        let message = failure_message(op);
+        let bytes = message.as_bytes();
+
+        let data_symbol = format!("napitia_failure_text_{}", op.as_str());
+        let data_id = object
+            .declare_data(&data_symbol, Linkage::Local, false, false)
+            .map_err(|error| format!("could not declare `{data_symbol}`: {error}"))?;
+        let mut description = DataDescription::new();
+        description.define(bytes.to_vec().into_boxed_slice());
+        object
+            .define_data(data_id, &description)
+            .map_err(|error| format!("could not define `{data_symbol}`: {error}"))?;
+
+        let symbol = format!("napitia_fail_{}", op.as_str());
+        let signature = object.make_signature();
+        context.func.signature = signature.clone();
+        let func_id = object
+            .declare_function(&symbol, Linkage::Local, &signature)
+            .map_err(|error| format!("could not declare `{symbol}`: {error}"))?;
+
+        {
+            let mut builder = FunctionBuilder::new(&mut context.func, frontend);
+            let block = builder.create_block();
+            builder.switch_to_block(block);
+
+            let text = object.declare_data_in_func(data_id, builder.func);
+            let address = builder.ins().symbol_value(pointer, text);
+            let descriptor = builder.ins().iconst(types::I32, STDERR);
+            let length = builder.ins().iconst(pointer, bytes.len() as i64);
+            let write_ref = object.declare_func_in_func(write, builder.func);
+            // The result is deliberately ignored. A failure that cannot
+            // even be written has nothing better to try, and retrying
+            // would make the exit status depend on whether standard
+            // error happened to be open.
+            builder
+                .ins()
+                .call(write_ref, &[descriptor, address, length]);
+
+            let status = builder.ins().iconst(types::I32, RUNTIME_FAILURE_STATUS);
+            let exit_ref = object.declare_func_in_func(exit, builder.func);
+            builder.ins().call(exit_ref, &[status]);
+            // `exit` does not return, but Cranelift does not know that
+            // and a block needs a terminator. Returning is the honest
+            // one here: this function's own signature says it returns
+            // nothing, and no value is fabricated.
+            builder.ins().return_(&[]);
+
+            builder.seal_all_blocks();
+            builder.finalize(frontend_config);
+        }
+
+        object
+            .define_function(func_id, context)
+            .map_err(|error| format!("Cranelift rejected `{symbol}`: {error}"))?;
+        object.clear_context(context);
+        handlers.insert(op, func_id);
+    }
+
+    Ok(RuntimeFailures { handlers })
 }
 
 fn set_flag(flags: &mut settings::Builder, name: &str, value: &str) -> Result<(), String> {
@@ -228,7 +391,7 @@ fn lookup<'a>(
 /// which occupies no ABI position at all.
 fn abi_type(scalar: Scalar) -> Option<types::Type> {
     match scalar {
-        Scalar::Int => Some(types::I128),
+        Scalar::Int => Some(types::I64),
         Scalar::Bool => Some(types::I8),
         Scalar::Unit => None,
     }
@@ -339,6 +502,7 @@ fn define_body(
     frontend_config: isa::TargetFrontendConfig,
     declared: &BTreeMap<ItemId, FuncId>,
     functions: &BTreeMap<ItemId, &Function>,
+    runtime: &RuntimeFailures,
     function: &Function,
     reachable: &[BlockId],
 ) -> Result<(), String> {
@@ -368,6 +532,7 @@ fn define_body(
         object,
         declared,
         functions,
+        runtime,
         values: BTreeMap::new(),
         blocks: cranelift_blocks,
     };
@@ -399,6 +564,7 @@ struct BodyLowerer<'a, 'f> {
     object: &'a mut ObjectModule,
     declared: &'a BTreeMap<ItemId, FuncId>,
     functions: &'a BTreeMap<ItemId, &'a Function>,
+    runtime: &'a RuntimeFailures,
     values: BTreeMap<ValueId, Native>,
     blocks: BTreeMap<BlockId, Block>,
 }
@@ -467,12 +633,8 @@ impl BodyLowerer<'_, '_> {
         }
     }
 
-    /// An `i128` literal, built from its two halves: Cranelift has no
-    /// 128-bit `iconst`.
-    fn int_const(&mut self, bits: i128) -> Value {
-        let low = self.builder.ins().iconst(types::I64, bits as i64);
-        let high = self.builder.ins().iconst(types::I64, (bits >> 64) as i64);
-        self.builder.ins().iconcat(low, high)
+    fn int_const(&mut self, bits: i64) -> Value {
+        self.builder.ins().iconst(types::I64, bits)
     }
 
     fn bool_const(&mut self, literal: bool) -> Value {
@@ -538,10 +700,17 @@ impl BodyLowerer<'_, '_> {
                 Ok(Native::Slot { variable, scalar })
             }
             ValueKind::Const(constant) => match constant {
-                // Exactly the interpreter's own conversion
-                // (`Value::Int(*v as i128)`), so a literal means the
-                // same number in both execution paths.
-                Const::Int(literal) => Ok(Native::Int(self.int_const(*literal as i128))),
+                // Narrowed through a checked conversion, exactly as the
+                // interpreter narrows the same constant. `nir::verify`
+                // has already rejected one outside `i64`, so this only
+                // ever guards a caller that reached code generation
+                // another way.
+                Const::Int(literal) => {
+                    let bits = i64::try_from(*literal).map_err(|_| {
+                        format!("the constant {literal} is not an i64; verification must reject it before code generation")
+                    })?;
+                    Ok(Native::Int(self.int_const(bits)))
+                }
                 Const::Bool(literal) => Ok(Native::Bool(self.bool_const(*literal))),
                 Const::Unit => Ok(Native::Unit),
                 Const::Float(_) | Const::Char(_) | Const::Str(_) => {
@@ -560,15 +729,9 @@ impl BodyLowerer<'_, '_> {
                     }
                 }
             }
-            ValueKind::Add(a, b) => {
-                self.arithmetic(*a, *b, |builder, x, y| builder.ins().iadd(x, y))
-            }
-            ValueKind::Sub(a, b) => {
-                self.arithmetic(*a, *b, |builder, x, y| builder.ins().isub(x, y))
-            }
-            ValueKind::Mul(a, b) => {
-                self.arithmetic(*a, *b, |builder, x, y| builder.ins().imul(x, y))
-            }
+            ValueKind::Add(a, b) => self.checked_binary(IntOp::Add, *a, *b),
+            ValueKind::Sub(a, b) => self.checked_binary(IntOp::Sub, *a, *b),
+            ValueKind::Mul(a, b) => self.checked_binary(IntOp::Mul, *a, *b),
             ValueKind::And(a, b) => {
                 self.arithmetic(*a, *b, |builder, x, y| builder.ins().band(x, y))
             }
@@ -578,7 +741,13 @@ impl BodyLowerer<'_, '_> {
             }
             ValueKind::Neg(a) => {
                 let value = self.integer(*a)?;
-                Ok(Native::Int(self.builder.ins().ineg(value)))
+                let result = self.builder.ins().ineg(value);
+                // The minimum is the one value whose negation is not an
+                // `i64`, and `ineg` of it quietly produces the minimum
+                // again.
+                let overflowed = self.builder.ins().icmp_imm_s(IntCC::Equal, value, i64::MIN);
+                self.guard(IntOp::Neg, overflowed)?;
+                Ok(Native::Int(result))
             }
             ValueKind::Not(a) => match self.value(*a)? {
                 Native::Int(value) => Ok(Native::Int(self.builder.ins().bnot(value))),
@@ -624,6 +793,96 @@ impl BodyLowerer<'_, '_> {
                 Err("capability validation let an unsupported instruction through".to_string())
             }
         }
+    }
+
+    /// One checked integer operation: the arithmetic, an explicit
+    /// signed-overflow test, and a branch to the failure path
+    /// (`rfcs/0015`).
+    ///
+    /// The tests are the ordinary two's-complement ones, and they state
+    /// in machine terms exactly what [`crate::types::numeric`] states in
+    /// Rust. That is the one rule in this compiler written down twice,
+    /// unavoidably: a backend emits code rather than running it. The
+    /// differential tests between `napitia run` and a built executable
+    /// are what keep the two statements honest.
+    fn checked_binary(&mut self, op: IntOp, a: ValueId, b: ValueId) -> Result<Native, String> {
+        let left = self.integer(a)?;
+        let right = self.integer(b)?;
+        let (result, overflowed) = match op {
+            IntOp::Add => {
+                let result = self.builder.ins().iadd(left, right);
+                // Two operands of the same sign producing a result of
+                // the other sign is the only way an addition leaves the
+                // domain.
+                let from_left = self.builder.ins().bxor(left, result);
+                let from_right = self.builder.ins().bxor(right, result);
+                let both = self.builder.ins().band(from_left, from_right);
+                (
+                    result,
+                    self.builder
+                        .ins()
+                        .icmp_imm_s(IntCC::SignedLessThan, both, 0i64),
+                )
+            }
+            IntOp::Sub => {
+                let result = self.builder.ins().isub(left, right);
+                // Operands of differing signs producing a result whose
+                // sign differs from the one it was subtracted from.
+                let operands = self.builder.ins().bxor(left, right);
+                let from_left = self.builder.ins().bxor(left, result);
+                let both = self.builder.ins().band(operands, from_left);
+                (
+                    result,
+                    self.builder
+                        .ins()
+                        .icmp_imm_s(IntCC::SignedLessThan, both, 0i64),
+                )
+            }
+            IntOp::Mul => {
+                let result = self.builder.ins().imul(left, right);
+                // The exact 128-bit product fits in 64 bits precisely
+                // when its high half is the sign extension of its low
+                // half.
+                let high = self.builder.ins().smulhi(left, right);
+                let sign = self.builder.ins().sshr_imm_s(result, 63i64);
+                (result, self.builder.ins().icmp(IntCC::NotEqual, high, sign))
+            }
+            IntOp::Neg | IntOp::Div | IntOp::Rem | IntOp::Shl | IntOp::Shr => {
+                return Err(format!(
+                    "`{}` is not a checked binary operation in this backend",
+                    op.as_str()
+                ));
+            }
+        };
+        self.guard(op, overflowed)?;
+        Ok(Native::Int(result))
+    }
+
+    /// Branches to `op`'s failure handler when `overflowed` holds, and
+    /// continues in a fresh block when it does not.
+    ///
+    /// The failure block ends in a trap, and that trap is unreachable by
+    /// construction: the handler writes the diagnostic and calls `exit`,
+    /// so control never comes back from it. The trap is a block
+    /// terminator, not the failure mechanism. Nothing about what this
+    /// program means depends on what a trap does, and no hardware
+    /// condition is being presented as a language rule -- the failure
+    /// has already been fully delivered, in words, before it.
+    fn guard(&mut self, op: IntOp, overflowed: Value) -> Result<(), String> {
+        let failed = self.builder.create_block();
+        let continued = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(overflowed, failed, &[], continued, &[]);
+
+        self.builder.switch_to_block(failed);
+        let handler = self.runtime.handler(op)?;
+        let handler_ref = self.object.declare_func_in_func(handler, self.builder.func);
+        self.builder.ins().call(handler_ref, &[]);
+        self.builder.ins().trap(UNREACHABLE_AFTER_EXIT);
+
+        self.builder.switch_to_block(continued);
+        Ok(())
     }
 
     fn arithmetic(
@@ -780,7 +1039,7 @@ impl BodyLowerer<'_, '_> {
 /// * `main() -> i64` hands back the low 32 bits of the returned value
 ///   as the C `int` result, which the kernel then reports to a waiting
 ///   parent as its low 8 bits -- so the observable exit status is the
-///   Napitia value taken modulo 256.
+///   Napitia value taken modulo 256 (`rfcs/0015`).
 fn define_entry_wrapper(
     object: &mut ObjectModule,
     context: &mut Context,
@@ -815,8 +1074,7 @@ fn define_entry_wrapper(
                     .first()
                     .copied()
                     .ok_or_else(|| "`main` returned nothing".to_string())?;
-                let (low, _high) = builder.ins().isplit(result);
-                builder.ins().ireduce(types::I32, low)
+                builder.ins().ireduce(types::I32, result)
             }
             Scalar::Bool => {
                 return Err("`main` may only return `i64` or `unit`".to_string());
@@ -1014,6 +1272,274 @@ mod tests {
         };
         assert!(contains(ENTRY_SYMBOL));
         assert!(contains("napitia_"), "internal symbols stay mangled");
+    }
+
+    // -- the internal runtime ----------------------------------------------
+
+    /// Object generation is host-independent, so the failure path can be
+    /// inspected anywhere -- including on a host that could never link
+    /// or run the result.
+    fn object_contains(object: &[u8], needle: &str) -> bool {
+        object
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    #[test]
+    fn every_checked_operation_gets_its_own_handler_and_its_own_message() {
+        let built = build(SCALAR_PROGRAM);
+        for op in CHECKED {
+            assert!(
+                object_contains(&built.object, &format!("napitia_fail_{}", op.as_str())),
+                "`{}` must have a failure handler in the object",
+                op.as_str()
+            );
+            let message = failure_message(op);
+            assert!(
+                object_contains(&built.object, message.trim_end()),
+                "`{}`'s message must be in the object as bytes: {message:?}",
+                op.as_str()
+            );
+        }
+    }
+
+    /// The words an executable reports are the words `napitia run`
+    /// reports. Read from the same table, never copied.
+    #[test]
+    fn a_failure_message_is_the_shared_rendering_with_this_backends_prefix() {
+        for op in CHECKED {
+            let failure = ArithFailure::Overflow(op);
+            assert_eq!(
+                failure_message(op),
+                format!("napitia: error[{}]: {failure}\n", failure.code())
+            );
+            assert!(failure_message(op).ends_with('\n'), "one complete line");
+        }
+        assert_eq!(
+            failure_message(IntOp::Add),
+            "napitia: error[X0002]: integer overflow in `add`\n"
+        );
+    }
+
+    /// The four operators the capability validator refuses have no
+    /// handler, because no code can branch to one.
+    #[test]
+    fn the_operators_outside_the_subset_have_no_failure_handler() {
+        let built = build(SCALAR_PROGRAM);
+        for op in [IntOp::Div, IntOp::Rem, IntOp::Shl, IntOp::Shr] {
+            assert!(
+                !object_contains(&built.object, &format!("napitia_fail_{}", op.as_str())),
+                "`{}` is refused before code generation, so it needs no handler",
+                op.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_runtime_imports_exactly_the_two_libc_entry_points_it_uses() {
+        let built = build(SCALAR_PROGRAM);
+        assert!(object_contains(&built.object, "write"));
+        assert!(object_contains(&built.object, "exit"));
+    }
+
+    /// The exit status is part of the documented contract, not an
+    /// implementation detail to be changed quietly.
+    #[test]
+    fn the_runtime_failure_status_is_the_one_the_rfc_documents() {
+        assert_eq!(RUNTIME_FAILURE_STATUS, 70);
+        assert_eq!(STDERR, 2);
+    }
+
+    /// The Cranelift IR one function lowers to, as text.
+    ///
+    /// Emitted bytes prove the handlers *exist*; they cannot show that
+    /// anything branches to one, because every handler is emitted
+    /// whether or not the program uses it. The IR shows the branch
+    /// itself, and can be read on a host that could never run the
+    /// result.
+    fn lowered_ir(text: &str, function_name: &str) -> (String, RuntimeFailures) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("native.npt", text);
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, registry } = driver::ir(&map, source, &mut interner) else {
+            panic!("the fixture must compile")
+        };
+        let plan = capability::validate(&nir, source, &interner, &registry, TARGET_TRIPLE, &[])
+            .expect("the fixture is inside the native subset");
+
+        let mut flags = settings::builder();
+        set_flag(&mut flags, "opt_level", "none").expect("a known flag");
+        set_flag(&mut flags, "is_pic", "true").expect("a known flag");
+        let isa =
+            isa::lookup(target_lexicon::Triple::from_str(TARGET_TRIPLE).expect("a real triple"))
+                .expect("a backend for the one target")
+                .finish(settings::Flags::new(flags))
+                .expect("a configurable backend");
+        let frontend_config = isa.frontend_config();
+        let builder =
+            ObjectBuilder::new(isa, OBJECT_NAME, cranelift_module::default_libcall_names())
+                .expect("an object builder");
+        let mut object = ObjectModule::new(builder);
+
+        let functions = index_functions(&nir, &plan);
+        let mut context = object.make_context();
+        let mut frontend = FunctionBuilderContext::new();
+        let runtime = define_runtime(&mut object, &mut context, &mut frontend, frontend_config)
+            .expect("the runtime is emitted");
+
+        let mut declared: BTreeMap<ItemId, FuncId> = BTreeMap::new();
+        for id in plan.functions() {
+            let function = lookup(&functions, *id).expect("a planned function");
+            let signature = native_signature(&mut object, function).expect("a native signature");
+            let symbol = symbol_name(*id, interner.resolve(function.name));
+            declared.insert(
+                *id,
+                object
+                    .declare_function(&symbol, Linkage::Local, &signature)
+                    .expect("a declarable function"),
+            );
+        }
+
+        for id in plan.functions() {
+            let function = lookup(&functions, *id).expect("a planned function");
+            if interner.resolve(function.name) != function_name {
+                continue;
+            }
+            let reachable = plan.reachable_blocks(*id).expect("a block plan");
+            context.func.signature =
+                native_signature(&mut object, function).expect("a native signature");
+            define_body(
+                &mut object,
+                &mut context,
+                &mut frontend,
+                frontend_config,
+                &declared,
+                &functions,
+                &runtime,
+                function,
+                reachable,
+            )
+            .expect("the body lowers");
+            return (context.func.display().to_string(), runtime);
+        }
+        panic!("`{function_name}` is not in the plan")
+    }
+
+    /// How Cranelift's own text names a declared function: the module's
+    /// namespace and the declaration's index. The handler's symbol name
+    /// does not appear in the IR, so this is what a reference to it
+    /// looks like.
+    fn reference_to(runtime: &RuntimeFailures, op: IntOp) -> String {
+        format!(
+            "u0:{}",
+            runtime
+                .handler(op)
+                .expect("a handler for a checked op")
+                .as_u32()
+        )
+    }
+
+    #[test]
+    fn a_checked_operation_branches_to_its_own_failure_handler() {
+        for (operator, op) in [
+            ("a + b", IntOp::Add),
+            ("a - b", IntOp::Sub),
+            ("a * b", IntOp::Mul),
+        ] {
+            let (ir, runtime) = lowered_ir(
+                &format!(
+                    "func work(a: i64, b: i64) -> i64 {{ return {operator}; }} \
+                     func main() -> i64 {{ return work(1, 2); }}"
+                ),
+                "work",
+            );
+            assert!(
+                ir.contains("brif"),
+                "`{operator}` must branch on its own overflow test:\n{ir}"
+            );
+            assert!(
+                ir.contains(&reference_to(&runtime, op)),
+                "`{operator}` must reach `{}`'s handler and no other:\n{ir}",
+                op.as_str()
+            );
+            for other in CHECKED.iter().filter(|other| **other != op) {
+                assert!(
+                    !ir.contains(&reference_to(&runtime, *other)),
+                    "`{operator}` must not reach `{}`'s handler:\n{ir}",
+                    other.as_str()
+                );
+            }
+            assert!(
+                ir.contains("trap"),
+                "the failure block is terminated after the handler call:\n{ir}"
+            );
+        }
+    }
+
+    #[test]
+    fn negation_branches_to_the_negation_handler_on_the_minimum_alone() {
+        let (ir, runtime) = lowered_ir(
+            "func work(a: i64) -> i64 { return -a; } \
+             func main() -> i64 { return work(1); }",
+            "work",
+        );
+        assert!(ir.contains("brif"), "{ir}");
+        assert!(ir.contains(&reference_to(&runtime, IntOp::Neg)), "{ir}");
+        assert!(
+            ir.contains("-9223372036854775808"),
+            "the test compares against the one value whose negation is not an i64:\n{ir}"
+        );
+    }
+
+    /// An operator with no exceptional case gets no test, no branch and
+    /// no trap.
+    #[test]
+    fn an_operator_that_cannot_leave_the_domain_gets_no_failure_branch() {
+        for (operator, returns, entry) in [
+            ("a & b", "i64", "return work(1, 2);"),
+            ("a | b", "i64", "return work(1, 2);"),
+            ("a ^ b", "i64", "return work(1, 2);"),
+            ("~a", "i64", "return work(1, 2);"),
+            ("a < b", "bool", "if work(1, 2) { return 1; } return 0;"),
+            ("a == b", "bool", "if work(1, 2) { return 1; } return 0;"),
+        ] {
+            let (ir, runtime) = lowered_ir(
+                &format!(
+                    "func work(a: i64, b: i64) -> {returns} {{ return {operator}; }} \
+                     func main() -> i64 {{ {entry} }}"
+                ),
+                "work",
+            );
+            assert!(
+                !ir.contains("trap"),
+                "`{operator}` cannot leave the domain, so it needs no failure path:\n{ir}"
+            );
+            for op in CHECKED {
+                assert!(
+                    !ir.contains(&reference_to(&runtime, op)),
+                    "`{operator}` must reach no handler at all:\n{ir}"
+                );
+            }
+        }
+    }
+
+    /// Every value in the generated IR is 64 bits wide, not 128.
+    #[test]
+    fn an_i64_is_lowered_as_a_64_bit_value() {
+        let (ir, _) = lowered_ir(
+            "func work(a: i64, b: i64) -> i64 { return a + b; } \
+             func main() -> i64 { return work(1, 2); }",
+            "work",
+        );
+        assert!(ir.contains("i64"), "{ir}");
+        assert!(
+            !ir.contains("i128"),
+            "nothing is held in a 128-bit value any more:\n{ir}"
+        );
+        assert!(
+            !ir.contains("isplit") && !ir.contains("iconcat"),
+            "and nothing is assembled out of two halves any more:\n{ir}"
+        );
     }
 
     // -- the backend refuses rather than panics ----------------------------

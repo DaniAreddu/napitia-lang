@@ -112,6 +112,45 @@ have caught instead. Where the type system *can* catch a failure mode
 statically (e.g. calling with the wrong argument count), it does, and no
 `raises` declaration is needed at all.
 
+Integer overflow is the first of those conditions to be *implemented*
+(Alpha 0.2.1, `rfcs/0015`). `add`, `sub`, `mul`, `neg`, a zero divisor
+and `i64::MIN / -1` on `i64` produce a runtime failure rather than a
+value. It is unrecoverable exactly as described above: no `raises`
+clause models it, `?` cannot propagate it and `handle` cannot catch it.
+
+Of those, `add`, `sub`, `mul` and `neg` behave identically in the
+interpreter and in a natively built executable. `div`, `rem` and the
+shifts are interpreter-only — the native backend refuses a program
+containing one (`A0009`) rather than compiling it, so there is no
+native behaviour for them to agree with.
+
+It is also a **fatal abort**, and that is a stronger statement than
+"unrecoverable". It is not a control-flow exit at all: execution stops
+at the failing operation, no later statement runs, no `defer` action
+runs, and no `drop` after it runs. A resource that was live is not
+destroyed, and nothing claims it was. `rfcs/0011`'s guarantee that every
+owned resource is destroyed on every exit path is about Napitia
+*control-flow* exits — fallthrough, `return`, `break`, `continue`,
+`raise`, `?` and `handle` — and a fatal abort is its one documented
+exception.
+
+"Unrecoverable" is not "unstructured". The failure carries a stable code
+in its own `X` namespace, renders as one deterministic line, and stops
+the program with a documented status — never a Rust panic, never a
+backtrace, and never a raw hardware signal presented as a language rule.
+Arithmetic failures are `X0001`, `X0002` and `X0003`; `X0004` is a
+different thing entirely — malformed or unverified NIR, or an invalid
+operation on the execution engine — and a valid program never produces
+one. `rfcs/0015` specifies the codes, the rendering and the status.
+
+Aborting also ends the execution context it happened in: the state it
+left is the middle of a statement, so nothing is executed against it
+again, and a later attempt is refused as an invalid engine operation
+rather than by repeating the original failure. That applies to any
+failure a running frame produces, not only an arithmetic one. A refusal
+decided before a frame is entered — an unknown function, say — changes
+nothing and leaves the engine usable.
+
 ## Unresolved research questions
 
 - **Resolved by `rfcs/0010` (Alpha 0.1.6):** `raises` is checked

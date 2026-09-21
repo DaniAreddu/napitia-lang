@@ -18,7 +18,22 @@ pub type FunctionRef = ItemId;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Const {
-    Int(u128),
+    /// A typed integer constant: the exact mathematical value, not a bit
+    /// pattern and not a magnitude (`rfcs/0015`).
+    ///
+    /// Signed, because `-9223372036854775808` has to be *one* constant.
+    /// A magnitude plus a `neg` cannot express it: the magnitude
+    /// `9223372036854775808` is not a value of `i64` at all, so the
+    /// intermediate step could never exist.
+    ///
+    /// Wider than any integer type Napitia executes, because NIR is
+    /// hand-buildable and its constants therefore arrive unvalidated.
+    /// [`crate::nir::verify_module`] is what checks this value against
+    /// the domain of the instruction's own result type, and a payload
+    /// narrow enough to make an out-of-range constant unrepresentable
+    /// would leave the verifier nothing to reject. Nothing downstream of
+    /// verification ever sees a value outside `i64`.
+    Int(i128),
     Float(f64),
     Bool(bool),
     Char(char),

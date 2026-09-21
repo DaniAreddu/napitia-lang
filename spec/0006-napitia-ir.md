@@ -50,6 +50,22 @@ value is a real, typed value, not an absence of one.
   instruction (an integer, float, bool, or char literal folded in from
   HIR).
 
+  An integer constant carries the exact mathematical value it denotes,
+  signed, *not* the magnitude the source wrote and not a bit pattern.
+  That is what lets `const.i64 -9223372036854775808` exist at all: its
+  magnitude is one past the maximum, so it can never be a positive
+  value of its own type that a later `neg` turns negative. Lowering
+  therefore folds a negation applied directly to an integer literal into
+  a single constant.
+
+  The value is carried in a representation wider than any integer type
+  Napitia executes. NIR is hand-buildable and its constants arrive
+  unvalidated, so verification is the stage that decides a constant is a
+  valid value of its declared type; a representation that could not hold
+  an out-of-range constant would leave verification nothing to reject.
+  Nothing downstream of verification ever sees a value outside `i64`
+  (`rfcs/0015`).
+
 ### Instructions implemented
 
 ```text
@@ -494,6 +510,24 @@ lowerer, and re-derives every invariant from the `Module` value itself:
   conditions are `bool`, returned values match the declared return
   type, instruction operand/result types agree, and no unresolved type
   variable or `Ty::Error` survives into executable NIR.
+- **Numeric domains** (Alpha 0.2.1, `rfcs/0015`): an integer constant's
+  *value* is checked against the domain of the type its own instruction
+  declares, not merely against "is this an integer type"; and no numeric
+  type this milestone does not execute — any integer width other than
+  `i64`, any unsigned width, `f32` — may appear anywhere in NIR,
+  including nested inside a generic argument. The second rule is what
+  "operands of incompatible widths or signedness" reduces to while
+  exactly one integer width exists: there is no second width for an
+  operand to disagree about.
+
+  Verification is not the only guard. NIR is hand-buildable and can be
+  handed straight to the interpreter, so the interpreter enforces the
+  same rule again while executing: a runtime integer is a value of
+  `i64` and nothing else, a runtime float is a value of `f64` and
+  nothing else, and an instruction's declared result type is checked
+  *before* the instruction runs as well as against the value it
+  produced. A caller that skips verification gets a structured refusal
+  (`X0004`), never arithmetic performed under the wrong type's name.
 - **Aggregates** (Alpha 0.1.1): `record.create`/`variant.create`
   reference a declared record/variant and initialize every field/match
   their case's payload arity and types exactly once each;

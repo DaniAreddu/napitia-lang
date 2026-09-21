@@ -1,0 +1,52 @@
+// The `i64` contract at its edges (`rfcs/0015`). Inside the native
+// subset, so both execution paths must reach the same answer:
+//
+//   napitia run   examples/numeric_boundaries.npt        -> 42
+//   napitia build examples/numeric_boundaries.npt --output boundaries
+//   ./boundaries; echo $?                                -> 42
+//
+// Every number below is exact in 64 bits and in nothing narrower, and
+// `-9223372036854775808` is a literal the compiler accepts while
+// `9223372036854775808` is not -- the minimum has no positive form.
+
+func main() -> i64 {
+    value lowest: i64 = -9223372036854775808;
+    value highest: i64 = 9223372036854775807;
+
+    // Arithmetic that reaches an edge without leaving it. A wider
+    // representation would agree here; a narrower one would not.
+    if lowest + 1 != -9223372036854775807 { return 1; }
+    if highest - 1 != 9223372036854775806 { return 2; }
+    if lowest + highest != -1 { return 3; }
+
+    // Ordering is signed across the sign boundary, not unsigned over
+    // the same bits.
+    if lowest >= 0 { return 4; }
+    if highest <= 0 { return 5; }
+    if lowest >= highest { return 6; }
+
+    // Bitwise work on the high bit, which is the sign bit.
+    if (lowest & highest) != 0 { return 7; }
+    if (lowest | highest) != -1 { return 8; }
+    if (lowest ^ highest) != -1 { return 9; }
+    if ~highest != lowest { return 10; }
+
+    // Both boundaries survive a call, in and back out again.
+    if echo(lowest) != lowest { return 11; }
+    if echo(highest) != highest { return 12; }
+
+    // And a mutable slot carried through a loop.
+    mutable counted: i64 = lowest;
+    mutable step: i64 = 0;
+    while step < 3 {
+        counted = counted + 1;
+        step = step + 1;
+    }
+    if counted != -9223372036854775805 { return 13; }
+
+    return 42;
+}
+
+func echo(n: i64) -> i64 {
+    return n;
+}

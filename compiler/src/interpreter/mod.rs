@@ -2,13 +2,24 @@
 //! (`spec/0006`), used to validate language semantics before any native
 //! backend exists.
 //!
-//! Every runtime value is represented uniformly as an `i128`/`f64` pair
-//! of kinds regardless of its declared width (`i8` and `i64` both
-//! execute as `Value::Int`); this milestone does not model
-//! width-specific overflow or truncation behavior. Integer arithmetic
-//! wraps on overflow (`wrapping_add` etc.) rather than panicking, since
-//! Rust's debug-mode overflow checks would otherwise crash the
-//! interpreter on ordinary, valid Napitia programs.
+//! # Numbers
+//!
+//! A Napitia `i64` executes as exactly one thing here: a Rust `i64`
+//! (`rfcs/0015`). There is no wider intermediate representation, and no
+//! type whose declared width and executed width differ -- `i64` is the
+//! only integer type NIR carries, because the checker refuses the others
+//! and the verifier refuses them again.
+//!
+//! Its arithmetic is checked. `add`, `sub`, `mul`, `neg` and the
+//! `i64::MIN / -1` case produce a structured [`InterpreterError`] when
+//! the exact mathematical result is outside the domain, never a wrapped
+//! or saturated value. The rules themselves live in
+//! [`crate::types::numeric`], which is also where the checker reads them
+//! from, so nothing here restates what an overflow is.
+//!
+//! No Napitia arithmetic is performed by a bare Rust operator, so how
+//! *this compiler* was built -- debug or release, overflow checks on or
+//! off -- cannot change what a Napitia program means.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -18,7 +29,8 @@ use crate::hir::ItemId;
 use crate::nir::{Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind};
 use crate::place::{Place, Projection};
 use crate::symbol::Interner;
-use crate::types::{Evidence, Ty};
+use crate::types::numeric;
+use crate::types::{ArithFailure, Evidence, Ty};
 
 /// A resource record's own identity within one [`Interpreter`]'s own
 /// runtime resource table (`rfcs/0011`, Blocker 8): the table index it
@@ -706,7 +718,10 @@ struct StorePlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Int(i128),
+    /// A Napitia `i64`, and exactly 64 bits of one (`rfcs/0015`). Not a
+    /// wider carrier wearing an `i64` label: every operation below is
+    /// defined on this domain and refuses to leave it.
+    Int(i64),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -771,18 +786,60 @@ pub enum Value {
     Dropped,
 }
 
-/// A condition the interpreter detects and reports instead of crashing:
-/// division/remainder by zero, or an internal-invariant violation (a
+/// Stable codes for the conditions that stop execution (`rfcs/0015`).
+///
+/// Owned by [`crate::types::numeric`], with the rules they describe, and
+/// re-exported here because this is where most callers meet them. The
+/// native backend reads the same table: an executable it emits must
+/// report a failure in exactly the words `napitia run` would.
+pub use crate::types::numeric::codes;
+
+/// A condition the interpreter detects and reports instead of crashing.
+///
+/// Two kinds, kept apart on purpose. An [`InterpreterError::Arithmetic`]
+/// is a *Napitia runtime failure*: a well-formed program asked for a
+/// result that does not exist, and `spec/0005` already reserves that as
+/// unrecoverable -- nothing in the language catches one, and it is not a
+/// `raises` value. An [`InterpreterError::InvalidOperation`] is the
+/// opposite: NIR that should never have reached execution at all (a
 /// value read before it was computed, an operator applied to
-/// incompatible value kinds, an unknown function). The latter should
-/// never happen for NIR produced by `nir::lower`, but the interpreter
-/// still returns a structured error rather than panicking or invoking
-/// undefined behavior, per the project's no-panic-on-malformed-input
-/// rule.
+/// incompatible kinds, a constant outside its own type). That cannot
+/// happen for NIR that went through `nir::verify`, and it is still
+/// returned as a structured error rather than a panic, per this
+/// project's no-panic-on-malformed-input rule.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
-    DivisionByZero,
+    /// A checked integer operation with no result in `i64`.
+    Arithmetic(ArithFailure),
     InvalidOperation(String),
+}
+
+impl InterpreterError {
+    /// This failure's stable code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            InterpreterError::Arithmetic(failure) => failure.code(),
+            InterpreterError::InvalidOperation(_) => codes::INVALID_OPERATION,
+        }
+    }
+}
+
+/// One line, decided entirely by the failure itself -- an arithmetic
+/// one renders exactly as [`ArithFailure`] does, which is the same text
+/// the native backend writes into an executable.
+impl std::fmt::Display for InterpreterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterpreterError::Arithmetic(failure) => write!(f, "{failure}"),
+            InterpreterError::InvalidOperation(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl From<ArithFailure> for InterpreterError {
+    fn from(failure: ArithFailure) -> Self {
+        InterpreterError::Arithmetic(failure)
+    }
 }
 
 /// A function frame's own two possible ways to end (`rfcs/0010`) -- never
@@ -819,6 +876,29 @@ pub struct Interpreter<'a> {
     /// recursive function exhausts the native stack and aborts the
     /// process instead of producing an error anything can report.
     call_depth: std::cell::Cell<usize>,
+    /// Whether a running frame has already failed on this interpreter
+    /// (`rfcs/0015`).
+    ///
+    /// A failure that reaches a running frame is not a Napitia
+    /// control-flow exit: it stops execution exactly where it stood.
+    /// Slots written before it keep what they hold, resources
+    /// constructed before it are still live, pending `defer` actions
+    /// never run, and no `drop` after it is reached. That is not a state
+    /// any Napitia semantics describe -- it is the middle of a statement
+    /// -- so nothing may be executed against it afterwards.
+    ///
+    /// Set for *every* error a frame returns, not only arithmetic. A
+    /// malformed instruction is often discovered after valid ones have
+    /// already run: hand-built NIR can construct a resource, write the
+    /// event log and only then reach a type this interpreter cannot
+    /// execute. That leaves exactly the same partial state an overflow
+    /// does, so it ends the context the same way.
+    ///
+    /// What does *not* set it is a refusal completed before any frame is
+    /// entered -- an unknown function or item, or an attempt to use an
+    /// interpreter already terminated. Those change nothing, so they
+    /// leave the interpreter usable.
+    terminated: std::cell::Cell<bool>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -829,7 +909,27 @@ impl<'a> Interpreter<'a> {
             #[cfg(test)]
             event_log: RefCell::new(Vec::new()),
             call_depth: std::cell::Cell::new(0),
+            terminated: std::cell::Cell::new(false),
         }
+    }
+
+    /// Refuses to start an execution on an interpreter whose previous
+    /// execution already failed.
+    ///
+    /// Reported as an invalid *operation on the engine* (`X0004`), never
+    /// as the code the original failure carried: that failure already
+    /// happened and was already reported, and repeating its code here
+    /// would claim this call performed the failing operation.
+    ///
+    /// Checked before anything else, so the refusal enters no frame,
+    /// runs no cleanup, touches no resource and appends no event.
+    fn check_not_terminated(&self) -> Result<(), InterpreterError> {
+        if self.terminated.get() {
+            return Err(invalid(
+                "this execution context ended in a failed execution and cannot be reused",
+            ));
+        }
+        Ok(())
     }
 
     /// `true` iff `item` names a declared `resource` (`rfcs/0011`) --
@@ -2254,6 +2354,14 @@ impl<'a> Interpreter<'a> {
                 "a runtime value is nested more deeply than this milestone supports",
             ));
         }
+        // Refused before the value is looked at at all: no value of any
+        // kind can satisfy a position whose declared numeric type this
+        // interpreter has no representation for (`rfcs/0015`).
+        if let Some(ty) = expected
+            && unexecutable_numeric_name(ty).is_some()
+        {
+            return Err(unexecutable_numeric(ty));
+        }
         // A tombstone stands where ownership *was*. A position that
         // never owned anything has nothing that could have moved out of
         // it, so a tombstone there is a malformed value, not an empty
@@ -2277,22 +2385,16 @@ impl<'a> Interpreter<'a> {
             }
         };
         match value {
-            Value::Int(_) => primitive_ok(matches!(
-                expected,
-                None | Some(
-                    Ty::I8
-                        | Ty::I16
-                        | Ty::I32
-                        | Ty::I64
-                        | Ty::Isize
-                        | Ty::U8
-                        | Ty::U16
-                        | Ty::U32
-                        | Ty::U64
-                        | Ty::Usize
-                )
-            )),
-            Value::Float(_) => primitive_ok(matches!(expected, None | Some(Ty::F32 | Ty::F64))),
+            // Exactly `i64`, and exactly `f64` -- not "some integer
+            // type" and not "some float type" (`rfcs/0015`). The
+            // interpreter has one integer representation and one float
+            // representation, so accepting a declared `u8` or `f32`
+            // here would run it as something else under its own name.
+            // The checker (`T0074`) and the verifier (`V0112`) each
+            // refuse those first; this is what stops a caller that
+            // bypassed both.
+            Value::Int(_) => primitive_ok(matches!(expected, None | Some(Ty::I64))),
+            Value::Float(_) => primitive_ok(matches!(expected, None | Some(Ty::F64))),
             Value::Bool(_) => primitive_ok(matches!(expected, None | Some(Ty::Bool))),
             Value::Char(_) => primitive_ok(matches!(expected, None | Some(Ty::Char))),
             Value::Str(_) => primitive_ok(matches!(expected, None | Some(Ty::Str))),
@@ -2493,17 +2595,22 @@ impl<'a> Interpreter<'a> {
                 };
                 Ok(actual_item == *expected_item)
             }
+            Ty::I64 => Ok(matches!(value, Value::Int(_))),
+            Ty::F64 => Ok(matches!(value, Value::Float(_))),
+            // A numeric name with no runtime representation here. Not
+            // `Ok(false)`: that would read as "the value is of the
+            // wrong kind", when the real problem is that no value of
+            // any kind could satisfy this position (`rfcs/0015`).
             Ty::I8
             | Ty::I16
             | Ty::I32
-            | Ty::I64
             | Ty::Isize
             | Ty::U8
             | Ty::U16
             | Ty::U32
             | Ty::U64
-            | Ty::Usize => Ok(matches!(value, Value::Int(_))),
-            Ty::F32 | Ty::F64 => Ok(matches!(value, Value::Float(_))),
+            | Ty::Usize
+            | Ty::F32 => Err(unexecutable_numeric(declared)),
             Ty::Bool => Ok(matches!(value, Value::Bool(_))),
             Ty::Char => Ok(matches!(value, Value::Char(_))),
             Ty::Str => Ok(matches!(value, Value::Str(_))),
@@ -3092,6 +3199,7 @@ impl<'a> Interpreter<'a> {
         interner: &Interner,
         args: Vec<Value>,
     ) -> Result<Value, InterpreterError> {
+        self.check_not_terminated()?;
         let function = self
             .module
             .functions
@@ -3115,6 +3223,7 @@ impl<'a> Interpreter<'a> {
     }
 
     pub fn call_item(&self, item: ItemId, args: Vec<Value>) -> Result<Value, InterpreterError> {
+        self.check_not_terminated()?;
         let function = self
             .module
             .functions
@@ -3236,6 +3345,33 @@ impl<'a> Interpreter<'a> {
         let outcome = self.call_function_in_frame(function, type_args, args, evidence);
         if outcome.is_err() {
             self.resources.borrow_mut().abandon_leases_from(mark);
+        }
+        // Any failure a *running frame* produced ends this whole
+        // execution, not just this frame (`rfcs/0015`).
+        //
+        // The boundary is this call to `call_function_in_frame`: past
+        // it, a frame has been entered and may already have bound
+        // parameters, constructed resources, written slots, transferred
+        // ownership or entered further calls. Whatever stopped it, what
+        // is left behind is the middle of a statement rather than any
+        // state Napitia describes, so nothing may be executed against
+        // it again -- and that is true of an `InvalidOperation` found
+        // after ten valid instructions exactly as it is of an overflow.
+        // An earlier version terminated only on `Arithmetic`, which
+        // left malformed NIR able to mutate the resource table and then
+        // hand back a reusable interpreter.
+        //
+        // Recorded here rather than at the public entry point so every
+        // frame the failure passes through sees the same terminal
+        // state. The failure itself travels on unchanged: nothing
+        // rewrites it into an engine-state error, so a caller still
+        // learns what actually went wrong.
+        //
+        // A Napitia `raise` is not an error here at all -- it is
+        // `Ok(Outcome::Raised)`, ordinary control flow -- so a fallible
+        // program that raises and handles never reaches this.
+        if outcome.is_err() {
+            self.terminated.set(true);
         }
         self.call_depth.set(self.call_depth.get() - 1);
         outcome
@@ -3460,6 +3596,19 @@ impl<'a> Interpreter<'a> {
             for instruction in &block.instructions {
                 match instruction {
                     crate::nir::Instruction::Value { result, ty, kind } => {
+                        // The declared result type, under this frame's
+                        // own instantiation, is checked *before* the
+                        // instruction runs: evaluating one can
+                        // construct a resource, transfer ownership,
+                        // enter a call or write the event log, and a
+                        // type this interpreter cannot execute must not
+                        // get that far (`rfcs/0015`). Verified NIR
+                        // never reaches this; a caller that bypassed
+                        // the verifier does.
+                        let declared = crate::types::substitute(ty, &frame_subst);
+                        if unexecutable_numeric_name(&declared).is_some() {
+                            return Err(unexecutable_numeric(&declared));
+                        }
                         let value = match kind {
                             ValueKind::PlaceRead { place, mode } => {
                                 self.access_place(&mut values, &load_origin, place, *mode)?
@@ -3481,10 +3630,32 @@ impl<'a> Interpreter<'a> {
                                 &mut active_leases,
                                 *observation,
                                 place,
-                                &crate::types::substitute(ty, &frame_subst),
+                                &declared,
                             )?,
                             _ => self.eval(kind, &values, &evidence, &frame_subst)?,
                         };
+                        // And the value it produced really is one of
+                        // that type. An `alloc` names the slot itself
+                        // rather than a value of the slot's type, so it
+                        // is the one kind excluded here.
+                        //
+                        // This compares the value against its declared
+                        // type without re-walking the whole value
+                        // graph: an aggregate's internals are validated
+                        // where ownership actually crosses a boundary,
+                        // by `validate_argument` on arguments and
+                        // returns, and repeating that walk once per
+                        // instruction would make every frame quadratic
+                        // in the size of the values it handles for a
+                        // check those boundaries already own.
+                        if !matches!(kind, ValueKind::Alloc)
+                            && !self.argument_matches_declared(&value, &declared)?
+                        {
+                            return Err(invalid(format!(
+                                "%{} produced a value that disagrees with its declared type",
+                                result.0
+                            )));
+                        }
                         values.insert(*result, value);
                     }
                     // Ending one (`rfcs/0013`). Refused unless it is
@@ -3890,7 +4061,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, InterpreterError> {
         match kind {
             ValueKind::Alloc => Ok(Value::Unit),
-            ValueKind::Const(c) => Ok(const_value(c)),
+            ValueKind::Const(c) => const_value(c),
             ValueKind::Load(id) => get(values, id),
             // Both explicitly transfer ownership (`rfcs/0011`): the
             // source's own handle is immediately stale (any later read
@@ -3918,28 +4089,23 @@ impl<'a> Interpreter<'a> {
             ValueKind::ObservePlace { .. } => Err(invalid(
                 "ValueKind::ObservePlace must be evaluated by call_function directly, never through eval",
             )),
-            ValueKind::Add(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_add,
-                |x, y| x + y,
-            ),
-            ValueKind::Sub(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_sub,
-                |x, y| x - y,
-            ),
-            ValueKind::Mul(a, b) => arith(
-                get(values, a)?,
-                get(values, b)?,
-                i128::wrapping_mul,
-                |x, y| x * y,
-            ),
-            ValueKind::Div(a, b) => div(get(values, a)?, get(values, b)?, false),
-            ValueKind::Rem(a, b) => div(get(values, a)?, get(values, b)?, true),
+            ValueKind::Add(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::add, |x, y| x + y)
+            }
+            ValueKind::Sub(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::sub, |x, y| x - y)
+            }
+            ValueKind::Mul(a, b) => {
+                arith(get(values, a)?, get(values, b)?, numeric::mul, |x, y| x * y)
+            }
+            ValueKind::Div(a, b) => {
+                divide(get(values, a)?, get(values, b)?, numeric::div, |x, y| x / y)
+            }
+            ValueKind::Rem(a, b) => {
+                divide(get(values, a)?, get(values, b)?, numeric::rem, |x, y| x % y)
+            }
             ValueKind::Neg(a) => match get(values, a)? {
-                Value::Int(x) => Ok(Value::Int(x.wrapping_neg())),
+                Value::Int(x) => Ok(Value::Int(numeric::neg(x)?)),
                 Value::Float(x) => Ok(Value::Float(-x)),
                 other => Err(invalid(format!("cannot negate {}", kind_name(&other)))),
             },
@@ -3954,22 +4120,30 @@ impl<'a> Interpreter<'a> {
             ValueKind::And(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x & y),
             ValueKind::Or(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x | y),
             ValueKind::Xor(a, b) => bitop(get(values, a)?, get(values, b)?, |x, y| x ^ y),
-            ValueKind::Shl(a, b) => shift(get(values, a)?, get(values, b)?, i128::checked_shl),
-            ValueKind::Shr(a, b) => shift(get(values, a)?, get(values, b)?, i128::checked_shr),
+            ValueKind::Shl(a, b) => shift(get(values, a)?, get(values, b)?, numeric::shl),
+            ValueKind::Shr(a, b) => shift(get(values, a)?, get(values, b)?, numeric::shr),
             ValueKind::Eq(a, b) => Ok(Value::Bool(eq(&get(values, a)?, &get(values, b)?)?)),
             ValueKind::Ne(a, b) => Ok(Value::Bool(!eq(&get(values, a)?, &get(values, b)?)?)),
-            ValueKind::Lt(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? == Ordering::Less,
-            )),
-            ValueKind::Le(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? != Ordering::Greater,
-            )),
-            ValueKind::Gt(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? == Ordering::Greater,
-            )),
-            ValueKind::Ge(a, b) => Ok(Value::Bool(
-                ord(&get(values, a)?, &get(values, b)?)? != Ordering::Less,
-            )),
+            ValueKind::Lt(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Lt,
+            )?)),
+            ValueKind::Le(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Le,
+            )?)),
+            ValueKind::Gt(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Gt,
+            )?)),
+            ValueKind::Ge(a, b) => Ok(Value::Bool(ordered(
+                &get(values, a)?,
+                &get(values, b)?,
+                OrderPredicate::Ge,
+            )?)),
             // Generic type arguments are compile-time-only bookkeeping:
             // one parametric NIR function body is shared by every call
             // regardless of them (`rfcs/0008`), and a runtime `Value`
@@ -4321,6 +4495,36 @@ fn invalid(message: impl Into<String>) -> InterpreterError {
     InterpreterError::InvalidOperation(message.into())
 }
 
+/// The Napitia spelling of a numeric type this interpreter has no
+/// representation for, or `None` for one it executes (`rfcs/0015`).
+///
+/// The integer names come from the shared numeric layer rather than
+/// being restated; `f32` is the only numeric name that is not an
+/// integer domain, so it is the one literal here.
+fn unexecutable_numeric_name(ty: &Ty) -> Option<&'static str> {
+    if crate::types::is_executable_numeric(ty) {
+        return None;
+    }
+    Some(match crate::types::domain_of(ty) {
+        Some(domain) => domain.name(),
+        None => "f32",
+    })
+}
+
+/// The refusal a declared numeric type with no runtime representation
+/// earns. `X0004`: NIR the interpreter was handed but cannot execute.
+fn unexecutable_numeric(ty: &Ty) -> InterpreterError {
+    match unexecutable_numeric_name(ty) {
+        Some(name) => invalid(format!(
+            "a runtime position declares `{name}`, which this interpreter does not execute"
+        )),
+        // Unreachable for every caller, which each reach this only
+        // after matching one of the names above. Reported rather than
+        // asserted, matching this module's no-panic rule.
+        None => invalid("a runtime position declares a type this interpreter does not execute"),
+    }
+}
+
 /// Converts a top-level call's own [`Outcome`] to this module's public
 /// `Result<Value, InterpreterError>` API. A well-typed `main` (or any
 /// other function reached directly through `Interpreter::call`/
@@ -4382,25 +4586,42 @@ fn kind_name(value: &Value) -> &'static str {
     }
 }
 
-fn const_value(c: &Const) -> Value {
-    match c {
-        Const::Int(v) => Value::Int(*v as i128),
+/// The runtime value one verified NIR constant denotes.
+///
+/// `nir::verify` has already checked every integer constant against the
+/// domain of its own declared type, so the narrowing below cannot fail
+/// for NIR that reached execution the supported way. It is still
+/// checked: a direct caller can hand the interpreter an unverified
+/// module, and the answer to that is a structured refusal, not a
+/// truncated value.
+fn const_value(c: &Const) -> Result<Value, InterpreterError> {
+    Ok(match c {
+        Const::Int(v) => Value::Int(i64::try_from(*v).map_err(|_| {
+            invalid(format!(
+                "the constant {v} is not an i64; verification must reject it before execution"
+            ))
+        })?),
         Const::Float(v) => Value::Float(*v),
         Const::Bool(v) => Value::Bool(*v),
         Const::Char(v) => Value::Char(*v),
         Const::Str(v) => Value::Str(v.clone()),
         Const::Unit => Value::Unit,
-    }
+    })
 }
 
+/// `add`, `sub` and `mul`.
+///
+/// The integer side is checked and the float side is not, because they
+/// are different arithmetics: leaving `i64` has no answer, while leaving
+/// `f64`'s finite range has one IEEE-754 already defines (`rfcs/0015`).
 fn arith(
     a: Value,
     b: Value,
-    int_op: impl Fn(i128, i128) -> i128,
+    int_op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y))),
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y)?)),
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(x, y))),
         (a, b) => Err(invalid(format!(
             "arithmetic between {} and {}",
@@ -4410,17 +4631,20 @@ fn arith(
     }
 }
 
-fn div(a: Value, b: Value, remainder: bool) -> Result<Value, InterpreterError> {
+/// `div` and `rem`.
+///
+/// A zero divisor is a failure for integers and an infinity or a NaN for
+/// floats. That asymmetry is IEEE-754's, not an oversight: `1.0 / 0.0`
+/// has a defined answer and `1 / 0` does not.
+fn divide(
+    a: Value,
+    b: Value,
+    int_op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
+    float_op: impl Fn(f64, f64) -> f64,
+) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(_), Value::Int(0)) => Err(InterpreterError::DivisionByZero),
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(if remainder {
-            x.wrapping_rem(y)
-        } else {
-            x.wrapping_div(y)
-        })),
-        (Value::Float(x), Value::Float(y)) => {
-            Ok(Value::Float(if remainder { x % y } else { x / y }))
-        }
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(x, y)?)),
+        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(x, y))),
         (a, b) => Err(invalid(format!(
             "division between {} and {}",
             kind_name(&a),
@@ -4429,7 +4653,7 @@ fn div(a: Value, b: Value, remainder: bool) -> Result<Value, InterpreterError> {
     }
 }
 
-fn bitop(a: Value, b: Value, op: impl Fn(i128, i128) -> i128) -> Result<Value, InterpreterError> {
+fn bitop(a: Value, b: Value, op: impl Fn(i64, i64) -> i64) -> Result<Value, InterpreterError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(Value::Int(op(x, y))),
         (a, b) => Err(invalid(format!(
@@ -4440,18 +4664,16 @@ fn bitop(a: Value, b: Value, op: impl Fn(i128, i128) -> i128) -> Result<Value, I
     }
 }
 
+/// A shift, whose count is itself an ordinary `i64` value -- so it can
+/// be negative, and a negative count is a failure rather than something
+/// to reinterpret as a large positive one.
 fn shift(
     a: Value,
     b: Value,
-    op: impl Fn(i128, u32) -> Option<i128>,
+    op: impl Fn(i64, i64) -> Result<i64, ArithFailure>,
 ) -> Result<Value, InterpreterError> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => {
-            let amount = u32::try_from(y).map_err(|_| invalid("shift amount out of range"))?;
-            op(x, amount)
-                .map(Value::Int)
-                .ok_or_else(|| invalid("shift amount out of range"))
-        }
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(op(x, y)?)),
         (a, b) => Err(invalid(format!(
             "shift between {} and {}",
             kind_name(&a),
@@ -4478,12 +4700,57 @@ fn eq(a: &Value, b: &Value) -> Result<bool, InterpreterError> {
     })
 }
 
+/// Which ordered comparison is being asked for.
+///
+/// Carried as a predicate rather than derived from an [`Ordering`],
+/// because for floats there is not always an ordering to derive one
+/// from (`rfcs/0015`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OrderPredicate {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// One ordered comparison, answered by the predicate it names.
+///
+/// Floats are compared with the corresponding IEEE-754 operator, never
+/// through a total ordering. A NaN is unordered with everything,
+/// including itself, so all four predicates answer `false` for one --
+/// and `false` is an *answer*, not a failure. Deriving these from a
+/// `partial_cmp` that has no result turned an ordinary float comparison
+/// into a malformed-NIR report, which is what `X0004` is reserved for
+/// and this is not.
+///
+/// `<=` and `>=` are the reason a predicate has to be carried this far
+/// down: "not greater" and "not less" are correct readings of an
+/// ordering that exists, and exactly wrong for a NaN, which is neither.
+fn ordered(a: &Value, b: &Value, predicate: OrderPredicate) -> Result<bool, InterpreterError> {
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(match predicate {
+            OrderPredicate::Lt => x < y,
+            OrderPredicate::Le => x <= y,
+            OrderPredicate::Gt => x > y,
+            OrderPredicate::Ge => x >= y,
+        });
+    }
+    let ordering = ord(a, b)?;
+    Ok(match predicate {
+        OrderPredicate::Lt => ordering == Ordering::Less,
+        OrderPredicate::Le => ordering != Ordering::Greater,
+        OrderPredicate::Gt => ordering == Ordering::Greater,
+        OrderPredicate::Ge => ordering != Ordering::Less,
+    })
+}
+
+/// The total ordering of every value kind that has one.
+///
+/// Floats are deliberately absent: [`ordered`] answers them before this
+/// is reached, because they have no total order to report.
 fn ord(a: &Value, b: &Value) -> Result<Ordering, InterpreterError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
-        (Value::Float(x), Value::Float(y)) => x
-            .partial_cmp(y)
-            .ok_or_else(|| invalid("comparison involving NaN")),
         (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
@@ -4504,8 +4771,15 @@ mod tests {
     use crate::parser::Parser;
     use crate::source::SourceMap;
     use crate::typeck::check_module;
+    use crate::types::IntOp;
 
-    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
+    /// The verified NIR for `text`, and the interner its symbols live
+    /// in -- for a test that drives an `Interpreter` itself rather than
+    /// taking the one [`run`] builds and discards. Every stage before
+    /// the interpreter is asserted clean, so a fixture that stops
+    /// compiling fails as a broken fixture rather than as a runtime
+    /// result.
+    pub(super) fn compiled(text: &str) -> (crate::nir::Module, Interner) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -4558,6 +4832,11 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
+        (nir, interner)
+    }
+
+    pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
+        let (nir, interner) = compiled(text);
         Interpreter::new(&nir).run("main", &interner)
     }
 
@@ -4719,13 +4998,23 @@ mod tests {
     #[test]
     fn detects_division_by_zero() {
         let text = "func main() -> i64 { value z = 0; return 1 / z }";
-        assert_eq!(run(text), Err(InterpreterError::DivisionByZero));
+        assert_eq!(
+            run(text),
+            Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+                IntOp::Div,
+            )))
+        );
     }
 
     #[test]
     fn detects_remainder_by_zero() {
         let text = "func main() -> i64 { value z = 0; return 1 % z }";
-        assert_eq!(run(text), Err(InterpreterError::DivisionByZero));
+        assert_eq!(
+            run(text),
+            Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+                IntOp::Rem,
+            )))
+        );
     }
 
     #[test]
@@ -4815,14 +5104,22 @@ mod tests {
     }
 
     #[test]
-    fn integer_overflow_wraps_instead_of_panicking() {
+    fn integer_overflow_is_a_runtime_failure_not_a_wrapped_value() {
+        // This used to assert the opposite: that `i64::MAX + 1`
+        // succeeded, because every integer was held in an `i128` and
+        // wrapped at 128 bits. `i64` is now 64 bits wide and its
+        // arithmetic is checked (`rfcs/0015`), so the sum has no result
+        // and the program fails instead of producing one.
         let text = format!(
             "func main() -> i64 {{ value m = {}; return m + 1 }}",
             i64::MAX
         );
-        // Must not panic; wrapping semantics are a documented
-        // simplification of this milestone's interpreter.
-        assert!(run(&text).is_ok());
+        assert_eq!(
+            run(&text),
+            Err(InterpreterError::Arithmetic(ArithFailure::Overflow(
+                IntOp::Add
+            )))
+        );
     }
 
     #[test]
@@ -8205,7 +8502,7 @@ mod store_place_transfer {
             .construct(NEST, vec![Value::Resource(inner)])
     }
 
-    fn a_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn a_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -8845,7 +9142,7 @@ mod drop_transaction {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -9507,7 +9804,7 @@ mod value_shape {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -9859,7 +10156,7 @@ mod transitive_observation {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -10116,7 +10413,7 @@ mod leak_backstop {
         }
     }
 
-    fn file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -10433,7 +10730,7 @@ mod transfer_transaction {
         }
     }
 
-    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -13707,7 +14004,7 @@ mod runtime_construction_validation {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
@@ -13715,7 +14012,7 @@ mod runtime_construction_validation {
         }
     }
 
-    fn new_file(interpreter: &Interpreter<'_>, descriptor: i128) -> ResourceHandle {
+    fn new_file(interpreter: &Interpreter<'_>, descriptor: i64) -> ResourceHandle {
         interpreter
             .resources
             .borrow_mut()
@@ -13794,7 +14091,7 @@ mod runtime_construction_validation {
     /// Builds a valid `File` in `%result`, from a constant in
     /// `%result - 1`, as a prefix every "now feed it somewhere illegal"
     /// test shares.
-    fn valid_file(descriptor: u128, konst: u32, result: u32) -> Vec<Instruction> {
+    fn valid_file(descriptor: i128, konst: u32, result: u32) -> Vec<Instruction> {
         vec![
             int(konst, descriptor),
             Instruction::Value {
@@ -14225,7 +14522,7 @@ mod typed_boundaries {
         }
     }
 
-    fn int(result: u32, value: u128) -> Instruction {
+    fn int(result: u32, value: i128) -> Instruction {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
@@ -15402,7 +15699,7 @@ mod observation_leases {
         Instruction::Value {
             result: ValueId(result),
             ty: Ty::I64,
-            kind: ValueKind::Const(Const::Int(value as u128)),
+            kind: ValueKind::Const(Const::Int(value)),
         }
     }
 
@@ -15741,17 +16038,19 @@ mod observation_leases {
             "an observation the refused frame opened is still active"
         );
 
-        // The same refusal again, on the *same* interpreter: reported
-        // identically and still changing nothing, which is what proves
-        // that nothing accumulated between the two attempts.
+        // A frame that failed ends this execution context (`rfcs/0015`),
+        // so the retry on the *same* interpreter is refused for that
+        // reason rather than by running the fixture again. It must still
+        // change nothing -- and now for a stronger reason than before,
+        // since it never enters a frame at all.
         let retry = live_session(&interpreter);
         let carried = record_count(&interpreter);
         let midpoint = shape_snapshot(&interpreter, carried);
+        let before_retry_drops = drop_events(&interpreter);
         let repeat = interpreter.call_item(SELF, vec![Value::Resource(retry)]);
-        assert_eq!(
-            refusal_shape(&outcome),
-            refusal_shape(&repeat),
-            "a refusal must be deterministic on the same interpreter"
+        assert!(
+            is_terminated_refusal(&repeat),
+            "a retry after a failed frame must be refused as a terminated context, got {repeat:?}"
         );
         assert_eq!(
             midpoint,
@@ -15759,10 +16058,37 @@ mod observation_leases {
             "the retry destroyed, moved out of or wrote into a resource"
         );
         assert_eq!(
+            before_retry_drops,
+            drop_events(&interpreter),
+            "the retry reported a destruction it never performed"
+        );
+        assert_eq!(
             open_leases(&interpreter),
             0,
             "the retry left an observation open"
         );
+
+        // Determinism of the *original* refusal, which the retry above
+        // can no longer demonstrate: a second interpreter over the same
+        // fixture reports it identically.
+        let fresh = Interpreter::new(&module);
+        let fresh_session = live_session(&fresh);
+        let again = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
+        assert_eq!(
+            refusal_shape(&outcome),
+            refusal_shape(&again),
+            "the same fixture must be refused identically on a fresh interpreter"
+        );
+    }
+
+    /// Whether `outcome` is the refusal a terminated execution context
+    /// gives, as opposed to the fixture's own refusal.
+    fn is_terminated_refusal(outcome: &Result<Value, InterpreterError>) -> bool {
+        matches!(
+            outcome,
+            Err(InterpreterError::InvalidOperation(message))
+                if message.contains("cannot be reused")
+        )
     }
 
     #[test]
@@ -15982,20 +16308,36 @@ mod observation_leases {
             "the session and both of its files were really destroyed"
         );
 
-        // And a later frame observing a fresh session still runs.
+        // A later frame is not run on this interpreter at all: the
+        // refused frame ended this execution context (`rfcs/0015`), so
+        // starting another is refused for that reason. The lease
+        // question is already answered above, by the caller's own
+        // successful destruction.
         let second = live_session(&interpreter);
         let again = interpreter.call_item(SELF, vec![Value::Resource(second)]);
-        assert_eq!(
-            refusal_shape(&refused),
-            refusal_shape(&again),
-            "a later frame must be refused for its own reason, not the first frame's"
+        assert!(
+            is_terminated_refusal(&again),
+            "a later frame on a terminated context must be refused as such, got {again:?}"
         );
         assert_eq!(open_leases(&interpreter), 0);
         assert_eq!(
             interpreter.drop_value(Value::Resource(second)),
             Ok(()),
-            "the second refusal froze its own session"
+            "the terminated refusal froze a session it never touched"
         );
+
+        // The "for its own reason, not the first frame's" half, where it
+        // can still be observed: a fresh interpreter running the same
+        // fixture reports the identical refusal.
+        let fresh = Interpreter::new(&module);
+        let fresh_session = live_session(&fresh);
+        let fresh_outcome = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
+        assert_eq!(
+            refusal_shape(&refused),
+            refusal_shape(&fresh_outcome),
+            "a frame must be refused for its own reason on every interpreter"
+        );
+        assert_eq!(open_leases(&fresh), 0);
     }
 
     #[test]
@@ -16540,9 +16882,13 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        // A failed frame ends its own execution context (`rfcs/0015`),
+        // so "repeatedly" is eight interpreters rather than eight calls
+        // on one. Each must abandon the observation its own frame
+        // opened, and report identically to the others.
         let mut first: Option<String> = None;
-        for _ in 0..8 {
+        for attempt in 0..8 {
+            let interpreter = Interpreter::new(&module);
             let session = live_session(&interpreter);
             let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
             let rendered = refusal_shape(&outcome);
@@ -16550,21 +16896,44 @@ mod observation_leases {
                 None => first = Some(rendered),
                 Some(expected) => assert_eq!(
                     *expected, rendered,
-                    "repeated failures stopped reporting identically"
+                    "attempt {attempt} stopped reporting identically"
                 ),
             }
             assert_eq!(
                 open_leases(&interpreter),
                 0,
-                "a failed frame accumulated an open observation"
+                "a failed frame left an open observation"
             );
+            assert_eq!(
+                interpreter.resources.borrow().leases.len(),
+                1,
+                "exactly the one observation this frame opened"
+            );
+            assert!(every_lease_ended(&interpreter));
         }
+
+        // And the same interpreter does not run a second frame at all,
+        // so nothing can accumulate across failures by construction.
+        let interpreter = Interpreter::new(&module);
+        let session = live_session(&interpreter);
+        assert!(
+            interpreter
+                .call_item(SELF, vec![Value::Resource(session)])
+                .is_err()
+        );
+        let after_first = interpreter.resources.borrow().leases.len();
+        let retry = live_session(&interpreter);
+        let repeat = interpreter.call_item(SELF, vec![Value::Resource(retry)]);
+        assert!(
+            is_terminated_refusal(&repeat),
+            "a second frame must be refused as a terminated context, got {repeat:?}"
+        );
         assert_eq!(
             interpreter.resources.borrow().leases.len(),
-            8,
-            "one observation per call was opened and then abandoned"
+            after_first,
+            "the refused retry opened an observation"
         );
-        assert!(every_lease_ended(&interpreter));
+        assert_eq!(open_leases(&interpreter), 0);
     }
 
     // -- invalid observation sources, refused by the runtime itself -----
@@ -16846,5 +17215,1953 @@ mod observation_leases {
         }
         let outcome = interpreter.call_item(SELF, vec![nested]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "excessive nesting");
+    }
+}
+
+/// `rfcs/0015` -- what `i64` and `f64` actually do at run time.
+///
+/// Every case is written as ordinary Napitia source and executed, so
+/// what is being tested is the language's behavior rather than a Rust
+/// helper's. The boundary values appear as literals, which is only
+/// possible because the checker accepts them and lowering folds the
+/// negated minimum into a single constant.
+#[cfg(test)]
+mod numeric_semantics {
+    use super::tests::run;
+    use super::{InterpreterError, Value};
+    use crate::types::{ArithFailure, IntOp};
+
+    const MIN: &str = "-9223372036854775808";
+    const MAX: &str = "9223372036854775807";
+
+    fn main_returning(body: &str) -> Result<Value, InterpreterError> {
+        run(&format!("func main() -> i64 {{ {body} }}"))
+    }
+
+    fn int(body: &str) -> i64 {
+        match main_returning(body) {
+            Ok(Value::Int(v)) => v,
+            other => panic!("`{body}` should produce an integer, got {other:?}"),
+        }
+    }
+
+    fn overflow(op: IntOp) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::Overflow(op)))
+    }
+
+    fn by_zero(op: IntOp) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::DivisionByZero(
+            op,
+        )))
+    }
+
+    fn shift_amount(count: i64) -> Result<Value, InterpreterError> {
+        Err(InterpreterError::Arithmetic(ArithFailure::ShiftAmount(
+            count,
+        )))
+    }
+
+    // -- the domain --------------------------------------------------------
+
+    /// Every value the release contract names, round-tripped through a
+    /// literal, a binding and a return.
+    #[test]
+    fn every_boundary_value_survives_a_literal_a_binding_and_a_return() {
+        for (text, expected) in [
+            ("0", 0),
+            ("1", 1),
+            ("-1", -1),
+            (MIN, i64::MIN),
+            ("-9223372036854775807", i64::MIN + 1),
+            ("9223372036854775806", i64::MAX - 1),
+            (MAX, i64::MAX),
+        ] {
+            assert_eq!(
+                int(&format!("value x: i64 = {text}; return x")),
+                expected,
+                "`{text}`"
+            );
+        }
+    }
+
+    /// The minimum is the one value that could not exist if a literal
+    /// were a magnitude negated afterwards.
+    #[test]
+    fn the_minimum_is_a_value_not_a_negation_that_could_not_be_performed() {
+        assert_eq!(int(&format!("return {MIN}")), i64::MIN);
+    }
+
+    // -- checked arithmetic ------------------------------------------------
+
+    #[test]
+    fn arithmetic_that_stays_in_the_domain_produces_the_exact_result() {
+        assert_eq!(int(&format!("return {MAX} - 1")), i64::MAX - 1);
+        assert_eq!(int(&format!("return {MIN} + 1")), i64::MIN + 1);
+        assert_eq!(int(&format!("return {MAX} * 1")), i64::MAX);
+        assert_eq!(int(&format!("return -({MIN} + 1)")), i64::MAX);
+        assert_eq!(int("return 6 * 7"), 42);
+        assert_eq!(int("return 0 - 0"), 0);
+    }
+
+    #[test]
+    fn addition_past_the_maximum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m + 1")),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn addition_past_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m + -1")),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn subtraction_past_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m - 1")),
+            overflow(IntOp::Sub)
+        );
+    }
+
+    #[test]
+    fn subtraction_past_the_maximum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m - -1")),
+            overflow(IntOp::Sub)
+        );
+    }
+
+    #[test]
+    fn multiplication_past_either_boundary_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MAX}; return m * 2")),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m * 2")),
+            overflow(IntOp::Mul)
+        );
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return m * -1")),
+            overflow(IntOp::Mul)
+        );
+    }
+
+    /// The one value whose negation is not an `i64`.
+    #[test]
+    fn negating_the_minimum_is_an_overflow() {
+        assert_eq!(
+            main_returning(&format!("value m: i64 = {MIN}; return -m")),
+            overflow(IntOp::Neg)
+        );
+    }
+
+    /// Written as two operators rather than one literal: the inner one
+    /// is applied directly to the literal and folds, the outer one is a
+    /// real negation of the minimum.
+    #[test]
+    fn the_outer_negation_of_a_negated_minimum_literal_overflows() {
+        assert_eq!(
+            main_returning(&format!("return - {MIN}")),
+            overflow(IntOp::Neg)
+        );
+    }
+
+    #[test]
+    fn negating_every_other_boundary_stays_in_the_domain() {
+        assert_eq!(int(&format!("value m: i64 = {MAX}; return -m")), -i64::MAX);
+        assert_eq!(int("return -0"), 0);
+        assert_eq!(int("value x: i64 = -1; return -x"), 1);
+    }
+
+    // -- division, remainder and shifts ------------------------------------
+
+    #[test]
+    fn division_or_remainder_by_zero_has_no_result() {
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 1 / z"),
+            by_zero(IntOp::Div)
+        );
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 1 % z"),
+            by_zero(IntOp::Rem)
+        );
+        assert_eq!(
+            main_returning("value z: i64 = 0; return 0 / z"),
+            by_zero(IntOp::Div)
+        );
+    }
+
+    /// The quotient `9223372036854775808` is not an `i64`; the remainder
+    /// `0` is. Two different answers to the same pair of operands, and
+    /// both are the arithmetic ones.
+    #[test]
+    fn the_minimum_divided_by_minus_one_overflows_but_its_remainder_is_zero() {
+        assert_eq!(
+            main_returning(&format!(
+                "value m: i64 = {MIN}; value d: i64 = -1; return m / d"
+            )),
+            overflow(IntOp::Div)
+        );
+        assert_eq!(
+            int(&format!(
+                "value m: i64 = {MIN}; value d: i64 = -1; return m % d"
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn division_truncates_toward_zero_and_remainder_takes_the_dividends_sign() {
+        assert_eq!(int("return 7 / 2"), 3);
+        assert_eq!(int("return -7 / 2"), -3);
+        assert_eq!(int("return 7 / -2"), -3);
+        assert_eq!(int("return 7 % 2"), 1);
+        assert_eq!(int("return -7 % 2"), -1);
+        assert_eq!(int("return 7 % -2"), 1);
+    }
+
+    #[test]
+    fn a_shift_count_at_or_past_the_width_has_no_result() {
+        assert_eq!(
+            main_returning("value n: i64 = 64; return 1 << n"),
+            shift_amount(64)
+        );
+        assert_eq!(
+            main_returning("value n: i64 = 64; return 1 >> n"),
+            shift_amount(64)
+        );
+        assert_eq!(
+            main_returning(&format!("value n: i64 = {MAX}; return 1 << n")),
+            shift_amount(i64::MAX)
+        );
+    }
+
+    /// The count is an ordinary `i64`, so a negative one is expressible
+    /// -- and is a failure rather than a very large positive count.
+    #[test]
+    fn a_negative_shift_count_has_no_result() {
+        assert_eq!(
+            main_returning("value n: i64 = -1; return 1 << n"),
+            shift_amount(-1)
+        );
+        assert_eq!(
+            main_returning("value n: i64 = -1; return 1 >> n"),
+            shift_amount(-1)
+        );
+        assert_eq!(
+            main_returning(&format!("value n: i64 = {MIN}; return 1 >> n")),
+            shift_amount(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn shifts_inside_the_width_discard_bits_and_replicate_the_sign() {
+        assert_eq!(int("return 1 << 0"), 1);
+        assert_eq!(int("return 1 << 62"), 1i64 << 62);
+        assert_eq!(
+            int("return 1 << 63"),
+            i64::MIN,
+            "the top bit is the sign bit, and reaching it is not an overflow"
+        );
+        assert_eq!(int(&format!("value m: i64 = {MIN}; return m >> 63")), -1);
+        assert_eq!(int("value x: i64 = -8; return x >> 1"), -4);
+        assert_eq!(int("value x: i64 = -1; return x >> 63"), -1);
+        assert_eq!(int(&format!("value m: i64 = {MAX}; return m >> 62")), 1);
+    }
+
+    // -- comparisons and bitwise operations --------------------------------
+
+    fn truth(body: &str) -> bool {
+        match run(&format!("func main() -> bool {{ {body} }}")) {
+            Ok(Value::Bool(v)) => v,
+            other => panic!("`{body}` should produce a bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordering_is_signed_across_zero_and_at_both_boundaries() {
+        assert!(truth(&format!("value m: i64 = {MIN}; return m < 0")));
+        assert!(truth(&format!("value m: i64 = {MAX}; return 0 < m")));
+        assert!(truth(&format!(
+            "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo < hi"
+        )));
+        assert!(truth(&format!(
+            "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return hi > lo"
+        )));
+        assert!(truth("value a: i64 = -1; return a < 0"));
+        assert!(truth("value a: i64 = -1; return a <= -1"));
+        assert!(truth("value a: i64 = -1; return a >= -1"));
+        assert!(!truth("value a: i64 = -1; return a > 0"));
+    }
+
+    #[test]
+    fn equality_holds_at_both_boundaries_and_nowhere_near_them() {
+        assert!(truth(&format!("value m: i64 = {MIN}; return m == {MIN}")));
+        assert!(truth(&format!("value m: i64 = {MAX}; return m == {MAX}")));
+        assert!(truth(&format!("value m: i64 = {MIN}; return m != {MAX}")));
+        assert!(truth(&format!(
+            "value m: i64 = {MIN}; return m != {MIN} + 1"
+        )));
+    }
+
+    /// The high bit is where a narrower representation would quietly
+    /// disagree.
+    #[test]
+    fn bitwise_operations_reach_the_high_bit() {
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo & hi"
+            )),
+            0
+        );
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo | hi"
+            )),
+            -1
+        );
+        assert_eq!(
+            int(&format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; return lo ^ hi"
+            )),
+            -1
+        );
+        assert_eq!(
+            int(&format!("value hi: i64 = {MAX}; return ~hi")),
+            i64::MIN,
+            "inverting the maximum is the minimum, in exactly 64 bits"
+        );
+        assert_eq!(int(&format!("value lo: i64 = {MIN}; return ~lo")), i64::MAX);
+        assert_eq!(int("return ~0"), -1);
+        assert_eq!(int("return ~-1"), 0);
+    }
+
+    // -- propagation -------------------------------------------------------
+
+    #[test]
+    fn a_failure_inside_a_call_reaches_the_caller_unchanged() {
+        assert_eq!(
+            run(&format!(
+                "func bump(n: i64) -> i64 {{ return n + 1 }} \
+                 func main() -> i64 {{ return bump({MAX}) }}"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_nested_call_reaches_the_outermost_caller() {
+        assert_eq!(
+            run(&format!(
+                "func inner(n: i64) -> i64 {{ return n + 1 }} \
+                 func middle(n: i64) -> i64 {{ return inner(n) }} \
+                 func main() -> i64 {{ return middle({MAX}) }}"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_loop_stops_the_loop() {
+        assert_eq!(
+            main_returning(&format!(
+                "mutable x: i64 = {MAX}; \
+                 mutable i: i64 = 0; \
+                 while i < 10 {{ x = x + 1; i = i + 1; }} \
+                 return x"
+            )),
+            overflow(IntOp::Add)
+        );
+    }
+
+    #[test]
+    fn a_failure_on_the_taken_branch_only_happens_when_that_branch_runs() {
+        let program = |flag: &str| {
+            format!(
+                "value chosen: bool = {flag}; \
+                 value m: i64 = {MAX}; \
+                 if chosen {{ return m + 1; }} \
+                 return 7"
+            )
+        };
+        assert_eq!(main_returning(&program("true")), overflow(IntOp::Add));
+        assert_eq!(int(&program("false")), 7);
+    }
+
+    /// A slot keeps the last value successfully written to it. The
+    /// failing operation never produced one, so it never stored one.
+    #[test]
+    fn a_failed_operation_leaves_the_state_before_it_untouched() {
+        assert_eq!(
+            main_returning(&format!(
+                "mutable x: i64 = 5; \
+                 x = x + 1; \
+                 value m: i64 = {MAX}; \
+                 x = m + 1; \
+                 return x"
+            )),
+            overflow(IntOp::Add),
+            "the program fails rather than storing a wrapped value"
+        );
+        assert_eq!(
+            int("mutable x: i64 = 5; x = x + 1; return x"),
+            6,
+            "the same prefix without the failing step"
+        );
+    }
+
+    // -- arguments, returns, slots and arity -------------------------------
+
+    #[test]
+    fn boundary_values_cross_a_call_in_both_directions() {
+        for (text, expected) in [(MIN, i64::MIN), (MAX, i64::MAX)] {
+            assert_eq!(
+                run(&format!(
+                    "func echo(n: i64) -> i64 {{ return n }} \
+                     func main() -> i64 {{ return echo({text}) }}"
+                )),
+                Ok(Value::Int(expected)),
+                "`{text}` must survive both the argument and the return"
+            );
+        }
+    }
+
+    #[test]
+    fn a_high_arity_call_places_every_boundary_argument_correctly() {
+        assert_eq!(
+            run(&format!(
+                "func weigh(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {{ \
+                   return a + b + c + d + e + f + g + h \
+                 }} \
+                 func main() -> i64 {{ return weigh({MIN}, {MAX}, 1, 0, 0, 0, 0, 0) }}"
+            )),
+            Ok(Value::Int(0)),
+            "the minimum plus the maximum plus one is zero, in exactly 64 bits"
+        );
+    }
+
+    #[test]
+    fn a_unit_parameter_between_two_integers_shifts_neither() {
+        assert_eq!(
+            run("func nothing() -> unit { return } \
+                 func mixed(before: unit, x: i64, between: unit, y: i64) -> i64 { return x - y } \
+                 func main() -> i64 { return mixed(nothing(), 40, nothing(), 2) }"),
+            Ok(Value::Int(38))
+        );
+    }
+
+    #[test]
+    fn a_mutable_slot_holds_a_boundary_value_across_a_loop() {
+        assert_eq!(
+            int(&format!(
+                "mutable x: i64 = {MIN}; \
+                 mutable i: i64 = 0; \
+                 while i < 3 {{ x = x + 1; i = i + 1; }} \
+                 return x"
+            )),
+            i64::MIN + 3
+        );
+    }
+
+    // -- determinism -------------------------------------------------------
+
+    #[test]
+    fn repeated_execution_produces_the_identical_answer() {
+        let ok = format!("func main() -> i64 {{ return {MIN} + 1 }}");
+        let failing = format!("func main() -> i64 {{ value m: i64 = {MAX}; return m * 2 }}");
+        let first_ok = run(&ok);
+        let first_failing = run(&failing);
+        for _ in 0..16 {
+            assert_eq!(run(&ok), first_ok);
+            assert_eq!(run(&failing), first_failing);
+        }
+        assert_eq!(first_ok, Ok(Value::Int(i64::MIN + 1)));
+        assert_eq!(first_failing, overflow(IntOp::Mul));
+    }
+
+    /// The rendered failure is what a differential test compares, so it
+    /// is pinned exactly.
+    #[test]
+    fn a_failure_renders_to_one_stable_line_with_its_code() {
+        for (body, code, text) in [
+            (
+                format!("value m: i64 = {MAX}; return m + 1"),
+                "X0002",
+                "integer overflow in `add`",
+            ),
+            (
+                format!("value m: i64 = {MIN}; return -m"),
+                "X0002",
+                "integer overflow in `neg`",
+            ),
+            (
+                "value z: i64 = 0; return 1 / z".to_string(),
+                "X0001",
+                "`div` by zero",
+            ),
+            (
+                "value z: i64 = 0; return 1 % z".to_string(),
+                "X0001",
+                "`rem` by zero",
+            ),
+            (
+                "value n: i64 = 64; return 1 << n".to_string(),
+                "X0003",
+                "shift amount 64 is outside 0..64",
+            ),
+        ] {
+            let error = main_returning(&body).expect_err("this program must fail");
+            assert_eq!(error.code(), code, "`{body}`");
+            assert_eq!(error.to_string(), text, "`{body}`");
+        }
+    }
+
+    // -- floats: only what is actually implemented -------------------------
+
+    fn float(body: &str) -> f64 {
+        match run(&format!("func main() -> f64 {{ {body} }}")) {
+            Ok(Value::Float(v)) => v,
+            other => panic!("`{body}` should produce a float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_finite_float_arithmetic_works() {
+        assert_eq!(float("return 1.5 + 2.25"), 3.75);
+        assert_eq!(float("return 1.5 - 2.5"), -1.0);
+        assert_eq!(float("return 1.5 * 2.0"), 3.0);
+        assert_eq!(float("return 3.0 / 2.0"), 1.5);
+        assert_eq!(float("return 7.5 % 2.0"), 1.5);
+        assert_eq!(float("return -1.5"), -1.5);
+    }
+
+    /// Both zeroes exist and compare equal, which is IEEE-754's rule and
+    /// not an accident of how they are stored.
+    #[test]
+    fn positive_and_negative_zero_are_distinct_values_that_compare_equal() {
+        assert!(float("return -0.0").is_sign_negative());
+        assert!(float("return 0.0").is_sign_positive());
+        assert!(truth("return 0.0 == -0.0"));
+    }
+
+    /// A zero divisor is a failure for integers and an infinity for
+    /// floats. The asymmetry is the standard's.
+    #[test]
+    fn float_division_by_zero_is_an_infinity_rather_than_a_failure() {
+        assert!(float("value z: f64 = 0.0; return 1.0 / z").is_infinite());
+        assert!(float("value z: f64 = 0.0; return -1.0 / z").is_infinite());
+        assert!(float("value z: f64 = 0.0; return 0.0 / z").is_nan());
+    }
+
+    /// There is no implicit conversion in either direction, and no cast
+    /// to ask for one with.
+    /// Every diagnostic checking `text` reports. Used where the point is
+    /// that a program never runs at all.
+    fn check_codes(text: &str) -> Vec<&'static str> {
+        let mut map = crate::source::SourceMap::new();
+        let id = map.add_file("t.npt", text);
+        let mut interner = crate::symbol::Interner::new();
+        crate::driver::check(&map, id, &mut interner)
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// There is no implicit conversion in either direction, and no cast
+    /// to ask for one with -- so a mixed expression never reaches the
+    /// interpreter.
+    #[test]
+    fn an_integer_and_a_float_never_mix() {
+        for text in [
+            "func main() -> f64 { return 1 }",
+            "func main() -> i64 { return 1.0 }",
+            "func main() -> f64 { value x: i64 = 1; value y: f64 = 1.0; return x + y }",
+            "func main() -> bool { value x: i64 = 1; value y: f64 = 1.0; return x == y }",
+        ] {
+            assert!(
+                !check_codes(text).is_empty(),
+                "`{text}` must be refused before it can run"
+            );
+        }
+    }
+
+    /// Napitia has no syntax that names a NaN, so the only way one
+    /// exists at all is as the result of an operation -- which makes
+    /// `0.0 / 0.0` the only fixture that can produce one.
+    const NAN: &str = "value zero: f64 = 0.0; value nan: f64 = 0.0 / zero;";
+
+    /// Every ordered predicate answers `false` when a NaN is involved,
+    /// on either side or both (`rfcs/0015`). `false` is an answer: a
+    /// NaN is unordered, not malformed, so none of these may produce a
+    /// diagnostic of any kind.
+    #[test]
+    fn every_ordered_predicate_answers_false_for_a_nan() {
+        for (position, left, right) in [
+            ("left", "nan", "1.0"),
+            ("right", "1.0", "nan"),
+            ("both", "nan", "nan"),
+        ] {
+            for operator in ["<", "<=", ">", ">="] {
+                let body = format!("{NAN} return {left} {operator} {right}");
+                let outcome = run(&format!("func main() -> bool {{ {body} }}"));
+                assert_eq!(
+                    outcome,
+                    Ok(Value::Bool(false)),
+                    "NaN on the {position} of `{operator}` must answer false, not fail"
+                );
+            }
+        }
+    }
+
+    /// `<=` and `>=` are the two that a total-ordering implementation
+    /// gets backwards: "not greater" and "not less" are true of a NaN
+    /// under any ordering that claims to have one.
+    #[test]
+    fn the_inclusive_predicates_are_not_derived_from_a_negated_ordering() {
+        assert!(!truth(&format!("{NAN} return nan <= nan")));
+        assert!(!truth(&format!("{NAN} return nan >= nan")));
+        assert!(!truth(&format!("{NAN} return nan <= 1.0")));
+        assert!(!truth(&format!("{NAN} return 1.0 >= nan")));
+    }
+
+    #[test]
+    fn equality_follows_ieee_for_a_nan_and_is_never_a_failure() {
+        assert!(!truth(&format!("{NAN} return nan == nan")));
+        assert!(!truth(&format!("{NAN} return nan == 1.0")));
+        assert!(!truth(&format!("{NAN} return 1.0 == nan")));
+        assert!(truth(&format!("{NAN} return nan != nan")));
+        assert!(truth(&format!("{NAN} return nan != 1.0")));
+    }
+
+    /// The values nearest the NaN cases, which do have answers -- so a
+    /// fix for NaN cannot have been "make every float comparison
+    /// false".
+    #[test]
+    fn infinities_and_signed_zero_still_compare_normally() {
+        const INF: &str = "value zero: f64 = 0.0; value inf: f64 = 1.0 / zero; \
+                           value negative: f64 = -1.0 / zero;";
+        assert!(truth(&format!("{INF} return inf > 1.0")));
+        assert!(truth(&format!("{INF} return negative < 1.0")));
+        assert!(truth(&format!("{INF} return negative < inf")));
+        assert!(truth(&format!("{INF} return inf == inf")));
+        assert!(truth(&format!("{INF} return inf >= inf")));
+        assert!(!truth(&format!("{INF} return inf < inf")));
+        assert!(truth("return 0.0 == -0.0"));
+        assert!(truth("return 0.0 <= -0.0"));
+        assert!(truth("return 0.0 >= -0.0"));
+        assert!(!truth("return 0.0 < -0.0"));
+        assert!(!truth("return -0.0 < 0.0"));
+    }
+
+    /// `X0004` means the interpreter was handed something malformed. A
+    /// valid program comparing a valid value is not that, however
+    /// unusual the value is.
+    #[test]
+    fn a_nan_comparison_never_reports_a_malformed_operation() {
+        for operator in ["<", "<=", ">", ">=", "==", "!="] {
+            let outcome = run(&format!(
+                "func main() -> bool {{ {NAN} return nan {operator} nan }}"
+            ));
+            let value = outcome.unwrap_or_else(|error| {
+                panic!("`{operator}` on a NaN must not fail, got {}", error.code())
+            });
+            assert!(matches!(value, Value::Bool(_)), "`{operator}`");
+        }
+    }
+
+    #[test]
+    fn a_nan_comparison_answers_identically_on_every_run() {
+        let text = format!("func main() -> bool {{ {NAN} return nan < nan }}");
+        let first = run(&text);
+        for _ in 0..8 {
+            assert_eq!(run(&text), first);
+        }
+    }
+
+    #[test]
+    fn a_float_prints_the_same_way_every_time() {
+        let text = "func main() -> f64 { return 1.0 / 3.0 }";
+        let first = run(text);
+        for _ in 0..8 {
+            assert_eq!(run(text), first);
+        }
+        let Ok(Value::Float(v)) = first else {
+            panic!("expected a float")
+        };
+        assert_eq!(v.to_string(), "0.3333333333333333");
+    }
+}
+
+/// `rfcs/0015` -- the interpreter's own refusal of numeric types it has
+/// no representation for, independently of the verifier.
+///
+/// Every module here is built by hand and handed straight to
+/// `Interpreter`, bypassing `nir::verify` entirely. That is the only way
+/// to reach these paths: source using one of these names is refused by
+/// the checker (`T0074`), and NIR carrying one is refused by the
+/// verifier (`V0112`). Each fixture asserts *both* -- that the verifier
+/// would have caught it, and that the interpreter refuses it anyway --
+/// so the stage boundary and the backstop are tested as separate facts.
+#[cfg(test)]
+mod unexecutable_numeric_nir {
+    use super::*;
+    use crate::hir::ItemRegistry;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, Terminator, verify_module};
+    use crate::source::SourceMap;
+    use crate::symbol::{Interner, Symbol};
+
+    const MAIN: ItemId = ItemId(0);
+    const HELPER: ItemId = ItemId(1);
+
+    /// The verifier code these modules must also earn.
+    const UNIMPLEMENTED_IN_NIR: &str = "V0112";
+
+    /// Every numeric name with no runtime representation here.
+    fn unexecutable() -> Vec<Ty> {
+        vec![
+            Ty::I8,
+            Ty::I16,
+            Ty::I32,
+            Ty::Isize,
+            Ty::U8,
+            Ty::U16,
+            Ty::U32,
+            Ty::U64,
+            Ty::Usize,
+            Ty::F32,
+        ]
+    }
+
+    fn function(
+        id: ItemId,
+        params: Vec<Param>,
+        return_type: Ty,
+        blocks: Vec<BasicBlock>,
+    ) -> Function {
+        Function {
+            id,
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params,
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn module(functions: Vec<Function>) -> Module {
+        Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions,
+            records: Vec::new(),
+            variants: Vec::new(),
+        }
+    }
+
+    fn param(value: u32, ty: Ty) -> Param {
+        Param {
+            value: ValueId(value),
+            ty,
+            take: false,
+        }
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, ty: Ty, literal: i128) -> Instruction {
+        value(result, ty, ValueKind::Const(Const::Int(literal)))
+    }
+
+    /// The interpreter refuses `module`, deterministically, with the
+    /// malformed-operation code -- and never by panicking.
+    fn assert_interpreter_refuses(module: &Module, args: Vec<Value>, case: &str) {
+        let first = Interpreter::new(module).call_item(MAIN, args.clone());
+        let error = match first {
+            Err(error) => error,
+            Ok(produced) => panic!(
+                "`{case}`: executed a type it has no representation for, producing {produced:?}"
+            ),
+        };
+        assert_eq!(
+            error.code(),
+            codes::INVALID_OPERATION,
+            "`{case}`: malformed NIR is X0004, never an arithmetic code"
+        );
+        assert!(
+            !error.to_string().to_lowercase().contains("panic"),
+            "`{case}`: {error}"
+        );
+        let again = Interpreter::new(module).call_item(MAIN, args);
+        assert_eq!(
+            Err(error),
+            again,
+            "`{case}`: the same malformed module must be refused identically"
+        );
+    }
+
+    /// And the verifier would have stopped the same module first, so
+    /// nothing reaches the interpreter's backstop through the driver.
+    fn assert_verifier_refuses(module: &Module, case: &str) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "");
+        let interner = Interner::new();
+        let found: Vec<&str> = verify_module(module, source, &interner, &ItemRegistry::default())
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            found.contains(&UNIMPLEMENTED_IN_NIR),
+            "`{case}`: the verifier must refuse this first, got {found:?}"
+        );
+    }
+
+    fn assert_refused_by_both(module: &Module, args: Vec<Value>, case: &str) {
+        assert_verifier_refuses(module, case);
+        assert_interpreter_refuses(module, args, case);
+    }
+
+    // -- one unexecutable type in each position ---------------------------
+
+    #[test]
+    fn a_constant_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(0, ty.clone(), 1), int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("const {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_parameter_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            // The argument is an ordinary `i64` value: the defect is
+            // the parameter's declared type, not what was passed.
+            assert_refused_by_both(
+                &module(vec![main]),
+                vec![Value::Int(1)],
+                &format!("param {ty:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_return_type_that_is_unexecutable_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                ty.clone(),
+                vec![block(
+                    0,
+                    vec![int(0, Ty::I64, 7)],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("return {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_unary_operation_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(1, ty.clone(), ValueKind::Neg(ValueId(0))),
+                        int(2, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("neg {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_binary_operation_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        int(1, Ty::I64, 2),
+                        value(2, ty.clone(), ValueKind::Add(ValueId(0), ValueId(1))),
+                        int(3, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(3))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("add {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_slot_and_store_of_an_unexecutable_type_are_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(0, ty.clone(), ValueKind::Alloc),
+                        int(1, Ty::I64, 1),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
+                        },
+                        int(2, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("slot {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_load_of_an_unexecutable_slot_is_refused() {
+        for ty in unexecutable() {
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(0, Ty::I64, ValueKind::Alloc),
+                        int(1, Ty::I64, 1),
+                        Instruction::Store {
+                            slot: ValueId(0),
+                            value: ValueId(1),
+                            mode: crate::nir::OwnershipMode::Observe,
+                        },
+                        value(2, ty.clone(), ValueKind::Load(ValueId(0))),
+                        int(3, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(3))),
+                )],
+            );
+            assert_refused_by_both(&module(vec![main]), Vec::new(), &format!("load {ty:?}"));
+        }
+    }
+
+    #[test]
+    fn a_call_argument_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let helper = function(
+                HELPER,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(
+                            1,
+                            Ty::I64,
+                            ValueKind::Call(HELPER, Vec::new(), vec![ValueId(0)], Vec::new()),
+                        ),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(
+                &module(vec![main, helper]),
+                Vec::new(),
+                &format!("call argument {ty:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_result_of_an_unexecutable_type_is_refused() {
+        for ty in unexecutable() {
+            let helper = function(
+                HELPER,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(0, Ty::I64, 7)],
+                    Terminator::Return(Some(ValueId(0))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        value(
+                            0,
+                            ty.clone(),
+                            ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+                        ),
+                        int(1, Ty::I64, 0),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_refused_by_both(
+                &module(vec![main, helper]),
+                Vec::new(),
+                &format!("call result {ty:?}"),
+            );
+        }
+    }
+
+    // -- the value must match its declared type ---------------------------
+
+    /// A declared type this interpreter *does* execute, holding a value
+    /// of the wrong kind, is refused too -- the check is against the
+    /// value, not only against the name.
+    #[test]
+    fn a_value_that_disagrees_with_its_executable_declared_type_is_refused() {
+        for (declared, wrong) in [
+            (Ty::I64, Value::Float(1.0)),
+            (Ty::F64, Value::Int(1)),
+            (Ty::I64, Value::Bool(true)),
+            (Ty::Bool, Value::Int(1)),
+        ] {
+            let main = function(
+                MAIN,
+                vec![param(0, declared.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_interpreter_refuses(
+                &module(vec![main]),
+                vec![wrong.clone()],
+                &format!("{declared:?} holding {wrong:?}"),
+            );
+        }
+    }
+
+    /// No silent widening: an `i64` value does not satisfy a narrower
+    /// declared integer type just because both are integers.
+    #[test]
+    fn an_integer_value_never_satisfies_a_narrower_declared_integer() {
+        for ty in [Ty::I8, Ty::I16, Ty::I32, Ty::U8, Ty::U32] {
+            let main = function(
+                MAIN,
+                vec![param(0, ty.clone())],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            assert_interpreter_refuses(
+                &module(vec![main]),
+                vec![Value::Int(1)],
+                &format!("i64 value in a {ty:?} position"),
+            );
+        }
+    }
+
+    /// And a float value does not satisfy `f32` just because both are
+    /// floats.
+    #[test]
+    fn a_float_value_never_satisfies_f32() {
+        let main = function(
+            MAIN,
+            vec![param(0, Ty::F32)],
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(1, Ty::I64, 0)],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        assert_interpreter_refuses(
+            &module(vec![main]),
+            vec![Value::Float(1.0)],
+            "f32 parameter",
+        );
+    }
+
+    // -- nothing runs before the refusal ----------------------------------
+
+    /// The declared result type is checked *before* the instruction is
+    /// evaluated, so a call whose result type is unexecutable never
+    /// enters its callee. Proved by the frame log: the callee's own
+    /// entry is absent.
+    #[test]
+    fn an_unexecutable_result_type_refuses_before_the_callee_runs() {
+        let helper = function(
+            HELPER,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, Ty::I64, 7)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let main = function(
+            MAIN,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![
+                    value(
+                        0,
+                        Ty::U8,
+                        ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+                    ),
+                    int(1, Ty::I64, 0),
+                ],
+                Terminator::Return(Some(ValueId(1))),
+            )],
+        );
+        let module = module(vec![main, helper]);
+        let interpreter = Interpreter::new(&module);
+        assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the callee must never have been entered"
+        );
+    }
+
+    /// The same module, with its two functions stored in the other
+    /// order: storage order decides nothing about the refusal.
+    #[test]
+    fn function_storage_order_does_not_change_the_refusal() {
+        let build = |reversed: bool| {
+            let helper = function(
+                HELPER,
+                vec![param(0, Ty::U8)],
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![int(1, Ty::I64, 0)],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            let main = function(
+                MAIN,
+                Vec::new(),
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![
+                        int(0, Ty::I64, 1),
+                        value(
+                            1,
+                            Ty::I64,
+                            ValueKind::Call(HELPER, Vec::new(), vec![ValueId(0)], Vec::new()),
+                        ),
+                    ],
+                    Terminator::Return(Some(ValueId(1))),
+                )],
+            );
+            if reversed {
+                module(vec![helper, main])
+            } else {
+                module(vec![main, helper])
+            }
+        };
+        let forward = Interpreter::new(&build(false)).call_item(MAIN, Vec::new());
+        let reversed = Interpreter::new(&build(true)).call_item(MAIN, Vec::new());
+        assert!(forward.is_err());
+        assert_eq!(forward, reversed);
+    }
+
+    /// The names this module tests are exactly the ones the shared
+    /// numeric layer calls unexecutable, so neither list can drift.
+    #[test]
+    fn this_module_covers_every_unexecutable_numeric_name() {
+        for ty in unexecutable() {
+            assert!(
+                !crate::types::is_executable_numeric(&ty),
+                "{ty:?} is executable, so it does not belong in this list"
+            );
+            assert!(
+                super::unexecutable_numeric_name(&ty).is_some(),
+                "{ty:?} must have a spelling to report"
+            );
+        }
+        for ty in [Ty::I64, Ty::F64, Ty::Bool, Ty::Str, Ty::Unit] {
+            assert_eq!(super::unexecutable_numeric_name(&ty), None, "{ty:?}");
+        }
+        assert_eq!(super::unexecutable_numeric_name(&Ty::F32), Some("f32"));
+        assert_eq!(super::unexecutable_numeric_name(&Ty::U8), Some("u8"));
+    }
+}
+
+/// `rfcs/0015` -- what a fatal abort does to an execution.
+///
+/// This module covers the arithmetic half of the rule; the stateful
+/// half -- a failure found after a frame has already changed things --
+/// lives in `stateful_termination` below.
+///
+/// A failure that reaches a running frame is not a Napitia control-flow
+/// exit. It is not a `raise`, it does not unwind scopes, and it runs no
+/// `drop` and no `defer`. Execution stops where it stood, and the
+/// interpreter that was running it is finished.
+///
+/// The deterministic event log is what makes this testable rather than
+/// asserted: it records every frame entered and every resource actually
+/// destroyed, in the order those really happened, so "no cleanup ran
+/// after the failure" is a fact about the run and not about the wording
+/// of a doc comment.
+#[cfg(test)]
+mod fatal_abort {
+    use super::tests::{compiled, run, run_with_log};
+    use super::{Interpreter, InterpreterError, Value, codes};
+    use crate::types::{ArithFailure, IntOp};
+
+    const MAX: &str = "9223372036854775807";
+
+    /// A `resource` whose destruction is visible in the event log, plus
+    /// the helpers the fixtures below share.
+    const RESOURCE: &str = "
+        resource File { descriptor: i64 }
+        func open(descriptor: i64) -> File { return File { descriptor: descriptor }; }
+        func peek(file: File) -> i64 { return file.descriptor; }
+    ";
+
+    fn overflow() -> InterpreterError {
+        InterpreterError::Arithmetic(ArithFailure::Overflow(IntOp::Add))
+    }
+
+    /// Every `drop:` entry the run produced, in order.
+    fn drops(log: &[String]) -> Vec<&String> {
+        log.iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    // -- where the failure happens ----------------------------------------
+
+    #[test]
+    fn a_failure_in_main_stops_the_program() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ value m: i64 = {MAX}; value bad: i64 = m + 1; return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            drops(&log).is_empty(),
+            "nothing may be destroyed after a fatal abort: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_nested_call_propagates_unchanged() {
+        let (outcome, log) = run_with_log(&format!(
+            "func inner(n: i64) -> i64 {{ return n + 1 }} \
+             func middle(n: i64) -> i64 {{ return inner(n) }} \
+             func main() -> i64 {{ return middle({MAX}) }}"
+        ));
+        assert_eq!(
+            outcome,
+            Err(overflow()),
+            "the caller must report the failure the callee had, not one of its own"
+        );
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    #[test]
+    fn a_failure_inside_a_loop_stops_the_loop() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ \
+               mutable x: i64 = {MAX}; mutable i: i64 = 0; \
+               while i < 10 {{ x = x + 1; i = i + 1; }} \
+               return x }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    #[test]
+    fn a_failure_inside_a_conditional_branch_stops_the_program() {
+        let (outcome, log) = run_with_log(&format!(
+            "func main() -> i64 {{ \
+               value chosen: bool = true; value m: i64 = {MAX}; \
+               if chosen {{ return m + 1; }} \
+               return 7 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    // -- what does not happen afterwards ----------------------------------
+
+    /// The statements after the failure never run. If they had, the
+    /// program would have returned a value instead of failing.
+    #[test]
+    fn no_statement_after_the_failure_executes() {
+        let (outcome, log) = run_with_log(&format!(
+            "func marker() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ \
+               value m: i64 = {MAX}; value bad: i64 = m + 1; \
+               return marker() }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert_eq!(
+            log,
+            vec!["call:main".to_string()],
+            "only `main` was ever entered: the call after the failure never ran"
+        );
+    }
+
+    /// A live resource is *not* destroyed by a fatal abort. This is the
+    /// honest half of the contract: the resource leaks, and the runtime
+    /// does not pretend otherwise by emitting a destruction event it
+    /// never performed.
+    #[test]
+    fn a_live_resource_is_not_destroyed_by_a_fatal_abort() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value file = open(9); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               drop file; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            drops(&log).is_empty(),
+            "a fatal abort ran cleanup it should not have: {log:?}"
+        );
+    }
+
+    /// The same, with the failure sitting between the resource and the
+    /// explicit `drop` that would have destroyed it.
+    #[test]
+    fn a_failure_before_an_explicit_drop_skips_that_drop() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value file = open(1); \
+               value seen: i64 = peek(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + seen; \
+               drop file; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(drops(&log).is_empty(), "{log:?}");
+    }
+
+    /// A pending `defer` does not run either.
+    #[test]
+    fn a_pending_defer_does_not_run_after_a_fatal_abort() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func close(file: File) -> unit {{ }} \
+             func main() -> i64 {{ \
+               value file = open(3); \
+               defer close(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        assert!(
+            !log.iter().any(|event| event.starts_with("drop:")),
+            "a deferred action or destruction ran after the abort: {log:?}"
+        );
+    }
+
+    /// One cleanup that already completed stays completed, and is not
+    /// repeated. The abort changes nothing about what already happened.
+    #[test]
+    fn a_cleanup_that_already_ran_is_neither_undone_nor_repeated() {
+        let (outcome, log) = run_with_log(&format!(
+            "{RESOURCE} \
+             func main() -> i64 {{ \
+               value first = open(1); \
+               drop first; \
+               value second = open(2); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               drop second; \
+               return 0 }}"
+        ));
+        assert_eq!(outcome, Err(overflow()));
+        let destroyed = drops(&log);
+        assert_eq!(
+            destroyed.len(),
+            1,
+            "exactly the one cleanup that ran before the failure: {log:?}"
+        );
+    }
+
+    // -- the engine is finished -------------------------------------------
+
+    /// The public API refuses to start anything else on an interpreter a
+    /// fatal abort already ended, and says so as an engine-state error
+    /// rather than by repeating the arithmetic code.
+    #[test]
+    fn a_terminated_interpreter_refuses_to_run_again() {
+        let (nir, interner) = compiled(&format!(
+            "func ok() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ value m: i64 = {MAX}; return m + 1 }}"
+        ));
+        let interpreter = Interpreter::new(&nir);
+
+        assert_eq!(interpreter.run("main", &interner), Err(overflow()));
+
+        let reused = interpreter
+            .run("ok", &interner)
+            .expect_err("a terminated interpreter must refuse");
+        assert_eq!(
+            reused.code(),
+            codes::INVALID_OPERATION,
+            "reuse is an invalid operation on the engine, not a second overflow"
+        );
+        assert_ne!(
+            reused,
+            overflow(),
+            "the arithmetic failure must not be reported twice"
+        );
+
+        // And it stays refused, identically, however many times it is
+        // asked.
+        for _ in 0..4 {
+            assert_eq!(interpreter.run("ok", &interner), Err(reused.clone()));
+        }
+    }
+
+    /// A fresh interpreter per execution is unaffected: the termination
+    /// is a property of the engine whose frame failed, not of the module.
+    #[test]
+    fn a_fresh_interpreter_runs_the_same_module_normally() {
+        let (nir, interner) = compiled(&format!(
+            "func ok() -> i64 {{ return 1 }} \
+             func main() -> i64 {{ value m: i64 = {MAX}; return m + 1 }}"
+        ));
+
+        assert_eq!(
+            Interpreter::new(&nir).run("main", &interner),
+            Err(overflow())
+        );
+        assert_eq!(
+            Interpreter::new(&nir).run("ok", &interner),
+            Ok(Value::Int(1)),
+            "a different interpreter never entered the terminated state"
+        );
+    }
+
+    /// A refusal decided *before any frame is entered* is not a fatal
+    /// abort: nothing ran and nothing changed, so the engine stays
+    /// usable.
+    ///
+    /// This is specifically about preflight refusals. A malformed-input
+    /// refusal found *during* execution does terminate the context, and
+    /// `stateful_termination` covers that case.
+    #[test]
+    fn a_preflight_refusal_does_not_terminate_the_engine() {
+        let (nir, interner) = compiled("func ok() -> i64 { return 1 }");
+        let interpreter = Interpreter::new(&nir);
+
+        let missing = interpreter
+            .run("no_such_function", &interner)
+            .expect_err("an unknown function is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+
+        assert_eq!(
+            interpreter.run("ok", &interner),
+            Ok(Value::Int(1)),
+            "a refusal that changed nothing must not end the engine"
+        );
+    }
+
+    // -- determinism -------------------------------------------------------
+
+    #[test]
+    fn repeated_fresh_executions_produce_identical_results_and_logs() {
+        let text = format!(
+            "{RESOURCE} \
+             func close(file: File) -> unit {{ }} \
+             func main() -> i64 {{ \
+               value file = open(5); \
+               defer close(file); \
+               value m: i64 = {MAX}; \
+               value bad: i64 = m + 1; \
+               return 0 }}"
+        );
+        let first = run_with_log(&text);
+        assert_eq!(first.0, Err(overflow()));
+        for _ in 0..8 {
+            assert_eq!(run_with_log(&text), first);
+        }
+    }
+
+    /// The failure a fatal abort reports is the arithmetic one, with its
+    /// own code and rendering -- never rewritten into an engine-state
+    /// error on the way out.
+    #[test]
+    fn the_original_failure_is_what_the_caller_sees() {
+        let outcome = run("func inner(n: i64) -> i64 { return -n } \
+             func main() -> i64 { return inner(-9223372036854775808) }");
+        let error = outcome.expect_err("negating the minimum has no result");
+        assert_eq!(error.code(), codes::INTEGER_OVERFLOW);
+        assert_eq!(error.to_string(), "integer overflow in `neg`");
+    }
+}
+
+/// `rfcs/0015` -- a failure found *after* a frame has already changed
+/// things ends the execution context, exactly as an overflow does.
+///
+/// This is the case an earlier implementation got wrong. It terminated
+/// only on an arithmetic failure, on the theory that a malformed-NIR
+/// refusal is always decided before anything happens. It is not:
+/// hand-built NIR that skipped verification can construct a resource,
+/// write the event log, and only then reach an instruction this
+/// interpreter cannot execute. What is left behind is the same partial
+/// state an overflow leaves, so it ends the context the same way.
+#[cfg(test)]
+mod stateful_termination {
+    use super::*;
+    use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::symbol::Symbol;
+
+    const FILE: ItemId = ItemId(10);
+    const MAIN: ItemId = ItemId(11);
+    const HELPER: ItemId = ItemId(12);
+
+    /// The symbols these fixtures use, in the order an [`Interner`]
+    /// hands them out. Interned for real rather than assumed, so a name
+    /// lookup through `run`/`call` can actually resolve one.
+    const MAIN_NAME: Symbol = Symbol(0);
+    const FILE_NAME: Symbol = Symbol(1);
+    const HELPER_NAME: Symbol = Symbol(3);
+
+    fn fixture_interner() -> Interner {
+        let mut interner = Interner::new();
+        assert_eq!(interner.intern("main"), MAIN_NAME);
+        assert_eq!(interner.intern("File"), FILE_NAME);
+        assert_eq!(interner.intern("descriptor"), Symbol(2));
+        assert_eq!(interner.intern("helper"), HELPER_NAME);
+        interner
+    }
+
+    fn file_ty() -> Ty {
+        Ty::Named(FILE, FILE_NAME)
+    }
+
+    /// `resource File { descriptor: i64 }` -- affine, so constructing
+    /// one really does enter the runtime resource table.
+    fn layouts() -> Vec<(ItemId, RecordLayout)> {
+        vec![(
+            FILE,
+            RecordLayout {
+                name: FILE_NAME,
+                type_params: Vec::new(),
+                fields: vec![(Symbol(2), Ty::I64)],
+                affine: true,
+            },
+        )]
+    }
+
+    fn function(
+        id: ItemId,
+        name: Symbol,
+        return_type: Ty,
+        instructions: Vec<Instruction>,
+        result: u32,
+    ) -> Function {
+        Function {
+            id,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::<Param>::new(),
+            return_type,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(ValueId(result))),
+            }],
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, ty: Ty, literal: i128) -> Instruction {
+        value(result, ty, ValueKind::Const(Const::Int(literal)))
+    }
+
+    /// `main` constructs a live `File`, performs another valid
+    /// instruction, and only then reaches one declared `u8`.
+    ///
+    /// The resource is deliberately never dropped: the frame cannot
+    /// reach a `drop`, which is the whole point -- a fatal failure runs
+    /// no cleanup, and this fixture leaves a genuinely leaked resource
+    /// behind for the assertions to find.
+    fn stateful_module() -> Module {
+        let main = function(
+            MAIN,
+            MAIN_NAME,
+            Ty::I64,
+            vec![
+                int(0, Ty::I64, 7),
+                value(
+                    1,
+                    file_ty(),
+                    ValueKind::RecordCreate(FILE, Vec::new(), vec![ValueId(0)]),
+                ),
+                int(2, Ty::I64, 1),
+                // Malformed: `u8` has no runtime representation here.
+                int(3, Ty::U8, 1),
+                int(4, Ty::I64, 0),
+            ],
+            4,
+        );
+        let helper = function(HELPER, HELPER_NAME, Ty::I64, vec![int(0, Ty::I64, 42)], 0);
+        Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![main, helper],
+            records: layouts(),
+            variants: Vec::new(),
+        }
+    }
+
+    fn live_records(interpreter: &Interpreter<'_>) -> usize {
+        interpreter
+            .resources
+            .borrow()
+            .records
+            .iter()
+            .filter(|record| record.status == ResourceStatus::Alive)
+            .count()
+    }
+
+    fn drop_events(interpreter: &Interpreter<'_>) -> Vec<String> {
+        interpreter
+            .event_log()
+            .into_iter()
+            .filter(|event| event.starts_with("drop:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_malformed_instruction_after_real_work_terminates_the_context() {
+        let module = stateful_module();
+        let interpreter = Interpreter::new(&module);
+
+        // 1. The first call is refused, structurally.
+        let first = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the `u8` instruction must be refused");
+        assert_eq!(first.code(), codes::INVALID_OPERATION);
+        assert!(
+            first.to_string().contains("u8"),
+            "the refusal must name what it could not execute: {first}"
+        );
+
+        // 2/3. The valid prefix really ran: the resource exists and is
+        // still alive, because nothing cleaned it up.
+        assert_eq!(
+            live_records(&interpreter),
+            1,
+            "the frame must have constructed its resource before failing"
+        );
+        assert_eq!(
+            interpreter.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the frame was entered and no other frame was"
+        );
+
+        // 4. No cleanup was performed, and none was reported.
+        assert!(
+            drop_events(&interpreter).is_empty(),
+            "a fatal failure ran no cleanup and must claim none: {:?}",
+            interpreter.event_log()
+        );
+
+        // 6/7. The context is over, and a valid function is refused for
+        // that reason rather than run.
+        let reused = interpreter
+            .call_item(HELPER, Vec::new())
+            .expect_err("a terminated context must refuse a later execution");
+        assert_eq!(reused.code(), codes::INVALID_OPERATION);
+        assert!(
+            reused.to_string().contains("cannot be reused"),
+            "the refusal must say the context ended: {reused}"
+        );
+
+        // 5. And it did not overwrite or repeat the original failure.
+        assert_ne!(
+            first.to_string(),
+            reused.to_string(),
+            "the termination refusal must not impersonate the original failure"
+        );
+
+        // 8/10. The helper was never entered, and nothing changed.
+        let after = interpreter.event_log();
+        assert_eq!(
+            after,
+            vec![format!("call:{}", MAIN.0)],
+            "the refused reuse entered a frame: {after:?}"
+        );
+        assert_eq!(
+            live_records(&interpreter),
+            1,
+            "the refused reuse mutated resources"
+        );
+
+        // 9. Repeated attempts are equal, and still change nothing.
+        for _ in 0..4 {
+            let again = interpreter.call_item(HELPER, Vec::new());
+            assert_eq!(again, Err(reused.clone()), "reuse refusals must be equal");
+        }
+        assert_eq!(interpreter.event_log(), after);
+        assert_eq!(live_records(&interpreter), 1);
+
+        // 11. A fresh interpreter runs the same valid function normally.
+        let fresh = Interpreter::new(&module);
+        assert_eq!(fresh.call_item(HELPER, Vec::new()), Ok(Value::Int(42)));
+        assert!(drop_events(&fresh).is_empty());
+    }
+
+    /// The same fixture, twice, on two interpreters: identical.
+    #[test]
+    fn the_stateful_refusal_is_deterministic_across_fresh_interpreters() {
+        let module = stateful_module();
+        let first = Interpreter::new(&module).call_item(MAIN, Vec::new());
+        for _ in 0..4 {
+            assert_eq!(Interpreter::new(&module).call_item(MAIN, Vec::new()), first);
+        }
+    }
+
+    /// Reaching the malformed instruction through a nested call
+    /// terminates the whole context, not just the callee's frame.
+    #[test]
+    fn a_malformed_instruction_in_a_nested_call_terminates_the_whole_context() {
+        let inner = function(
+            HELPER,
+            HELPER_NAME,
+            Ty::I64,
+            vec![int(0, Ty::U8, 1), int(1, Ty::I64, 0)],
+            1,
+        );
+        let outer = function(
+            MAIN,
+            MAIN_NAME,
+            Ty::I64,
+            vec![value(
+                0,
+                Ty::I64,
+                ValueKind::Call(HELPER, Vec::new(), Vec::new(), Vec::new()),
+            )],
+            0,
+        );
+        let module = Module {
+            protocols: Vec::new(),
+            extends: Vec::new(),
+            functions: vec![outer, inner],
+            records: Vec::new(),
+            variants: Vec::new(),
+        };
+        let interpreter = Interpreter::new(&module);
+
+        let failure = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the nested `u8` instruction must be refused");
+        assert_eq!(failure.code(), codes::INVALID_OPERATION);
+        assert!(
+            failure.to_string().contains("u8"),
+            "the caller must see the callee's own failure: {failure}"
+        );
+
+        let reused = interpreter
+            .call_item(MAIN, Vec::new())
+            .expect_err("the outer context must be terminated too");
+        assert!(reused.to_string().contains("cannot be reused"));
+    }
+
+    // -- what does *not* terminate ----------------------------------------
+
+    /// An unknown function is refused before any frame is entered and
+    /// changes nothing, so the interpreter stays usable.
+    #[test]
+    fn an_unknown_item_refusal_does_not_terminate_the_context() {
+        let module = stateful_module();
+        let interpreter = Interpreter::new(&module);
+
+        let missing = interpreter
+            .call_item(ItemId(999), Vec::new())
+            .expect_err("an unknown item is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+        assert!(
+            interpreter.event_log().is_empty(),
+            "a pre-entry refusal entered a frame"
+        );
+
+        assert_eq!(
+            interpreter.call_item(HELPER, Vec::new()),
+            Ok(Value::Int(42)),
+            "a refusal that ran no frame must leave the interpreter usable"
+        );
+    }
+
+    /// The same for a name lookup through the other public entry point.
+    #[test]
+    fn an_unknown_name_refusal_does_not_terminate_the_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+        let interpreter = Interpreter::new(&module);
+
+        let missing = interpreter
+            .call("no_such_function", &interner, Vec::new())
+            .expect_err("an unknown name is refused");
+        assert_eq!(missing.code(), codes::INVALID_OPERATION);
+        assert!(interpreter.event_log().is_empty());
+
+        assert_eq!(
+            interpreter.call_item(HELPER, Vec::new()),
+            Ok(Value::Int(42)),
+            "a name lookup that ran no frame must leave the interpreter usable"
+        );
+    }
+
+    // -- every public execution entry point is guarded --------------------
+
+    /// `run`, `call`, `run_item` and `call_item` are the four routes
+    /// that start execution. Each must refuse a terminated context, and
+    /// each must be able to terminate one.
+    #[test]
+    fn every_public_entry_point_refuses_a_terminated_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+
+        // Terminate through `call_item`, then try all four.
+        let interpreter = Interpreter::new(&module);
+        assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
+        for (route, outcome) in [
+            ("call_item", interpreter.call_item(HELPER, Vec::new())),
+            ("run_item", interpreter.run_item(HELPER)),
+            ("call", interpreter.call("\u{0}", &interner, Vec::new())),
+            ("run", interpreter.run("\u{0}", &interner)),
+        ] {
+            let error = outcome.expect_err("a terminated context refuses every route");
+            assert!(
+                error.to_string().contains("cannot be reused"),
+                "`{route}` did not report the terminated context: {error}"
+            );
+        }
+    }
+
+    /// And each route can itself terminate the context, so none of them
+    /// is a way in that skips the rule.
+    #[test]
+    fn every_public_entry_point_can_terminate_the_context() {
+        let module = stateful_module();
+        let interner = fixture_interner();
+
+        let by_call_item = Interpreter::new(&module);
+        assert!(by_call_item.call_item(MAIN, Vec::new()).is_err());
+        assert!(
+            by_call_item
+                .call_item(HELPER, Vec::new())
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
+
+        let by_run_item = Interpreter::new(&module);
+        assert!(by_run_item.run_item(MAIN).is_err());
+        assert!(
+            by_run_item
+                .run_item(HELPER)
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
+
+        // `run`/`call` resolve by name; both fixtures share `Symbol(0)`,
+        // so the lookup finds `main` -- which is the failing one.
+        let by_run = Interpreter::new(&module);
+        let name = interner.resolve(Symbol(0)).to_string();
+        assert!(by_run.run(&name, &interner).is_err());
+        assert!(
+            by_run
+                .run(&name, &interner)
+                .expect_err("terminated")
+                .to_string()
+                .contains("cannot be reused")
+        );
     }
 }

@@ -11,9 +11,9 @@
 //!
 //! It is not a second NIR verifier. [`crate::nir::verify_module`] has
 //! already run and already owns every structural and typing invariant
-//! NIR has. Where this pass notices such a violation anyway -- it is a
-//! public function and a caller may hand it hand-built NIR that never
-//! went through the verifier -- it reports
+//! NIR has. Where this pass notices such a violation anyway -- it is
+//! `pub(crate)`, and a crate-internal caller may hand it hand-built
+//! NIR that never went through the verifier -- it reports
 //! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is
@@ -40,26 +40,30 @@
 //! # Arithmetic
 //!
 //! Every operator this pass accepts is one the native backend
-//! reproduces *exactly*, over the operator's whole input domain, as the
-//! interpreter already implements it (see [`super::Scalar`] for why
-//! that forces a 128-bit integer representation). Four operators are
-//! rejected instead of approximated:
+//! reproduces *exactly*, over the operator's whole input domain,
+//! including where that domain runs out. `add`, `sub`, `mul` and `neg`
+//! have an exceptional case -- a result outside `i64` -- and
+//! [`super::lower`] compiles an explicit test for it and a branch to
+//! the runtime failure path, so both execution paths fail on exactly
+//! the same inputs (`rfcs/0015`). `not`, bitwise `and`/`or`/`xor` and
+//! the six comparisons have no exceptional case at all.
 //!
-//! * `div` and `rem`, because the interpreter answers a zero divisor
-//!   with `InterpreterError::DivisionByZero` -- a *runtime error value*
-//!   -- and Alpha 0.2.0 has no native runtime facility to raise, report
-//!   or carry one. A hardware trap is not the same behavior, and
-//!   silently emitting one would be exactly the kind of borrowed host
-//!   semantics this backend refuses.
-//! * `shl` and `shr`, for the same reason: the interpreter rejects an
-//!   out-of-range shift amount with a runtime error
-//!   (`i128::checked_shl`/`checked_shr` plus an explicit `u32`
-//!   conversion), where the hardware would silently mask the amount
-//!   instead.
+//! Four operators are still rejected rather than approximated:
 //!
-//! Every other accepted operator -- `add`, `sub`, `mul`, `neg`, `not`,
-//! bitwise `and`/`or`/`xor`, and the six comparisons -- agrees with the
-//! interpreter on every input, with no exceptional case at all.
+//! * `div` and `rem`, whose exceptional cases are a zero divisor and
+//!   the minimum over minus one;
+//! * `shl` and `shr`, whose exceptional case is a count outside
+//!   `0..64`, where the hardware would silently mask the count instead.
+//!
+//! Alpha 0.2.1 has the runtime facility these would need -- the same
+//! one checked arithmetic branches to -- and deliberately does not use
+//! it here. This is a stabilization release: it makes the subset that
+//! already existed genuinely correct rather than a larger one
+//! approximately so. Expanding the subset means a failure path per
+//! operator and a differential test per exceptional input, and that is
+//! a later milestone's work. Until then these four remain
+//! interpreter-only, refused before code generation with
+//! [`super::codes::UNSUPPORTED_OPERATOR`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -2280,7 +2284,7 @@ mod hand_built_tests {
         }
     }
 
-    fn int(result: u32, literal: u128) -> Instruction {
+    fn int(result: u32, literal: i128) -> Instruction {
         value(result, Ty::I64, ValueKind::Const(Const::Int(literal)))
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "compiler"
-version = "0.2.0-alpha.1"
+version = "0.2.1-alpha.1"
 edition = "2024"
 # `rust-version` is Cargo's MSRV field: it would claim a *guaranteed
 # minimum* rustc, which has never been established here (edition 2024
@@ -31,7 +31,7 @@ toml = "0.8"
 # named target, with no IR-level language assumptions of its own and no
 # C++ toolchain to build. That is exactly the surface this milestone
 # needs, and no more -- `cranelift-jit` is deliberately absent, since
-# Alpha 0.2.0 compiles ahead of time and nothing here runs generated
+# `napitia build` compiles ahead of time and nothing here runs generated
 # code in this process.
 #
 # `x86` is requested explicitly rather than relying on `host-arch`:
@@ -46,11 +46,10 @@ cranelift-frontend = "0.135.2"
 # The `Module`/`Linkage` abstraction `cranelift-object` implements:
 # declaring every function before any body is emitted.
 cranelift-module = "0.135.2"
-# Writes the compiled functions out as a real ELF object file. No
-# `target-lexicon` dependency is declared alongside it: the one
-# supported triple is named as a string and looked up through
-# `cranelift_codegen::isa::lookup_by_name`, so nothing here needs to
-# parse a triple into its components.
+# Writes the compiled functions out as a real ELF object file. It is
+# handed an ISA the backend has already selected, so the triple
+# parsing that selection needs is declared separately, below, rather
+# than reached through this crate.
 cranelift-object = "0.135.2"
 # Parses a target triple into the components `cranelift_codegen::isa`
 # selects a backend from. Declared directly, rather than reached

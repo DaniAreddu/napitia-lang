@@ -762,11 +762,10 @@ fn no_example_that_checks_cleanly_leaks_an_internal_native_diagnostic() {
 
 // -- the scalar ABI at its boundaries -------------------------------------
 //
-// `i64` is held in a Cranelift `I128`, because the interpreter holds
-// every Napitia integer in an `i128` and wraps at 128 bits. That is the
-// most unusual decision in this release, so it is checked where it
-// actually matters -- at the edges of that width, not on small positive
-// numbers where every plausible representation agrees.
+// `i64` is a signed two's-complement 64-bit integer in both execution
+// paths (`rfcs/0015`), so the interesting inputs are the edges of that
+// width, not small positive numbers where every plausible
+// representation agrees.
 //
 // Each program decides for itself whether it is correct and returns a
 // small marker, so the answer never travels through the exit status'
@@ -774,69 +773,84 @@ fn no_example_that_checks_cleanly_leaks_an_internal_native_diagnostic() {
 // well: the assertion is that the two agree, not that the native side
 // produced some number.
 
-/// The literals for `i128::MAX` and `i128::MIN`. Napitia's lexer parses
-/// an integer literal as `u128` and the interpreter reinterprets it as
-/// `i128`, so both edges are writable directly and neither needs
-/// hand-built NIR.
-const I128_MAX: &str = "170141183460469231731687303715884105727";
-const I128_MIN: &str = "-170141183460469231731687303715884105728";
+const MIN: &str = "-9223372036854775808";
+const MAX: &str = "9223372036854775807";
 
 #[test]
 fn the_scalar_abi_agrees_with_the_interpreter_at_its_boundaries() {
-    let cases: [(&str, String); 9] = [
-        // Addition wrapping at the top of the width.
+    let cases: [(&str, String); 10] = [
+        // Both boundaries survive a binding and a comparison.
         (
-            "add_wraps",
-            format!("if {I128_MAX} + 1 == {I128_MIN} {{ return 42; }} return 0;"),
+            "boundaries_round_trip",
+            format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; \
+                 if lo == {MIN} {{ if hi == {MAX} {{ return 42; }} }} return 0;"
+            ),
         ),
-        // Subtraction wrapping at the bottom.
+        // Arithmetic that reaches a boundary exactly, without leaving
+        // it. A 64-bit representation is the only one where these hold.
         (
-            "sub_wraps",
-            format!("if {I128_MIN} - 1 == {I128_MAX} {{ return 42; }} return 0;"),
+            "arithmetic_reaches_the_edges",
+            format!(
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; \
+                 if lo + 1 == -9223372036854775807 {{ \
+                 if hi - 1 == 9223372036854775806 {{ \
+                 if lo + hi == -1 {{ return 42; }} }} }} return 0;"
+            ),
         ),
-        // Multiplication wrapping: (2^127 - 1) * 2 is -2.
+        // The one value whose negation is not an `i64` -- negating the
+        // *other* boundary is fine, and this checks that the checked
+        // path did not break the ordinary one.
         (
-            "mul_wraps",
-            format!("if {I128_MAX} * 2 == -2 {{ return 42; }} return 0;"),
+            "negation_of_the_maximum",
+            format!(
+                "value hi: i64 = {MAX}; if -hi == -9223372036854775807 {{ return 42; }} return 0;"
+            ),
         ),
-        // The one value whose negation is itself.
+        // Multiplication that stays in range across the sign.
         (
-            "neg_of_min",
-            format!("if -({I128_MIN}) == {I128_MIN} {{ return 42; }} return 0;"),
+            "multiplication_across_the_sign",
+            format!(
+                "value hi: i64 = {MAX}; \
+                 if hi * -1 == -9223372036854775807 {{ \
+                 if -1 * -1 == 1 {{ return 42; }} }} return 0;"
+            ),
         ),
         // Ordering has to be signed across the sign boundary, not
         // unsigned over the same bits.
         (
             "signed_order",
             format!(
-                "value min = {I128_MIN}; value max = {I128_MAX}; \
-                 if min < 0 {{ if 0 < max {{ if min < max {{ if max > min {{ return 42; }} }} }} }} \
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; \
+                 if lo < 0 {{ if 0 < hi {{ if lo < hi {{ if hi > lo {{ \
+                 if lo <= lo {{ if hi >= hi {{ return 42; }} }} }} }} }} }} \
                  return 0;"
             ),
         ),
-        // Bitwise work on the high half, where a 64-bit representation
+        // Bitwise work on the high bit, where a narrower representation
         // would quietly drop the bits that matter.
         (
             "high_bits",
             format!(
-                "value min = {I128_MIN}; value max = {I128_MAX}; \
-                 if (min & max) == 0 {{ if (min | max) == -1 {{ \
-                 if (min ^ max) == -1 {{ if ~max == min {{ return 42; }} }} }} }} \
-                 return 0;"
+                "value lo: i64 = {MIN}; value hi: i64 = {MAX}; \
+                 if (lo & hi) == 0 {{ if (lo | hi) == -1 {{ \
+                 if (lo ^ hi) == -1 {{ if ~hi == lo {{ if ~lo == hi {{ \
+                 return 42; }} }} }} }} }} return 0;"
             ),
         ),
         // A boundary value crossing a call, in and back out again.
         (
             "call_carries_boundaries",
-            format!("if wrap({I128_MAX}, 1) == {I128_MIN} {{ return 42; }} return 0;"),
+            format!(
+                "if echo({MIN}) == {MIN} {{ if echo({MAX}) == {MAX} {{ return 42; }} }} return 0;"
+            ),
         ),
-        // Eight `i64` arguments. Each one is an `I128`, so this is well
-        // past what the platform passes in registers and exercises the
-        // stack half of the argument sequence.
+        // Eight `i64` arguments: past what the platform passes in
+        // registers, so this exercises the stack half of the sequence.
         (
             "high_arity_call",
             format!(
-                "if many({I128_MAX}, 1, 0, 0, 0, 0, 0, {I128_MIN}) == 0 {{ \
+                "if many({MIN}, {MAX}, 1, 0, 0, 0, 0, 0) == 0 {{ \
                  if many(1, 2, 3, 4, 5, 6, 7, 8) == 36 {{ return 42; }} }} return 0;"
             ),
         ),
@@ -848,10 +862,19 @@ fn the_scalar_abi_agrees_with_the_interpreter_at_its_boundaries() {
              if mixed(nothing(), false, 40, nothing(), 2) == 0 { return 42; } } return 0;"
                 .to_string(),
         ),
+        // A boundary value carried through a mutable slot and a loop.
+        (
+            "slot_and_loop",
+            format!(
+                "mutable x: i64 = {MIN}; mutable i: i64 = 0; \
+                 while i < 3 {{ x = x + 1; i = i + 1; }} \
+                 if x == -9223372036854775805 {{ return 42; }} return 0;"
+            ),
+        ),
     ];
 
     const HELPERS: &str = "
-        func wrap(a: i64, b: i64) -> i64 { return a + b; }
+        func echo(n: i64) -> i64 { return n; }
         func many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
             return a + b + c + d + e + f + g + h;
         }
@@ -877,6 +900,28 @@ fn the_scalar_abi_agrees_with_the_interpreter_at_its_boundaries() {
                 status, 42,
                 "`{name}`: the native build must reach the same answer as the interpreter"
             );
+        }
+    }
+}
+
+/// `main`'s returned value reaches the process as its low 8 bits, which
+/// is a language rule (`rfcs/0015`) and the one place a native run's
+/// answer is *not* the Napitia value.
+#[test]
+fn the_exit_status_is_the_returned_value_modulo_256() {
+    let workspace = Workspace::new("exit-status");
+    for (name, body, status) in [
+        ("zero", "return 0".to_string(), 0),
+        ("small", "return 42".to_string(), 42),
+        ("above_a_byte", "return 300".to_string(), 44),
+        ("boundary_max", format!("return {MAX}"), 255),
+        ("boundary_min", format!("return {MIN}"), 0),
+        ("negative", "return -1".to_string(), 255),
+    ] {
+        let source = workspace.source(name, &format!("func main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+        if let Some(observed) = build_and_run(&workspace, &source, &output) {
+            assert_eq!(observed, status, "`{name}`");
         }
     }
 }
@@ -907,4 +952,613 @@ fn a_high_arity_call_places_every_argument_where_the_callee_expects_it() {
     if let Some(status) = build_and_run(&workspace, &source, &output) {
         assert_eq!(status, 42);
     }
+}
+
+// -- runtime failures, in both execution paths ----------------------------
+//
+// An operation whose exact result is outside `i64` produces no value in
+// either path (`rfcs/0015`). The interpreter reports it and exits 1; a
+// built executable writes the same sentence to standard error and exits
+// with the one documented runtime-failure status. Neither wraps, and
+// neither leaves a Rust panic or a backtrace behind.
+
+/// The status a Napitia runtime failure exits a built executable with.
+/// Written out rather than imported, so a change to the constant has to
+/// be a deliberate change to this documented contract too.
+const RUNTIME_FAILURE_STATUS: i32 = 70;
+
+/// What `napitia run` does with a program that fails at run time: the
+/// exit status and everything it wrote to standard error.
+fn interpreted_failure(source: &Path) -> (i32, String) {
+    let output = napitia(&["run", as_str(source)]);
+    let err = stderr(&output);
+    assert!(
+        !output.status.success(),
+        "this program must fail at run time, but `run` succeeded"
+    );
+    assert!(
+        !err.contains("panicked at") && !err.contains("RUST_BACKTRACE"),
+        "a Napitia runtime failure is never a Rust panic:\n{err}"
+    );
+    (
+        output.status.code().expect("`run` exits normally"),
+        err.trim().to_string(),
+    )
+}
+
+/// Builds `source` and runs it, reporting the executable's status and
+/// standard error -- or `None` when this host cannot link, having first
+/// asserted the exact refusal it gives instead.
+fn build_and_capture(workspace: &Workspace, source: &Path, output: &Path) -> Option<(i32, String)> {
+    let built = napitia(&["build", as_str(source), "--output", as_str(output)]);
+    let expected = match classify_host(workspace) {
+        Host::Links => {
+            assert!(
+                built.status.success(),
+                "a GNU host with a matching linker must build:\n{}",
+                stderr(&built)
+            );
+            let run = Command::new(output)
+                .output()
+                .expect("the built executable must be runnable");
+            return Some((
+                run.status.code().expect("the program exits normally"),
+                String::from_utf8_lossy(&run.stderr).trim().to_string(),
+            ));
+        }
+        Host::NoLinker => codes::LINKER_LAUNCH_FAILED,
+        Host::WrongLinkerTarget => codes::LINKER_TARGET_MISMATCH,
+        Host::Unsupported => codes::UNSUPPORTED_HOST,
+    };
+    assert_eq!(built.status.code(), Some(1));
+    assert!(
+        stderr(&built).contains(expected),
+        "this host must refuse with {expected}:\n{}",
+        stderr(&built)
+    );
+    assert!(
+        !output.exists(),
+        "a host that cannot link writes no executable"
+    );
+    None
+}
+
+/// Every overflow the native subset can produce, in both paths.
+///
+/// The interpreter is the reference: whatever it says the failure is,
+/// the executable must say the same thing, in the same words.
+const OVERFLOWS: [(&str, &str, &str); 5] = [
+    (
+        "add_overflows",
+        "value m: i64 = 9223372036854775807; return m + 1",
+        "integer overflow in `add`",
+    ),
+    (
+        "add_underflows",
+        "value m: i64 = -9223372036854775808; return m + -1",
+        "integer overflow in `add`",
+    ),
+    (
+        "sub_underflows",
+        "value m: i64 = -9223372036854775808; return m - 1",
+        "integer overflow in `sub`",
+    ),
+    (
+        "mul_overflows",
+        "value m: i64 = 9223372036854775807; return m * 2",
+        "integer overflow in `mul`",
+    ),
+    (
+        "neg_of_the_minimum",
+        "value m: i64 = -9223372036854775808; return -m",
+        "integer overflow in `neg`",
+    ),
+];
+
+#[test]
+fn an_overflow_fails_the_same_way_in_both_execution_paths() {
+    let workspace = Workspace::new("overflow");
+    for (name, body, category) in OVERFLOWS {
+        let source = workspace.source(name, &format!("func main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+
+        let (interpreted_status, interpreted_error) = interpreted_failure(&source);
+        assert_ne!(interpreted_status, 0, "`{name}`");
+        assert!(
+            interpreted_error.contains(category),
+            "`{name}`: the interpreter must name the failure: {interpreted_error}"
+        );
+
+        let Some((status, error)) = build_and_capture(&workspace, &source, &output) else {
+            continue;
+        };
+        assert_eq!(
+            status, RUNTIME_FAILURE_STATUS,
+            "`{name}`: a runtime failure has one documented status"
+        );
+        assert!(
+            error.contains(category),
+            "`{name}`: the executable must name the same failure: {error}"
+        );
+        assert!(
+            !error.contains("panicked at") && !error.contains("RUST_BACKTRACE"),
+            "`{name}`: no panic, no backtrace: {error}"
+        );
+        assert_eq!(
+            error,
+            format!("napitia: {interpreted_error}"),
+            "`{name}`: the executable reports exactly what `run` reports, \
+             prefixed only by its own name"
+        );
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// The same program, built and run twice, answers identically. The
+/// failure path is generated code like any other, so it is held to the
+/// same determinism rule.
+#[test]
+fn a_failing_program_answers_identically_on_every_run() {
+    let workspace = Workspace::new("overflow-determinism");
+    let source = workspace.source(
+        "repeat",
+        "func main() -> i64 { value m: i64 = 9223372036854775807; return m * 2 }",
+    );
+    let output = workspace.output("repeat");
+
+    let first = interpreted_failure(&source);
+    for _ in 0..3 {
+        assert_eq!(interpreted_failure(&source), first);
+    }
+
+    let Some(native) = build_and_capture(&workspace, &source, &output) else {
+        return;
+    };
+    for _ in 0..3 {
+        let again = Command::new(&output)
+            .output()
+            .expect("the built executable must be runnable");
+        assert_eq!(
+            (
+                again.status.code().expect("the program exits normally"),
+                String::from_utf8_lossy(&again.stderr).trim().to_string(),
+            ),
+            native,
+            "repeated runs of one executable must agree"
+        );
+    }
+}
+
+/// A successful program writes nothing to standard error, which is what
+/// makes that stream -- rather than the exit status, whose every byte a
+/// returned value can produce -- the discriminator for a failure.
+#[test]
+fn a_successful_program_writes_nothing_to_standard_error() {
+    let workspace = Workspace::new("quiet-success");
+    let source = workspace.source("quiet", "func main() -> i64 { return 70 }");
+    let output = workspace.output("quiet");
+
+    let Some((status, error)) = build_and_capture(&workspace, &source, &output) else {
+        return;
+    };
+    assert_eq!(
+        status, RUNTIME_FAILURE_STATUS,
+        "this program returns exactly the runtime-failure status"
+    );
+    assert!(
+        error.is_empty(),
+        "and is still distinguishable, because it says nothing: {error}"
+    );
+}
+
+/// The operators whose exceptional cases the native subset does not
+/// implement are refused before code generation, on every host, rather
+/// than compiled to something that behaves differently.
+#[test]
+fn the_operators_outside_the_native_subset_are_still_refused() {
+    let workspace = Workspace::new("outside-subset");
+    for (name, body) in [
+        ("div", "value a: i64 = 9; value b: i64 = 2; return a / b"),
+        ("rem", "value a: i64 = 9; value b: i64 = 2; return a % b"),
+        ("shl", "value a: i64 = 1; value b: i64 = 2; return a << b"),
+        ("shr", "value a: i64 = 4; value b: i64 = 2; return a >> b"),
+    ] {
+        let source = workspace.source(name, &format!("func main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+        let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(built.status.code(), Some(1), "`{name}`");
+        assert!(
+            stderr(&built).contains(codes::UNSUPPORTED_OPERATOR),
+            "`{name}`: must be refused as an unsupported operator:\n{}",
+            stderr(&built)
+        );
+        assert!(!output.exists(), "`{name}`: a refused build writes nothing");
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// A literal outside `i64` stops every command at the same diagnostic,
+/// before NIR lowering or code generation can run, and does so
+/// byte-identically twice in a row.
+#[test]
+fn an_out_of_range_literal_stops_every_command_identically() {
+    let workspace = Workspace::new("literal-range");
+    for (name, literal) in [
+        ("too_high", "9223372036854775808"),
+        ("too_low", "-9223372036854775809"),
+    ] {
+        let source = workspace.source(
+            name,
+            &format!("func main() -> i64 {{ value x: i64 = {literal}; return 0 }}"),
+        );
+        let output = workspace.output(name);
+
+        let mut renderings = Vec::new();
+        for command in ["check", "ir", "run"] {
+            let result = napitia(&[command, as_str(&source)]);
+            assert_eq!(result.status.code(), Some(1), "`{name}`/{command}");
+            assert!(
+                stdout(&result).is_empty(),
+                "`{name}`/{command}: nothing is produced past the diagnostic"
+            );
+            assert!(
+                stderr(&result).contains("T0073"),
+                "`{name}`/{command}: {}",
+                stderr(&result)
+            );
+            renderings.push(stderr(&result));
+        }
+
+        let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(built.status.code(), Some(1), "`{name}`/build");
+        assert!(stderr(&built).contains("T0073"), "{}", stderr(&built));
+        assert!(
+            !output.exists(),
+            "`{name}`: no executable from a failed build"
+        );
+        renderings.push(stderr(&built));
+
+        assert!(
+            renderings.windows(2).all(|pair| pair[0] == pair[1]),
+            "`{name}`: every command must stop at the identical diagnostic: {renderings:?}"
+        );
+
+        // Twice, byte for byte.
+        assert_eq!(
+            stderr(&napitia(&["check", as_str(&source)])),
+            stderr(&napitia(&["check", as_str(&source)])),
+            "`{name}`: repeated runs must render identically"
+        );
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// A numeric type with no execution semantics is refused the same way,
+/// by every command.
+#[test]
+fn an_unimplemented_numeric_type_stops_every_command_identically() {
+    let workspace = Workspace::new("numeric-type");
+    let source = workspace.source(
+        "unsupported",
+        "func main() -> i64 { value x: u8 = 0; return 0 }",
+    );
+    let output = workspace.output("unsupported");
+
+    let mut renderings = Vec::new();
+    for command in ["check", "ir", "run"] {
+        let result = napitia(&[command, as_str(&source)]);
+        assert_eq!(result.status.code(), Some(1), "{command}");
+        assert!(stderr(&result).contains("T0074"), "{}", stderr(&result));
+        renderings.push(stderr(&result));
+    }
+    let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+    assert_eq!(built.status.code(), Some(1));
+    assert!(stderr(&built).contains("T0074"), "{}", stderr(&built));
+    assert!(!output.exists());
+    renderings.push(stderr(&built));
+
+    assert!(
+        renderings.windows(2).all(|pair| pair[0] == pair[1]),
+        "every command must stop at the identical diagnostic: {renderings:?}"
+    );
+}
+
+// -- overflow reached through control flow --------------------------------
+//
+// An overflow in `main`'s own straight-line body is the easy case. These
+// put the failing operation behind a call, a loop and a branch, so the
+// backend's failure path has to be correct in a block that is not the
+// entry block and is not the only predecessor of what follows it.
+//
+// Every one is run through the interpreter first and the executable
+// second, and the two are compared exactly -- status and stderr.
+
+/// Programs whose overflow is reached only through control flow. Each
+/// returns a value on the path that does *not* fail, so a build that
+/// simply never failed would be caught by the success case too.
+const CONTROL_FLOW_OVERFLOWS: [(&str, &str, &str); 6] = [
+    (
+        "nested_call",
+        "func bump(n: i64) -> i64 { return n + 1; } \
+         func main() -> i64 { return bump(9223372036854775807); }",
+        "integer overflow in `add`",
+    ),
+    (
+        "twice_nested_call",
+        "func inner(n: i64) -> i64 { return n * 2; } \
+         func middle(n: i64) -> i64 { return inner(n); } \
+         func main() -> i64 { return middle(9223372036854775807); }",
+        "integer overflow in `mul`",
+    ),
+    (
+        "loop_body",
+        "func main() -> i64 { \
+           mutable x: i64 = 9223372036854775800; \
+           mutable i: i64 = 0; \
+           while i < 100 { x = x + 1; i = i + 1; } \
+           return x; }",
+        "integer overflow in `add`",
+    ),
+    (
+        "loop_counter_negation",
+        "func main() -> i64 { \
+           mutable x: i64 = -9223372036854775808; \
+           mutable i: i64 = 0; \
+           while i < 3 { x = -x; i = i + 1; } \
+           return x; }",
+        "integer overflow in `neg`",
+    ),
+    (
+        "taken_branch",
+        "func main() -> i64 { \
+           value chosen: bool = true; \
+           value m: i64 = -9223372036854775808; \
+           if chosen { return m - 1; } \
+           return 7; }",
+        "integer overflow in `sub`",
+    ),
+    (
+        "branch_inside_a_call",
+        "func pick(flag: bool, n: i64) -> i64 { if flag { return n + 1; } return 0; } \
+         func main() -> i64 { return pick(true, 9223372036854775807); }",
+        "integer overflow in `add`",
+    ),
+];
+
+#[test]
+fn an_overflow_reached_through_control_flow_fails_identically_in_both_paths() {
+    let workspace = Workspace::new("overflow-control-flow");
+    for (name, program, category) in CONTROL_FLOW_OVERFLOWS {
+        let source = workspace.source(name, program);
+        let output = workspace.output(name);
+
+        let (interpreted_status, interpreted_error) = interpreted_failure(&source);
+        assert_eq!(
+            interpreted_status, 1,
+            "`{name}`: `run` reports failure as 1"
+        );
+        assert!(
+            interpreted_error.contains(category),
+            "`{name}`: the interpreter must name the failure: {interpreted_error}"
+        );
+
+        let Some((status, error)) = build_and_capture(&workspace, &source, &output) else {
+            continue;
+        };
+        assert_eq!(
+            status, RUNTIME_FAILURE_STATUS,
+            "`{name}`: a runtime failure has one documented status"
+        );
+        assert_eq!(
+            error,
+            format!("napitia: {interpreted_error}"),
+            "`{name}`: the executable must report exactly what `run` reports"
+        );
+        assert!(
+            !error.contains("panicked at") && !error.contains("RUST_BACKTRACE"),
+            "`{name}`: {error}"
+        );
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// The same shapes, on the path that does *not* overflow: a build whose
+/// failure path was always taken, or never taken, fails one of these.
+#[test]
+fn the_same_control_flow_shapes_succeed_when_nothing_overflows() {
+    let workspace = Workspace::new("control-flow-success");
+    for (name, program, expected) in [
+        (
+            "nested_call_ok",
+            "func bump(n: i64) -> i64 { return n + 1; } \
+             func main() -> i64 { if bump(41) == 42 { return 42; } return 0; }",
+            42,
+        ),
+        (
+            "loop_ok",
+            "func main() -> i64 { \
+               mutable x: i64 = 9223372036854775800; \
+               mutable i: i64 = 0; \
+               while i < 7 { x = x + 1; i = i + 1; } \
+               if x == 9223372036854775807 { return 42; } \
+               return 0; }",
+            42,
+        ),
+        (
+            "untaken_branch_ok",
+            "func main() -> i64 { \
+               value chosen: bool = false; \
+               value m: i64 = 9223372036854775807; \
+               if chosen { return m + 1; } \
+               return 42; }",
+            42,
+        ),
+        (
+            "negation_of_the_maximum_ok",
+            "func main() -> i64 { \
+               value m: i64 = 9223372036854775807; \
+               if -m == -9223372036854775807 { return 42; } \
+               return 0; }",
+            42,
+        ),
+    ] {
+        let source = workspace.source(name, program);
+        let output = workspace.output(name);
+
+        assert_eq!(
+            interpreted(&source),
+            expected.to_string(),
+            "`{name}`: the interpreter must reach the answer"
+        );
+        if let Some(status) = build_and_run(&workspace, &source, &output) {
+            assert_eq!(status, expected, "`{name}`");
+        }
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// Multiplication across every sign combination, at magnitudes that
+/// stay in range and at magnitudes that do not. A sign error in the
+/// overflow test would show up here rather than in a single case.
+#[test]
+fn multiplication_agrees_on_every_sign_combination() {
+    let workspace = Workspace::new("multiplication-signs");
+
+    let ok = workspace.source(
+        "signs_ok",
+        "func main() -> i64 { \
+           if 3 * 4 == 12 { if -3 * 4 == -12 { if 3 * -4 == -12 { if -3 * -4 == 12 { \
+           return 42; } } } } return 0; }",
+    );
+    let ok_output = workspace.output("signs_ok");
+    assert_eq!(interpreted(&ok), "42");
+    if let Some(status) = build_and_run(&workspace, &ok, &ok_output) {
+        assert_eq!(status, 42);
+    }
+
+    for (name, body, category) in [
+        (
+            "positive_times_positive",
+            "value m: i64 = 9223372036854775807; return m * 2",
+            "integer overflow in `mul`",
+        ),
+        (
+            "negative_times_positive",
+            "value m: i64 = -9223372036854775808; return m * 2",
+            "integer overflow in `mul`",
+        ),
+        (
+            "negative_times_negative",
+            "value m: i64 = -9223372036854775808; value n: i64 = -1; return m * n",
+            "integer overflow in `mul`",
+        ),
+        (
+            "positive_times_negative",
+            "value m: i64 = 9223372036854775807; value n: i64 = -2; return m * n",
+            "integer overflow in `mul`",
+        ),
+    ] {
+        let source = workspace.source(name, &format!("func main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+        let (_, interpreted_error) = interpreted_failure(&source);
+        assert!(interpreted_error.contains(category), "`{name}`");
+        if let Some((status, error)) = build_and_capture(&workspace, &source, &output) {
+            assert_eq!(status, RUNTIME_FAILURE_STATUS, "`{name}`");
+            assert_eq!(error, format!("napitia: {interpreted_error}"), "`{name}`");
+        }
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// The operations the native backend does not implement are refused
+/// with `A0009`, deterministically, and are *not* claimed to have
+/// native parity -- the interpreter runs them and the backend does not.
+#[test]
+fn operations_outside_native_capability_are_a0009_and_still_interpret() {
+    let workspace = Workspace::new("a0009-boundary");
+    for (name, body, interpreted_answer) in [
+        (
+            "div",
+            "value a: i64 = 9; value b: i64 = 2; return a / b",
+            "4",
+        ),
+        (
+            "rem",
+            "value a: i64 = 9; value b: i64 = 2; return a % b",
+            "1",
+        ),
+        (
+            "shl",
+            "value a: i64 = 1; value b: i64 = 4; return a << b",
+            "16",
+        ),
+        (
+            "shr",
+            "value a: i64 = 16; value b: i64 = 2; return a >> b",
+            "4",
+        ),
+    ] {
+        let source = workspace.source(name, &format!("func main() -> i64 {{ {body} }}"));
+        let output = workspace.output(name);
+
+        // The interpreter is the complete execution path and runs it.
+        assert_eq!(interpreted(&source), interpreted_answer, "`{name}`");
+
+        // The backend refuses it, by name, on every host, twice
+        // identically.
+        let first = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(first.status.code(), Some(1), "`{name}`");
+        assert!(
+            stderr(&first).contains(codes::UNSUPPORTED_OPERATOR),
+            "`{name}`: must be A0009:\n{}",
+            stderr(&first)
+        );
+        assert!(!output.exists(), "`{name}`: a refused build writes nothing");
+        let second = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(
+            stderr(&first),
+            stderr(&second),
+            "`{name}`: the refusal must be byte-identical across runs"
+        );
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
+}
+
+/// `f64` is outside the native subset too, and is refused for its type
+/// rather than silently compiled as something else. Which code depends
+/// on where the float is: `main`'s own result is the entry point's
+/// business, a float anywhere else is the type rule's.
+#[test]
+fn a_float_program_is_refused_by_the_native_backend_but_still_interprets() {
+    let workspace = Workspace::new("float-boundary");
+    for (name, program, answer, expected) in [
+        (
+            "float_result",
+            "func main() -> f64 { value x: f64 = 1.5; return x + 0.5 }",
+            "2",
+            codes::ENTRY_RETURN_TYPE,
+        ),
+        (
+            "float_local",
+            "func main() -> i64 { value x: f64 = 1.5; if x > 1.0 { return 42; } return 0 }",
+            "42",
+            codes::UNSUPPORTED_TYPE,
+        ),
+    ] {
+        let source = workspace.source(name, program);
+        let output = workspace.output(name);
+
+        // The interpreter is the complete execution path and runs it.
+        assert_eq!(interpreted(&source), answer, "`{name}`");
+
+        let built = napitia(&["build", as_str(&source), "--output", as_str(&output)]);
+        assert_eq!(built.status.code(), Some(1), "`{name}`");
+        assert!(
+            stderr(&built).contains(expected),
+            "`{name}`: must be refused with {expected}:\n{}",
+            stderr(&built)
+        );
+        assert!(!output.exists(), "`{name}`");
+    }
+    assert!(workspace.leftover_build_directories().is_empty());
 }

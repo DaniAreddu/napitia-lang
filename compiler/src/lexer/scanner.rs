@@ -272,7 +272,7 @@ impl<'a> Scanner<'a> {
                         span,
                         codes::MALFORMED_NUMBER,
                         "integer literal out of range",
-                        "value does not fit in a 128-bit integer",
+                        "too large for any Napitia integer type, and too large for the compiler to read",
                     );
                     TokenKind::Error
                 }
@@ -302,7 +302,7 @@ impl<'a> Scanner<'a> {
                     span,
                     codes::MALFORMED_NUMBER,
                     "integer literal out of range",
-                    "value does not fit in a 128-bit integer",
+                    "too large for any Napitia integer type, and too large for the compiler to read",
                 );
                 TokenKind::Error
             }
@@ -703,6 +703,31 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    /// A magnitude past what the compiler can read at all is the lexer's
+    /// business, not the checker's range rule (`rfcs/0015`): there is no
+    /// value here to compare against a type's domain in the first place.
+    ///
+    /// The message says that without naming the width of the compiler's
+    /// own carrier, which is not a Napitia type and would be exactly the
+    /// wrong thing for a reader to infer one from.
+    #[test]
+    fn a_literal_too_large_to_read_is_a_lexer_diagnostic() {
+        for text in ["9".repeat(64), format!("0x{}", "f".repeat(64))] {
+            let (tokens, diags) = lex(&text);
+            assert_eq!(diags.len(), 1, "`{text}`");
+            assert_eq!(diags[0].code, "N0002");
+            assert_eq!(tokens[0].kind, TokenKind::Error);
+            let label = match &diags[0].primary_label {
+                Some(label) => label.clone(),
+                None => panic!("`{text}`: this diagnostic must underline the literal"),
+            };
+            assert!(
+                !label.contains("128") && !diags[0].message.contains("128"),
+                "`{text}`: no Napitia type is 128 bits wide, so nothing should say so: {label}"
+            );
+        }
     }
 
     #[test]

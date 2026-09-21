@@ -2,6 +2,14 @@
 //! (`spec/0006`), used to validate language semantics before any native
 //! backend exists.
 //!
+//! # What it accepts
+//!
+//! A [`crate::nir::VerifiedModule`] (`rfcs/0016`), so no production
+//! caller can point this engine at NIR the verifier never accepted. The
+//! runtime refusals below are therefore genuinely a second line rather
+//! than the only one, and the `#[cfg(test)]` `Interpreter::unchecked`
+//! path is what keeps them under test.
+//!
 //! # Numbers
 //!
 //! A Napitia `i64` executes as exactly one thing here: a Rust `i64`

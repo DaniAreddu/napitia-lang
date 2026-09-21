@@ -21,7 +21,7 @@
 //! care: the interpreter's own defence-in-depth checks (`rfcs/0015`,
 //! `X0001`-`X0004`) stay exactly as they are, and remain observable
 //! through the `#[cfg(test)]`-only unchecked path
-//! ([`VerifiedModule::seal_unchecked`]), which the production library
+//! (`VerifiedModule::seal_unchecked`), which the production library
 //! does not compile at all.
 
 use crate::diagnostics::Diagnostic;

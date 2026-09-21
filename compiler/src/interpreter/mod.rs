@@ -19243,8 +19243,7 @@ mod stateful_termination {
             &interner,
             &crate::hir::ItemRegistry::default(),
         )
-        .err()
-        .expect("a module the runtime cannot execute must never seal");
+        .expect_err("a module the runtime cannot execute must never seal");
         assert_eq!(
             diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
             vec!["V0112", "V0077"]
@@ -19265,8 +19264,7 @@ mod stateful_termination {
                 &interner,
                 &crate::hir::ItemRegistry::default(),
             )
-            .err()
-            .expect("the module never seals")
+            .expect_err("the module never seals")
             .iter()
             .map(|d| crate::diagnostics::render(d, &map))
             .collect::<String>()

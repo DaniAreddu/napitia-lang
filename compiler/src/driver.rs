@@ -415,27 +415,23 @@ mod tests {
     /// coercions compile only while that is true; a signature that went
     /// back to `&nir::Module` would fail to compile here, which is the
     /// assertion.
+    type ValidateEntry = fn(
+        &VerifiedModule,
+        SourceId,
+        &Interner,
+        &ItemRegistry,
+        &str,
+        &[Span],
+    ) -> Result<crate::native::capability::NativePlan, Vec<Diagnostic>>;
+
+    type BuildEntry =
+        fn(&VerifiedModule, SourceId, &Interner, &ItemRegistry, &[Span], &Path) -> Vec<Diagnostic>;
+
     #[test]
     fn no_production_entry_point_accepts_a_raw_module() {
         fn interpreter_entry<'a>(_: fn(&'a VerifiedModule) -> Interpreter<'a>) {}
         interpreter_entry(Interpreter::new);
-        let _validate: fn(
-            &VerifiedModule,
-            SourceId,
-            &Interner,
-            &crate::hir::ItemRegistry,
-            &str,
-            &[Span],
-        )
-            -> Result<crate::native::capability::NativePlan, Vec<Diagnostic>> =
-            crate::native::capability::validate;
-        let _build: fn(
-            &VerifiedModule,
-            SourceId,
-            &Interner,
-            &crate::hir::ItemRegistry,
-            &[Span],
-            &Path,
-        ) -> Vec<Diagnostic> = crate::native::build_executable;
+        let _validate: ValidateEntry = crate::native::capability::validate;
+        let _build: BuildEntry = crate::native::build_executable;
     }
 }

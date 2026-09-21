@@ -1099,6 +1099,7 @@ mod tests {
     use crate::hir::ItemRegistry;
     use crate::native::TARGET_TRIPLE;
     use crate::native::capability;
+    use crate::nir::VerifiedModule;
     use crate::source::SourceMap;
 
     struct Built {
@@ -1226,13 +1227,19 @@ mod tests {
             panic!("the fixture must compile")
         };
 
-        let mut reversed = forward.clone();
-        reversed.functions.reverse();
-        for function in &mut reversed.functions {
+        // Reversing is a *rebuild* of the raw module, then a fresh seal:
+        // a sealed module cannot be reordered in place, which is the
+        // boundary working as intended. The unchecked seal is the
+        // `#[cfg(test)]` path, and reordering storage cannot make
+        // already-verified NIR invalid.
+        let mut rebuilt = forward.module().clone();
+        rebuilt.functions.reverse();
+        for function in &mut rebuilt.functions {
             function.blocks.reverse();
         }
+        let reversed = VerifiedModule::seal_unchecked(rebuilt);
 
-        let object_of = |module: &Module, registry: &ItemRegistry| {
+        let object_of = |module: &VerifiedModule, registry: &ItemRegistry| {
             let plan =
                 capability::validate(module, source, &interner, registry, TARGET_TRIPLE, &[])
                     .expect("the fixture is inside the native subset");

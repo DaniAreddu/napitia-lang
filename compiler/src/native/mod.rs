@@ -1147,10 +1147,21 @@ mod link_tests {
             .iter()
             .map(|d| d.code)
             .collect();
-        let native: Vec<&str> = build_executable(module, source, interner, &registry, &[], output)
-            .iter()
-            .map(|d| d.code)
-            .collect();
+        // A hand-built module can never earn a seal, so the only way to
+        // ask the native pipeline about one is the `#[cfg(test)]`
+        // unchecked path -- which is exactly the caller `A0019` exists
+        // for.
+        let native: Vec<&str> = build_executable(
+            &VerifiedModule::seal_unchecked(module.clone()),
+            source,
+            interner,
+            &registry,
+            &[],
+            output,
+        )
+        .iter()
+        .map(|d| d.code)
+        .collect();
         (verifier, native)
     }
 
@@ -1308,9 +1319,15 @@ mod link_tests {
             )],
         );
 
-        let refused =
-            capability::validate(&module, source, &interner, &registry, TARGET_TRIPLE, &[])
-                .expect_err("a `str` result is outside the native subset");
+        let refused = capability::validate(
+            &VerifiedModule::seal_unchecked(module),
+            source,
+            &interner,
+            &registry,
+            TARGET_TRIPLE,
+            &[],
+        )
+        .expect_err("a `str` result is outside the native subset");
         assert_eq!(
             refused.iter().map(|d| d.code).collect::<Vec<_>>(),
             vec![codes::ENTRY_RETURN_TYPE]

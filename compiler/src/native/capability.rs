@@ -70,8 +70,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry};
 use crate::nir::{
-    BasicBlock, BlockId, Const, Function, Instruction, Module, OwnershipMode, Terminator, ValueId,
-    ValueKind,
+    BasicBlock, BlockId, Const, Function, Instruction, OwnershipMode, Terminator, ValueId,
+    ValueKind, VerifiedModule,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
@@ -104,7 +104,7 @@ pub(crate) const ENTRY_NAME: &str = "main";
 ///
 /// Every order in here is derived from semantic identity
 /// ([`ItemId`]/[`BlockId`]), never from the position an item happened to
-/// occupy in a `Vec`, so reversing `Module::functions` or a function's
+/// occupy in a `Vec`, so reversing the module's functions or a function's
 /// own `blocks` changes nothing about what is emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativePlan {
@@ -149,6 +149,14 @@ impl NativePlan {
 
 /// Validates `module` against the native subset, targeting `target`.
 ///
+/// Takes a [`VerifiedModule`] rather than a bare [`crate::nir::Module`]
+/// because
+/// every rule here is asked *on top of* the NIR verifier's own, never
+/// instead of them (see this module's header): a module that never
+/// passed `nir::verify` has no business being asked whether it is
+/// inside the native subset, and outside this crate's own tests there
+/// is no way to build one of these that skipped it.
+///
 /// `imports` carries the span of every `import` declaration the source
 /// itself wrote. Single-file compilation resolves no imports at all, so
 /// nothing about the NIR records that one was written -- and a native
@@ -160,7 +168,7 @@ impl NativePlan {
 /// facts, then the entry contract, then each reachable function in
 /// ascending [`ItemId`] order, then call-graph cycles.
 pub(crate) fn validate(
-    module: &Module,
+    module: &VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
@@ -1784,7 +1792,7 @@ mod tests {
     /// One compiled, verified single-file program, kept together so a
     /// test can validate it and render whatever it refuses.
     struct Compiled {
-        module: Module,
+        module: VerifiedModule,
         registry: ItemRegistry,
         source: SourceId,
         interner: Interner,
@@ -2272,7 +2280,7 @@ mod tests {
 #[cfg(test)]
 mod hand_built_tests {
     use super::*;
-    use crate::nir::{Param, verify_module};
+    use crate::nir::{Module, Param, verify_module};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -2337,11 +2345,17 @@ mod hand_built_tests {
     /// Validates hand-built NIR the way a caller who skipped the
     /// verifier would: nothing here has a registry entry, so every
     /// diagnostic has to identify itself by NIR identity alone.
+    ///
+    /// Reaching the validator at all now requires a seal, and these
+    /// modules could never earn one, so they take the `#[cfg(test)]`
+    /// unchecked path. That is the whole point of the test: it proves
+    /// which layer owns which refusal, and no production caller can
+    /// stand where it stands.
     fn codes_of(module: &Module, interner: &Interner) -> Vec<&'static str> {
         let mut map = SourceMap::new();
         let source = map.add_file("hand-built.npt", "\n");
         match validate(
-            module,
+            &VerifiedModule::seal_unchecked(module.clone()),
             source,
             interner,
             &ItemRegistry::default(),
@@ -3169,7 +3183,7 @@ mod hand_built_tests {
             let mut map = SourceMap::new();
             let source = map.add_file("hand-built.npt", "\n");
             match validate(
-                &built,
+                &VerifiedModule::seal_unchecked(built.clone()),
                 source,
                 &interner,
                 &ItemRegistry::default(),

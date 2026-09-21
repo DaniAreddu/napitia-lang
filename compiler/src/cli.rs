@@ -1,5 +1,10 @@
 //! Command-line entry point. Kept free of compiler logic: it only parses
 //! arguments and delegates to [`crate::driver`].
+//!
+//! Every command that touches NIR receives it already sealed
+//! (`rfcs/0016`): `ir` prints the verified module through its read-only
+//! accessor, and `run`/`build` never see NIR at all -- the driver hands
+//! them a result, never a module to execute.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -236,7 +241,10 @@ fn dispatch_project(command: &str, manifest_path: &Path) -> ExitCode {
                 exit_for(&diagnostics)
             }
             ProjectIrOutput::Ready { nir, registry } => {
-                print!("{}", crate::nir::print_module(&nir, &interner, &registry));
+                print!(
+                    "{}",
+                    crate::nir::print_module(nir.module(), &interner, &registry)
+                );
                 ExitCode::SUCCESS
             }
         },
@@ -322,7 +330,10 @@ fn ir_command(map: &SourceMap, source: SourceId, interner: &mut Interner) -> Exi
             exit_for(&diagnostics)
         }
         IrOutput::Ready { nir, registry } => {
-            print!("{}", crate::nir::print_module(&nir, interner, &registry));
+            print!(
+                "{}",
+                crate::nir::print_module(nir.module(), interner, &registry)
+            );
             ExitCode::SUCCESS
         }
     }

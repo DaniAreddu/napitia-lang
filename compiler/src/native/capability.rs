@@ -11,9 +11,10 @@
 //!
 //! It is not a second NIR verifier. [`crate::nir::verify_module`] has
 //! already run and already owns every structural and typing invariant
-//! NIR has. Where this pass notices such a violation anyway -- it is
-//! `pub(crate)`, and a crate-internal caller may hand it hand-built
-//! NIR that never went through the verifier -- it reports
+//! NIR has -- and since Alpha 0.2.2 (`rfcs/0016`) this pass takes a
+//! [`crate::nir::VerifiedModule`], so no production caller can reach it
+//! with anything else. Where it notices such a violation anyway -- only
+//! a `#[cfg(test)]` unchecked seal can put one here -- it reports
 //! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is

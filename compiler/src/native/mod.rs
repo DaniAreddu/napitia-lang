@@ -24,7 +24,7 @@
 //!
 //! * [`crate::nir::verify()`] is mandatory and runs first, and its seal
 //!   is what this backend takes: `build_executable` and
-//!   [`capability::validate`] accept a [`crate::nir::VerifiedModule`],
+//!   `capability::validate` accept a [`crate::nir::VerifiedModule`],
 //!   never a bare module, so code generation cannot be reached with NIR
 //!   the verifier has not accepted. Nothing here re-derives structural
 //!   invariants the verifier already owns -- and where this module does

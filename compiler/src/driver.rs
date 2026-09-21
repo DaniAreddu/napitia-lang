@@ -349,4 +349,93 @@ mod tests {
             }
         }
     }
+
+    /// One scalar program, inside the native subset and trivially
+    /// runnable, used wherever a test needs a fixture that really does
+    /// reach the far end of the pipeline.
+    const SCALAR: &str = "func add(a: i64, b: i64) -> i64 { return a + b; } \
+                          func main() -> i64 { return add(40, 2); }";
+
+    #[test]
+    fn a_valid_program_lowers_verifies_and_runs_through_the_seal() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, .. } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+
+        // The seal is what the interpreter takes, and it holds the
+        // program that was compiled: both functions, entry block first.
+        assert_eq!(nir.module().functions.len(), 2);
+        assert_eq!(
+            Interpreter::new(&nir).run("main", &interner),
+            Ok(Value::Int(42))
+        );
+
+        // And the ordinary `run` path agrees, because it is the same
+        // path.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+        match run(&map, source, &mut interner, "main") {
+            RunOutput::Result(result) => assert_eq!(result, Ok(Value::Int(42))),
+            RunOutput::Diagnostics(diagnostics) => {
+                panic!("unexpected diagnostics: {diagnostics:?}")
+            }
+        }
+    }
+
+    /// The native backend's first stage is reached with the seal, and
+    /// accepts it: capability validation is downstream of verification,
+    /// never a substitute for it.
+    #[test]
+    fn valid_verified_nir_reaches_the_native_capability_validator() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, registry } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+
+        crate::native::capability::validate(
+            &nir,
+            source,
+            &interner,
+            &registry,
+            crate::native::TARGET_TRIPLE,
+            &[],
+        )
+        .expect("a scalar program is inside the native subset");
+    }
+
+    /// Production entry points take the seal, not a bare module. These
+    /// coercions compile only while that is true; a signature that went
+    /// back to `&nir::Module` would fail to compile here, which is the
+    /// assertion.
+    #[test]
+    fn no_production_entry_point_accepts_a_raw_module() {
+        fn interpreter_entry<'a>(_: fn(&'a VerifiedModule) -> Interpreter<'a>) {}
+        interpreter_entry(Interpreter::new);
+        let _validate: fn(
+            &VerifiedModule,
+            SourceId,
+            &Interner,
+            &crate::hir::ItemRegistry,
+            &str,
+            &[Span],
+        )
+            -> Result<crate::native::capability::NativePlan, Vec<Diagnostic>> =
+            crate::native::capability::validate;
+        let _build: fn(
+            &VerifiedModule,
+            SourceId,
+            &Interner,
+            &crate::hir::ItemRegistry,
+            &[Span],
+            &Path,
+        ) -> Vec<Diagnostic> = crate::native::build_executable;
+    }
 }

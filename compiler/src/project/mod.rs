@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{self, HirModule, ItemId};
-use crate::nir::{self, Module as NirModule};
+use crate::nir::{self, VerifiedModule};
 use crate::source::{SourceId, SourceMap};
 use crate::symbol::Interner;
 use crate::syntax::ast;
@@ -35,9 +35,12 @@ pub(crate) mod codes {
 }
 
 /// A fully compiled, verified project, ready to print or execute.
+///
+/// `nir` is sealed: it is the exact module `nir::verify` accepted, and
+/// there is no way from here back to a raw, unverified one.
 #[derive(Debug)]
 pub struct CompiledProject {
-    pub nir: NirModule,
+    pub nir: VerifiedModule,
     /// The entry module's own `main`, resolved by identity -- never a
     /// name lookup over the merged module, which a project with more
     /// than one module could make ambiguous.
@@ -276,14 +279,14 @@ pub fn compile_project(
         &module_path_of,
     )?;
 
-    let verify_diagnostics =
-        nir::verify_module(&nir_module, loaded.manifest_source, interner, &registry);
-    if !verify_diagnostics.is_empty() {
-        return Err(verify_diagnostics);
-    }
+    // Where a project crosses the verified boundary -- once, over the
+    // single merged module, never once per source module: the merged
+    // module is what runs, so it is the module that has to be checked
+    // and sealed.
+    let nir = nir::verify(nir_module, loaded.manifest_source, interner, &registry)?;
 
     Ok(CompiledProject {
-        nir: nir_module,
+        nir,
         entry_item,
         registry,
     })
@@ -1773,6 +1776,66 @@ mod tests {
         assert!(
             !diags.iter().any(|d| d.message.contains("Alpha 0.1.2")),
             "stale version-specific wording leaked: {diags:?}"
+        );
+    }
+
+    /// A project crosses the verified boundary exactly once, and over
+    /// the merged module that will actually run -- never once per
+    /// source module, which could not have checked a cross-module call
+    /// at all.
+    #[test]
+    fn a_project_crosses_the_verified_boundary_exactly_once() {
+        let project = TempProject::new("verified_boundary_once");
+        project.write("napitia.toml", MANIFEST);
+        project.write(
+            "src/main.npt",
+            "import math.add;\nfunc main() -> i64 { return add(20, 22) }\n",
+        );
+        project.write(
+            "src/math.npt",
+            "public func add(left: i64, right: i64) -> i64 { left + right }\n",
+        );
+
+        let mut map = SourceMap::new();
+        let mut interner = Interner::new();
+        let compiled = compile_project(&project.manifest_path(), &mut map, &mut interner)
+            .unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"));
+
+        // One seal, holding both modules' functions: the call across
+        // the module boundary was inside what the verifier saw.
+        let names: Vec<&str> = compiled
+            .nir
+            .module()
+            .functions
+            .iter()
+            .map(|function| interner.resolve(function.name))
+            .collect();
+        assert!(
+            names.contains(&"main") && names.contains(&"add"),
+            "the sealed module must be the merged one, got {names:?}"
+        );
+
+        // Asking the verifier about that same module again reports
+        // nothing, which is exactly why no later stage does: `ir` and
+        // `run` take the seal as it stands rather than checking it a
+        // second time.
+        let mut again = SourceMap::new();
+        let anchor = again.add_file("recheck.npt", "\n");
+        assert!(
+            crate::nir::verify_module(
+                compiled.nir.module(),
+                anchor,
+                &interner,
+                &compiled.registry,
+            )
+            .is_empty(),
+            "an already-sealed project module must still verify clean"
+        );
+
+        // And that one seal is what executes.
+        assert_eq!(
+            Interpreter::new(&compiled.nir).run_item(compiled.entry_item),
+            Ok(crate::interpreter::Value::Int(42))
         );
     }
 }

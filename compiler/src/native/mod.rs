@@ -22,13 +22,15 @@
 //! Two of those stages are load-bearing in a way worth stating
 //! explicitly:
 //!
-//! * [`crate::nir::verify_module`] is mandatory and runs first. Code
-//!   generation never sees NIR the verifier has not accepted, so
-//!   nothing here re-derives structural invariants the verifier already
-//!   owns -- and where this module does notice such a violation anyway
-//!   (`build_executable` is `pub(crate)`, and a crate-internal caller
-//!   can hand it anything), it refuses with
-//!   [`codes::UNVERIFIED_NIR`] rather than guessing.
+//! * [`crate::nir::verify()`] is mandatory and runs first, and its seal
+//!   is what this backend takes: `build_executable` and
+//!   `capability::validate` accept a [`crate::nir::VerifiedModule`],
+//!   never a bare module, so code generation cannot be reached with NIR
+//!   the verifier has not accepted. Nothing here re-derives structural
+//!   invariants the verifier already owns -- and where this module does
+//!   notice such a violation anyway (a `#[cfg(test)]` unchecked seal is
+//!   still a seal), it refuses with [`codes::UNVERIFIED_NIR`] rather
+//!   than guessing.
 //! * `capability` runs after verification and before Cranelift ever
 //!   sees a function. It decides, exhaustively, whether the whole
 //!   reachable program is inside the supported subset. Everything after
@@ -59,7 +61,7 @@ use target_lexicon::Triple;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::ItemRegistry;
-use crate::nir::Module;
+use crate::nir::VerifiedModule;
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::Ty;
@@ -362,7 +364,7 @@ fn probe_linker_target(linker: &OsStr) -> Result<LinkerTarget, std::io::Error> {
 /// `imports` carries the span of every `import` the source declared
 /// (see [`capability::validate`]).
 pub(crate) fn build_executable(
-    module: &Module,
+    module: &VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
@@ -379,7 +381,7 @@ pub(crate) fn build_executable(
     // subset gets the same diagnostic wherever it is compiled, and
     // whether this host could have linked the result is a separate
     // question from whether the program was compilable at all.
-    let object = match lower::emit_object(module, interner, &plan, TARGET_TRIPLE) {
+    let object = match lower::emit_object(module.module(), interner, &plan, TARGET_TRIPLE) {
         Ok(object) => object,
         Err(reason) => {
             return vec![
@@ -772,6 +774,7 @@ mod tests {
 mod link_tests {
     use super::*;
     use crate::driver::{self, IrOutput};
+    use crate::nir::Module;
     use crate::source::SourceMap;
 
     /// A directory of this test's own, under the system temporary
@@ -874,7 +877,7 @@ mod link_tests {
         assert_eq!(build_directory_parent(Path::new("program")), Path::new("."));
     }
 
-    fn compiled(text: &str) -> (Module, ItemRegistry, SourceId, Interner) {
+    fn compiled(text: &str) -> (VerifiedModule, ItemRegistry, SourceId, Interner) {
         let mut map = SourceMap::new();
         let source = map.add_file("link.npt", text);
         let mut interner = Interner::new();
@@ -1144,10 +1147,21 @@ mod link_tests {
             .iter()
             .map(|d| d.code)
             .collect();
-        let native: Vec<&str> = build_executable(module, source, interner, &registry, &[], output)
-            .iter()
-            .map(|d| d.code)
-            .collect();
+        // A hand-built module can never earn a seal, so the only way to
+        // ask the native pipeline about one is the `#[cfg(test)]`
+        // unchecked path -- which is exactly the caller `A0019` exists
+        // for.
+        let native: Vec<&str> = build_executable(
+            &VerifiedModule::seal_unchecked(module.clone()),
+            source,
+            interner,
+            &registry,
+            &[],
+            output,
+        )
+        .iter()
+        .map(|d| d.code)
+        .collect();
         (verifier, native)
     }
 
@@ -1305,9 +1319,15 @@ mod link_tests {
             )],
         );
 
-        let refused =
-            capability::validate(&module, source, &interner, &registry, TARGET_TRIPLE, &[])
-                .expect_err("a `str` result is outside the native subset");
+        let refused = capability::validate(
+            &VerifiedModule::seal_unchecked(module),
+            source,
+            &interner,
+            &registry,
+            TARGET_TRIPLE,
+            &[],
+        )
+        .expect_err("a `str` result is outside the native subset");
         assert_eq!(
             refused.iter().map(|d| d.code).collect::<Vec<_>>(),
             vec![codes::ENTRY_RETURN_TYPE]

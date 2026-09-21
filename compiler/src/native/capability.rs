@@ -11,9 +11,10 @@
 //!
 //! It is not a second NIR verifier. [`crate::nir::verify_module`] has
 //! already run and already owns every structural and typing invariant
-//! NIR has. Where this pass notices such a violation anyway -- it is
-//! `pub(crate)`, and a crate-internal caller may hand it hand-built
-//! NIR that never went through the verifier -- it reports
+//! NIR has -- and since Alpha 0.2.2 (`rfcs/0016`) this pass takes a
+//! [`crate::nir::VerifiedModule`], so no production caller can reach it
+//! with anything else. Where it notices such a violation anyway -- only
+//! a `#[cfg(test)]` unchecked seal can put one here -- it reports
 //! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is
@@ -70,8 +71,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry};
 use crate::nir::{
-    BasicBlock, BlockId, Const, Function, Instruction, Module, OwnershipMode, Terminator, ValueId,
-    ValueKind,
+    BasicBlock, BlockId, Const, Function, Instruction, OwnershipMode, Terminator, ValueId,
+    ValueKind, VerifiedModule,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
@@ -104,7 +105,7 @@ pub(crate) const ENTRY_NAME: &str = "main";
 ///
 /// Every order in here is derived from semantic identity
 /// ([`ItemId`]/[`BlockId`]), never from the position an item happened to
-/// occupy in a `Vec`, so reversing `Module::functions` or a function's
+/// occupy in a `Vec`, so reversing the module's functions or a function's
 /// own `blocks` changes nothing about what is emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativePlan {
@@ -149,6 +150,14 @@ impl NativePlan {
 
 /// Validates `module` against the native subset, targeting `target`.
 ///
+/// Takes a [`VerifiedModule`] rather than a bare [`crate::nir::Module`]
+/// because
+/// every rule here is asked *on top of* the NIR verifier's own, never
+/// instead of them (see this module's header): a module that never
+/// passed `nir::verify` has no business being asked whether it is
+/// inside the native subset, and outside this crate's own tests there
+/// is no way to build one of these that skipped it.
+///
 /// `imports` carries the span of every `import` declaration the source
 /// itself wrote. Single-file compilation resolves no imports at all, so
 /// nothing about the NIR records that one was written -- and a native
@@ -160,7 +169,7 @@ impl NativePlan {
 /// facts, then the entry contract, then each reachable function in
 /// ascending [`ItemId`] order, then call-graph cycles.
 pub(crate) fn validate(
-    module: &Module,
+    module: &VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
@@ -1779,12 +1788,13 @@ fn strongly_connected_components(
 mod tests {
     use super::*;
     use crate::driver::{self, IrOutput};
+    use crate::nir::Module;
     use crate::source::SourceMap;
 
     /// One compiled, verified single-file program, kept together so a
     /// test can validate it and render whatever it refuses.
     struct Compiled {
-        module: Module,
+        module: VerifiedModule,
         registry: ItemRegistry,
         source: SourceId,
         interner: Interner,
@@ -1815,6 +1825,25 @@ mod tests {
     impl Compiled {
         fn validate(&self) -> Result<NativePlan, Vec<Diagnostic>> {
             self.validate_for(TARGET_TRIPLE, &[])
+        }
+
+        /// The same compiled program with its NIR storage rearranged.
+        ///
+        /// A sealed module cannot be reordered in place -- that is the
+        /// boundary working as intended -- so this rebuilds the raw
+        /// module and seals it again through the `#[cfg(test)]`
+        /// unchecked path. Moving already-verified functions and blocks
+        /// around in their own vectors cannot make them unverifiable:
+        /// nothing the verifier checks depends on storage position,
+        /// which is the very claim these tests exist to hold the
+        /// validator to.
+        fn rearranged(self, rearrange: impl FnOnce(&mut Module)) -> Compiled {
+            let mut raw = self.module.module().clone();
+            rearrange(&mut raw);
+            Compiled {
+                module: VerifiedModule::seal_unchecked(raw),
+                ..self
+            }
         }
 
         fn validate_for(
@@ -1939,11 +1968,12 @@ mod tests {
     #[test]
     fn reversed_function_and_block_storage_produce_an_identical_plan() {
         let forward = compile(EVERY_SUPPORTED_CONSTRUCT);
-        let mut reversed = compile(EVERY_SUPPORTED_CONSTRUCT);
-        reversed.module.functions.reverse();
-        for function in &mut reversed.module.functions {
-            function.blocks.reverse();
-        }
+        let reversed = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            module.functions.reverse();
+            for function in &mut module.functions {
+                function.blocks.reverse();
+            }
+        });
 
         let expected = forward.validate().expect("the forward module validates");
         let actual = reversed
@@ -1956,12 +1986,13 @@ mod tests {
     /// at `bb0`.
     #[test]
     fn an_entry_block_stored_last_is_still_the_entry_block() {
-        let mut compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
-        for function in &mut compiled.module.functions {
-            if function.blocks.len() > 1 {
-                function.blocks.rotate_left(1);
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            for function in &mut module.functions {
+                if function.blocks.len() > 1 {
+                    function.blocks.rotate_left(1);
+                }
             }
-        }
+        });
         compiled
             .validate()
             .expect("the entry block is bb0 wherever it is stored");
@@ -2272,7 +2303,7 @@ mod tests {
 #[cfg(test)]
 mod hand_built_tests {
     use super::*;
-    use crate::nir::{Param, verify_module};
+    use crate::nir::{Module, Param, verify_module};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
@@ -2337,11 +2368,17 @@ mod hand_built_tests {
     /// Validates hand-built NIR the way a caller who skipped the
     /// verifier would: nothing here has a registry entry, so every
     /// diagnostic has to identify itself by NIR identity alone.
+    ///
+    /// Reaching the validator at all now requires a seal, and these
+    /// modules could never earn one, so they take the `#[cfg(test)]`
+    /// unchecked path. That is the whole point of the test: it proves
+    /// which layer owns which refusal, and no production caller can
+    /// stand where it stands.
     fn codes_of(module: &Module, interner: &Interner) -> Vec<&'static str> {
         let mut map = SourceMap::new();
         let source = map.add_file("hand-built.npt", "\n");
         match validate(
-            module,
+            &VerifiedModule::seal_unchecked(module.clone()),
             source,
             interner,
             &ItemRegistry::default(),
@@ -3169,7 +3206,7 @@ mod hand_built_tests {
             let mut map = SourceMap::new();
             let source = map.add_file("hand-built.npt", "\n");
             match validate(
-                &built,
+                &VerifiedModule::seal_unchecked(built.clone()),
                 source,
                 &interner,
                 &ItemRegistry::default(),

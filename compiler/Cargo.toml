@@ -50,7 +50,7 @@ cranelift-module = "0.135.2"
 # handed an ISA the backend has already selected, so the triple
 # parsing that selection needs is declared separately, below, rather
 # than reached through this crate.
-cranelift-object = "0.135.2"
+cranelift-object = "0.136.0"
 # Parses a target triple into the components `cranelift_codegen::isa`
 # selects a backend from. Declared directly, rather than reached
 # through Cranelift, because the alternative -- `isa::lookup_by_name`

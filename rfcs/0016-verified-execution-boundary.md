@@ -219,17 +219,21 @@ nameable outside this crate. Every production caller goes through
 
 The seal is a claim about *structure*, established by a pass that is
 itself code that can have bugs. Alpha 0.2.1's runtime refusals
-(`rfcs/0015`) are what stands between such a bug and a panic, and they
-are unchanged:
+(`rfcs/0015`) are unchanged, but they are not all defence in depth:
 
-| Code | Meaning |
-| --- | --- |
-| `X0001` | division by zero |
-| `X0002` | integer overflow |
-| `X0003` | shift amount out of range |
-| `X0004` | an operation this engine cannot execute, or a reused terminated context |
+| Code | Meaning | Role |
+| --- | --- | --- |
+| `X0001` | division by zero | ordinary runtime failure of a verified program |
+| `X0002` | integer overflow | ordinary runtime failure of a verified program |
+| `X0003` | shift amount out of range | ordinary runtime failure of a verified program |
+| `X0004` | an operation this engine cannot execute, or a reused terminated context | defence in depth |
 
-The unchecked path keeps them under test. Given a module that
+A verified program can still divide by zero, overflow or shift out of
+range; the verifier does not and cannot rule those out. What stands
+between a verifier bug and a panic is `X0004`, which the interpreter's
+own type and structure re-checks report.
+
+The unchecked path keeps `X0004` under test. Given a module that
 constructs a live resource and then reaches an instruction the
 interpreter cannot execute, the unchecked interpreter still returns a
 structured `X0004`, still terminates the execution context per
@@ -264,6 +268,15 @@ the failure case. That is the change this RFC is for.
   which registry. Verifying against one `ItemRegistry` and printing
   against another is still possible; nothing here makes registries part
   of the seal.
+* Likewise nothing checks that the registry later passed to
+  `nir::print_module`, or the source and registry passed to native
+  capability validation, are the ones `nir::verify` was given.
+* A seal does not guarantee the absence of runtime failures:
+  `X0001`–`X0003` remain ordinary failures of verified programs.
+* A seal does not guarantee native compilability: capability
+  validation may still refuse a `VerifiedModule`.
+* `Module` is `Clone`, so `verified.module().clone()` yields a raw,
+  unsealed `Module` again -- one no executor accepts.
 * It is a compile-time boundary within one crate's type system, not a
   cryptographic or runtime one. A `#[cfg(test)]` build can still seal
   anything, deliberately.

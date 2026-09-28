@@ -387,6 +387,89 @@ mod tests {
         }
     }
 
+    /// A program whose `main` spans several blocks -- a loop, then an
+    /// `if` -- and calls a helper, so storage order is something a
+    /// consumer could wrongly depend on. `main` returns 1121.
+    const MULTI_BLOCK: &str = "func step(x: i64) -> i64 { return x * 3 + 1; } \
+                               func main() -> i64 { \
+                                 mutable acc: i64 = 0; \
+                                 mutable i: i64 = 0; \
+                                 while i < 5 { acc = step(acc); i = i + 1; } \
+                                 if acc > 100 { return acc + 1000; } \
+                                 return 0 - acc; }";
+
+    /// Compiles [`MULTI_BLOCK`], applies `permute` to a raw copy of the
+    /// verified module, reseals it through `nir::verify`, and checks
+    /// the resealed module runs to the same result as the original.
+    /// `check` sees `main`'s permuted blocks before resealing.
+    fn assert_permuted_storage_runs_the_same(
+        permute: impl Fn(&mut nir::Module),
+        check: impl Fn(&[nir::BasicBlock]),
+    ) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", MULTI_BLOCK);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, registry } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+        let expected = Interpreter::new(&nir).run("main", &interner);
+        assert_eq!(expected, Ok(Value::Int(1121)));
+
+        let main_blocks = |module: &nir::Module| {
+            module
+                .functions
+                .iter()
+                .find(|f| interner.resolve(f.name) == "main")
+                .expect("the fixture declares `main`")
+                .blocks
+                .clone()
+        };
+        let original = main_blocks(nir.module());
+        assert!(original.len() >= 3, "main must span several blocks");
+        assert_eq!(original[0].id, nir::BlockId(0), "lowering stores bb0 first");
+
+        let mut raw = nir.module().clone();
+        permute(&mut raw);
+        check(&main_blocks(&raw));
+
+        let resealed = crate::nir::verify(raw, source, &interner, &registry)
+            .expect("block and function storage order is not a verifier invariant");
+        assert_eq!(Interpreter::new(&resealed).run("main", &interner), expected);
+    }
+
+    /// Entry is `BlockId(0)`, not whichever block is stored first:
+    /// reversing every function's blocks (and the functions
+    /// themselves) stores `main`'s entry block last, and both the
+    /// seal and the interpreter still accept it.
+    #[test]
+    fn reversed_block_storage_reseals_and_runs_the_same() {
+        assert_permuted_storage_runs_the_same(
+            |module| {
+                module.functions.reverse();
+                for function in &mut module.functions {
+                    function.blocks.reverse();
+                }
+            },
+            |blocks| assert_eq!(blocks.last().map(|b| b.id), Some(nir::BlockId(0))),
+        );
+    }
+
+    /// The same, with the original relative order kept but shifted by
+    /// one: `main`'s entry block is stored neither first nor last.
+    #[test]
+    fn rotated_block_storage_reseals_and_runs_the_same() {
+        assert_permuted_storage_runs_the_same(
+            |module| {
+                module.functions.rotate_right(1);
+                for function in &mut module.functions {
+                    function.blocks.rotate_right(1);
+                }
+            },
+            |blocks| assert_eq!(blocks[1].id, nir::BlockId(0)),
+        );
+    }
+
     /// The native backend's first stage is reached with the seal, and
     /// accepts it: capability validation is downstream of verification,
     /// never a substitute for it.

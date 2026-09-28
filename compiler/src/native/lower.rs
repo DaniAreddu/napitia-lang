@@ -14,7 +14,7 @@
 //! toolchain, and nothing in here can quietly stop being true of that:
 //!
 //! * functions are declared, and then defined, in ascending [`ItemId`]
-//!   order -- never in the order `Module::functions` happens to store
+//!   order -- never in the order the module's own `functions` happens to store
 //!   them;
 //! * blocks are created and filled in reverse postorder of a traversal
 //!   that visits successors in ascending [`BlockId`] order, so a
@@ -54,7 +54,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::hir::ItemId;
 use crate::nir::{
-    BasicBlock, BlockId, Const, Function, Instruction, Module, Terminator, ValueId, ValueKind,
+    BasicBlock, BlockId, Const, Function, Instruction, Terminator, ValueId, ValueKind,
 };
 use crate::symbol::Interner;
 use crate::types::{ArithFailure, IntOp};
@@ -94,12 +94,17 @@ enum Native {
 
 /// Compiles `plan`'s functions into one ELF object for `target`.
 ///
+/// Takes no module of its own. The module it compiles is the one
+/// `plan` borrows -- the exact [`crate::nir::VerifiedModule`]
+/// [`super::capability::validate`] was given -- so raw NIR cannot reach
+/// Cranelift and a plan built from one module cannot be applied to
+/// another. There is no second argument to disagree with the first.
+///
 /// Returns the object's bytes, or the single reason this backend could
 /// not produce them.
 pub(super) fn emit_object(
-    module: &Module,
+    plan: &NativePlan<'_>,
     interner: &Interner,
-    plan: &NativePlan,
     target: &str,
 ) -> Result<Vec<u8>, String> {
     let mut flags = settings::builder();
@@ -123,7 +128,7 @@ pub(super) fn emit_object(
         .map_err(|error| format!("could not start an object for `{target}`: {error}"))?;
     let mut object = ObjectModule::new(builder);
 
-    let functions = index_functions(module, plan);
+    let functions = index_functions(plan);
 
     let mut context = object.make_context();
     let mut frontend = FunctionBuilderContext::new();
@@ -364,10 +369,13 @@ pub(super) fn symbol_name(id: ItemId, declared: &str) -> String {
     format!("napitia_{}_{}", id.0, sanitized)
 }
 
-fn index_functions<'a>(module: &'a Module, plan: &NativePlan) -> BTreeMap<ItemId, &'a Function> {
+/// Indexes the plan's own functions out of the plan's own module --
+/// one borrow, one module, no way for the two to be about different
+/// things.
+fn index_functions<'module>(plan: &NativePlan<'module>) -> BTreeMap<ItemId, &'module Function> {
     let wanted: BTreeSet<ItemId> = plan.functions().iter().copied().collect();
     let mut functions: BTreeMap<ItemId, &Function> = BTreeMap::new();
-    for function in &module.functions {
+    for function in &plan.module().functions {
         if wanted.contains(&function.id) {
             functions.insert(function.id, function);
         }
@@ -1127,7 +1135,7 @@ mod tests {
                     panic!("this fixture must be inside the native subset, got {codes:?}")
                 }
             };
-        match emit_object(&nir, &interner, &plan, TARGET_TRIPLE) {
+        match emit_object(&plan, &interner, TARGET_TRIPLE) {
             Ok(object) => Built { object },
             Err(reason) => panic!("code generation failed: {reason}"),
         }
@@ -1243,7 +1251,7 @@ mod tests {
             let plan =
                 capability::validate(module, source, &interner, registry, TARGET_TRIPLE, &[])
                     .expect("the fixture is inside the native subset");
-            emit_object(module, &interner, &plan, TARGET_TRIPLE).expect("code generation succeeds")
+            emit_object(&plan, &interner, TARGET_TRIPLE).expect("code generation succeeds")
         };
 
         assert_eq!(
@@ -1388,7 +1396,7 @@ mod tests {
                 .expect("an object builder");
         let mut object = ObjectModule::new(builder);
 
-        let functions = index_functions(&nir, &plan);
+        let functions = index_functions(&plan);
         let mut context = object.make_context();
         let mut frontend = FunctionBuilderContext::new();
         let runtime = define_runtime(&mut object, &mut context, &mut frontend, frontend_config)
@@ -1561,7 +1569,7 @@ mod tests {
         };
         let plan = capability::validate(&nir, source, &interner, &registry, TARGET_TRIPLE, &[])
             .expect("the fixture is inside the native subset");
-        let failure = emit_object(&nir, &interner, &plan, "not-a-real-triple")
+        let failure = emit_object(&plan, &interner, "not-a-real-triple")
             .expect_err("an unknown triple has no backend");
         assert!(failure.contains("not-a-real-triple"), "{failure}");
     }

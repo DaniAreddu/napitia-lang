@@ -381,7 +381,7 @@ pub(crate) fn build_executable(
     // subset gets the same diagnostic wherever it is compiled, and
     // whether this host could have linked the result is a separate
     // question from whether the program was compilable at all.
-    let object = match lower::emit_object(module.module(), interner, &plan, TARGET_TRIPLE) {
+    let object = match lower::emit_object(&plan, interner, TARGET_TRIPLE) {
         Ok(object) => object,
         Err(reason) => {
             return vec![

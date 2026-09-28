@@ -18,9 +18,11 @@
 //! byte the one the verifier accepted.
 //!
 //! The wrapper is a claim about structure, not a substitute for runtime
-//! care: the interpreter's own defence-in-depth checks (`rfcs/0015`,
-//! `X0001`-`X0004`) stay exactly as they are, and remain observable
-//! through the `#[cfg(test)]`-only unchecked path
+//! care. Division by zero, overflow and out-of-range shifts (`rfcs/0015`,
+//! `X0001`-`X0003`) are ordinary runtime failures of verified programs,
+//! unchanged. The interpreter's defence in depth -- `X0004` and its own
+//! type re-checks -- also stays exactly as it is, and remains
+//! observable through the `#[cfg(test)]`-only unchecked path
 //! (`VerifiedModule::seal_unchecked`), which the production library
 //! does not compile at all.
 

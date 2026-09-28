@@ -3554,11 +3554,14 @@ impl<'a> Interpreter<'a> {
         // at any depth and through resource records as well as inline
         // aggregates, so this one intersection covers bare resources,
         // records, variants, generic instantiations and any nesting of
-        // them.
+        // them. The lowest shared id is the one named, never whichever
+        // the `HashSet`'s per-process hash order happens to yield first,
+        // so the same call is refused with the same message every run.
         if let Some(shared) = plan
             .reachable
             .iter()
-            .find(|id| observed_identities.contains(id))
+            .filter(|id| observed_identities.contains(id))
+            .min_by_key(|id| id.0)
         {
             return Err(invalid(format!(
                 "one resource (#{}) is passed to this call as both an observing argument and a \
@@ -11001,6 +11004,65 @@ mod transfer_transaction {
             "a refused call moves no generation"
         );
         assert_eq!(record.status, ResourceStatus::Alive, "and destroys nothing");
+    }
+
+    /// Two resources, each both observed and taken by one call. Which
+    /// one the refusal names used to be whichever a `HashSet` yielded
+    /// first -- a per-process hash order, so the same program could be
+    /// refused with a different message on each run. The lowest id is
+    /// named, whatever order the arguments list them in.
+    #[test]
+    fn a_refusal_naming_a_shared_resource_names_the_lowest_one() {
+        let module = module();
+        let interpreter = Interpreter::unchecked(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        assert!(first.id.0 < second.id.0, "the fixture relies on this order");
+        let param = |value: u32, take: bool| Param {
+            value: ValueId(value),
+            ty: file_ty(),
+            take,
+        };
+        let callee = Function {
+            id: ItemId(88),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                param(0, false),
+                param(1, false),
+                param(2, true),
+                param(3, true),
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        for _ in 0..8 {
+            let error = interpreter
+                .call_function(
+                    &callee,
+                    &[],
+                    vec![
+                        Value::Resource(second),
+                        Value::Resource(first),
+                        Value::Resource(second),
+                        Value::Resource(first),
+                    ],
+                    Vec::new(),
+                )
+                .map(|_| ())
+                .expect_err("both resources are observed and taken by one call");
+            assert!(
+                format!("{error:?}").contains(&format!("one resource (#{})", first.id.0)),
+                "the lowest shared resource must be the one named, got {error:?}"
+            );
+        }
     }
 
     #[test]

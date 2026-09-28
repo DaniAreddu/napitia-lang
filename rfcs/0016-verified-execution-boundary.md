@@ -102,19 +102,56 @@ and `pub(crate)`. See "The test-only unchecked path" below.
 | --- | --- | --- |
 | `interpreter::Interpreter::new` | `&VerifiedModule` | the complete semantic execution path |
 | `native::build_executable` | `&VerifiedModule` | the whole AOT pipeline |
-| `native::capability::validate` | `&VerifiedModule` | its rules sit *on top of* the verifier's, never instead of them |
+| `native::capability::validate` | `&'module VerifiedModule`, returning a `NativePlan<'module>` that borrows it | its rules sit *on top of* the verifier's, never instead of them |
 | `driver::IrOutput::Ready` | carries a `VerifiedModule` | `ir`, `run` and `build` all start from it |
 | `driver::ProjectIrOutput::Ready` | carries a `VerifiedModule` | the project equivalent |
 | `project::CompiledProject` | carries a `VerifiedModule` | the merged module a project executes |
 
-Two components deliberately keep a raw borrow:
+`native::build_executable` and `capability::validate` are `pub(crate)`,
+and `native::lower::emit_object` is `pub(super)`: they are internal to
+the compiler crate, not API an embedder can call.
 
-* `nir::print_module` takes `&Module`. Printing is read-only, and
-  printing raw NIR is exactly what a verifier test needs. `ir` prints
-  the verified module through the read-only projection.
-* `native::lower::emit_object` takes `&Module`. It is unreachable
-  without a `NativePlan`, and only `capability::validate` can mint one,
-  so it is already behind the seal.
+One component deliberately keeps a raw borrow: `nir::print_module`
+takes `&Module`. Printing is read-only, and printing raw NIR is exactly
+what a verifier test needs. `ir` prints the verified module through the
+read-only projection.
+
+### The native plan is bound to its module
+
+`native::lower::emit_object` takes no module at all:
+
+```rust
+pub(super) fn emit_object(
+    plan: &NativePlan<'_>,
+    interner: &Interner,
+    target: &str,
+) -> Result<Vec<u8>, String>;
+```
+
+The `NativePlan<'module>` that `capability::validate` returns borrows
+the exact `VerifiedModule` it validated, its fields are private to the
+capability module, and `validate` is the only thing that builds one.
+Code generation reads NIR only through the plan; the lowering helpers
+behind `emit_object` inspect the sealed module only after entering
+through it. So a plan validated against module A cannot be applied to
+module B, because emission accepts no module to disagree with the plan.
+This is enforced by the type system and the plan's lifetime, not by a
+runtime identity check.
+
+### Verification versus native capability validation
+
+These are two different passes answering two different questions.
+`nir::verify` decides whether NIR is *well formed*, and a
+`VerifiedModule` says only that. `capability::validate` then decides
+whether the reachable program is inside the native subset, and may
+still refuse a `VerifiedModule` with an `A0001`–`A0019` code; the
+backend layer after it can still fail with `A0020`–`A0025` (for
+example `A0020` when Cranelift rejects something, `A0021` when the host
+cannot link). A `VerifiedModule` is therefore not necessarily one the
+native backend can compile. The capability pass does not re-verify:
+where it notices a verifier-owned violation anyway -- only a
+`#[cfg(test)]` unchecked seal can put one there -- it refuses with
+`A0019` rather than guessing.
 
 There are two sealing sites in the whole compiler, and they are the two
 places the verifier was already called:
@@ -228,9 +265,9 @@ the failure case. That is the change this RFC is for.
 * It is a compile-time boundary within one crate's type system, not a
   cryptographic or runtime one. A `#[cfg(test)]` build can still seal
   anything, deliberately.
-* `nir::print_module` and `native::lower::emit_object` still take raw
-  borrows, as described above. Both are read-only, and the second is
-  unreachable without a plan.
+* `nir::print_module` still takes a raw borrow, as described above. It
+  is read-only. `native::lower::emit_object` takes only a `NativePlan`,
+  and reaches the module through it.
 * Nothing about *what* the verifier checks changed in this milestone.
   Every rule, code and ordering is exactly Alpha 0.2.1's.
 

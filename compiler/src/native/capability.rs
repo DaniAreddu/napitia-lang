@@ -1888,19 +1888,17 @@ mod tests {
         ///
         /// A sealed module cannot be reordered in place -- that is the
         /// boundary working as intended -- so this rebuilds the raw
-        /// module and seals it again through the `#[cfg(test)]`
-        /// unchecked path. Moving already-verified functions and blocks
-        /// around in their own vectors cannot make them unverifiable:
-        /// nothing the verifier checks depends on storage position,
-        /// which is the very claim these tests exist to hold the
-        /// validator to.
+        /// module and seals it again through `nir::verify`, the one
+        /// production seal. Nothing the verifier checks should depend
+        /// on storage position; resealing through it rather than around
+        /// it makes every storage-order test prove that too, instead of
+        /// assuming it.
         fn rearranged(self, rearrange: impl FnOnce(&mut Module)) -> Compiled {
             let mut raw = self.module.module().clone();
             rearrange(&mut raw);
-            Compiled {
-                module: VerifiedModule::seal_unchecked(raw),
-                ..self
-            }
+            let module = crate::nir::verify(raw, self.source, &self.interner, &self.registry)
+                .expect("rearranging storage must keep the module verifiable");
+            Compiled { module, ..self }
         }
 
         fn validate_for(

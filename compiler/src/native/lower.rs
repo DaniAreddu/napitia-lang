@@ -1237,15 +1237,16 @@ mod tests {
 
         // Reversing is a *rebuild* of the raw module, then a fresh seal:
         // a sealed module cannot be reordered in place, which is the
-        // boundary working as intended. The unchecked seal is the
-        // `#[cfg(test)]` path, and reordering storage cannot make
-        // already-verified NIR invalid.
+        // boundary working as intended. The fresh seal goes through
+        // `nir::verify`, the production path, so this also proves that
+        // reordering storage keeps already-verified NIR verifiable.
         let mut rebuilt = forward.module().clone();
         rebuilt.functions.reverse();
         for function in &mut rebuilt.functions {
             function.blocks.reverse();
         }
-        let reversed = VerifiedModule::seal_unchecked(rebuilt);
+        let reversed = crate::nir::verify(rebuilt, source, &interner, &registry)
+            .expect("reversing storage must keep the module verifiable");
 
         let object_of = |module: &VerifiedModule, registry: &ItemRegistry| {
             let plan =

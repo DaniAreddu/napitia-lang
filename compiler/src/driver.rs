@@ -1,8 +1,13 @@
-//! Sequences the compiler stages (lex -> parse -> resolve -> typeck -> nir)
-//! behind the operations the CLI exposes. Each stage accumulates
+//! Sequences the compiler stages (lex -> parse -> resolve -> typeck ->
+//! resourceck -> NIR lowering -> `nir::verify`) behind the operations
+//! the CLI exposes. Each stage up to resource checking accumulates
 //! diagnostics from every stage before it, so `check`, `ir`, and `run`
-//! all report lexer/parser/resolver/type errors together rather than
-//! stopping at the first one.
+//! all report lexer/parser/resolver/type/resource errors together
+//! rather than stopping at the first one. NIR lowering runs only once
+//! those are clean, and `nir::verify` runs last: it is where the
+//! pipeline seals NIR, and the [`VerifiedModule`] it produces is the
+//! only form of NIR the interpreter and the native backend accept
+//! outside `#[cfg(test)]`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -149,7 +154,7 @@ pub enum IrOutput {
     /// Lexing, parsing, resolution, or type-checking failed (NIR
     /// lowering never ran), lowering itself failed, or lowering
     /// succeeded but produced NIR the verifier rejected. Either way,
-    /// there is no NIR safe to run.
+    /// there is no verified NIR to run.
     Diagnostics(Vec<Diagnostic>),
 }
 
@@ -494,10 +499,6 @@ mod tests {
         .expect("a scalar program is inside the native subset");
     }
 
-    /// Production entry points take the seal, not a bare module. These
-    /// coercions compile only while that is true; a signature that went
-    /// back to `&nir::Module` would fail to compile here, which is the
-    /// assertion.
     /// The plan capability validation returns borrows the exact module
     /// it validated, for as long as the plan lives. Spelling that
     /// lifetime here is the assertion: a `validate` that returned a
@@ -515,6 +516,10 @@ mod tests {
     type BuildEntry =
         fn(&VerifiedModule, SourceId, &Interner, &ItemRegistry, &[Span], &Path) -> Vec<Diagnostic>;
 
+    /// Production entry points take the seal, not a bare module. These
+    /// coercions compile only while that is true; a signature that went
+    /// back to `&nir::Module` would fail to compile here, which is the
+    /// assertion.
     #[test]
     fn no_production_entry_point_accepts_a_raw_module() {
         fn interpreter_entry<'a>(_: fn(&'a VerifiedModule) -> Interpreter<'a>) {}

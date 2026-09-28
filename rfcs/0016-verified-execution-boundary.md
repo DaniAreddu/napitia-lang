@@ -153,6 +153,8 @@ where it notices a verifier-owned violation anyway -- only a
 `#[cfg(test)]` unchecked seal can put one there -- it refuses with
 `A0019` rather than guessing.
 
+### Sealing sites
+
 There are two sealing sites in the whole compiler, and they are the two
 places the verifier was already called:
 

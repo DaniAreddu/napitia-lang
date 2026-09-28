@@ -65,13 +65,18 @@ A sealed module has no mutable accessor, no unsealing conversion and no
 public constructor, so nothing can substitute, reorder or edit the
 module between the check and the run. Raw `nir::Module` stays public
 and unchanged, because lowering builds one and the verifier's own tests
-need hand-built malformed ones — they simply cannot be executed any
-more.
+need hand-built malformed ones — they simply cannot be executed
+outside this crate's own `#[cfg(test)]` builds.
 
-The runtime's own defence in depth is unchanged and stays under test:
-`X0001`–`X0004` still refuse what the verifier would have caught, via a
+Verification does not rule out runtime failures: division by zero,
+overflow and an out-of-range shift (`X0001`–`X0003`) are ordinary,
+unchanged runtime failures of verified programs. The defence in depth
+is `X0004` and the interpreter's own type re-checks, which still refuse
+what the verifier would have caught and stay under test via a
 `#[cfg(test)]`-only unchecked path the production library never
-compiles. `rfcs/0016` states the sealing invariant, which components
+compiles. Nor is every `VerifiedModule` one the native backend can
+compile: native capability validation is a separate pass that may
+still refuse it with an `Axxxx` code. `rfcs/0016` states the sealing invariant, which components
 take a `VerifiedModule`, and what the seal does not cover.
 
 ### Numeric semantics (from Alpha 0.2.1)

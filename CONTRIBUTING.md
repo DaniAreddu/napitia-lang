@@ -75,8 +75,12 @@ compiler logic — they should only parse arguments and call into
 Compiler stages, in pipeline order:
 
 ```text
-source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> (interpreter | native)
+source -> lexer -> parser (AST) -> hir (+ resolve) -> typeck -> nir -> nir::verify -> VerifiedModule -> (interpreter | native)
 ```
+
+A new executor must accept a `VerifiedModule`, never a bare `nir::Module`
+(`rfcs/0016`); tests that need hand-built NIR behind it use the
+`#[cfg(test)]`-only `VerifiedModule::seal_unchecked`.
 
 Each `.npt` file goes through that pipeline once. A multi-file project
 (`project/`, `rfcs/0006`) is a layer in front of it, not a replacement:

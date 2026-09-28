@@ -2789,6 +2789,81 @@ mod hand_built_tests {
         assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
     }
 
+    /// Two functions sharing one id make every id-keyed decision
+    /// ambiguous -- which body a call reaches, which symbol it binds.
+    /// The verifier refuses that (`V0001`), and the capability pass,
+    /// handed it anyway, refuses it as unverified NIR rather than
+    /// letting one body silently shadow the other.
+    #[test]
+    fn duplicate_function_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let helper = interner.intern("helper");
+        let shadow = func(
+            0,
+            helper,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 2)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let built = module(vec![minimal_main(&mut interner), shadow]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0001"),
+            "a reused function id is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    /// Two blocks sharing one id leave a branch with two possible
+    /// targets. The verifier refuses that (`V0002`); the capability
+    /// pass refuses it again as unverified NIR instead of keeping
+    /// whichever block it happened to key last.
+    #[test]
+    fn duplicate_block_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let mut main = minimal_main(&mut interner);
+        main.blocks.push(block(
+            0,
+            vec![int(1, 2)],
+            Terminator::Return(Some(ValueId(1))),
+        ));
+        let built = module(vec![main]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0002"),
+            "a reused block id is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    /// A value defined twice has no single definition for a use to
+    /// name. The verifier refuses that (`V0016`); the capability pass
+    /// refuses it again as unverified NIR instead of lowering either
+    /// definition as the one that counts.
+    #[test]
+    fn duplicate_value_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 1), int(0, 2)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0016"),
+            "a value defined twice is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
     // -- slots --------------------------------------------------------------
 
     #[test]

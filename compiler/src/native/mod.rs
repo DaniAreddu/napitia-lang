@@ -26,16 +26,20 @@
 //!   is what this backend takes: `build_executable` and
 //!   `capability::validate` accept a [`crate::nir::VerifiedModule`],
 //!   never a bare module, so code generation cannot be reached with NIR
-//!   the verifier has not accepted. Nothing here re-derives structural
-//!   invariants the verifier already owns -- and where this module does
-//!   notice such a violation anyway (a `#[cfg(test)]` unchecked seal is
-//!   still a seal), it refuses with [`codes::UNVERIFIED_NIR`] rather
-//!   than guessing.
+//!   the verifier has not accepted. Nothing here relies on re-deriving
+//!   structural invariants the verifier already owns -- but where this
+//!   module does notice such a violation anyway (a duplicate function,
+//!   block or value id, a dangling target; a `#[cfg(test)]` unchecked
+//!   seal is still a seal), it refuses with [`codes::UNVERIFIED_NIR`]
+//!   rather than guessing.
 //! * `capability` runs after verification and before Cranelift ever
 //!   sees a function. It decides, exhaustively, whether the whole
 //!   reachable program is inside the supported subset. Everything after
 //!   it may therefore assume that subset, which is why `lower` has no
-//!   "unsupported, give up" path buried inside code generation.
+//!   "unsupported, give up" path buried inside code generation. `lower`
+//!   receives only the plan `capability` returns, which borrows the
+//!   verified module it was validated against; it takes no module of
+//!   its own.
 //!
 //! # Diagnostic layers
 //!
@@ -114,9 +118,11 @@ pub mod codes {
     /// `switch`, `invoke` or `raise`.
     pub const UNSUPPORTED_TERMINATOR: &str = "A0008";
     /// A reachable operator whose *exceptional* behavior this backend
-    /// cannot reproduce without a runtime facility Alpha 0.2.0 does not
-    /// have -- the capability validator documents exactly which
-    /// operators those are, and why each one is on that list.
+    /// does not reproduce yet. The runtime failure path checked
+    /// arithmetic branches to exists, but the native subset deliberately
+    /// does not route these operators' exceptional cases to it -- the
+    /// capability validator documents exactly which operators those
+    /// are, and why each one is on that list.
     pub const UNSUPPORTED_OPERATOR: &str = "A0009";
     /// A reachable function declares type parameters, or a reachable
     /// call supplies type arguments. There is no monomorphization here.
@@ -150,8 +156,13 @@ pub mod codes {
     /// Structure [`crate::nir::verify_module`] would already have
     /// rejected reached this backend: a dangling block target, an
     /// undefined value, a duplicate id, a type inconsistency. Reported
-    /// instead of guessed at, and never produced for NIR that actually
-    /// went through the verifier.
+    /// instead of guessed at. Also used when the capability validator
+    /// finds its own bookkeeping inconsistent ("missing validation
+    /// metadata": a reachable function with no block plan or no
+    /// recorded call edges, or an entry result left without a native
+    /// representation) -- a defect in the backend itself, which the
+    /// verifier cannot rule out. For NIR that actually went through the
+    /// verifier, that is the only way this code is produced.
     pub const UNVERIFIED_NIR: &str = "A0019";
 
     /// Cranelift rejected, or failed to emit, something this backend
@@ -355,7 +366,8 @@ fn probe_linker_target(linker: &OsStr) -> Result<LinkerTarget, std::io::Error> {
 
 /// Runs the whole native pipeline for one already-verified module:
 /// capability validation, Cranelift object generation, and the system
-/// linker.
+/// linker. Object generation is handed only the plan validation
+/// returned, never `module` directly; the plan borrows it.
 ///
 /// Returns every reason it could not, or an empty list on success.
 /// There is no partial outcome and no fallback: if this returns

@@ -303,8 +303,11 @@ in this spec, though:
 - Verification is mandatory and runs first, and since Alpha 0.2.2
   (`rfcs/0016`) the backend's own entry points say so: `build_executable`
   and the capability pass take a `VerifiedModule`. The native backend
-  never sees NIR `nir::verify` has not accepted, so nothing in it
-  re-derives an invariant this document already assigns to the verifier.
+  never sees NIR `nir::verify` has not accepted, so it does not rely on
+  re-deriving an invariant this document already assigns to the
+  verifier; where it notices a violation anyway (a duplicate function,
+  block or value id, for instance) it refuses with `A0019` rather than
+  guessing.
 - A separate capability pass runs after verification and before any
   code is generated, and decides exhaustively whether the reachable
   program is inside that subset. NIR that is *valid but unsupported* is
@@ -495,7 +498,11 @@ backend and its capability pass all accept that type and not a bare
 `Module`. A sealed module has no mutable accessor and no unsealing
 conversion, so what an executor receives is exactly what the verifier
 accepted. Raw `Module` remains the lowerer's working representation and
-the verifier's own test input.
+the verifier's own test input. A `VerifiedModule` is well-formed NIR,
+not necessarily NIR the native backend can compile: native capability
+validation is a separate pass that may still refuse it with an `Axxxx`
+code, and code generation reaches NIR only through the `NativePlan`
+that pass returns, which borrows that exact `VerifiedModule`.
 
 - **Structure**: every function/block id is unique; every branch target
   and called function exists; call argument counts match.
@@ -696,7 +703,8 @@ the verifier's own test input.
   `Initialized`, with the union-origins/conservative-role merge above
   already representing it soundly).
 
-It reports structured diagnostics (`V0001`–`V0082` as of this milestone)
+It reports structured diagnostics (`V0001`–`V0112` as of Alpha 0.2.2,
+with `V0094` deliberately unassigned)
 and never panics; a module that fails verification is never handed to
 the interpreter, and since Alpha 0.2.2 that is enforced by the type
 system rather than by convention: `Interpreter::new` takes a

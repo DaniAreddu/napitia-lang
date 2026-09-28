@@ -2006,6 +2006,25 @@ mod tests {
         );
     }
 
+    /// The plan hands back the very module it validated -- the same
+    /// address, not an equal copy -- and so does every clone of it.
+    ///
+    /// Lowering reads its module from the plan alone, so this pointer
+    /// identity is what makes "codegen sees the module the capability
+    /// check saw" a fact rather than a convention. `PartialEq` on a
+    /// plan deliberately ignores the module, so only `ptr::eq` can pin
+    /// this.
+    #[test]
+    fn a_plan_reads_back_the_exact_module_it_validated() {
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
+        let plan = accepts(&compiled);
+        assert!(std::ptr::eq(plan.module(), compiled.module.module()));
+        assert!(
+            std::ptr::eq(plan.clone().module(), compiled.module.module()),
+            "cloning a plan copies the borrow, never the module"
+        );
+    }
+
     #[test]
     fn a_unit_returning_main_validates() {
         let compiled = compile(

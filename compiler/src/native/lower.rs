@@ -1260,6 +1260,53 @@ mod tests {
         );
     }
 
+    // -- the sealed boundary -----------------------------------------------
+
+    /// Pins the shape of lowering's entry points at compile time.
+    ///
+    /// Both must accept a plan of *any* module lifetime and take no
+    /// module of their own: the only module they can reach is the one
+    /// the plan borrows. A signature that regained an independent
+    /// module argument -- or tied its result to anything but the plan's
+    /// own module -- would fail to coerce here and stop this test
+    /// compiling.
+    #[test]
+    fn lowering_takes_its_module_only_from_the_plan() {
+        type Emit = for<'p, 'm> fn(&'p NativePlan<'m>, &Interner, &str) -> Result<Vec<u8>, String>;
+        type Index = for<'p, 'm> fn(&'p NativePlan<'m>) -> BTreeMap<ItemId, &'m Function>;
+        let _: Emit = emit_object;
+        let _: Index = index_functions;
+    }
+
+    /// What lowering indexes is borrowed out of the validated module
+    /// itself -- the same addresses, not equal copies -- and covers
+    /// exactly the functions the plan decided to compile.
+    #[test]
+    fn indexed_functions_are_borrowed_from_the_plans_own_module() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("native.npt", SCALAR_PROGRAM);
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, registry } = driver::ir(&map, source, &mut interner) else {
+            panic!("the fixture must compile")
+        };
+        let plan = capability::validate(&nir, source, &interner, &registry, TARGET_TRIPLE, &[])
+            .expect("the fixture is inside the native subset");
+
+        let indexed = index_functions(&plan);
+        for function in indexed.values() {
+            assert!(
+                nir.module()
+                    .functions
+                    .iter()
+                    .any(|stored| std::ptr::eq(stored, *function)),
+                "function id {} was not borrowed from the validated module",
+                function.id.0
+            );
+        }
+        let keys: Vec<ItemId> = indexed.keys().copied().collect();
+        assert_eq!(keys, plan.functions());
+    }
+
     // -- symbols -----------------------------------------------------------
 
     #[test]

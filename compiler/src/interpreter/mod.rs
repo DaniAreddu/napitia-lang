@@ -1,6 +1,6 @@
 //! A small interpreter for the NIR subset this milestone lowers to
-//! (`spec/0006`), used to validate language semantics before any native
-//! backend exists.
+//! (`spec/0006`): the complete semantic execution path. The native
+//! backend (`rfcs/0014`) compiles only a scalar subset of the same NIR.
 //!
 //! # What it accepts
 //!
@@ -927,10 +927,12 @@ impl<'a> Interpreter<'a> {
     ///
     /// Compiled only under `cfg(test)`, and `pub(crate)` even there: no
     /// build of the production library contains it. It is what keeps
-    /// the runtime's own refusals (`rfcs/0015`, `X0001`-`X0004`)
-    /// testable now that no production caller can hand this engine a
-    /// malformed module -- those refusals are the reason a verifier bug
-    /// would still not become a panic or silent misbehaviour.
+    /// the runtime's malformed-NIR refusal (`X0004`) and its own type
+    /// re-checks testable now that no production caller can hand this
+    /// engine a malformed module -- those refusals are the reason a
+    /// verifier bug would still not become a panic or silent
+    /// misbehaviour. `X0001`-`X0003` (`rfcs/0015`) need no such path:
+    /// they are ordinary arithmetic failures of verified programs.
     #[cfg(test)]
     pub(crate) fn unchecked(module: &'a Module) -> Self {
         Interpreter::over(module)

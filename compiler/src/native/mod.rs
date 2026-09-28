@@ -1217,6 +1217,19 @@ mod link_tests {
             !verifier.is_empty(),
             "{tag}: this NIR must fail `nir::verify` in the first place"
         );
+        // And the production constructor refuses it too, with the
+        // verifier's own codes: the unchecked seal `build_unverified`
+        // used is the only one this fixture could ever get.
+        let mut map = SourceMap::new();
+        let source = map.add_file("sealed.npt", "\n");
+        match crate::nir::verify(module.clone(), source, interner, &ItemRegistry::default()) {
+            Ok(_) => panic!("{tag}: `nir::verify` must not seal this NIR"),
+            Err(diagnostics) => assert_eq!(
+                diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+                verifier,
+                "{tag}: the seal must refuse with exactly the verifier's diagnostics"
+            ),
+        }
         assert_eq!(
             native,
             vec![codes::UNVERIFIED_NIR],

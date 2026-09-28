@@ -415,14 +415,19 @@ mod tests {
     /// coercions compile only while that is true; a signature that went
     /// back to `&nir::Module` would fail to compile here, which is the
     /// assertion.
-    type ValidateEntry = fn(
-        &VerifiedModule,
-        SourceId,
-        &Interner,
-        &ItemRegistry,
-        &str,
-        &[Span],
-    ) -> Result<crate::native::capability::NativePlan, Vec<Diagnostic>>;
+    /// The plan capability validation returns borrows the exact module
+    /// it validated, for as long as the plan lives. Spelling that
+    /// lifetime here is the assertion: a `validate` that returned a
+    /// plan detached from its module would no longer coerce to this.
+    type ValidateEntry<'module> =
+        fn(
+            &'module VerifiedModule,
+            SourceId,
+            &Interner,
+            &ItemRegistry,
+            &str,
+            &[Span],
+        ) -> Result<crate::native::capability::NativePlan<'module>, Vec<Diagnostic>>;
 
     type BuildEntry =
         fn(&VerifiedModule, SourceId, &Interner, &ItemRegistry, &[Span], &Path) -> Vec<Diagnostic>;
@@ -430,8 +435,9 @@ mod tests {
     #[test]
     fn no_production_entry_point_accepts_a_raw_module() {
         fn interpreter_entry<'a>(_: fn(&'a VerifiedModule) -> Interpreter<'a>) {}
+        fn validate_entry<'module>(_: ValidateEntry<'module>) {}
         interpreter_entry(Interpreter::new);
-        let _validate: ValidateEntry = crate::native::capability::validate;
+        validate_entry(crate::native::capability::validate);
         let _build: BuildEntry = crate::native::build_executable;
     }
 }

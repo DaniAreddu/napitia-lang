@@ -71,7 +71,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry};
 use crate::nir::{
-    BasicBlock, BlockId, Const, Function, Instruction, OwnershipMode, Terminator, ValueId,
+    BasicBlock, BlockId, Const, Function, Instruction, Module, OwnershipMode, Terminator, ValueId,
     ValueKind, VerifiedModule,
 };
 use crate::source::{SourceId, Span};
@@ -107,15 +107,35 @@ pub(crate) const ENTRY_NAME: &str = "main";
 /// ([`ItemId`]/[`BlockId`]), never from the position an item happened to
 /// occupy in a `Vec`, so reversing the module's functions or a function's
 /// own `blocks` changes nothing about what is emitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativePlan {
+#[derive(Clone)]
+pub(crate) struct NativePlan<'module> {
+    /// The exact module this plan was validated against, borrowed for
+    /// as long as the plan exists.
+    ///
+    /// Carrying it here is what makes the plan a proof about *one*
+    /// module rather than a free-floating list of ids. Code generation
+    /// reads its module from this field ([`NativePlan::module`]) and
+    /// takes no module argument of its own, so there is no second
+    /// parameter for a caller to disagree with: a plan validated from
+    /// module A cannot be applied to module B, because applying it does
+    /// not accept a module at all.
+    module: &'module VerifiedModule,
     entry: ItemId,
     entry_result: Scalar,
     functions: Vec<ItemId>,
     reachable_blocks: BTreeMap<ItemId, Vec<BlockId>>,
 }
 
-impl NativePlan {
+impl<'module> NativePlan<'module> {
+    /// The validated module itself, borrowed read-only for the whole
+    /// life of the plan.
+    ///
+    /// This is the only module code generation ever sees, and it is by
+    /// construction the one every decision below was made about.
+    pub(super) fn module(&self) -> &'module Module {
+        self.module.module()
+    }
+
     /// The single `main` this build compiles an entry wrapper around.
     pub(super) fn entry(&self) -> ItemId {
         self.entry
@@ -148,6 +168,42 @@ impl NativePlan {
     }
 }
 
+/// Deliberately omits the borrowed module. A plan is identified by what
+/// it decided, and printing a whole NIR module into an assertion
+/// failure would bury exactly the fields being compared.
+impl std::fmt::Debug for NativePlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePlan")
+            .field("entry", &self.entry)
+            .field("entry_result", &self.entry_result)
+            .field("functions", &self.functions)
+            .field("reachable_blocks", &self.reachable_blocks)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Compares what two validations *decided*, field by field, and not the
+/// module each borrowed.
+///
+/// Reference identity is not a semantic property, and neither is
+/// storage order: two validations of the same program whose functions
+/// and blocks happen to be stored in opposite orders must compare
+/// equal, because every field above is derived from `ItemId`/`BlockId`
+/// rather than from a vector position. Nothing about this weakens the
+/// binding -- a plan is still usable only against the module it
+/// borrows, which is a matter of which module lowering can reach, not
+/// of which plans compare equal.
+impl PartialEq for NativePlan<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.entry_result == other.entry_result
+            && self.functions == other.functions
+            && self.reachable_blocks == other.reachable_blocks
+    }
+}
+
+impl Eq for NativePlan<'_> {}
+
 /// Validates `module` against the native subset, targeting `target`.
 ///
 /// Takes a [`VerifiedModule`] rather than a bare [`crate::nir::Module`]
@@ -168,14 +224,14 @@ impl NativePlan {
 /// the subset, in a deterministic order: target, then module-level
 /// facts, then the entry contract, then each reachable function in
 /// ascending [`ItemId`] order, then call-graph cycles.
-pub(crate) fn validate(
-    module: &VerifiedModule,
+pub(crate) fn validate<'module>(
+    module: &'module VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
     target: &str,
     imports: &[Span],
-) -> Result<NativePlan, Vec<Diagnostic>> {
+) -> Result<NativePlan<'module>, Vec<Diagnostic>> {
     // A different target is not a partial failure to compile *this*
     // program -- nothing below it would be meaningful, since every
     // decision this pass makes is a decision about one specific
@@ -330,6 +386,7 @@ pub(crate) fn validate(
     };
 
     Ok(NativePlan {
+        module,
         entry,
         entry_result,
         functions,
@@ -1823,7 +1880,7 @@ mod tests {
     }
 
     impl Compiled {
-        fn validate(&self) -> Result<NativePlan, Vec<Diagnostic>> {
+        fn validate(&self) -> Result<NativePlan<'_>, Vec<Diagnostic>> {
             self.validate_for(TARGET_TRIPLE, &[])
         }
 
@@ -1850,7 +1907,7 @@ mod tests {
             &self,
             target: &str,
             imports: &[Span],
-        ) -> Result<NativePlan, Vec<Diagnostic>> {
+        ) -> Result<NativePlan<'_>, Vec<Diagnostic>> {
             validate(
                 &self.module,
                 self.source,
@@ -1879,8 +1936,14 @@ mod tests {
         }
     }
 
-    fn accepts(text: &str) -> NativePlan {
-        let compiled = compile(text);
+    /// The plan a program inside the native subset validates to.
+    ///
+    /// Takes the compiled program by reference rather than compiling it
+    /// here, because a plan borrows the verified module it validated
+    /// and so cannot outlive it. That is the binding working: a caller
+    /// has to keep the exact module alive for as long as it intends to
+    /// use the plan built from it.
+    fn accepts<'compiled>(compiled: &'compiled Compiled) -> NativePlan<'compiled> {
         match compiled.validate() {
             Ok(plan) => plan,
             Err(diagnostics) => {
@@ -1933,7 +1996,8 @@ mod tests {
 
     #[test]
     fn every_supported_construct_validates() {
-        let plan = accepts(EVERY_SUPPORTED_CONSTRUCT);
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
+        let plan = accepts(&compiled);
         assert_eq!(plan.entry_result, Scalar::Int);
         assert_eq!(
             plan.functions.len(),
@@ -1944,19 +2008,21 @@ mod tests {
 
     #[test]
     fn a_unit_returning_main_validates() {
-        let plan = accepts(
+        let compiled = compile(
             "func nothing() -> unit { return; } func main() -> unit { nothing(); return; }",
         );
+        let plan = accepts(&compiled);
         assert_eq!(plan.entry_result, Scalar::Unit);
         assert_eq!(plan.functions.len(), 2);
     }
 
     #[test]
     fn a_bool_local_and_a_bool_parameter_validate() {
-        accepts(
+        let compiled = compile(
             "func flip(x: bool) -> bool { return !x; } \
              func main() -> i64 { value b = flip(true); if b { return 1; } return 0; }",
         );
+        accepts(&compiled);
     }
 
     // -- storage order --------------------------------------------------
@@ -2005,7 +2071,7 @@ mod tests {
     /// fail. Exactly what the interpreter does with it -- nothing.
     #[test]
     fn an_unreachable_function_using_a_resource_does_not_fail_the_build() {
-        let plan = accepts(
+        let compiled = compile(
             "
             resource File { descriptor: i64 }
             func open() -> File { return File { descriptor: 1 }; }
@@ -2018,6 +2084,7 @@ mod tests {
             func main() -> i64 { return 7; }
             ",
         );
+        let plan = accepts(&compiled);
         assert_eq!(
             plan.functions.len(),
             1,
@@ -2303,7 +2370,7 @@ mod tests {
 #[cfg(test)]
 mod hand_built_tests {
     use super::*;
-    use crate::nir::{Module, Param, verify_module};
+    use crate::nir::{Param, verify_module};
     use crate::source::SourceMap;
     use crate::symbol::Symbol;
 

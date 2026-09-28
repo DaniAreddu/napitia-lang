@@ -4821,7 +4821,7 @@ mod tests {
     /// the interpreter is asserted clean, so a fixture that stops
     /// compiling fails as a broken fixture rather than as a runtime
     /// result.
-    pub(super) fn compiled(text: &str) -> (crate::nir::Module, Interner) {
+    pub(super) fn compiled(text: &str) -> (crate::nir::VerifiedModule, Interner) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -4874,12 +4874,29 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        (nir, interner)
+        (seal(nir, &hir, id, &interner), interner)
+    }
+
+    /// Crosses the production boundary, `nir::verify`, exactly as the
+    /// driver does. A source fixture is valid NIR by construction, so a
+    /// fixture whose lowering the verifier refuses is a broken fixture
+    /// (or a lowering bug) and fails here rather than being executed
+    /// unchecked.
+    fn seal(
+        nir: crate::nir::Module,
+        hir: &crate::hir::HirModule,
+        source: crate::source::SourceId,
+        interner: &Interner,
+    ) -> crate::nir::VerifiedModule {
+        let registry = crate::hir::registry::build(hir, &HashMap::new());
+        crate::nir::verify(nir, source, interner, &registry).unwrap_or_else(|diagnostics| {
+            panic!("expected the lowered fixture to verify: {diagnostics:?}")
+        })
     }
 
     pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
         let (nir, interner) = compiled(text);
-        Interpreter::unchecked(&nir).run("main", &interner)
+        Interpreter::new(&nir).run("main", &interner)
     }
 
     /// Like [`run`], but also returns the exact call/drop event order
@@ -4939,7 +4956,8 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        let interpreter = Interpreter::unchecked(&nir);
+        let nir = seal(nir, &hir, id, &interner);
+        let interpreter = Interpreter::new(&nir);
         let outcome = interpreter.run("main", &interner);
         // Resolves every `call:<ItemId>` entry to the callee's own
         // source name, so an assertion against this log reads (and stays
@@ -18774,7 +18792,7 @@ mod fatal_abort {
             "func ok() -> i64 {{ return 1 }} \
              func main() -> i64 {{ value m: i64 = {MAX}; return m + 1 }}"
         ));
-        let interpreter = Interpreter::unchecked(&nir);
+        let interpreter = Interpreter::new(&nir);
 
         assert_eq!(interpreter.run("main", &interner), Err(overflow()));
 
@@ -18809,11 +18827,11 @@ mod fatal_abort {
         ));
 
         assert_eq!(
-            Interpreter::unchecked(&nir).run("main", &interner),
+            Interpreter::new(&nir).run("main", &interner),
             Err(overflow())
         );
         assert_eq!(
-            Interpreter::unchecked(&nir).run("ok", &interner),
+            Interpreter::new(&nir).run("ok", &interner),
             Ok(Value::Int(1)),
             "a different interpreter never entered the terminated state"
         );
@@ -18829,7 +18847,7 @@ mod fatal_abort {
     #[test]
     fn a_preflight_refusal_does_not_terminate_the_engine() {
         let (nir, interner) = compiled("func ok() -> i64 { return 1 }");
-        let interpreter = Interpreter::unchecked(&nir);
+        let interpreter = Interpreter::new(&nir);
 
         let missing = interpreter
             .run("no_such_function", &interner)

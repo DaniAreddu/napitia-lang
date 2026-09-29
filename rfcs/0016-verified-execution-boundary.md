@@ -149,9 +149,9 @@ backend layer after it can still fail with `A0020`–`A0025` (for
 example `A0020` when Cranelift rejects something, `A0021` when the host
 cannot link). A `VerifiedModule` is therefore not necessarily one the
 native backend can compile. The capability pass does not re-verify:
-where it notices a verifier-owned violation anyway -- only a
-`#[cfg(test)]` unchecked seal can put one there -- it refuses with
-`A0019` rather than guessing.
+where it notices a verifier-owned violation anyway -- outside a
+`#[cfg(test)]` unchecked seal, only a verifier or backend defect can put
+one there -- it refuses with `A0019` rather than guessing.
 
 ### Sealing sites
 
@@ -163,9 +163,11 @@ places the verifier was already called:
   merged module, because a per-module verification could never have
   checked a cross-module call.
 
-`check` is upstream of NIR entirely and is unchanged: it reports
-lexer, parser, resolver, type and resource diagnostics, and lowers
-nothing.
+`check` is unchanged. For a single file it is upstream of NIR
+entirely: it reports lexer, parser, resolver, type and resource
+diagnostics, and lowers nothing. For a project it runs
+`project::compile_project`, so it lowers and verifies -- sealing the
+merged module at the second site above -- and then discards the seal.
 
 ## Normal verification failures
 
@@ -226,12 +228,16 @@ itself code that can have bugs. Alpha 0.2.1's runtime refusals
 | `X0001` | division by zero | ordinary runtime failure of a verified program |
 | `X0002` | integer overflow | ordinary runtime failure of a verified program |
 | `X0003` | shift amount out of range | ordinary runtime failure of a verified program |
-| `X0004` | an operation this engine cannot execute, or a reused terminated context | defence in depth |
+| `X0004` | an operation this engine cannot execute, an exceeded implementation budget, or a reused terminated context | defence in depth, and budget refusals |
 
 A verified program can still divide by zero, overflow or shift out of
 range; the verifier does not and cannot rule those out. What stands
 between a verifier bug and a panic is `X0004`, which the interpreter's
-own type and structure re-checks report.
+own type and structure re-checks report. `X0004` is not reserved for
+verifier bugs, though: a verified program that exceeds an
+implementation budget -- 512 call frames (`limits::MAX_CALL_DEPTH`), or
+a runtime value nested 64 or more levels deep
+(`limits::MAX_GENERIC_DEPTH`) -- is refused with it as well.
 
 The unchecked path keeps `X0004` under test. Given a module that
 constructs a live resource and then reaches an instruction the
@@ -246,7 +252,13 @@ point: the runtime refusal is the second line, not the first.
 
 Source programs, diagnostics and runtime behaviour are unchanged. A
 program that compiled, ran or built under Alpha 0.2.1 does all three
-identically under Alpha 0.2.2, with identical output.
+identically under Alpha 0.2.2, with identical output. One runtime
+refusal is now deterministic where it was not: when one call receives
+several resources both as observing and as `take` arguments, the
+`X0004` message names the lowest resource id rather than whichever a
+hash set yielded first. Its text is otherwise unchanged, and no program
+the CLI accepts reaches it -- resource checking and the verifier refuse
+that pairing first.
 
 The library API changes for anyone embedding the compiler crate:
 
@@ -270,7 +282,12 @@ the failure case. That is the change this RFC is for.
   of the seal.
 * Likewise nothing checks that the registry later passed to
   `nir::print_module`, or the source and registry passed to native
-  capability validation, are the ones `nir::verify` was given.
+  capability validation, are the ones `nir::verify` was given. The
+  plan does not bind the interner or the target triple either:
+  `emit_object` takes both as arguments of its own.
+* The seal covers NIR, not runtime values. `Interpreter::call` and
+  `Interpreter::call_item` accept caller-built argument values, which
+  the interpreter re-checks itself at run time; no verifier sees them.
 * A seal does not guarantee the absence of runtime failures:
   `X0001`–`X0003` remain ordinary failures of verified programs.
 * A seal does not guarantee native compilability: capability

@@ -76,7 +76,8 @@ what the verifier would have caught and stay under test via a
 `#[cfg(test)]`-only unchecked path the production library never
 compiles. `X0004` is not *only* that: a verified program that exceeds
 an implementation budget (512 call frames, or a value nested 64 or
-more levels deep) is refused with it too. Nor is every `VerifiedModule`
+more levels deep reaching a check that walks it) is refused with it
+too. Nor is every `VerifiedModule`
 one the native backend can compile: native capability validation is a
 separate pass that may still refuse it with an `Axxxx` code.
 `rfcs/0016` states the sealing invariant, which components take a
@@ -160,8 +161,9 @@ Every stage before that one is the stage `napitia ir` already ran —
 parse, resolve, type-check, resource-check, lower, verify — so `ir`,
 `run` and `build` agree by construction about what a program means.
 Single-file `check` shares every stage up to resource checking, and
-stops there: it does not lower or verify. Two new stages follow it: a native *capability validator*, which
-decides exhaustively whether the reachable program is inside the
+stops there: it does not lower or verify. Two new stages follow
+verification: a native *capability validator*, which decides
+exhaustively whether the reachable program is inside the
 compiled subset, and then Cranelift plus the system linker. A stage
 that fails stops the pipeline and nothing is written.
 

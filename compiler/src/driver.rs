@@ -229,9 +229,10 @@ pub enum NativeOutput {
 ///
 /// This is [`ir`]'s pipeline with two more stages on the end: native
 /// capability validation, then Cranelift and the system linker. It
-/// shares those earlier stages rather than repeating them, so `check`,
-/// `ir`, `run` and `build` all agree by construction about what a
-/// program means.
+/// shares those earlier stages rather than repeating them, so `ir`,
+/// `run` and `build` all agree by construction about what a program
+/// means. Single-file [`check`] shares them only up to resource
+/// checking: it neither lowers nor verifies.
 ///
 /// There is no interpreter fallback. A program the native backend
 /// cannot compile is refused with a diagnostic naming why; running it

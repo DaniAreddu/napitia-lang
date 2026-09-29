@@ -814,9 +814,13 @@ pub use crate::types::numeric::codes;
 /// opposite: NIR that should never have reached execution at all (a
 /// value read before it was computed, an operator applied to
 /// incompatible kinds, a constant outside its own type). That cannot
-/// happen for NIR that went through `nir::verify`, and it is still
-/// returned as a structured error rather than a panic, per this
-/// project's no-panic-on-malformed-input rule.
+/// happen for NIR that went through `nir::verify` short of a verifier
+/// bug, and it is still returned as a structured error rather than a
+/// panic, per this project's no-panic-on-malformed-input rule. The same
+/// variant also carries this engine's own budget refusals, which a
+/// verified program *can* reach: more than `limits::MAX_CALL_DEPTH`
+/// frames, or a runtime value nested `limits::MAX_GENERIC_DEPTH` levels
+/// deep.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
     /// A checked integer operation with no result in `i64`.

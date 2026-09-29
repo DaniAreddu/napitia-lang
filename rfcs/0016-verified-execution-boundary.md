@@ -237,7 +237,9 @@ own type and structure re-checks report. `X0004` is not reserved for
 verifier bugs, though: a verified program that exceeds an
 implementation budget -- 512 call frames (`limits::MAX_CALL_DEPTH`), or
 a runtime value nested 64 or more levels deep
-(`limits::MAX_GENERIC_DEPTH`) -- is refused with it as well.
+(`limits::MAX_GENERIC_DEPTH`) reaching a check that walks it, such as
+passing, returning, transferring, observing or dropping it -- is
+refused with it as well.
 
 The unchecked path keeps `X0004` under test. Given a module that
 constructs a live resource and then reaches an instruction the
@@ -298,27 +300,34 @@ the failure case. That is the change this RFC is for.
   cryptographic or runtime one. A `#[cfg(test)]` build can still seal
   anything, deliberately.
 * `nir::print_module` still takes a raw borrow, as described above. It
-  is read-only. `native::lower::emit_object` takes only a `NativePlan`,
-  and reaches the module through it.
+  is read-only. `native::lower::emit_object` takes a `NativePlan` plus
+  the interner and target triple, and reaches the module only through
+  the plan.
 * Nothing about *what* the verifier checks changed in this milestone.
-  Every rule, code and ordering is exactly Alpha 0.2.1's. Two of its
+  Every rule, code and ordering is exactly Alpha 0.2.1's. Three of its
   existing properties therefore still hold, and the seal does not
   change them:
-  * a seal is not a proof that every scalar slot is stored before it is
+  * a seal is not a proof that every slot is stored before it is
     loaded -- the verifier tracks definite initialization only for
-    resource-owning and `invoke` result slots. Hand-built NIR can verify and
-    still be refused at run time with `X0004` (natively, `A0017`);
-    lowering never emits such a load. `rfcs/0015`'s "never produced by
-    a valid program" for `X0004` is read in that light, and alongside
-    the budget refusals above;
+    slots whose type is a declared `resource`, and for `invoke` result
+    slots. Hand-built NIR can verify and still be refused at run time
+    with `X0004` (natively, `A0017`), except that a never-stored `unit`
+    slot simply reads as `()`. Lowering never emits such a load.
+    `rfcs/0015`'s and `spec/0005`'s "never produced by a valid program"
+    for `X0004` are read in that light, and alongside the budget
+    refusals above;
   * with more than one verifier diagnostic, their relative order
     follows function and block storage order. It is identical on every
     run of the same module, but reordering storage can reorder it;
-  * the verifier's affinity query stops at `limits::MAX_GENERIC_DEPTH`
-    (64) levels of record nesting and answers "not affine" there, so a
-    hand-built module whose resource sits that deep can verify with an
-    unreported leak. Source cannot reach it: the interpreter refuses a
-    value nested that deeply with `X0004` before it could leak.
+  * the verifier's affinity and leak-obligation walks stop at
+    `limits::MAX_GENERIC_DEPTH` (64) levels of record, variant or
+    generic nesting and answer "nothing owned" there, so a hand-built
+    module whose resource sits that deep can verify with an unreported
+    leak. Whether lowered source can reach this is not established:
+    resource checking's own affinity query has no such cutoff and plans
+    the cleanup lowering emits, but nothing after it is a backstop --
+    the interpreter's leak check stops at the same depth and would
+    report no leak rather than `X0004`.
 
 ## What this RFC does not do
 

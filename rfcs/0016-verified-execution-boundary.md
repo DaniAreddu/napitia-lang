@@ -301,7 +301,19 @@ the failure case. That is the change this RFC is for.
   is read-only. `native::lower::emit_object` takes only a `NativePlan`,
   and reaches the module through it.
 * Nothing about *what* the verifier checks changed in this milestone.
-  Every rule, code and ordering is exactly Alpha 0.2.1's.
+  Every rule, code and ordering is exactly Alpha 0.2.1's. Two of its
+  existing properties therefore still hold, and the seal does not
+  change them:
+  * a seal is not a proof that every scalar slot is stored before it is
+    loaded -- the verifier tracks definite initialization only for
+    resource-owning and `invoke` result slots. Hand-built NIR can verify and
+    still be refused at run time with `X0004` (natively, `A0017`);
+    lowering never emits such a load. `rfcs/0015`'s "never produced by
+    a valid program" for `X0004` is read in that light, and alongside
+    the budget refusals above;
+  * with more than one verifier diagnostic, their relative order
+    follows function and block storage order. It is identical on every
+    run of the same module, but reordering storage can reorder it.
 
 ## What this RFC does not do
 

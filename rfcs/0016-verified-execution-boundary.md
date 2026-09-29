@@ -313,7 +313,12 @@ the failure case. That is the change this RFC is for.
     the budget refusals above;
   * with more than one verifier diagnostic, their relative order
     follows function and block storage order. It is identical on every
-    run of the same module, but reordering storage can reorder it.
+    run of the same module, but reordering storage can reorder it;
+  * the verifier's affinity query stops at `limits::MAX_GENERIC_DEPTH`
+    (64) levels of record nesting and answers "not affine" there, so a
+    hand-built module whose resource sits that deep can verify with an
+    unreported leak. Source cannot reach it: the interpreter refuses a
+    value nested that deeply with `X0004` before it could leak.
 
 ## What this RFC does not do
 

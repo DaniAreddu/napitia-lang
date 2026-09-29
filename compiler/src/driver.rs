@@ -1,8 +1,13 @@
-//! Sequences the compiler stages (lex -> parse -> resolve -> typeck -> nir)
-//! behind the operations the CLI exposes. Each stage accumulates
+//! Sequences the compiler stages (lex -> parse -> resolve -> typeck ->
+//! resourceck -> NIR lowering -> `nir::verify`) behind the operations
+//! the CLI exposes. Each stage up to resource checking accumulates
 //! diagnostics from every stage before it, so `check`, `ir`, and `run`
-//! all report lexer/parser/resolver/type errors together rather than
-//! stopping at the first one.
+//! all report lexer/parser/resolver/type/resource errors together
+//! rather than stopping at the first one. NIR lowering runs only once
+//! those are clean, and `nir::verify` runs last: it is where the
+//! pipeline seals NIR, and the [`VerifiedModule`] it produces is the
+//! only form of NIR the interpreter and the native backend accept
+//! outside `#[cfg(test)]`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,7 +16,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{self, HirModule, ItemRegistry, LocalId};
 use crate::interpreter::{Interpreter, InterpreterError, Value};
 use crate::lexer::{self, Token};
-use crate::nir::{self, Module as NirModule};
+use crate::nir::{self, VerifiedModule};
 use crate::parser::Parser;
 use crate::project::{self, CompiledProject};
 use crate::source::{SourceId, SourceMap, Span};
@@ -143,13 +148,13 @@ pub enum IrOutput {
     /// so every item's canonical qualified name is just its own
     /// declared name (`rfcs/0007`).
     Ready {
-        nir: NirModule,
+        nir: VerifiedModule,
         registry: ItemRegistry,
     },
     /// Lexing, parsing, resolution, or type-checking failed (NIR
     /// lowering never ran), lowering itself failed, or lowering
     /// succeeded but produced NIR the verifier rejected. Either way,
-    /// there is no NIR safe to run.
+    /// there is no verified NIR to run.
     Diagnostics(Vec<Diagnostic>),
 }
 
@@ -197,17 +202,17 @@ fn ir_with_imports(
     // does not trust lowering's own bookkeeping, so a bug in `lower.rs`
     // surfaces as a diagnostic here rather than a panic or silent
     // misbehavior in the interpreter.
-    let verify_diagnostics = nir::verify_module(&nir_module, source, interner, &registry);
-    if !verify_diagnostics.is_empty() {
-        return (IrOutput::Diagnostics(verify_diagnostics), imports);
-    }
-    (
-        IrOutput::Ready {
-            nir: nir_module,
-            registry,
-        },
-        imports,
-    )
+    //
+    // This is also where single-file compilation crosses the verified
+    // boundary, exactly once: `nir::verify` consumes the module it
+    // checked and hands back the seal every executor demands, so no
+    // later stage can substitute a different module or reach one that
+    // was never checked.
+    let nir = match nir::verify(nir_module, source, interner, &registry) {
+        Ok(nir) => nir,
+        Err(diagnostics) => return (IrOutput::Diagnostics(diagnostics), imports),
+    };
+    (IrOutput::Ready { nir, registry }, imports)
 }
 
 pub enum NativeOutput {
@@ -224,9 +229,10 @@ pub enum NativeOutput {
 ///
 /// This is [`ir`]'s pipeline with two more stages on the end: native
 /// capability validation, then Cranelift and the system linker. It
-/// shares those earlier stages rather than repeating them, so `check`,
-/// `ir`, `run` and `build` all agree by construction about what a
-/// program means.
+/// shares those earlier stages rather than repeating them, so `ir`,
+/// `run` and `build` all agree by construction about what a program
+/// means. Single-file [`check`] shares them only up to resource
+/// checking: it neither lowers nor verifies.
 ///
 /// There is no interpreter fallback. A program the native backend
 /// cannot compile is refused with a diagnostic naming why; running it
@@ -281,7 +287,7 @@ pub fn check_project(
 
 pub enum ProjectIrOutput {
     Ready {
-        nir: NirModule,
+        nir: VerifiedModule,
         registry: ItemRegistry,
     },
     Diagnostics(Vec<Diagnostic>),
@@ -348,5 +354,179 @@ mod tests {
                 panic!("expected compilation to fail, but it ran and produced {result:?}")
             }
         }
+    }
+
+    /// One scalar program, inside the native subset and trivially
+    /// runnable, used wherever a test needs a fixture that really does
+    /// reach the far end of the pipeline.
+    const SCALAR: &str = "func add(a: i64, b: i64) -> i64 { return a + b; } \
+                          func main() -> i64 { return add(40, 2); }";
+
+    #[test]
+    fn a_valid_program_lowers_verifies_and_runs_through_the_seal() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, .. } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+
+        // The seal is what the interpreter takes, and it holds the
+        // program that was compiled: both functions, entry block first.
+        assert_eq!(nir.module().functions.len(), 2);
+        assert_eq!(
+            Interpreter::new(&nir).run("main", &interner),
+            Ok(Value::Int(42))
+        );
+
+        // And the ordinary `run` path agrees, because it is the same
+        // path.
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+        match run(&map, source, &mut interner, "main") {
+            RunOutput::Result(result) => assert_eq!(result, Ok(Value::Int(42))),
+            RunOutput::Diagnostics(diagnostics) => {
+                panic!("unexpected diagnostics: {diagnostics:?}")
+            }
+        }
+    }
+
+    /// A program whose `main` spans several blocks -- a loop, then an
+    /// `if` -- and calls a helper, so storage order is something a
+    /// consumer could wrongly depend on. `main` returns 1121.
+    const MULTI_BLOCK: &str = "func step(x: i64) -> i64 { return x * 3 + 1; } \
+                               func main() -> i64 { \
+                                 mutable acc: i64 = 0; \
+                                 mutable i: i64 = 0; \
+                                 while i < 5 { acc = step(acc); i = i + 1; } \
+                                 if acc > 100 { return acc + 1000; } \
+                                 return 0 - acc; }";
+
+    /// Compiles [`MULTI_BLOCK`], applies `permute` to a raw copy of the
+    /// verified module, reseals it through `nir::verify`, and checks
+    /// the resealed module runs to the same result as the original.
+    /// `check` sees `main`'s permuted blocks before resealing.
+    fn assert_permuted_storage_runs_the_same(
+        permute: impl Fn(&mut nir::Module),
+        check: impl Fn(&[nir::BasicBlock]),
+    ) {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", MULTI_BLOCK);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, registry } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+        let expected = Interpreter::new(&nir).run("main", &interner);
+        assert_eq!(expected, Ok(Value::Int(1121)));
+
+        let main_blocks = |module: &nir::Module| {
+            module
+                .functions
+                .iter()
+                .find(|f| interner.resolve(f.name) == "main")
+                .expect("the fixture declares `main`")
+                .blocks
+                .clone()
+        };
+        let original = main_blocks(nir.module());
+        assert!(original.len() >= 3, "main must span several blocks");
+        assert_eq!(original[0].id, nir::BlockId(0), "lowering stores bb0 first");
+
+        let mut raw = nir.module().clone();
+        permute(&mut raw);
+        check(&main_blocks(&raw));
+
+        let resealed = crate::nir::verify(raw, source, &interner, &registry)
+            .expect("block and function storage order is not a verifier invariant");
+        assert_eq!(Interpreter::new(&resealed).run("main", &interner), expected);
+    }
+
+    /// Entry is `BlockId(0)`, not whichever block is stored first:
+    /// reversing every function's blocks (and the functions
+    /// themselves) stores `main`'s entry block last, and both the
+    /// seal and the interpreter still accept it.
+    #[test]
+    fn reversed_block_storage_reseals_and_runs_the_same() {
+        assert_permuted_storage_runs_the_same(
+            |module| {
+                module.functions.reverse();
+                for function in &mut module.functions {
+                    function.blocks.reverse();
+                }
+            },
+            |blocks| assert_eq!(blocks.last().map(|b| b.id), Some(nir::BlockId(0))),
+        );
+    }
+
+    /// The same, with the original relative order kept but shifted by
+    /// one: `main`'s entry block is stored neither first nor last.
+    #[test]
+    fn rotated_block_storage_reseals_and_runs_the_same() {
+        assert_permuted_storage_runs_the_same(
+            |module| {
+                module.functions.rotate_right(1);
+                for function in &mut module.functions {
+                    function.blocks.rotate_right(1);
+                }
+            },
+            |blocks| assert_eq!(blocks[1].id, nir::BlockId(0)),
+        );
+    }
+
+    /// The native backend's first stage is reached with the seal, and
+    /// accepts it: capability validation is downstream of verification,
+    /// never a substitute for it.
+    #[test]
+    fn valid_verified_nir_reaches_the_native_capability_validator() {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", SCALAR);
+        let mut interner = Interner::new();
+
+        let IrOutput::Ready { nir, registry } = ir(&map, source, &mut interner) else {
+            panic!("a valid program must lower and verify")
+        };
+
+        crate::native::capability::validate(
+            &nir,
+            source,
+            &interner,
+            &registry,
+            crate::native::TARGET_TRIPLE,
+            &[],
+        )
+        .expect("a scalar program is inside the native subset");
+    }
+
+    /// The plan capability validation returns borrows the exact module
+    /// it validated, for as long as the plan lives. Spelling that
+    /// lifetime here is the assertion: a `validate` that returned a
+    /// plan detached from its module would no longer coerce to this.
+    type ValidateEntry<'module> =
+        fn(
+            &'module VerifiedModule,
+            SourceId,
+            &Interner,
+            &ItemRegistry,
+            &str,
+            &[Span],
+        ) -> Result<crate::native::capability::NativePlan<'module>, Vec<Diagnostic>>;
+
+    type BuildEntry =
+        fn(&VerifiedModule, SourceId, &Interner, &ItemRegistry, &[Span], &Path) -> Vec<Diagnostic>;
+
+    /// Production entry points take the seal, not a bare module. These
+    /// coercions compile only while that is true; a signature that went
+    /// back to `&nir::Module` would fail to compile here, which is the
+    /// assertion.
+    #[test]
+    fn no_production_entry_point_accepts_a_raw_module() {
+        fn interpreter_entry<'a>(_: fn(&'a VerifiedModule) -> Interpreter<'a>) {}
+        fn validate_entry<'module>(_: ValidateEntry<'module>) {}
+        interpreter_entry(Interpreter::new);
+        validate_entry(crate::native::capability::validate);
+        let _build: BuildEntry = crate::native::build_executable;
     }
 }

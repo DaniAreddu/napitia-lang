@@ -11,9 +11,11 @@
 //!
 //! It is not a second NIR verifier. [`crate::nir::verify_module`] has
 //! already run and already owns every structural and typing invariant
-//! NIR has. Where this pass notices such a violation anyway -- it is
-//! `pub(crate)`, and a crate-internal caller may hand it hand-built
-//! NIR that never went through the verifier -- it reports
+//! NIR has -- and since Alpha 0.2.2 (`rfcs/0016`) this pass takes a
+//! [`crate::nir::VerifiedModule`], so no production caller can reach it
+//! with anything else. Where it notices such a violation anyway --
+//! outside a `#[cfg(test)]` unchecked seal, only a verifier or backend
+//! defect can put one here -- it reports
 //! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is
@@ -71,7 +73,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{ItemId, ItemRegistry};
 use crate::nir::{
     BasicBlock, BlockId, Const, Function, Instruction, Module, OwnershipMode, Terminator, ValueId,
-    ValueKind,
+    ValueKind, VerifiedModule,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
@@ -104,17 +106,37 @@ pub(crate) const ENTRY_NAME: &str = "main";
 ///
 /// Every order in here is derived from semantic identity
 /// ([`ItemId`]/[`BlockId`]), never from the position an item happened to
-/// occupy in a `Vec`, so reversing `Module::functions` or a function's
+/// occupy in a `Vec`, so reversing the module's functions or a function's
 /// own `blocks` changes nothing about what is emitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativePlan {
+#[derive(Clone)]
+pub(crate) struct NativePlan<'module> {
+    /// The exact module this plan was validated against, borrowed for
+    /// as long as the plan exists.
+    ///
+    /// Carrying it here is what makes the plan a proof about *one*
+    /// module rather than a free-floating list of ids. Code generation
+    /// reads its module from this field ([`NativePlan::module`]) and
+    /// takes no module argument of its own, so there is no second
+    /// parameter for a caller to disagree with: a plan validated from
+    /// module A cannot be applied to module B, because applying it does
+    /// not accept a module at all.
+    module: &'module VerifiedModule,
     entry: ItemId,
     entry_result: Scalar,
     functions: Vec<ItemId>,
     reachable_blocks: BTreeMap<ItemId, Vec<BlockId>>,
 }
 
-impl NativePlan {
+impl<'module> NativePlan<'module> {
+    /// The validated module itself, borrowed read-only for the whole
+    /// life of the plan.
+    ///
+    /// This is the only module code generation ever sees, and it is by
+    /// construction the one every decision below was made about.
+    pub(super) fn module(&self) -> &'module Module {
+        self.module.module()
+    }
+
     /// The single `main` this build compiles an entry wrapper around.
     pub(super) fn entry(&self) -> ItemId {
         self.entry
@@ -147,7 +169,51 @@ impl NativePlan {
     }
 }
 
+/// Deliberately omits the borrowed module. A plan is identified by what
+/// it decided, and printing a whole NIR module into an assertion
+/// failure would bury exactly the fields being compared.
+impl std::fmt::Debug for NativePlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePlan")
+            .field("entry", &self.entry)
+            .field("entry_result", &self.entry_result)
+            .field("functions", &self.functions)
+            .field("reachable_blocks", &self.reachable_blocks)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Compares what two validations *decided*, field by field, and not the
+/// module each borrowed.
+///
+/// Reference identity is not a semantic property, and neither is
+/// storage order: two validations of the same program whose functions
+/// and blocks happen to be stored in opposite orders must compare
+/// equal, because every field above is derived from `ItemId`/`BlockId`
+/// rather than from a vector position. Nothing about this weakens the
+/// binding -- a plan is still usable only against the module it
+/// borrows, which is a matter of which module lowering can reach, not
+/// of which plans compare equal.
+impl PartialEq for NativePlan<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.entry_result == other.entry_result
+            && self.functions == other.functions
+            && self.reachable_blocks == other.reachable_blocks
+    }
+}
+
+impl Eq for NativePlan<'_> {}
+
 /// Validates `module` against the native subset, targeting `target`.
+///
+/// Takes a [`VerifiedModule`] rather than a bare [`crate::nir::Module`]
+/// because
+/// every rule here is asked *on top of* the NIR verifier's own, never
+/// instead of them (see this module's header): a module that never
+/// passed `nir::verify` has no business being asked whether it is
+/// inside the native subset, and outside this crate's own tests there
+/// is no way to build one of these that skipped it.
 ///
 /// `imports` carries the span of every `import` declaration the source
 /// itself wrote. Single-file compilation resolves no imports at all, so
@@ -159,14 +225,14 @@ impl NativePlan {
 /// the subset, in a deterministic order: target, then module-level
 /// facts, then the entry contract, then each reachable function in
 /// ascending [`ItemId`] order, then call-graph cycles.
-pub(crate) fn validate(
-    module: &Module,
+pub(crate) fn validate<'module>(
+    module: &'module VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
     target: &str,
     imports: &[Span],
-) -> Result<NativePlan, Vec<Diagnostic>> {
+) -> Result<NativePlan<'module>, Vec<Diagnostic>> {
     // A different target is not a partial failure to compile *this*
     // program -- nothing below it would be meaningful, since every
     // decision this pass makes is a decision about one specific
@@ -321,6 +387,7 @@ pub(crate) fn validate(
     };
 
     Ok(NativePlan {
+        module,
         entry,
         entry_result,
         functions,
@@ -1779,12 +1846,13 @@ fn strongly_connected_components(
 mod tests {
     use super::*;
     use crate::driver::{self, IrOutput};
+    use crate::nir::Module;
     use crate::source::SourceMap;
 
     /// One compiled, verified single-file program, kept together so a
     /// test can validate it and render whatever it refuses.
     struct Compiled {
-        module: Module,
+        module: VerifiedModule,
         registry: ItemRegistry,
         source: SourceId,
         interner: Interner,
@@ -1813,15 +1881,32 @@ mod tests {
     }
 
     impl Compiled {
-        fn validate(&self) -> Result<NativePlan, Vec<Diagnostic>> {
+        fn validate(&self) -> Result<NativePlan<'_>, Vec<Diagnostic>> {
             self.validate_for(TARGET_TRIPLE, &[])
+        }
+
+        /// The same compiled program with its NIR storage rearranged.
+        ///
+        /// A sealed module cannot be reordered in place -- that is the
+        /// boundary working as intended -- so this rebuilds the raw
+        /// module and seals it again through `nir::verify`, the one
+        /// production seal. Nothing the verifier checks should depend
+        /// on storage position; resealing through it rather than around
+        /// it makes every storage-order test prove that too, instead of
+        /// assuming it.
+        fn rearranged(self, rearrange: impl FnOnce(&mut Module)) -> Compiled {
+            let mut raw = self.module.module().clone();
+            rearrange(&mut raw);
+            let module = crate::nir::verify(raw, self.source, &self.interner, &self.registry)
+                .expect("rearranging storage must keep the module verifiable");
+            Compiled { module, ..self }
         }
 
         fn validate_for(
             &self,
             target: &str,
             imports: &[Span],
-        ) -> Result<NativePlan, Vec<Diagnostic>> {
+        ) -> Result<NativePlan<'_>, Vec<Diagnostic>> {
             validate(
                 &self.module,
                 self.source,
@@ -1850,8 +1935,14 @@ mod tests {
         }
     }
 
-    fn accepts(text: &str) -> NativePlan {
-        let compiled = compile(text);
+    /// The plan a program inside the native subset validates to.
+    ///
+    /// Takes the compiled program by reference rather than compiling it
+    /// here, because a plan borrows the verified module it validated
+    /// and so cannot outlive it. That is the binding working: a caller
+    /// has to keep the exact module alive for as long as it intends to
+    /// use the plan built from it.
+    fn accepts<'compiled>(compiled: &'compiled Compiled) -> NativePlan<'compiled> {
         match compiled.validate() {
             Ok(plan) => plan,
             Err(diagnostics) => {
@@ -1904,7 +1995,8 @@ mod tests {
 
     #[test]
     fn every_supported_construct_validates() {
-        let plan = accepts(EVERY_SUPPORTED_CONSTRUCT);
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
+        let plan = accepts(&compiled);
         assert_eq!(plan.entry_result, Scalar::Int);
         assert_eq!(
             plan.functions.len(),
@@ -1913,21 +2005,42 @@ mod tests {
         );
     }
 
+    /// The plan hands back the very module it validated -- the same
+    /// address, not an equal copy -- and so does every clone of it.
+    ///
+    /// Lowering reads its module from the plan alone, so this pointer
+    /// identity is what makes "codegen sees the module the capability
+    /// check saw" a fact rather than a convention. `PartialEq` on a
+    /// plan deliberately ignores the module, so only `ptr::eq` can pin
+    /// this.
+    #[test]
+    fn a_plan_reads_back_the_exact_module_it_validated() {
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
+        let plan = accepts(&compiled);
+        assert!(std::ptr::eq(plan.module(), compiled.module.module()));
+        assert!(
+            std::ptr::eq(plan.clone().module(), compiled.module.module()),
+            "cloning a plan copies the borrow, never the module"
+        );
+    }
+
     #[test]
     fn a_unit_returning_main_validates() {
-        let plan = accepts(
+        let compiled = compile(
             "func nothing() -> unit { return; } func main() -> unit { nothing(); return; }",
         );
+        let plan = accepts(&compiled);
         assert_eq!(plan.entry_result, Scalar::Unit);
         assert_eq!(plan.functions.len(), 2);
     }
 
     #[test]
     fn a_bool_local_and_a_bool_parameter_validate() {
-        accepts(
+        let compiled = compile(
             "func flip(x: bool) -> bool { return !x; } \
              func main() -> i64 { value b = flip(true); if b { return 1; } return 0; }",
         );
+        accepts(&compiled);
     }
 
     // -- storage order --------------------------------------------------
@@ -1939,11 +2052,12 @@ mod tests {
     #[test]
     fn reversed_function_and_block_storage_produce_an_identical_plan() {
         let forward = compile(EVERY_SUPPORTED_CONSTRUCT);
-        let mut reversed = compile(EVERY_SUPPORTED_CONSTRUCT);
-        reversed.module.functions.reverse();
-        for function in &mut reversed.module.functions {
-            function.blocks.reverse();
-        }
+        let reversed = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            module.functions.reverse();
+            for function in &mut module.functions {
+                function.blocks.reverse();
+            }
+        });
 
         let expected = forward.validate().expect("the forward module validates");
         let actual = reversed
@@ -1956,12 +2070,13 @@ mod tests {
     /// at `bb0`.
     #[test]
     fn an_entry_block_stored_last_is_still_the_entry_block() {
-        let mut compiled = compile(EVERY_SUPPORTED_CONSTRUCT);
-        for function in &mut compiled.module.functions {
-            if function.blocks.len() > 1 {
-                function.blocks.rotate_left(1);
+        let compiled = compile(EVERY_SUPPORTED_CONSTRUCT).rearranged(|module| {
+            for function in &mut module.functions {
+                if function.blocks.len() > 1 {
+                    function.blocks.rotate_left(1);
+                }
             }
-        }
+        });
         compiled
             .validate()
             .expect("the entry block is bb0 wherever it is stored");
@@ -1974,7 +2089,7 @@ mod tests {
     /// fail. Exactly what the interpreter does with it -- nothing.
     #[test]
     fn an_unreachable_function_using_a_resource_does_not_fail_the_build() {
-        let plan = accepts(
+        let compiled = compile(
             "
             resource File { descriptor: i64 }
             func open() -> File { return File { descriptor: 1 }; }
@@ -1987,6 +2102,7 @@ mod tests {
             func main() -> i64 { return 7; }
             ",
         );
+        let plan = accepts(&compiled);
         assert_eq!(
             plan.functions.len(),
             1,
@@ -2337,11 +2453,17 @@ mod hand_built_tests {
     /// Validates hand-built NIR the way a caller who skipped the
     /// verifier would: nothing here has a registry entry, so every
     /// diagnostic has to identify itself by NIR identity alone.
+    ///
+    /// Reaching the validator at all now requires a seal, and these
+    /// modules could never earn one, so they take the `#[cfg(test)]`
+    /// unchecked path. That is the whole point of the test: it proves
+    /// which layer owns which refusal, and no production caller can
+    /// stand where it stands.
     fn codes_of(module: &Module, interner: &Interner) -> Vec<&'static str> {
         let mut map = SourceMap::new();
         let source = map.add_file("hand-built.npt", "\n");
         match validate(
-            module,
+            &VerifiedModule::seal_unchecked(module.clone()),
             source,
             interner,
             &ItemRegistry::default(),
@@ -2663,6 +2785,81 @@ mod hand_built_tests {
                 Terminator::Return(Some(ValueId(0))),
             )],
         )]);
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    /// Two functions sharing one id make every id-keyed decision
+    /// ambiguous -- which body a call reaches, which symbol it binds.
+    /// The verifier refuses that (`V0001`), and the capability pass,
+    /// handed it anyway, refuses it as unverified NIR rather than
+    /// letting one body silently shadow the other.
+    #[test]
+    fn duplicate_function_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let helper = interner.intern("helper");
+        let shadow = func(
+            0,
+            helper,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 2)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        );
+        let built = module(vec![minimal_main(&mut interner), shadow]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0001"),
+            "a reused function id is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    /// Two blocks sharing one id leave a branch with two possible
+    /// targets. The verifier refuses that (`V0002`); the capability
+    /// pass refuses it again as unverified NIR instead of keeping
+    /// whichever block it happened to key last.
+    #[test]
+    fn duplicate_block_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let mut main = minimal_main(&mut interner);
+        main.blocks.push(block(
+            0,
+            vec![int(1, 2)],
+            Terminator::Return(Some(ValueId(1))),
+        ));
+        let built = module(vec![main]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0002"),
+            "a reused block id is malformed NIR, and the verifier says so"
+        );
+        assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
+    }
+
+    /// A value defined twice has no single definition for a use to
+    /// name. The verifier refuses that (`V0016`); the capability pass
+    /// refuses it again as unverified NIR instead of lowering either
+    /// definition as the one that counts.
+    #[test]
+    fn duplicate_value_ids_fail_verification_and_never_reach_codegen() {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let built = module(vec![func(
+            0,
+            main,
+            Vec::new(),
+            Ty::I64,
+            vec![block(
+                0,
+                vec![int(0, 1), int(0, 2)],
+                Terminator::Return(Some(ValueId(0))),
+            )],
+        )]);
+        assert!(
+            verifier_codes(&built, &interner).contains(&"V0016"),
+            "a value defined twice is malformed NIR, and the verifier says so"
+        );
         assert_eq!(codes_of(&built, &interner), vec![codes::UNVERIFIED_NIR]);
     }
 
@@ -3169,7 +3366,7 @@ mod hand_built_tests {
             let mut map = SourceMap::new();
             let source = map.add_file("hand-built.npt", "\n");
             match validate(
-                &built,
+                &VerifiedModule::seal_unchecked(built.clone()),
                 source,
                 &interner,
                 &ItemRegistry::default(),

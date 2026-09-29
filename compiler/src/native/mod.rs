@@ -22,18 +22,24 @@
 //! Two of those stages are load-bearing in a way worth stating
 //! explicitly:
 //!
-//! * [`crate::nir::verify_module`] is mandatory and runs first. Code
-//!   generation never sees NIR the verifier has not accepted, so
-//!   nothing here re-derives structural invariants the verifier already
-//!   owns -- and where this module does notice such a violation anyway
-//!   (`build_executable` is `pub(crate)`, and a crate-internal caller
-//!   can hand it anything), it refuses with
-//!   [`codes::UNVERIFIED_NIR`] rather than guessing.
+//! * [`crate::nir::verify()`] is mandatory and runs first, and its seal
+//!   is what this backend takes: `build_executable` and
+//!   `capability::validate` accept a [`crate::nir::VerifiedModule`],
+//!   never a bare module, so code generation cannot be reached with NIR
+//!   the verifier has not accepted. Nothing here relies on re-deriving
+//!   structural invariants the verifier already owns -- but where this
+//!   module does notice such a violation anyway (a duplicate function,
+//!   block or value id, a dangling target; a `#[cfg(test)]` unchecked
+//!   seal is still a seal), it refuses with [`codes::UNVERIFIED_NIR`]
+//!   rather than guessing.
 //! * `capability` runs after verification and before Cranelift ever
 //!   sees a function. It decides, exhaustively, whether the whole
 //!   reachable program is inside the supported subset. Everything after
 //!   it may therefore assume that subset, which is why `lower` has no
-//!   "unsupported, give up" path buried inside code generation.
+//!   "unsupported, give up" path buried inside code generation. `lower`
+//!   receives only the plan `capability` returns, which borrows the
+//!   verified module it was validated against; it takes no module of
+//!   its own.
 //!
 //! # Diagnostic layers
 //!
@@ -59,7 +65,7 @@ use target_lexicon::Triple;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::ItemRegistry;
-use crate::nir::Module;
+use crate::nir::VerifiedModule;
 use crate::source::{SourceId, Span};
 use crate::symbol::Interner;
 use crate::types::Ty;
@@ -112,9 +118,11 @@ pub mod codes {
     /// `switch`, `invoke` or `raise`.
     pub const UNSUPPORTED_TERMINATOR: &str = "A0008";
     /// A reachable operator whose *exceptional* behavior this backend
-    /// cannot reproduce without a runtime facility Alpha 0.2.0 does not
-    /// have -- the capability validator documents exactly which
-    /// operators those are, and why each one is on that list.
+    /// does not reproduce yet. The runtime failure path checked
+    /// arithmetic branches to exists, but the native subset deliberately
+    /// does not route these operators' exceptional cases to it -- the
+    /// capability validator documents exactly which operators those
+    /// are, and why each one is on that list.
     pub const UNSUPPORTED_OPERATOR: &str = "A0009";
     /// A reachable function declares type parameters, or a reachable
     /// call supplies type arguments. There is no monomorphization here.
@@ -148,8 +156,13 @@ pub mod codes {
     /// Structure [`crate::nir::verify_module`] would already have
     /// rejected reached this backend: a dangling block target, an
     /// undefined value, a duplicate id, a type inconsistency. Reported
-    /// instead of guessed at, and never produced for NIR that actually
-    /// went through the verifier.
+    /// instead of guessed at. Also used when the capability validator
+    /// finds its own bookkeeping inconsistent ("missing validation
+    /// metadata": a reachable function with no block plan or no
+    /// recorded call edges, or an entry result left without a native
+    /// representation) -- a defect in the backend itself, which the
+    /// verifier cannot rule out. For NIR that actually went through the
+    /// verifier, that is the only way this code is produced.
     pub const UNVERIFIED_NIR: &str = "A0019";
 
     /// Cranelift rejected, or failed to emit, something this backend
@@ -353,7 +366,8 @@ fn probe_linker_target(linker: &OsStr) -> Result<LinkerTarget, std::io::Error> {
 
 /// Runs the whole native pipeline for one already-verified module:
 /// capability validation, Cranelift object generation, and the system
-/// linker.
+/// linker. Object generation is handed only the plan validation
+/// returned, never `module` directly; the plan borrows it.
 ///
 /// Returns every reason it could not, or an empty list on success.
 /// There is no partial outcome and no fallback: if this returns
@@ -362,7 +376,7 @@ fn probe_linker_target(linker: &OsStr) -> Result<LinkerTarget, std::io::Error> {
 /// `imports` carries the span of every `import` the source declared
 /// (see [`capability::validate`]).
 pub(crate) fn build_executable(
-    module: &Module,
+    module: &VerifiedModule,
     source: SourceId,
     interner: &Interner,
     registry: &ItemRegistry,
@@ -379,7 +393,7 @@ pub(crate) fn build_executable(
     // subset gets the same diagnostic wherever it is compiled, and
     // whether this host could have linked the result is a separate
     // question from whether the program was compilable at all.
-    let object = match lower::emit_object(module, interner, &plan, TARGET_TRIPLE) {
+    let object = match lower::emit_object(&plan, interner, TARGET_TRIPLE) {
         Ok(object) => object,
         Err(reason) => {
             return vec![
@@ -772,6 +786,7 @@ mod tests {
 mod link_tests {
     use super::*;
     use crate::driver::{self, IrOutput};
+    use crate::nir::Module;
     use crate::source::SourceMap;
 
     /// A directory of this test's own, under the system temporary
@@ -874,7 +889,7 @@ mod link_tests {
         assert_eq!(build_directory_parent(Path::new("program")), Path::new("."));
     }
 
-    fn compiled(text: &str) -> (Module, ItemRegistry, SourceId, Interner) {
+    fn compiled(text: &str) -> (VerifiedModule, ItemRegistry, SourceId, Interner) {
         let mut map = SourceMap::new();
         let source = map.add_file("link.npt", text);
         let mut interner = Interner::new();
@@ -1144,10 +1159,21 @@ mod link_tests {
             .iter()
             .map(|d| d.code)
             .collect();
-        let native: Vec<&str> = build_executable(module, source, interner, &registry, &[], output)
-            .iter()
-            .map(|d| d.code)
-            .collect();
+        // A hand-built module can never earn a seal, so the only way to
+        // ask the native pipeline about one is the `#[cfg(test)]`
+        // unchecked path -- which is exactly the caller `A0019` exists
+        // for.
+        let native: Vec<&str> = build_executable(
+            &VerifiedModule::seal_unchecked(module.clone()),
+            source,
+            interner,
+            &registry,
+            &[],
+            output,
+        )
+        .iter()
+        .map(|d| d.code)
+        .collect();
         (verifier, native)
     }
 
@@ -1203,6 +1229,19 @@ mod link_tests {
             !verifier.is_empty(),
             "{tag}: this NIR must fail `nir::verify` in the first place"
         );
+        // And the production constructor refuses it too, with the
+        // verifier's own codes: the unchecked seal `build_unverified`
+        // used is the only one this fixture could ever get.
+        let mut map = SourceMap::new();
+        let source = map.add_file("sealed.npt", "\n");
+        match crate::nir::verify(module.clone(), source, interner, &ItemRegistry::default()) {
+            Ok(_) => panic!("{tag}: `nir::verify` must not seal this NIR"),
+            Err(diagnostics) => assert_eq!(
+                diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+                verifier,
+                "{tag}: the seal must refuse with exactly the verifier's diagnostics"
+            ),
+        }
         assert_eq!(
             native,
             vec![codes::UNVERIFIED_NIR],
@@ -1305,9 +1344,15 @@ mod link_tests {
             )],
         );
 
-        let refused =
-            capability::validate(&module, source, &interner, &registry, TARGET_TRIPLE, &[])
-                .expect_err("a `str` result is outside the native subset");
+        let refused = capability::validate(
+            &VerifiedModule::seal_unchecked(module),
+            source,
+            &interner,
+            &registry,
+            TARGET_TRIPLE,
+            &[],
+        )
+        .expect_err("a `str` result is outside the native subset");
         assert_eq!(
             refused.iter().map(|d| d.code).collect::<Vec<_>>(),
             vec![codes::ENTRY_RETURN_TYPE]

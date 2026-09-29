@@ -1,6 +1,14 @@
 //! A small interpreter for the NIR subset this milestone lowers to
-//! (`spec/0006`), used to validate language semantics before any native
-//! backend exists.
+//! (`spec/0006`): the complete semantic execution path. The native
+//! backend (`rfcs/0014`) compiles only a scalar subset of the same NIR.
+//!
+//! # What it accepts
+//!
+//! A [`crate::nir::VerifiedModule`] (`rfcs/0016`), so no production
+//! caller can point this engine at NIR the verifier never accepted. The
+//! runtime refusals below are therefore genuinely a second line rather
+//! than the only one, and the `#[cfg(test)]` `Interpreter::unchecked`
+//! path is what keeps them under test.
 //!
 //! # Numbers
 //!
@@ -26,7 +34,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::hir::ItemId;
-use crate::nir::{Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind};
+use crate::nir::{
+    Const, Function, Module, OwnershipMode, Terminator, ValueId, ValueKind, VerifiedModule,
+};
 use crate::place::{Place, Projection};
 use crate::symbol::Interner;
 use crate::types::numeric;
@@ -804,9 +814,13 @@ pub use crate::types::numeric::codes;
 /// opposite: NIR that should never have reached execution at all (a
 /// value read before it was computed, an operator applied to
 /// incompatible kinds, a constant outside its own type). That cannot
-/// happen for NIR that went through `nir::verify`, and it is still
-/// returned as a structured error rather than a panic, per this
-/// project's no-panic-on-malformed-input rule.
+/// happen for NIR that went through `nir::verify` short of a verifier
+/// bug, and it is still returned as a structured error rather than a
+/// panic, per this project's no-panic-on-malformed-input rule. The same
+/// variant also carries this engine's own budget refusals, which a
+/// verified program *can* reach: more than `limits::MAX_CALL_DEPTH`
+/// frames, or a runtime value nested `limits::MAX_GENERIC_DEPTH` or
+/// more levels deep reaching a check that walks it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
     /// A checked integer operation with no result in `i64`.
@@ -902,7 +916,36 @@ pub struct Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
-    pub fn new(module: &'a Module) -> Self {
+    /// The production constructor, and the only one outside this
+    /// crate's own tests.
+    ///
+    /// Takes a [`VerifiedModule`], so an interpreter can only ever be
+    /// pointed at NIR `nir::verify` accepted -- the defence-in-depth
+    /// checks below are then genuinely a second line, rather than the
+    /// only one.
+    pub fn new(module: &'a VerifiedModule) -> Self {
+        Interpreter::over(module.module())
+    }
+
+    /// Points an interpreter at NIR nothing verified.
+    ///
+    /// Compiled only under `cfg(test)`, and `pub(crate)` even there: no
+    /// build of the production library contains it. It is what keeps
+    /// the runtime's malformed-NIR refusal (`X0004`) and its own type
+    /// re-checks testable now that no production caller can hand this
+    /// engine a malformed module -- those refusals are the reason a
+    /// verifier bug would still not become a panic or silent
+    /// misbehaviour. `X0001`-`X0003` (`rfcs/0015`) need no such path:
+    /// they are ordinary arithmetic failures of verified programs.
+    #[cfg(test)]
+    pub(crate) fn unchecked(module: &'a Module) -> Self {
+        Interpreter::over(module)
+    }
+
+    /// The construction itself, private so that [`Interpreter::new`]
+    /// and the `cfg(test)` unchecked path are the only ways to reach
+    /// it. Nothing in this module builds an interpreter outside them.
+    fn over(module: &'a Module) -> Self {
         Interpreter {
             module,
             resources: RefCell::new(ResourceTable::default()),
@@ -3517,11 +3560,14 @@ impl<'a> Interpreter<'a> {
         // at any depth and through resource records as well as inline
         // aggregates, so this one intersection covers bare resources,
         // records, variants, generic instantiations and any nesting of
-        // them.
+        // them. The lowest shared id is the one named, never whichever
+        // the `HashSet`'s per-process hash order happens to yield first,
+        // so the same call is refused with the same message every run.
         if let Some(shared) = plan
             .reachable
             .iter()
-            .find(|id| observed_identities.contains(id))
+            .filter(|id| observed_identities.contains(id))
+            .min_by_key(|id| id.0)
         {
             return Err(invalid(format!(
                 "one resource (#{}) is passed to this call as both an observing argument and a \
@@ -4779,7 +4825,7 @@ mod tests {
     /// the interpreter is asserted clean, so a fixture that stops
     /// compiling fails as a broken fixture rather than as a runtime
     /// result.
-    pub(super) fn compiled(text: &str) -> (crate::nir::Module, Interner) {
+    pub(super) fn compiled(text: &str) -> (crate::nir::VerifiedModule, Interner) {
         let mut map = SourceMap::new();
         let id = map.add_file("t.npt", text);
         let mut interner = Interner::new();
@@ -4832,7 +4878,24 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        (nir, interner)
+        (seal(nir, &hir, id, &interner), interner)
+    }
+
+    /// Crosses the production boundary, `nir::verify`, exactly as the
+    /// driver does. A source fixture is valid NIR by construction, so a
+    /// fixture whose lowering the verifier refuses is a broken fixture
+    /// (or a lowering bug) and fails here rather than being executed
+    /// unchecked.
+    fn seal(
+        nir: crate::nir::Module,
+        hir: &crate::hir::HirModule,
+        source: crate::source::SourceId,
+        interner: &Interner,
+    ) -> crate::nir::VerifiedModule {
+        let registry = crate::hir::registry::build(hir, &HashMap::new());
+        crate::nir::verify(nir, source, interner, &registry).unwrap_or_else(|diagnostics| {
+            panic!("expected the lowered fixture to verify: {diagnostics:?}")
+        })
     }
 
     pub(super) fn run(text: &str) -> Result<Value, InterpreterError> {
@@ -4897,6 +4960,7 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
+        let nir = seal(nir, &hir, id, &interner);
         let interpreter = Interpreter::new(&nir);
         let outcome = interpreter.run("main", &interner);
         // Resolves every `call:<ItemId>` entry to the callee's own
@@ -5219,7 +5283,7 @@ mod tests {
             id,
         )
         .expect("expected lowering to succeed");
-        let outcome = Interpreter::new(&nir).run("does_not_exist", &interner);
+        let outcome = Interpreter::unchecked(&nir).run("does_not_exist", &interner);
         assert!(matches!(
             outcome,
             Err(InterpreterError::InvalidOperation(_))
@@ -5279,7 +5343,7 @@ mod tests {
             .find(|f| interner.resolve(f.name) == "other_main")
             .expect("other_main should have lowered")
             .id;
-        let outcome = Interpreter::new(&nir).run_item(other_main_id);
+        let outcome = Interpreter::unchecked(&nir).run_item(other_main_id);
         assert_eq!(outcome, Ok(Value::Int(2)));
     }
 
@@ -5325,7 +5389,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, vec![Value::Int(1)]);
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected an arity-mismatch error, got {outcome:?}"
@@ -5364,8 +5428,11 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome =
-            Interpreter::new(&module).call("f", &interner, vec![Value::Int(1), Value::Int(2)]);
+        let outcome = Interpreter::unchecked(&module).call(
+            "f",
+            &interner,
+            vec![Value::Int(1), Value::Int(2)],
+        );
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected an arity-mismatch error, got {outcome:?}"
@@ -5411,7 +5478,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, vec![Value::Int(1)]);
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, vec![Value::Int(1)]);
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected an evidence-count error, got {outcome:?}"
@@ -5449,7 +5516,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a missing-entry-block error, got {outcome:?}"
@@ -5614,7 +5681,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured error, not a panic, got {outcome:?}"
@@ -5671,7 +5738,7 @@ mod tests {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured error, not a panic, got {outcome:?}"
@@ -5810,7 +5877,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured double-drop error, not a panic, got {outcome:?}"
@@ -5907,7 +5974,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured stale-handle error, not a panic, got {outcome:?}"
@@ -5985,7 +6052,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured stale-handle error, not a panic, got {outcome:?}"
@@ -6062,7 +6129,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured observer-drop error, not a panic, got {outcome:?}"
@@ -6127,7 +6194,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let arg = interpreter
             .resources
             .borrow_mut()
@@ -6195,7 +6262,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let outcome = Interpreter::new(&module).call("f", &interner, Vec::new());
+        let outcome = Interpreter::unchecked(&module).call("f", &interner, Vec::new());
         assert!(
             matches!(outcome, Err(InterpreterError::InvalidOperation(_))),
             "expected a structured frame-exit leak error, not a panic, got {outcome:?}"
@@ -6251,7 +6318,7 @@ mod tests {
             )],
             variants: Vec::new(),
         };
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -6619,7 +6686,7 @@ mod structural_runtime {
     fn a_well_formed_generic_instantiation_is_affine_only_for_an_affine_argument() {
         let name = Symbol(0);
         let module = module_with(vec![(crate::hir::TypeParamId(0), name)]);
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(
             interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::Named(FILE, name)])),
             "`Box[File]` must be affine at runtime"
@@ -6633,7 +6700,7 @@ mod structural_runtime {
     #[test]
     fn a_missing_type_parameter_list_fails_closed_to_affine() {
         let module = module_with(Vec::new());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(
             interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
             "missing generic metadata must never be answered as an empty substitution"
@@ -6643,7 +6710,7 @@ mod structural_runtime {
     #[test]
     fn an_unknown_generic_item_fails_closed_to_affine() {
         let module = module_with(vec![(crate::hir::TypeParamId(0), Symbol(0))]);
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(
             interpreter.is_affine(&Ty::Applied(ItemId(9999), vec![Ty::I64])),
             "an item with no recorded layout must never be answered as non-affine"
@@ -6653,7 +6720,7 @@ mod structural_runtime {
     #[test]
     fn an_affine_record_is_a_legal_structural_drop_target() {
         let module = nested_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -6681,7 +6748,7 @@ mod structural_runtime {
     #[test]
     fn dropping_an_already_destroyed_value_is_a_structured_error_not_a_panic() {
         let module = module_with(Vec::new());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -6699,7 +6766,7 @@ mod structural_runtime {
     #[test]
     fn dropping_a_tombstone_is_a_structured_error_not_a_silent_success() {
         let module = module_with(Vec::new());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(
             matches!(
                 interpreter.drop_value(Value::Moved),
@@ -6719,7 +6786,7 @@ mod structural_runtime {
     #[test]
     fn a_place_projecting_through_a_variant_field_is_a_structured_error() {
         let module = module_with(Vec::new());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let projection = crate::place::Projection::VariantField {
             variant: BOXY,
             case: crate::place::CaseId(0),
@@ -6735,7 +6802,7 @@ mod structural_runtime {
     #[test]
     fn observing_through_a_mixed_chain_mutates_nothing_at_any_depth() {
         let module = nested_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -6779,7 +6846,7 @@ mod structural_runtime {
     #[test]
     fn a_failed_traversal_leaves_every_container_on_the_path_untouched() {
         let module = nested_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -6820,7 +6887,7 @@ mod structural_runtime {
     #[test]
     fn transferring_through_a_mixed_chain_empties_only_the_final_field() {
         let module = nested_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -7358,7 +7425,7 @@ mod generic_destruction {
     #[test]
     fn a_runtime_arity_disagreement_is_a_structured_error_not_a_silent_skip() {
         let module = generic_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -7392,7 +7459,7 @@ mod generic_destruction {
     #[test]
     fn an_unknown_runtime_item_is_a_structured_error() {
         let module = generic_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let unknown = Value::Record {
             item: ItemId(9999),
             type_args: Vec::new(),
@@ -7411,7 +7478,7 @@ mod generic_destruction {
     #[test]
     fn a_well_formed_generic_value_answers_from_its_own_arguments() {
         let module = generic_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let name = Symbol(0);
         let handle = interpreter
             .resources
@@ -7436,7 +7503,7 @@ mod generic_destruction {
     #[test]
     fn a_record_value_with_more_fields_than_its_declaration_is_refused() {
         let module = generic_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -7490,7 +7557,7 @@ mod generic_destruction {
             protocols: Vec::new(),
             extends: Vec::new(),
         };
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -7514,7 +7581,7 @@ mod generic_destruction {
     #[test]
     fn a_variant_value_naming_an_out_of_range_case_is_refused() {
         let module = generic_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let malformed = Value::Variant {
             item: ItemId(91),
             type_args: vec![Ty::I64],
@@ -7719,7 +7786,7 @@ mod store_place_transfer {
     #[test]
     fn a_successful_store_transfers_ownership_into_the_place() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
 
         interpreter
@@ -7751,7 +7818,7 @@ mod store_place_transfer {
     #[test]
     fn the_old_source_is_no_longer_a_current_owner_after_a_store() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
 
         interpreter
@@ -7783,7 +7850,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_into_a_live_field_leaves_the_source_untouched() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = interpreter
             .resources
             .borrow_mut()
@@ -7830,7 +7897,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_of_an_already_dropped_source_leaves_the_destination_empty() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
         interpreter
             .drop_value(Value::Resource(replacement))
@@ -7856,7 +7923,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_whose_source_and_destination_are_the_same_storage_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let mut values = HashMap::new();
         values.insert(
             ValueId(0),
@@ -7886,7 +7953,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_aliasing_its_destination_through_a_load_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let mut values = HashMap::new();
         values.insert(
             ValueId(0),
@@ -7915,7 +7982,7 @@ mod store_place_transfer {
     #[test]
     fn a_nested_affine_record_is_transferred_whole() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let inner = interpreter
             .resources
             .borrow_mut()
@@ -7971,7 +8038,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_into_a_generic_aggregate_preserves_its_type_arguments() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let replacement = interpreter
             .resources
             .borrow_mut()
@@ -8009,7 +8076,7 @@ mod store_place_transfer {
     #[test]
     fn a_store_through_a_missing_field_index_is_a_structured_error() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, replacement) = emptied_holder(&interpreter, 0, 1);
         let before = values.clone();
 
@@ -8037,7 +8104,7 @@ mod store_place_transfer {
     #[test]
     fn a_duplicate_identity_in_the_source_is_refused_without_mutation() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = interpreter
             .resources
             .borrow_mut()
@@ -8081,7 +8148,7 @@ mod store_place_transfer {
     #[test]
     fn a_refused_store_reports_the_identical_error_every_time() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, _) = emptied_holder(&interpreter, 0, 1);
         let first = interpreter.store_place_transfer(
             &mut values,
@@ -8195,7 +8262,7 @@ mod store_place_transfer {
     #[test]
     fn a_duplicate_handle_nested_inside_records_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = interpreter
             .resources
             .borrow_mut()
@@ -8225,7 +8292,7 @@ mod store_place_transfer {
     #[test]
     fn a_duplicate_handle_across_record_and_variant_nesting_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = interpreter
             .resources
             .borrow_mut()
@@ -8259,7 +8326,7 @@ mod store_place_transfer {
     #[test]
     fn a_source_sharing_an_identity_with_the_destination_path_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // The destination is reached *through* this resource, and the
         // source carries the same identity: transferring it would
         // invalidate the handle the install has to walk through.
@@ -8284,7 +8351,7 @@ mod store_place_transfer {
     #[test]
     fn a_stale_child_after_a_valid_sibling_is_refused_without_moving_the_sibling() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let good = interpreter
             .resources
             .borrow_mut()
@@ -8317,7 +8384,7 @@ mod store_place_transfer {
     #[test]
     fn a_source_whose_field_count_disagrees_with_its_declaration_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = interpreter
             .resources
             .borrow_mut()
@@ -8341,7 +8408,7 @@ mod store_place_transfer {
     #[test]
     fn a_source_with_mismatched_generic_type_arguments_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = interpreter
             .resources
             .borrow_mut()
@@ -8365,7 +8432,7 @@ mod store_place_transfer {
     #[test]
     fn a_source_variant_with_the_wrong_payload_count_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = interpreter
             .resources
             .borrow_mut()
@@ -8389,7 +8456,7 @@ mod store_place_transfer {
     #[test]
     fn a_destination_traversed_through_a_stale_resource_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let spine = interpreter
             .resources
             .borrow_mut()
@@ -8420,7 +8487,7 @@ mod store_place_transfer {
     #[test]
     fn a_successful_nested_generic_store_transfers_every_resource_once() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = interpreter
             .resources
             .borrow_mut()
@@ -8512,7 +8579,7 @@ mod store_place_transfer {
     #[test]
     fn a_duplicate_reached_through_a_resource_and_directly_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = a_file(&interpreter, 1);
         let owner = session(&interpreter);
         own(&interpreter, owner, Value::Resource(shared));
@@ -8540,7 +8607,7 @@ mod store_place_transfer {
     #[test]
     fn a_duplicate_nested_several_levels_down_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = a_file(&interpreter, 1);
         let inner = session(&interpreter);
         own(&interpreter, inner, Value::Resource(shared));
@@ -8568,7 +8635,7 @@ mod store_place_transfer {
     #[test]
     fn a_source_descendant_that_is_the_destination_spine_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // The destination is written *through* `spine`, and the source
         // owns `spine` below its own outer handle. Transferring it
         // would invalidate the very handle the install walks through,
@@ -8592,7 +8659,7 @@ mod store_place_transfer {
     #[test]
     fn a_destination_descendant_that_is_in_the_source_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = a_file(&interpreter, 1);
         // The destination container already owns `shared` in a sibling
         // of the slot being written, and the source carries it too.
@@ -8645,7 +8712,7 @@ mod store_place_transfer {
     #[test]
     fn a_direct_ownership_cycle_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let spine = session(&interpreter);
         // `spine` would end up owning itself.
         let mut values = HashMap::new();
@@ -8665,7 +8732,7 @@ mod store_place_transfer {
     #[test]
     fn an_indirect_ownership_cycle_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let spine = session(&interpreter);
         let middle = nest(&interpreter, spine);
         // Writing `middle` into `spine`'s own empty field closes the
@@ -8687,7 +8754,7 @@ mod store_place_transfer {
     #[test]
     fn a_stale_child_inside_a_resource_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let stale = a_file(&interpreter, 1);
         let carrier = session(&interpreter);
         own(&interpreter, carrier, Value::Resource(stale));
@@ -8712,7 +8779,7 @@ mod store_place_transfer {
     #[test]
     fn a_malformed_value_nested_inside_a_resource_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let carrier = session(&interpreter);
         // `Session` declares one `File` field; this one holds an `i64`.
         own(&interpreter, carrier, Value::Int(7));
@@ -8731,7 +8798,7 @@ mod store_place_transfer {
     #[test]
     fn a_nested_child_keeps_its_own_generation_when_its_parent_moves() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let child = a_file(&interpreter, 1);
         let carrier = session(&interpreter);
         own(&interpreter, carrier, Value::Resource(child));
@@ -9190,7 +9257,7 @@ mod drop_transaction {
     #[test]
     fn a_resource_with_an_extra_runtime_field_is_refused_and_leaks_nothing() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let leaked = file(&interpreter, 1);
         // `Session` declares one field; this record carries two, and the
         // extra one holds a live resource. Skipping it would destroy the
@@ -9213,7 +9280,7 @@ mod drop_transaction {
     #[test]
     fn a_resource_with_a_missing_runtime_field_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let handle = interpreter
             .resources
             .borrow_mut()
@@ -9228,7 +9295,7 @@ mod drop_transaction {
     #[test]
     fn a_record_with_a_missing_generic_type_argument_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         assert_refused_without_mutation(
             &interpreter,
@@ -9245,7 +9312,7 @@ mod drop_transaction {
     #[test]
     fn a_record_with_an_extra_generic_type_argument_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         assert_refused_without_mutation(
             &interpreter,
@@ -9262,7 +9329,7 @@ mod drop_transaction {
     #[test]
     fn a_nested_malformed_record_is_refused_before_its_valid_sibling_is_destroyed() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let good = file(&interpreter, 1);
         let inner = file(&interpreter, 2);
         // The outer record is well formed; its *second* field is an
@@ -9289,7 +9356,7 @@ mod drop_transaction {
     #[test]
     fn a_nested_malformed_variant_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         assert_refused_without_mutation(
             &interpreter,
@@ -9311,7 +9378,7 @@ mod drop_transaction {
     #[test]
     fn a_variant_naming_an_invalid_active_case_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert_refused_without_mutation(
             &interpreter,
             Value::Variant {
@@ -9327,7 +9394,7 @@ mod drop_transaction {
     #[test]
     fn a_duplicate_resource_handle_in_two_fields_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let shared = file(&interpreter, 1);
         // One identity reached through two positions would be
         // destroyed twice.
@@ -9346,7 +9413,7 @@ mod drop_transaction {
     #[test]
     fn a_stale_child_after_a_valid_sibling_is_refused_without_destroying_the_sibling() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let good = file(&interpreter, 1);
         let stale = file(&interpreter, 2);
         let _ = interpreter
@@ -9375,7 +9442,7 @@ mod drop_transaction {
     #[test]
     fn an_already_dropped_nested_child_is_skipped_not_destroyed_twice() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         let session = interpreter
             .resources
@@ -9394,7 +9461,7 @@ mod drop_transaction {
     #[test]
     fn a_deeply_nested_generic_graph_is_destroyed_in_exact_order() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = file(&interpreter, 1);
         let second = file(&interpreter, 2);
         let session = interpreter
@@ -9435,7 +9502,7 @@ mod drop_transaction {
     #[test]
     fn a_refused_destruction_reports_the_identical_error_every_time() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         let malformed = || Value::Record {
             item: BOXY,
@@ -9553,7 +9620,7 @@ mod decomposition_claims {
     #[test]
     fn a_claim_naming_an_unrelated_value_is_refused_and_the_shell_is_untouched() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, real, unrelated) = frame(&interpreter);
         assert_refused_without_mutation(
             &interpreter,
@@ -9573,7 +9640,7 @@ mod decomposition_claims {
     #[test]
     fn a_claim_naming_a_value_this_frame_never_computed_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, _, _) = frame(&interpreter);
         assert_refused_without_mutation(
             &interpreter,
@@ -9587,7 +9654,7 @@ mod decomposition_claims {
     #[test]
     fn a_claim_of_a_position_out_of_range_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, _, _) = frame(&interpreter);
         assert_refused_without_mutation(
             &interpreter,
@@ -9601,7 +9668,7 @@ mod decomposition_claims {
     #[test]
     fn a_decomposition_naming_the_inactive_case_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, _, _) = frame(&interpreter);
         assert_refused_without_mutation(
             &interpreter,
@@ -9615,7 +9682,7 @@ mod decomposition_claims {
     #[test]
     fn one_bad_claim_after_a_good_one_leaves_the_shell_entirely_untouched() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, real, _) = frame(&interpreter);
         // Position 0 is claimed correctly; position 3 does not exist.
         // Validating claim by claim and writing as it goes would have
@@ -9636,7 +9703,7 @@ mod decomposition_claims {
     #[test]
     fn the_matching_claim_moves_exactly_that_position_out_of_the_shell() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (mut values, real, _) = frame(&interpreter);
         interpreter
             .decompose_variant(
@@ -9855,7 +9922,7 @@ mod value_shape {
     #[test]
     fn a_resource_hidden_in_a_non_affine_field_is_refused_and_stays_alive() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let hidden = file(&interpreter, 1);
         // `Wrapper` declares one `i64` field. This one holds a live
         // resource, which a count-based check walks straight past.
@@ -9877,7 +9944,7 @@ mod value_shape {
     #[test]
     fn an_integer_in_a_resource_typed_field_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert_refused_without_mutation(
             &interpreter,
             Value::Record {
@@ -9892,7 +9959,7 @@ mod value_shape {
     #[test]
     fn a_record_naming_the_wrong_declaration_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         // `Holder`'s field is declared `File`; this value claims to be
         // an `Other`, which is a different declaration entirely.
@@ -9915,7 +9982,7 @@ mod value_shape {
     #[test]
     fn a_variant_naming_the_wrong_declaration_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         assert_refused_without_mutation(
             &interpreter,
@@ -9937,7 +10004,7 @@ mod value_shape {
     #[test]
     fn a_resource_handle_of_the_wrong_declaration_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // A `Wrapper` handle standing where a `File` is declared.
         let wrapper = interpreter
             .resources
@@ -9958,7 +10025,7 @@ mod value_shape {
     #[test]
     fn a_value_of_the_right_length_but_the_wrong_kind_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         // One field, as declared -- but a `Variant` where a `Record` is.
         assert_refused_without_mutation(
@@ -9977,7 +10044,7 @@ mod value_shape {
     #[test]
     fn a_tombstone_in_a_non_affine_field_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // Nothing can have moved out of an `i64`: there is no ownership
         // there to move.
         let wrapper = interpreter
@@ -9994,7 +10061,7 @@ mod value_shape {
     #[test]
     fn a_tombstone_in_an_affine_field_is_accepted() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let untouched = file(&interpreter, 1);
         // The `File` really was moved out of this `Holder` already.
         interpreter
@@ -10010,7 +10077,7 @@ mod value_shape {
     #[test]
     fn a_nested_generic_instantiation_is_validated_all_the_way_down() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         // `Box[Maybe[File]]` whose `Maybe` claims to hold an `i64`.
         assert_refused_without_mutation(
@@ -10033,7 +10100,7 @@ mod value_shape {
     #[test]
     fn a_well_formed_nested_generic_graph_is_accepted() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let live = file(&interpreter, 1);
         interpreter
             .drop_value(Value::Record {
@@ -10057,7 +10124,7 @@ mod value_shape {
     #[test]
     fn a_resource_owning_itself_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let outer = interpreter
             .resources
             .borrow_mut()
@@ -10197,7 +10264,7 @@ mod transitive_observation {
     #[test]
     fn a_record_of_resources_becomes_an_observing_view_throughout() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let value = Value::Record {
             item: BOXY,
@@ -10224,7 +10291,7 @@ mod transitive_observation {
     #[test]
     fn a_variant_payload_becomes_an_observing_view() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let view = interpreter
             .to_observer_if_resource(Value::Variant {
@@ -10240,7 +10307,7 @@ mod transitive_observation {
     #[test]
     fn a_deeply_nested_value_becomes_an_observing_view_at_every_level() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let view = interpreter
             .to_observer_if_resource(Value::Record {
@@ -10260,7 +10327,7 @@ mod transitive_observation {
     #[test]
     fn reading_a_field_through_an_observer_yields_an_observer() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let inner = file(&interpreter, 1);
         let session = interpreter
             .resources
@@ -10289,7 +10356,7 @@ mod transitive_observation {
     #[test]
     fn reading_a_field_through_an_owner_still_yields_the_owner() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let inner = file(&interpreter, 1);
         let session = interpreter
             .resources
@@ -10310,7 +10377,7 @@ mod transitive_observation {
     #[test]
     fn an_observing_view_cannot_be_transferred_or_destroyed() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let view = interpreter
             .to_observer_if_resource(Value::Record {
@@ -10438,7 +10505,7 @@ mod leak_backstop {
     #[test]
     fn a_resource_nested_in_a_record_is_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let values = frame(vec![(
             7,
@@ -10454,7 +10521,7 @@ mod leak_backstop {
     #[test]
     fn a_resource_nested_in_a_variant_is_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let values = frame(vec![(
             3,
@@ -10475,7 +10542,7 @@ mod leak_backstop {
     #[test]
     fn a_resource_nested_several_levels_down_is_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let values = frame(vec![(
             2,
@@ -10499,7 +10566,7 @@ mod leak_backstop {
     #[test]
     fn an_observing_view_is_never_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let view = interpreter
             .to_observer_if_resource(boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0))))
@@ -10515,7 +10582,7 @@ mod leak_backstop {
     #[test]
     fn a_fully_destroyed_aggregate_is_never_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owned = file(&interpreter, 1);
         let value = boxed(Value::Resource(owned), Ty::Named(FILE, Symbol(0)));
         interpreter
@@ -10532,7 +10599,7 @@ mod leak_backstop {
     #[test]
     fn the_lowest_owning_value_id_is_reported_whatever_the_map_order() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = file(&interpreter, 1);
         let second = file(&interpreter, 2);
         let values = frame(vec![
@@ -10553,7 +10620,7 @@ mod leak_backstop {
     #[test]
     fn a_resource_owning_itself_terminates_and_is_reported_once() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = interpreter
             .resources
             .borrow_mut()
@@ -10571,7 +10638,7 @@ mod leak_backstop {
     #[test]
     fn a_stale_handle_owning_a_live_child_is_still_reported() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let child = file(&interpreter, 1);
         let owner = interpreter
             .resources
@@ -10802,7 +10869,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_whose_second_take_argument_is_an_observer_transfers_neither() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -10835,7 +10902,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_whose_second_take_argument_is_stale_transfers_neither() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         // Moved elsewhere, so `other` itself is now a stale handle.
@@ -10865,7 +10932,7 @@ mod transfer_transaction {
     #[test]
     fn one_identity_passed_to_two_take_parameters_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let callee = two_take_files();
 
@@ -10892,7 +10959,7 @@ mod transfer_transaction {
     #[test]
     fn an_observing_argument_aliasing_a_later_take_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let callee = Function {
             id: ItemId(87),
@@ -10963,10 +11030,69 @@ mod transfer_transaction {
         assert_eq!(record.status, ResourceStatus::Alive, "and destroys nothing");
     }
 
+    /// Two resources, each both observed and taken by one call. Which
+    /// one the refusal names used to be whichever a `HashSet` yielded
+    /// first -- a per-process hash order, so the same program could be
+    /// refused with a different message on each run. The lowest id is
+    /// named, whatever order the arguments list them in.
+    #[test]
+    fn a_refusal_naming_a_shared_resource_names_the_lowest_one() {
+        let module = module();
+        let interpreter = Interpreter::unchecked(&module);
+        let first = new_file(&interpreter, 1);
+        let second = new_file(&interpreter, 2);
+        assert!(first.id.0 < second.id.0, "the fixture relies on this order");
+        let param = |value: u32, take: bool| Param {
+            value: ValueId(value),
+            ty: file_ty(),
+            take,
+        };
+        let callee = Function {
+            id: ItemId(88),
+            name: Symbol(0),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![
+                param(0, false),
+                param(1, false),
+                param(2, true),
+                param(3, true),
+            ],
+            return_type: Ty::Unit,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        };
+
+        for _ in 0..8 {
+            let error = interpreter
+                .call_function(
+                    &callee,
+                    &[],
+                    vec![
+                        Value::Resource(second),
+                        Value::Resource(first),
+                        Value::Resource(second),
+                        Value::Resource(first),
+                    ],
+                    Vec::new(),
+                )
+                .map(|_| ())
+                .expect_err("both resources are observed and taken by one call");
+            assert!(
+                format!("{error:?}").contains(&format!("one resource (#{})", first.id.0)),
+                "the lowest shared resource must be the one named, got {error:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_call_whose_arguments_are_all_valid_transfers_each_exactly_once() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         let callee = two_take_files();
@@ -11001,7 +11127,7 @@ mod transfer_transaction {
     #[test]
     fn an_aggregate_whose_second_field_is_an_observer_transfers_neither() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -11031,7 +11157,7 @@ mod transfer_transaction {
     #[test]
     fn an_aggregate_whose_second_field_is_stale_transfers_neither() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let _current = interpreter
@@ -11054,7 +11180,7 @@ mod transfer_transaction {
     #[test]
     fn one_identity_in_two_fields_of_one_aggregate_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
 
         rejected_without_a_trace(
@@ -11071,7 +11197,7 @@ mod transfer_transaction {
     #[test]
     fn an_ownership_cycle_between_two_resources_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         {
@@ -11094,7 +11220,7 @@ mod transfer_transaction {
     #[test]
     fn a_resource_owning_itself_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let only = new_file(&interpreter, 1);
         interpreter.resources.borrow_mut().records[only.id.0 as usize].fields =
             vec![Value::Resource(only)];
@@ -11109,7 +11235,7 @@ mod transfer_transaction {
     #[test]
     fn a_record_create_failing_on_its_last_field_moves_none_of_the_earlier_ones() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -11142,7 +11268,7 @@ mod transfer_transaction {
     #[test]
     fn a_variant_create_failing_on_its_last_payload_moves_none_of_the_earlier_ones() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -11212,7 +11338,7 @@ mod transfer_transaction {
     #[test]
     fn a_return_rejected_by_the_leak_backstop_moves_no_generation() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let returned = new_file(&interpreter, 1);
         let leaked = new_file(&interpreter, 2);
         let callee = returns_one_leaks_the_other();
@@ -11270,7 +11396,7 @@ mod transfer_transaction {
     #[test]
     fn a_returned_aggregate_with_one_invalid_child_moves_neither_child() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let good = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -11328,7 +11454,7 @@ mod transfer_transaction {
     #[test]
     fn a_raise_whose_transfer_fails_moves_nothing() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let good = new_file(&interpreter, 1);
         let other = new_file(&interpreter, 2);
         let observer = interpreter
@@ -11364,7 +11490,7 @@ mod transfer_transaction {
     #[test]
     fn a_valid_aggregate_transfer_moves_every_identity_exactly_once() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
 
@@ -11403,7 +11529,7 @@ mod transfer_transaction {
     #[test]
     fn planning_alone_moves_no_generation_at_all() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         let before = runtime_state(&interpreter);
@@ -11451,7 +11577,7 @@ mod transfer_transaction {
     #[test]
     fn a_store_over_a_slot_that_still_owns_a_resource_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         // Hand-built NIR the verifier would reject under V0100: two
@@ -11552,7 +11678,7 @@ mod transfer_transaction {
         };
         let mut module = module();
         module.functions.push(callee);
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let existing = new_file(&interpreter, 1);
         let caller = Function {
             id: ItemId(86),
@@ -11625,7 +11751,7 @@ mod transfer_transaction {
     #[test]
     fn a_store_of_a_slots_own_contents_is_not_refused_as_an_overwrite() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         // `%0` is the slot; `%2` is a `Load` of it, stored straight
         // back. `%1` is the incoming owner that fills the slot first.
@@ -11760,7 +11886,7 @@ mod transfer_transaction {
         for take_first in [false, true] {
             for drop_first in [false, true] {
                 let module = module();
-                let interpreter = Interpreter::new(&module);
+                let interpreter = Interpreter::unchecked(&module);
                 let owner = new_file(&interpreter, 1);
                 let callee = observe_and_take_callee(file_ty(), file_ty(), take_first, drop_first);
                 rejected_without_a_trace(
@@ -11792,7 +11918,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_aliasing_through_a_nested_record_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let inner = new_file(&interpreter, 1);
         let holder = Value::Record {
             item: HOLDER,
@@ -11845,7 +11971,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_aliasing_through_a_variant_payload_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let inner = new_file(&interpreter, 1);
         // A second, distinct resource fills the other payload slot, so
         // the only repeat is *across* the two arguments. Putting `inner`
@@ -11904,7 +12030,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_observing_one_resource_twice_is_accepted_at_run_time() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let callee = Function {
             id: ItemId(96),
@@ -11950,7 +12076,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_observing_one_resource_and_taking_another_is_accepted_at_run_time() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let kept = new_file(&interpreter, 1);
         let given = new_file(&interpreter, 2);
         let callee = observe_and_take_callee(file_ty(), file_ty(), false, false);
@@ -12030,7 +12156,7 @@ mod transfer_transaction {
     fn an_invoke_with_consistent_generic_arguments_is_accepted() {
         let mut module = module();
         module.functions.push(same_type_twice());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let caller = invoking_caller(
             ItemId(97),
             vec![Ty::I64],
@@ -12064,7 +12190,7 @@ mod transfer_transaction {
     fn an_invoke_with_inconsistent_generic_arguments_is_refused() {
         let mut module = module();
         module.functions.push(same_type_twice());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let caller = invoking_caller(
             ItemId(97),
             vec![Ty::I64],
@@ -12107,7 +12233,7 @@ mod transfer_transaction {
     fn an_invoke_with_the_wrong_generic_arity_is_refused_without_mutating() {
         let mut module = module();
         module.functions.push(same_type_twice());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let caller = invoking_caller(
             ItemId(97),
@@ -12169,7 +12295,7 @@ mod transfer_transaction {
     #[test]
     fn an_invoke_type_argument_is_resolved_through_the_frame() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let param = crate::hir::TypeParamId(0);
         let mut frame = HashMap::new();
         frame.insert(param, Ty::I64);
@@ -12217,7 +12343,7 @@ mod transfer_transaction {
     #[test]
     fn a_callee_without_an_entry_block_is_refused_without_mutating() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let callee = callee_without_an_entry_block();
 
@@ -12266,7 +12392,7 @@ mod transfer_transaction {
     #[test]
     fn a_failure_after_frame_entry_stays_observable() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         // Enters `bb0`, destroys its argument, then branches to a block
         // that does not exist.
@@ -12362,7 +12488,7 @@ mod transfer_transaction {
     #[test]
     fn a_transferring_self_store_is_accepted_at_run_time() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let function = self_store_function(
             OwnershipMode::Transfer,
@@ -12393,7 +12519,7 @@ mod transfer_transaction {
     #[test]
     fn an_observing_self_store_is_refused_at_run_time_without_mutating() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let function = self_store_function(OwnershipMode::Observe, Vec::new());
 
@@ -12433,7 +12559,7 @@ mod transfer_transaction {
     #[test]
     fn a_stale_historical_load_stored_back_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         let function = Function {
@@ -12564,7 +12690,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_call_with_consistent_arguments_is_accepted() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         interpreter
             .call_function(
                 &same_type_twice(),
@@ -12578,7 +12704,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_call_with_inconsistent_arguments_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(
                 &same_type_twice(),
@@ -12604,7 +12730,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_call_whose_arguments_ignore_the_instantiation_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(
                 &same_type_twice(),
@@ -12626,7 +12752,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_call_with_the_wrong_outer_constructor_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let error = interpreter
             .call_function(
@@ -12649,7 +12775,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_function_called_with_no_type_arguments_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(
                 &same_type_twice(),
@@ -12668,7 +12794,7 @@ mod transfer_transaction {
     #[test]
     fn a_generic_function_called_with_extra_type_arguments_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(
                 &same_type_twice(),
@@ -12687,7 +12813,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_site_type_argument_left_unresolved_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let param = crate::hir::TypeParamId(9);
         // No frame substitution binds `T`, so this call site names a
         // type nobody can supply.
@@ -12704,7 +12830,7 @@ mod transfer_transaction {
     #[test]
     fn a_call_site_type_argument_is_resolved_through_the_frame() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let param = crate::hir::TypeParamId(0);
         let mut frame = HashMap::new();
         frame.insert(param, Ty::I64);
@@ -12721,7 +12847,7 @@ mod transfer_transaction {
     #[test]
     fn a_rejected_generic_call_mutates_nothing() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let param = crate::hir::TypeParamId(0);
         // `f[T](take a: Box[T])` handed a `Box[bool]` under `T = File`.
@@ -12811,7 +12937,7 @@ mod transfer_transaction {
     fn a_call_rejected_for_arity_records_no_call_event() {
         let mut module = module();
         module.functions.push(two_take_files());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         // `two_take_files` wants two arguments; this call site passes one.
         let caller = caller_of(
@@ -12841,7 +12967,7 @@ mod transfer_transaction {
         module
             .functions
             .push(observe_and_take_callee(file_ty(), file_ty(), false, false));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let caller = caller_of(
             ItemId(93),
@@ -12895,7 +13021,7 @@ mod transfer_transaction {
                 terminator: Terminator::Return(None),
             }],
         });
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let caller = caller_of(NEEDS_EVIDENCE, Vec::new(), Vec::new());
 
         interpreter
@@ -12913,7 +13039,7 @@ mod transfer_transaction {
     fn a_call_rejected_for_a_generic_mismatch_records_no_call_event() {
         let mut module = module();
         module.functions.push(same_type_twice());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // `same_type_twice` is generic, and the call site supplies no
         // type arguments -- refused before the frame is entered.
         let caller = caller_of(
@@ -12953,7 +13079,7 @@ mod transfer_transaction {
     fn a_successful_nested_call_records_exactly_one_call_event() {
         let mut module = module();
         module.functions.push(two_take_files());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let first = new_file(&interpreter, 1);
         let second = new_file(&interpreter, 2);
         let caller = caller_of(
@@ -12996,7 +13122,7 @@ mod transfer_transaction {
     #[test]
     fn an_argument_disagreeing_with_a_resolved_parameter_type_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let owner = new_file(&interpreter, 1);
         let callee = two_take_files();
 
@@ -13035,7 +13161,7 @@ mod transfer_transaction {
     #[test]
     fn an_argument_filling_a_generic_parameter_is_not_compared_against_it() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let param = crate::hir::TypeParamId(0);
         let owner = new_file(&interpreter, 1);
 
@@ -13077,7 +13203,7 @@ mod transfer_transaction {
     #[test]
     fn a_partial_generic_keeps_its_concrete_outer_constructor() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let param = crate::hir::TypeParamId(0);
         let owner = new_file(&interpreter, 1);
         let wrong_outer = Value::Record {
@@ -13232,7 +13358,7 @@ mod stage_agreement {
 
         // The interpreter's own answer, which never changed: dropping
         // through the observing view the slot handed back is refused.
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let runtime = interpreter
             .call_item(MAIN, Vec::new())
             .expect_err("destroying through an observing handle must be refused at run time");
@@ -13347,7 +13473,7 @@ mod stage_agreement {
                 .collect::<Vec<_>>()
         );
 
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         interpreter
             .call_item(MAIN, Vec::new())
             .expect("the interpreter must accept exactly what the verifier accepted");
@@ -13611,7 +13737,7 @@ mod observed_projection_atomicity {
     #[test]
     fn a_take_through_an_observed_ancestor_is_refused_without_mutating_anything() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
         let before = snapshot(&interpreter);
 
@@ -13635,7 +13761,7 @@ mod observed_projection_atomicity {
     #[test]
     fn a_take_through_a_nearer_observed_ancestor_is_refused_without_mutating_anything() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
         let before = snapshot(&interpreter);
 
@@ -13656,7 +13782,7 @@ mod observed_projection_atomicity {
     #[test]
     fn a_take_through_an_observed_variant_payload_is_refused_without_mutating_anything() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (_session, holder) = build_variant(&interpreter);
         let before = snapshot(&interpreter);
 
@@ -13691,7 +13817,7 @@ mod observed_projection_atomicity {
     #[test]
     fn reading_through_an_observer_yields_no_owner_at_any_depth() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
 
         let view = observer(&interpreter, fixture.outer);
@@ -13710,7 +13836,7 @@ mod observed_projection_atomicity {
     #[test]
     fn reading_a_variant_payload_through_an_observer_yields_no_owner() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let (_session, holder) = build_variant(&interpreter);
 
         let view = observer(&interpreter, holder);
@@ -13735,7 +13861,7 @@ mod observed_projection_atomicity {
     #[test]
     fn observing_a_projection_through_an_observer_yields_no_owner() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
         let view = Value::Resource(observer(&interpreter, fixture.outer));
 
@@ -13753,7 +13879,7 @@ mod observed_projection_atomicity {
     #[test]
     fn a_store_through_an_observed_ancestor_is_refused_without_mutating_anything() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
         // Empty the field first, through the real owner, so the store
         // would otherwise have somewhere legal to land.
@@ -13782,7 +13908,7 @@ mod observed_projection_atomicity {
     #[test]
     fn the_same_path_through_a_real_owner_still_transfers() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
 
         let path = [field(OUTER), field(BOXY), field(SESSION)];
@@ -13812,7 +13938,7 @@ mod observed_projection_atomicity {
     #[test]
     fn repeating_a_rejected_take_is_deterministic() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let fixture = build(&interpreter);
         let before = snapshot(&interpreter);
         let path = [field(OUTER), field(BOXY), field(SESSION)];
@@ -14054,7 +14180,7 @@ mod runtime_construction_validation {
     /// change to the rejection.
     fn refused(function: Function, expected_resources: usize, what: &str) -> String {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(&function, &[], Vec::new(), Vec::new())
             .map(|_| ())
@@ -14154,7 +14280,7 @@ mod runtime_construction_validation {
         // the malformed construction ran, so this one asserts the
         // rejection directly rather than through the shared helper.
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(&function, &[], Vec::new(), Vec::new())
             .map(|_| ())
@@ -14285,7 +14411,7 @@ mod runtime_construction_validation {
             2,
         );
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         interpreter
             .call_function(&function, &[], Vec::new(), Vec::new())
             .expect("`Box[File]` really does accept a `File`");
@@ -14309,7 +14435,7 @@ mod runtime_construction_validation {
     #[test]
     fn a_nested_malformed_aggregate_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         // A `Box[File]` whose slot actually holds an `i64`, handed to a
         // position that declares `Box[File]`.
         let malformed = Value::Record {
@@ -14343,7 +14469,7 @@ mod runtime_construction_validation {
     #[test]
     fn a_duplicated_identity_in_one_construction_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = new_file(&interpreter, 1);
         let function = Function {
             id: CALLER,
@@ -14396,7 +14522,7 @@ mod runtime_construction_validation {
     #[test]
     fn well_formed_constructions_still_succeed() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         // A plain record.
         let pair = constructing_from_consts(
@@ -14563,7 +14689,7 @@ mod typed_boundaries {
     /// and no resource left half-moved.
     fn refuse(function: &Function, args: Vec<Value>, what: &str) -> String {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let error = interpreter
             .call_function(function, &[], args, Vec::new())
             .map(|_| ())
@@ -14666,7 +14792,7 @@ mod typed_boundaries {
     #[test]
     fn a_take_argument_of_the_wrong_declared_type_is_refused() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = interpreter
             .resources
             .borrow_mut()
@@ -14715,7 +14841,7 @@ mod typed_boundaries {
     #[test]
     fn the_well_formed_spellings_still_succeed() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         // Store of a `File` into a slot that declares `File`.
         let mut body = make_file(0, 1);
@@ -15025,7 +15151,7 @@ mod observed_extraction {
     /// interpreter that it is exactly reproducible.
     fn refused(function: &Function, what: &str) -> String {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let before = snapshot(&interpreter);
 
@@ -15059,7 +15185,7 @@ mod observed_extraction {
             "{what}: the observed resource must still be alive and its handle still current"
         );
 
-        let again = Interpreter::new(&module);
+        let again = Interpreter::unchecked(&module);
         let session_again = live_session(&again);
         let repeat = again
             .call_function(
@@ -15106,7 +15232,7 @@ mod observed_extraction {
     #[test]
     fn the_extracted_value_is_an_observer_before_anything_consumes_it() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let observed = interpreter
             .to_observer_if_resource(Value::Resource(session))
@@ -15145,7 +15271,7 @@ mod observed_extraction {
     #[test]
     fn a_generic_aggregate_read_through_an_observed_resource_is_all_observers() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = interpreter
             .resources
             .borrow_mut()
@@ -15177,7 +15303,7 @@ mod observed_extraction {
     #[test]
     fn a_variant_read_through_an_observed_resource_is_all_observers() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = interpreter
             .resources
             .borrow_mut()
@@ -15212,7 +15338,7 @@ mod observed_extraction {
     #[test]
     fn a_resource_nested_in_an_observed_inline_aggregate_stays_an_observation() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = interpreter
             .resources
             .borrow_mut()
@@ -15263,7 +15389,7 @@ mod observed_extraction {
     fn an_observing_place_read_never_hands_back_an_owner() {
         for through_an_observation in [true, false] {
             let module = module();
-            let interpreter = Interpreter::new(&module);
+            let interpreter = Interpreter::unchecked(&module);
             let session = live_session(&interpreter);
             let root = if through_an_observation {
                 interpreter
@@ -15404,7 +15530,7 @@ mod observed_extraction {
         // that the store is refused and the observed session's own
         // field is left exactly as it was.
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let before = interpreter.resources.borrow().records[session.id.0 as usize]
             .fields
@@ -15431,7 +15557,7 @@ mod observed_extraction {
     #[test]
     fn the_transferring_place_read_still_hands_back_a_real_owner() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
 
         let mut values = HashMap::new();
@@ -15468,7 +15594,7 @@ mod observed_extraction {
     #[test]
     fn a_payload_read_of_an_observed_variant_is_already_an_observation() {
         let module = module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let file = interpreter
             .resources
             .borrow_mut()
@@ -15747,7 +15873,7 @@ mod observation_leases {
     /// Like [`run_under_test`], but the session is handed in as an
     /// observation rather than transferred.
     fn run_observing(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
-        let interpreter = Interpreter::new(module);
+        let interpreter = Interpreter::unchecked(module);
         let session = live_session(&interpreter);
         let before = snapshot(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
@@ -15756,7 +15882,7 @@ mod observation_leases {
     }
 
     fn run_under_test(module: &Module) -> (Result<Value, InterpreterError>, String, String) {
-        let interpreter = Interpreter::new(module);
+        let interpreter = Interpreter::unchecked(module);
         let session = live_session(&interpreter);
         let before = snapshot(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
@@ -16006,7 +16132,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let existing = record_count(&interpreter);
         let before = shape_snapshot(&interpreter, existing);
@@ -16071,7 +16197,7 @@ mod observation_leases {
         // Determinism of the *original* refusal, which the retry above
         // can no longer demonstrate: a second interpreter over the same
         // fixture reports it identically.
-        let fresh = Interpreter::new(&module);
+        let fresh = Interpreter::unchecked(&module);
         let fresh_session = live_session(&fresh);
         let again = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
         assert_eq!(
@@ -16237,7 +16363,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(2))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         for _ in 0..64 {
             let session = live_session(&interpreter);
             assert_eq!(
@@ -16278,7 +16404,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(2))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let refused = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert!(
@@ -16329,7 +16455,7 @@ mod observation_leases {
         // The "for its own reason, not the first frame's" half, where it
         // can still be observed: a fresh interpreter running the same
         // fixture reports the identical refusal.
-        let fresh = Interpreter::new(&module);
+        let fresh = Interpreter::unchecked(&module);
         let fresh_session = live_session(&fresh);
         let fresh_outcome = fresh.call_item(SELF, vec![Value::Resource(fresh_session)]);
         assert_eq!(
@@ -16518,7 +16644,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         // Make the session own itself: a graph no ownership operation
         // could ever satisfy, and one a naive walk would never leave.
@@ -16550,7 +16676,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let fresh = interpreter
             .resources
@@ -16721,7 +16847,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert!(
@@ -16888,7 +17014,7 @@ mod observation_leases {
         // opened, and report identically to the others.
         let mut first: Option<String> = None;
         for attempt in 0..8 {
-            let interpreter = Interpreter::new(&module);
+            let interpreter = Interpreter::unchecked(&module);
             let session = live_session(&interpreter);
             let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
             let rendered = refusal_shape(&outcome);
@@ -16914,7 +17040,7 @@ mod observation_leases {
 
         // And the same interpreter does not run a second frame at all,
         // so nothing can accumulate across failures by construction.
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         assert!(
             interpreter
@@ -16993,7 +17119,7 @@ mod observation_leases {
     #[test]
     fn observing_a_moved_tombstone_is_refused() {
         let module = wildcard_observer(file_ty());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let outcome = interpreter.call_item(SELF, vec![Value::Moved]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "moved tombstone");
     }
@@ -17001,7 +17127,7 @@ mod observation_leases {
     #[test]
     fn observing_a_dropped_tombstone_is_refused() {
         let module = wildcard_observer(file_ty());
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let outcome = interpreter.call_item(SELF, vec![Value::Dropped]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "dropped tombstone");
     }
@@ -17026,7 +17152,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "moved field");
@@ -17054,7 +17180,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert_refused_without_opening_anything(
@@ -17107,7 +17233,7 @@ mod observation_leases {
         // begin's own walk of what it is about to freeze that has to
         // notice.
         let module = observes_the_whole_session();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = session_with_a_stale_field(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "stale nested handle");
@@ -17116,7 +17242,7 @@ mod observation_leases {
     #[test]
     fn observing_a_stale_whole_resource_handle_is_refused() {
         let module = observes_the_whole_session();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let fresh = interpreter.resources.borrow_mut().transfer(session);
         assert!(fresh.is_ok(), "the fixture is transferable");
@@ -17134,7 +17260,7 @@ mod observation_leases {
     #[test]
     fn observing_an_aggregate_holding_an_already_destroyed_resource_is_refused() {
         let module = observes_the_whole_session();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let nested = nested_file(&interpreter, session);
         assert!(
@@ -17165,7 +17291,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         // One observation legitimately opened and ended; the second must
@@ -17190,7 +17316,7 @@ mod observation_leases {
                 terminator: Terminator::Return(Some(ValueId(9))),
             }],
         ));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let session = live_session(&interpreter);
         let outcome = interpreter.call_item(SELF, vec![Value::Resource(session)]);
         assert_refused_without_opening_anything(&interpreter, &outcome, 0, "declared type");
@@ -17204,7 +17330,7 @@ mod observation_leases {
     #[test]
     fn observing_a_value_nested_past_the_supported_depth_is_refused() {
         let module = wildcard_observer(Ty::Param(crate::hir::TypeParamId(0), Symbol(7)));
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         let mut nested = Value::Int(0);
         for _ in 0..(crate::limits::MAX_GENERIC_DEPTH + 4) {
             nested = Value::Record {
@@ -17997,7 +18123,7 @@ mod unexecutable_numeric_nir {
     /// The interpreter refuses `module`, deterministically, with the
     /// malformed-operation code -- and never by panicking.
     fn assert_interpreter_refuses(module: &Module, args: Vec<Value>, case: &str) {
-        let first = Interpreter::new(module).call_item(MAIN, args.clone());
+        let first = Interpreter::unchecked(module).call_item(MAIN, args.clone());
         let error = match first {
             Err(error) => error,
             Ok(produced) => panic!(
@@ -18013,7 +18139,7 @@ mod unexecutable_numeric_nir {
             !error.to_string().to_lowercase().contains("panic"),
             "`{case}`: {error}"
         );
-        let again = Interpreter::new(module).call_item(MAIN, args);
+        let again = Interpreter::unchecked(module).call_item(MAIN, args);
         assert_eq!(
             Err(error),
             again,
@@ -18384,7 +18510,7 @@ mod unexecutable_numeric_nir {
             )],
         );
         let module = module(vec![main, helper]);
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
         assert_eq!(
             interpreter.event_log(),
@@ -18431,8 +18557,8 @@ mod unexecutable_numeric_nir {
                 module(vec![main, helper])
             }
         };
-        let forward = Interpreter::new(&build(false)).call_item(MAIN, Vec::new());
-        let reversed = Interpreter::new(&build(true)).call_item(MAIN, Vec::new());
+        let forward = Interpreter::unchecked(&build(false)).call_item(MAIN, Vec::new());
+        let reversed = Interpreter::unchecked(&build(true)).call_item(MAIN, Vec::new());
         assert!(forward.is_err());
         assert_eq!(forward, reversed);
     }
@@ -18787,6 +18913,7 @@ mod fatal_abort {
 mod stateful_termination {
     use super::*;
     use crate::nir::{BasicBlock, BlockId, Instruction, Param, RecordLayout, Terminator};
+    use crate::source::SourceMap;
     use crate::symbol::Symbol;
 
     const FILE: ItemId = ItemId(10);
@@ -18919,7 +19046,7 @@ mod stateful_termination {
     #[test]
     fn a_malformed_instruction_after_real_work_terminates_the_context() {
         let module = stateful_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         // 1. The first call is refused, structurally.
         let first = interpreter
@@ -18991,7 +19118,7 @@ mod stateful_termination {
         assert_eq!(live_records(&interpreter), 1);
 
         // 11. A fresh interpreter runs the same valid function normally.
-        let fresh = Interpreter::new(&module);
+        let fresh = Interpreter::unchecked(&module);
         assert_eq!(fresh.call_item(HELPER, Vec::new()), Ok(Value::Int(42)));
         assert!(drop_events(&fresh).is_empty());
     }
@@ -19000,9 +19127,12 @@ mod stateful_termination {
     #[test]
     fn the_stateful_refusal_is_deterministic_across_fresh_interpreters() {
         let module = stateful_module();
-        let first = Interpreter::new(&module).call_item(MAIN, Vec::new());
+        let first = Interpreter::unchecked(&module).call_item(MAIN, Vec::new());
         for _ in 0..4 {
-            assert_eq!(Interpreter::new(&module).call_item(MAIN, Vec::new()), first);
+            assert_eq!(
+                Interpreter::unchecked(&module).call_item(MAIN, Vec::new()),
+                first
+            );
         }
     }
 
@@ -19035,7 +19165,7 @@ mod stateful_termination {
             records: Vec::new(),
             variants: Vec::new(),
         };
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         let failure = interpreter
             .call_item(MAIN, Vec::new())
@@ -19059,7 +19189,7 @@ mod stateful_termination {
     #[test]
     fn an_unknown_item_refusal_does_not_terminate_the_context() {
         let module = stateful_module();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         let missing = interpreter
             .call_item(ItemId(999), Vec::new())
@@ -19082,7 +19212,7 @@ mod stateful_termination {
     fn an_unknown_name_refusal_does_not_terminate_the_context() {
         let module = stateful_module();
         let interner = fixture_interner();
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
 
         let missing = interpreter
             .call("no_such_function", &interner, Vec::new())
@@ -19108,7 +19238,7 @@ mod stateful_termination {
         let interner = fixture_interner();
 
         // Terminate through `call_item`, then try all four.
-        let interpreter = Interpreter::new(&module);
+        let interpreter = Interpreter::unchecked(&module);
         assert!(interpreter.call_item(MAIN, Vec::new()).is_err());
         for (route, outcome) in [
             ("call_item", interpreter.call_item(HELPER, Vec::new())),
@@ -19131,7 +19261,7 @@ mod stateful_termination {
         let module = stateful_module();
         let interner = fixture_interner();
 
-        let by_call_item = Interpreter::new(&module);
+        let by_call_item = Interpreter::unchecked(&module);
         assert!(by_call_item.call_item(MAIN, Vec::new()).is_err());
         assert!(
             by_call_item
@@ -19141,7 +19271,7 @@ mod stateful_termination {
                 .contains("cannot be reused")
         );
 
-        let by_run_item = Interpreter::new(&module);
+        let by_run_item = Interpreter::unchecked(&module);
         assert!(by_run_item.run_item(MAIN).is_err());
         assert!(
             by_run_item
@@ -19153,7 +19283,7 @@ mod stateful_termination {
 
         // `run`/`call` resolve by name; both fixtures share `Symbol(0)`,
         // so the lookup finds `main` -- which is the failing one.
-        let by_run = Interpreter::new(&module);
+        let by_run = Interpreter::unchecked(&module);
         let name = interner.resolve(Symbol(0)).to_string();
         assert!(by_run.run(&name, &interner).is_err());
         assert!(
@@ -19163,5 +19293,79 @@ mod stateful_termination {
                 .to_string()
                 .contains("cannot be reused")
         );
+    }
+
+    /// The whole reason the unchecked path exists only under
+    /// `cfg(test)`: the production pipeline never reaches any of the
+    /// state the fixtures above observe.
+    ///
+    /// The same module, run unchecked, really does enter a frame,
+    /// construct a live resource and only then refuse. Offered to
+    /// `nir::verify` instead -- which is the only way a production
+    /// caller can obtain the `VerifiedModule` `Interpreter::new`
+    /// demands -- it produces structured `V` diagnostics and no seal,
+    /// so no interpreter, no frame, no resource table and no event ever
+    /// come into existence.
+    #[test]
+    fn verification_refuses_the_stateful_module_before_any_frame_is_entered() {
+        let interner = fixture_interner();
+
+        // What the runtime does when nothing checked the module first.
+        let raw = stateful_module();
+        let unchecked = Interpreter::unchecked(&raw);
+        let refused = unchecked
+            .call_item(MAIN, Vec::new())
+            .expect_err("the `u8` instruction must be refused");
+        assert_eq!(refused.code(), codes::INVALID_OPERATION);
+        assert_eq!(
+            live_records(&unchecked),
+            1,
+            "the unchecked path really does construct a resource before failing"
+        );
+        assert_eq!(
+            unchecked.event_log(),
+            vec![format!("call:{}", MAIN.0)],
+            "the unchecked path really does enter a frame"
+        );
+
+        // What the production path does with the identical module.
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        let diagnostics = crate::nir::verify(
+            stateful_module(),
+            source,
+            &interner,
+            &crate::hir::ItemRegistry::default(),
+        )
+        .expect_err("a module the runtime cannot execute must never seal");
+        assert_eq!(
+            diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+            vec!["V0112", "V0077"]
+        );
+    }
+
+    /// Repeating that refusal changes nothing about it: same codes,
+    /// same order, byte-identical rendering.
+    #[test]
+    fn the_refusal_of_the_stateful_module_is_byte_identical_across_runs() {
+        let interner = fixture_interner();
+        let rendered = || {
+            let mut map = SourceMap::new();
+            let source = map.add_file("hand-built.npt", "\n");
+            crate::nir::verify(
+                stateful_module(),
+                source,
+                &interner,
+                &crate::hir::ItemRegistry::default(),
+            )
+            .expect_err("the module never seals")
+            .iter()
+            .map(|d| crate::diagnostics::render(d, &map))
+            .collect::<String>()
+        };
+        let first = rendered();
+        assert!(first.contains("V0112"), "{first}");
+        assert_eq!(first, rendered());
+        assert_eq!(first, rendered());
     }
 }

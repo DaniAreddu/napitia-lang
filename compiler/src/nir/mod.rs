@@ -3,11 +3,13 @@
 //! NIR is lower-level than HIR and was designed to be a reasonable
 //! input to a native backend (`spec/0006`). This module lowers HIR to
 //! NIR (`lower.rs`), prints NIR as text for debugging (`printer.rs`),
-//! and checks it independently of how it was built (`verify.rs`).
+//! and checks it independently of how it was built (`verify.rs`),
+//! then seals what passed behind [`VerifiedModule`] (`verified.rs`).
 //!
 //! Verified NIR has two consumers, and neither is this module's
-//! business: the tree-walking interpreter (`crate::driver`'s `run`
-//! support), which remains the complete semantic execution path, and
+//! business (both take a [`VerifiedModule`], never a bare [`Module`]):
+//! the tree-walking interpreter (`crate::driver`'s `run` support),
+//! which remains the complete semantic execution path, and
 //! [`crate::native`] (`rfcs/0014`), which compiles a small scalar
 //! subset of it ahead of time. Nothing here is aware of either -- a
 //! rule the native backend needs and NIR itself does not is a native
@@ -17,12 +19,14 @@ pub mod block;
 pub mod instruction;
 pub mod lower;
 pub mod printer;
+pub mod verified;
 pub mod verify;
 
 pub use block::{BasicBlock, BlockId, InvokeErrTarget, Terminator};
 pub use instruction::{Const, FunctionRef, Instruction, OwnershipMode, ValueId, ValueKind};
 pub use lower::{lower_module, lower_module_with_paths};
 pub use printer::print_module;
+pub use verified::{VerifiedModule, verify};
 pub use verify::verify_module;
 
 use crate::hir::{ItemId, TypeParamId};

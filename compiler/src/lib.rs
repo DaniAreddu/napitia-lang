@@ -8,6 +8,15 @@
 //! the language, and a native ahead-of-time backend ([`native`],
 //! `rfcs/0014`) that compiles a deliberately small scalar subset of it
 //! to an `x86_64-unknown-linux-gnu` executable.
+//!
+//! No `unsafe` code, anywhere in this library. The verified-NIR boundary
+//! (`rfcs/0016`) is a type-system guarantee -- a private field, no
+//! mutable accessor, a plan that borrows its module -- and a transmute
+//! or raw-pointer write could forge or alter a `VerifiedModule` without
+//! the verifier ever running. Forbidding it keeps that guarantee a
+//! property the compiler checks rather than a convention.
+
+#![forbid(unsafe_code)]
 
 pub mod cli;
 pub mod diagnostics;

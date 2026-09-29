@@ -57,7 +57,7 @@ pub(crate) const MAX_GENERIC_INSTANCES: usize = 4096;
 ///
 /// This bound is what turns that into an ordinary runtime error. It
 /// only helps if the native stack actually outlasts it, so `cli::run`
-/// provisions a stack sized for it (`cli::INTERPRETER_STACK_BYTES`)
+/// provisions a stack sized for it (`cli::WORKER_STACK_BYTES`)
 /// rather than relying on whatever default the platform gives the main
 /// thread -- 1 MiB on Windows, which a debug build exhausts after
 /// roughly 25 frames. A library caller driving `Interpreter` on a

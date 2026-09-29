@@ -40,9 +40,52 @@ REST APIs, database access, distributed systems, and AI/ML are explicitly
 on top of Napitia's generics, protocols, and effect system, once those exist.
 Nothing about the language core should need to know these domains exist.
 
-## Current status: Alpha 0.2.1
+## Current status: Alpha 0.2.2
 
-This milestone is **numeric semantics stabilization**
+This milestone is the **verified execution boundary**
+(`rfcs/0016-verified-execution-boundary.md`). It adds no feature, no
+diagnostic and no syntax, and changes no program's meaning. It makes an
+existing guarantee structural.
+
+Every release up to Alpha 0.2.1 ran the NIR verifier in the right place
+and then handed its *input* to the executor. The interpreter and the
+native backend both took a raw `nir::Module`, and both documented — in
+prose — that they were only ever given verified NIR.
+
+Now verification **consumes** the module it checked and returns an
+opaque `VerifiedModule`, and that is the type both executors accept:
+
+```text
+source -> parse -> resolve -> typecheck -> resource checking
+       -> NIR lowering -> NIR verification -> VerifiedModule
+       -> interpreter or native backend
+```
+
+A sealed module has no mutable accessor, no unsealing conversion and no
+public constructor, so nothing can substitute, reorder or edit the
+module between the check and the run. Raw `nir::Module` stays public
+and unchanged, because lowering builds one and the verifier's own tests
+need hand-built malformed ones — they simply cannot be executed
+outside this crate's own `#[cfg(test)]` builds.
+
+Verification does not rule out runtime failures: division by zero,
+overflow and an out-of-range shift (`X0001`–`X0003`) are ordinary,
+unchanged runtime failures of verified programs. The defence in depth
+is `X0004` and the interpreter's own type re-checks, which still refuse
+what the verifier would have caught and stay under test via a
+`#[cfg(test)]`-only unchecked path the production library never
+compiles. `X0004` is not *only* that: a verified program that exceeds
+an implementation budget (512 call frames, or a value nested 64 or
+more levels deep reaching a check that walks it) is refused with it
+too. Nor is every `VerifiedModule`
+one the native backend can compile: native capability validation is a
+separate pass that may still refuse it with an `Axxxx` code.
+`rfcs/0016` states the sealing invariant, which components take a
+`VerifiedModule`, and what the seal does not cover.
+
+### Numeric semantics (from Alpha 0.2.1)
+
+That milestone was **numeric semantics stabilization**
 (`rfcs/0015-numeric-semantics.md`). It adds no feature. It makes `i64`
 mean what its name says.
 
@@ -115,10 +158,12 @@ napitia build examples/native_scalar_calls.npt --output scalar
 ```
 
 Every stage before that one is the stage `napitia ir` already ran —
-parse, resolve, type-check, resource-check, lower, verify — so `check`,
-`ir`, `run` and `build` agree by construction about what a program
-means. Two new stages follow it: a native *capability validator*, which
-decides exhaustively whether the reachable program is inside the
+parse, resolve, type-check, resource-check, lower, verify — so `ir`,
+`run` and `build` agree by construction about what a program means.
+Single-file `check` shares every stage up to resource checking, and
+stops there: it does not lower or verify. Two new stages follow
+verification: a native *capability validator*, which decides
+exhaustively whether the reachable program is inside the
 compiled subset, and then Cranelift plus the system linker. A stage
 that fails stops the pipeline and nothing is written.
 

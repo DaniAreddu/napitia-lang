@@ -141,7 +141,9 @@ backtrace, and never a raw hardware signal presented as a language rule.
 Arithmetic failures are `X0001`, `X0002` and `X0003`; `X0004` is a
 different thing entirely — malformed or unverified NIR, or an invalid
 operation on the execution engine — and a valid program never produces
-one. `rfcs/0015` specifies the codes, the rendering and the status.
+one, except by exceeding one of the engine's implementation budgets
+(call depth, value nesting; `rfcs/0016`). `rfcs/0015` specifies the
+codes, the rendering and the status.
 
 Aborting also ends the execution context it happened in: the state it
 left is the middle of a statement, so nothing is executed against it

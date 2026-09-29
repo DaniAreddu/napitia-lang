@@ -74,10 +74,13 @@ unchanged runtime failures of verified programs. The defence in depth
 is `X0004` and the interpreter's own type re-checks, which still refuse
 what the verifier would have caught and stay under test via a
 `#[cfg(test)]`-only unchecked path the production library never
-compiles. Nor is every `VerifiedModule` one the native backend can
-compile: native capability validation is a separate pass that may
-still refuse it with an `Axxxx` code. `rfcs/0016` states the sealing invariant, which components
-take a `VerifiedModule`, and what the seal does not cover.
+compiles. `X0004` is not *only* that: a verified program that exceeds
+an implementation budget (512 call frames, or a value nested 64 or
+more levels deep) is refused with it too. Nor is every `VerifiedModule`
+one the native backend can compile: native capability validation is a
+separate pass that may still refuse it with an `Axxxx` code.
+`rfcs/0016` states the sealing invariant, which components take a
+`VerifiedModule`, and what the seal does not cover.
 
 ### Numeric semantics (from Alpha 0.2.1)
 
@@ -154,9 +157,10 @@ napitia build examples/native_scalar_calls.npt --output scalar
 ```
 
 Every stage before that one is the stage `napitia ir` already ran —
-parse, resolve, type-check, resource-check, lower, verify — so `check`,
-`ir`, `run` and `build` agree by construction about what a program
-means. Two new stages follow it: a native *capability validator*, which
+parse, resolve, type-check, resource-check, lower, verify — so `ir`,
+`run` and `build` agree by construction about what a program means.
+Single-file `check` shares every stage up to resource checking, and
+stops there: it does not lower or verify. Two new stages follow it: a native *capability validator*, which
 decides exhaustively whether the reachable program is inside the
 compiled subset, and then Cranelift plus the system linker. A stage
 that fails stops the pipeline and nothing is written.

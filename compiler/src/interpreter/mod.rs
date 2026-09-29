@@ -819,8 +819,8 @@ pub use crate::types::numeric::codes;
 /// panic, per this project's no-panic-on-malformed-input rule. The same
 /// variant also carries this engine's own budget refusals, which a
 /// verified program *can* reach: more than `limits::MAX_CALL_DEPTH`
-/// frames, or a runtime value nested `limits::MAX_GENERIC_DEPTH` levels
-/// deep.
+/// frames, or a runtime value nested `limits::MAX_GENERIC_DEPTH` or
+/// more levels deep reaching a check that walks it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
     /// A checked integer operation with no result in `i64`.

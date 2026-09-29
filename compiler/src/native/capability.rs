@@ -13,8 +13,9 @@
 //! already run and already owns every structural and typing invariant
 //! NIR has -- and since Alpha 0.2.2 (`rfcs/0016`) this pass takes a
 //! [`crate::nir::VerifiedModule`], so no production caller can reach it
-//! with anything else. Where it notices such a violation anyway -- only
-//! a `#[cfg(test)]` unchecked seal can put one here -- it reports
+//! with anything else. Where it notices such a violation anyway --
+//! outside a `#[cfg(test)]` unchecked seal, only a verifier or backend
+//! defect can put one here -- it reports
 //! [`super::codes::UNVERIFIED_NIR`] and refuses,
 //! rather than guessing at a repair or walking off the end of
 //! something. A resource is *unsupported*; a dangling block target is

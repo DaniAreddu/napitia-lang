@@ -551,6 +551,11 @@ The verifier checks:
   (`rfcs/0016`), and the `#[cfg(test)]` unchecked path that can still
   gets a structured refusal (`X0004`) and a terminated execution
   context, never arithmetic performed under the wrong type's name.
+  Verification does not make that re-check dead code, though: the
+  verifier tracks definite initialization only for resource-owning and
+  `invoke` result slots, so hand-built NIR that `load`s a never-stored scalar
+  slot verifies, and is refused here with `X0004` (and by the native
+  backend with `A0017`). Lowering never emits such a load.
 - **Aggregates** (Alpha 0.1.1): `record.create`/`variant.create`
   reference a declared record/variant and initialize every field/match
   their case's payload arity and types exactly once each;

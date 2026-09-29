@@ -9,7 +9,7 @@
 //! `rfcs/0014`) that compiles a deliberately small scalar subset of it
 //! to an `x86_64-unknown-linux-gnu` executable.
 //!
-//! No `unsafe` code, anywhere in the crate. The verified-NIR boundary
+//! No `unsafe` code, anywhere in this library. The verified-NIR boundary
 //! (`rfcs/0016`) is a type-system guarantee -- a private field, no
 //! mutable accessor, a plan that borrows its module -- and a transmute
 //! or raw-pointer write could forge or alter a `VerifiedModule` without

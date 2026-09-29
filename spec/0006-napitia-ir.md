@@ -489,7 +489,7 @@ Alpha 0.1 — all three now have real lowering, described above and in
 
 Between lowering and interpretation, a verifier pass re-checks the
 produced NIR independently of how it was built — it does not trust the
-lowerer, and re-derives every invariant from the `Module` value itself:
+lowerer, and re-derives every invariant from the `Module` value itself.
 
 As of Alpha 0.2.2 (`rfcs/0016`) that pass is also the boundary between
 raw and executable NIR. `nir::verify` consumes the `Module` it checked
@@ -503,6 +503,8 @@ not necessarily NIR the native backend can compile: native capability
 validation is a separate pass that may still refuse it with an `Axxxx`
 code, and code generation reaches NIR only through the `NativePlan`
 that pass returns, which borrows that exact `VerifiedModule`.
+
+The verifier checks:
 
 - **Structure**: every function/block id is unique; every branch target
   and called function exists; call argument counts match.

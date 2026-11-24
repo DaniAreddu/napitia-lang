@@ -40,6 +40,140 @@ use super::Module;
 /// need it. What the type withholds is every other kind of access:
 /// there is no `&mut Module`, no `into_module`, and no public
 /// constructor that skips verification.
+///
+/// # What a caller outside this crate can do
+///
+/// Every example below starts from the same hidden setup: compile a
+/// one-line program through the driver and keep the seal it returns.
+/// This one compiles and runs; each `compile_fail` example after it is
+/// that same setup plus exactly one forbidden line, so that line is the
+/// only thing that can be what refuses to compile.
+///
+/// ```
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// // Reading is unrestricted, through the explicit accessor or `Deref`.
+/// assert_eq!(sealed.functions.len(), sealed.module().functions.len());
+/// // An executor takes the seal.
+/// let interpreter = Interpreter::new(&sealed);
+/// assert_eq!(interpreter.run("main", &interner), Ok(Value::Int(42)));
+/// // Copying the contents out yields a raw module, not a second seal.
+/// let raw: Module = sealed.module().clone();
+/// # let _: (&mut VerifiedModule, Module) = (&mut sealed, raw);
+/// ```
+///
+/// A seal cannot be built from a raw module (`rfcs/0016`, property 2):
+///
+/// ```compile_fail,E0451
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// let forged = VerifiedModule { module: Module::default() };
+/// ```
+///
+/// nor through the test-only unchecked path, which is not compiled into
+/// the library a caller links against:
+///
+/// ```compile_fail,E0599
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// let forged = VerifiedModule::seal_unchecked(Module::default());
+/// ```
+///
+/// A seal cannot be edited, even through a mutable binding (property 3):
+///
+/// ```compile_fail,E0596
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// sealed.functions.clear();
+/// ```
+///
+/// A copy of a seal's contents is not a seal:
+///
+/// ```compile_fail,E0308
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// let copy: VerifiedModule = sealed.clone();
+/// ```
+///
+/// and no executor takes raw NIR, whether it was copied out of a seal
+/// or built by hand, nor exposes its test-only unchecked constructor:
+///
+/// ```compile_fail,E0308
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// let raw: Module = sealed.module().clone();
+/// let interpreter = Interpreter::new(&raw);
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use compiler::driver::{self, IrOutput};
+/// # use compiler::interpreter::{Interpreter, Value};
+/// # use compiler::nir::{Module, VerifiedModule};
+/// # use compiler::source::SourceMap;
+/// # use compiler::symbol::Interner;
+/// # let mut map = SourceMap::new();
+/// # let source = map.add_file("seal.npt", "func main() -> i64 { return 42 }\n");
+/// # let mut interner = Interner::new();
+/// # let IrOutput::Ready { nir: mut sealed, .. } = driver::ir(&map, source, &mut interner) else {
+/// #     unreachable!("the program compiles")
+/// # };
+/// let raw: Module = sealed.module().clone();
+/// let interpreter = Interpreter::unchecked(&raw);
+/// ```
 #[derive(Debug)]
 pub struct VerifiedModule {
     module: Module,

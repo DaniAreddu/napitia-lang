@@ -648,6 +648,14 @@ mod codes {
     /// which is what "operands of incompatible widths or signedness"
     /// reduces to when exactly one integer width exists.
     pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "V0112";
+    /// A type this module uses cannot be classified as owning a resource
+    /// or not (`types::affinity`, Alpha 0.2.3): it nests records and
+    /// variants past the affinity depth budget, or contains itself.
+    /// Every check that depends on the answer treats it as affine, so
+    /// nothing is waived; this is the reason those checks had no real
+    /// answer. Type checking refuses the same types in source (`T0075`,
+    /// `T0020`), so this is reached only by hand-built NIR.
+    pub const AFFINITY_UNDECIDABLE: &str = "V0116";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -701,6 +709,67 @@ struct AggregateContext<'a> {
     /// Read by `check_evidence` to resolve an `Evidence::Extension`
     /// against its own declared extend.
     extends: HashMap<ItemId, &'a ExtendLayout>,
+    /// Completed affinity classifications (`types::affinity`), shared by
+    /// every check in this module -- see [`is_affine_in`].
+    affinity_cache: std::cell::RefCell<crate::types::affinity::AffinityCache>,
+    /// Every type a check asked about that has no classification, with
+    /// why, in the order they were first met -- reported once each as
+    /// `AFFINITY_UNDECIDABLE` when verification ends.
+    affinity_failures: std::cell::RefCell<Vec<(Ty, crate::types::affinity::AffinityError)>>,
+}
+
+impl super::LayoutLookup for AggregateContext<'_> {
+    fn record_layout(&self, item: ItemId) -> Option<&RecordLayout> {
+        self.records.get(&item).copied()
+    }
+
+    fn variant_layout(&self, item: ItemId) -> Option<&VariantLayout> {
+        self.variants.get(&item).copied()
+    }
+}
+
+/// One `AFFINITY_UNDECIDABLE` per distinct type `agg` could not classify,
+/// in a canonical order -- by the rendered type, then the cause -- so
+/// which function or block asked first cannot reorder them.
+fn affinity_diagnostics(
+    agg: &AggregateContext,
+    source: SourceId,
+    interner: &Interner,
+) -> Vec<Diagnostic> {
+    let mut failures: Vec<(String, String)> = agg
+        .affinity_failures
+        .borrow()
+        .iter()
+        .map(|(ty, error)| {
+            let why = match error {
+                crate::types::affinity::AffinityError::DepthExceeded { limit } => {
+                    format!("it nests records and variants more than {limit} levels deep")
+                }
+                crate::types::affinity::AffinityError::CyclicLayout { item } => format!(
+                    "it contains itself (through item {}), so it has no finite layout",
+                    item.0
+                ),
+            };
+            (crate::types::display_ty(ty, interner), why)
+        })
+        .collect();
+    failures.sort();
+    failures.dedup();
+    failures
+        .into_iter()
+        .map(|(ty, why)| {
+            Diagnostic::error(
+                codes::AFFINITY_UNDECIDABLE,
+                source,
+                Span::dummy(),
+                format!("cannot decide whether `{ty}` owns a resource: {why}"),
+            )
+            .with_note(
+                "every check that needed the answer treated the type as owning one, so nothing \
+                 was waived; this module still cannot be verified",
+            )
+        })
+        .collect()
 }
 
 /// Verifies every function in `module`, collecting every diagnostic it
@@ -842,6 +911,8 @@ pub fn verify_module(
         variants: module.variants.iter().map(|(id, v)| (*id, v)).collect(),
         protocols: module.protocols.iter().map(|(id, p)| (*id, p)).collect(),
         extends: module.extends.iter().map(|(id, e)| (*id, e)).collect(),
+        affinity_cache: Default::default(),
+        affinity_failures: Default::default(),
     };
 
     // Every record field's and every variant case payload's own
@@ -1178,7 +1249,13 @@ pub fn verify_module(
         }
     }
 
-    for function in &module.functions {
+    // In `ItemId` order, not storage order: which order a module happens
+    // to store its functions in is not something its diagnostics may
+    // depend on (Alpha 0.2.3). Ties -- a duplicate id, already reported
+    // above -- keep their storage order.
+    let mut ordered: Vec<&Function> = module.functions.iter().collect();
+    ordered.sort_by_key(|function| function.id);
+    for function in ordered {
         verify_function(
             function,
             &known_functions,
@@ -1190,6 +1267,7 @@ pub fn verify_module(
         );
     }
 
+    diagnostics.extend(affinity_diagnostics(&agg, source, interner));
     diagnostics
 }
 
@@ -4215,97 +4293,34 @@ impl PlaceError {
     }
 }
 
-/// `true` iff `ty` is transitively affine (`rfcs/0012`) -- independently
-/// recomputed from `agg`'s own declared record/variant layouts,
-/// mirroring `resourceck`'s/`nir::lower`'s identical query, never
-/// trusted from either. Guarded against a genuinely cyclic declaration
-/// the same way every other stage's identical query is: a cycle
-/// back-edge contributes `false` to that one occurrence alone, never
-/// cached (this file's own resource checks are not called densely
-/// enough per module to need memoizing).
+/// `true` iff `ty` is transitively affine (`rfcs/0012`), answered by the
+/// one classification every stage shares (`types::affinity`) over
+/// `agg`'s own declared record and variant layouts -- recomputed here,
+/// never trusted from lowering, but by the same rule. The copy this
+/// replaced stopped at `MAX_GENERIC_DEPTH` answering "not affine" and
+/// walked shared substructure once per path.
+///
+/// A type the classification cannot answer for is treated as affine, so
+/// no ownership check is waived, and is recorded in
+/// `agg.affinity_failures`: verification then refuses the module with
+/// `AFFINITY_UNDECIDABLE` naming it, so no module is sealed on the
+/// strength of a check that had no real answer.
 fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
-    is_affine_in_visiting(ty, agg, &mut HashSet::new(), 0)
-}
-
-fn is_affine_in_visiting(
-    ty: &Ty,
-    agg: &AggregateContext,
-    visiting: &mut HashSet<ItemId>,
-    depth: usize,
-) -> bool {
-    // Bounds a genuinely cyclic declaration, which `typeck::cycles`
-    // independently rejects as an infinite layout long before anything
-    // reaches NIR -- and, for a `Ty::Applied`, is the *only* guard, see
-    // below.
-    if depth >= MAX_GENERIC_DEPTH {
-        return false;
-    }
-    // A generic instantiation's own affinity is decided by what it was
-    // instantiated *with* (`rfcs/0008`, `rfcs/0012`): `Box[File]` is
-    // affine, `Box[i64]` is not, and the same declaration answers both
-    // -- so its own arguments are substituted into the declaration's
-    // field types before recursing. Answering `false` for every
-    // `Ty::Applied` (as this once did) is what let a `Box[File]` reach
-    // `Drop`/`PlaceRead` looking like an ordinary, freely-copyable
-    // value.
-    let (item, args): (&ItemId, &[Ty]) = match ty {
-        Ty::Named(item, _) => (item, &[]),
-        Ty::Applied(item, args) => (item, args.as_slice()),
-        _ => return false,
-    };
-    if agg.records.get(item).is_some_and(|r| r.affine) {
-        return true;
-    }
-    // `visiting` guards a *non-generic* cycle only. It is keyed by bare
-    // `ItemId`, so it cannot tell a genuine cycle apart from a
-    // legitimately nested instantiation of the same declaration --
-    // `Box[Box[Box[File]]]` reaches `Box` three times with different
-    // arguments and must answer from the innermost one. For an
-    // instantiation, `depth` above is the termination guard, matching
-    // `typeck::Checker::is_affine`.
-    let generic = matches!(ty, Ty::Applied(..));
-    if !generic && !visiting.insert(*item) {
-        return false;
-    }
-    let subst = match item_substitution(*item, args, agg) {
-        Ok(subst) => subst,
-        // A malformed arity is reported as its own structured
-        // diagnostic wherever a *place* projects through it
-        // (`PLACE_GENERIC_ARITY_MISMATCH`). This pure query has no
-        // diagnostic channel of its own, so it fails *closed*, to
-        // affine -- matching every other stage. Answering `false` from
-        // a substitution nobody could build is the one direction that
-        // silently drops an ownership obligation.
-        Err(()) => {
-            if !generic {
-                visiting.remove(item);
+    let outcome = crate::types::affinity::classify(
+        ty,
+        &super::LayoutShapes(agg),
+        &mut agg.affinity_cache.borrow_mut(),
+    );
+    match outcome {
+        Ok(affinity) => affinity.is_affine(),
+        Err(error) => {
+            let mut failures = agg.affinity_failures.borrow_mut();
+            if !failures.iter().any(|(seen, _)| seen == ty) {
+                failures.push((ty.clone(), error));
             }
-            return true;
+            true
         }
-    };
-    let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
-        record.fields.iter().map(|(_, t)| t.clone()).collect()
-    } else if let Some(variant) = agg.variants.get(item) {
-        variant
-            .cases
-            .iter()
-            .flat_map(|c| c.payload.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let result = field_types.iter().any(|fty| {
-        is_affine_in_visiting(
-            &crate::types::substitute(fty, &subst),
-            agg,
-            visiting,
-            depth + 1,
-        )
-    });
-    if !generic {
-        visiting.remove(item);
     }
-    result
 }
 
 /// `item`'s own declared type parameters paired with `args`
@@ -13397,6 +13412,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let evidence = Evidence::Extension {
             extend: extend_id,
@@ -13429,6 +13446,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends: HashMap::new(),
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let caller_requirements = vec![CapabilityRequirement::new(
             protocol_id,
@@ -13779,6 +13798,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let mut evidence = Evidence::Extension {
             extend: extend_id,
@@ -13837,6 +13858,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         // Shallow (well within the depth limit) but wide enough at every
         // level to blow well past a small work budget: `WIDTH^levels`
@@ -28256,5 +28279,201 @@ mod numeric_ir {
         for _ in 0..8 {
             assert_eq!(rendered(several_defects()), first);
         }
+    }
+}
+
+/// The verifier's affinity answers come from the shared classification
+/// (`types::affinity`, Alpha 0.2.3): a type it cannot classify refuses the
+/// module with `AFFINITY_UNDECIDABLE` instead of being silently treated
+/// as owning nothing, and function storage order does not reorder
+/// diagnostics.
+#[cfg(test)]
+mod affinity_classification {
+    use super::*;
+    use crate::nir::Param;
+    use crate::source::SourceMap;
+
+    const FILE: u32 = 1;
+    const MAIN: u32 = 2;
+    const FIRST_RECORD: u32 = 100;
+
+    /// `resource File { descriptor: i64 }` plus `depth` records, each
+    /// wrapping the next, the innermost wrapping `File`; and
+    /// `func main(take x: R0) -> i64 { drop x; return 1 }`.
+    fn chain_module(depth: u32, interner: &mut Interner) -> Module {
+        let file = interner.intern("File");
+        let field = interner.intern("inner");
+        let mut records = vec![(
+            ItemId(FILE),
+            RecordLayout {
+                name: file,
+                type_params: Vec::new(),
+                fields: vec![(interner.intern("descriptor"), Ty::I64)],
+                affine: true,
+            },
+        )];
+        let mut inner = Ty::Named(ItemId(FILE), file);
+        for k in (0..depth).rev() {
+            let name = interner.intern(&format!("R{k}"));
+            records.push((
+                ItemId(FIRST_RECORD + k),
+                RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(field, inner)],
+                    affine: false,
+                },
+            ));
+            inner = Ty::Named(ItemId(FIRST_RECORD + k), name);
+        }
+        Module {
+            functions: vec![drop_and_return(
+                ItemId(MAIN),
+                interner.intern("main"),
+                inner,
+            )],
+            records,
+            ..Module::default()
+        }
+    }
+
+    fn drop_and_return(id: ItemId, name: Symbol, ty: Ty) -> Function {
+        Function {
+            id,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty,
+                take: true,
+            }],
+            return_type: Ty::I64,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Drop { value: ValueId(0) },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        }
+    }
+
+    fn verified(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+    }
+
+    #[test]
+    fn a_resource_inside_the_budget_is_dropped_cleanly() {
+        let mut interner = Interner::new();
+        let module = chain_module(63, &mut interner);
+        assert_eq!(verified(&module, &interner), Vec::new());
+    }
+
+    /// Before Alpha 0.2.3 the walk stopped at the budget and answered
+    /// "not affine", so this `drop` was refused as a drop of a
+    /// non-resource (`V0074`) -- or, without the `drop`, verified with
+    /// the resource unaccounted for.
+    #[test]
+    fn a_resource_past_the_budget_refuses_the_module_with_its_own_code() {
+        let mut interner = Interner::new();
+        let module = chain_module(64, &mut interner);
+        let diagnostics = verified(&module, &interner);
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![codes::AFFINITY_UNDECIDABLE], "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("`R0`"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("64 levels"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_that_contains_itself_refuses_the_module() {
+        let mut interner = Interner::new();
+        let node = interner.intern("Node");
+        let ty = Ty::Named(ItemId(FIRST_RECORD), node);
+        let module = Module {
+            functions: vec![drop_and_return(
+                ItemId(MAIN),
+                interner.intern("main"),
+                ty.clone(),
+            )],
+            records: vec![(
+                ItemId(FIRST_RECORD),
+                RecordLayout {
+                    name: node,
+                    type_params: Vec::new(),
+                    fields: vec![(interner.intern("next"), ty)],
+                    affine: false,
+                },
+            )],
+            ..Module::default()
+        };
+        let codes: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(codes.contains(&codes::AFFINITY_UNDECIDABLE), "{codes:?}");
+    }
+
+    /// Each refused type is reported once, however many checks asked.
+    #[test]
+    fn one_undecidable_type_is_reported_once() {
+        let mut interner = Interner::new();
+        let mut module = chain_module(64, &mut interner);
+        let ty = module.functions[0].params[0].ty.clone();
+        module.functions.push(drop_and_return(
+            ItemId(MAIN + 1),
+            interner.intern("again"),
+            ty,
+        ));
+        let codes: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert_eq!(codes, vec![codes::AFFINITY_UNDECIDABLE]);
+    }
+
+    /// Two functions, each with its own defect: the diagnostics come out
+    /// in the same order whichever order the functions are stored in.
+    #[test]
+    fn function_storage_order_does_not_reorder_diagnostics() {
+        let mut interner = Interner::new();
+        let broken = |id: u32, name: &str, interner: &mut Interner| Function {
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(ValueId(7))),
+            }],
+            params: Vec::new(),
+            ..drop_and_return(ItemId(id), interner.intern(name), Ty::I64)
+        };
+        let forward = Module {
+            functions: vec![
+                broken(MAIN, "first", &mut interner),
+                broken(MAIN + 1, "second", &mut interner),
+            ],
+            ..Module::default()
+        };
+        let mut backward = forward.clone();
+        backward.functions.reverse();
+        let render = |module: &Module| -> Vec<String> {
+            verified(module, &interner)
+                .iter()
+                .map(|d| format!("{} {}", d.code, d.message))
+                .collect()
+        };
+        let forward_text = render(&forward);
+        assert_eq!(forward_text.len(), 2, "{forward_text:?}");
+        assert_eq!(forward_text, render(&backward));
     }
 }

@@ -262,6 +262,13 @@ hash set yielded first. Its text is otherwise unchanged, and no program
 the CLI accepts reaches it -- resource checking and the verifier refuse
 that pairing first.
 
+One library-only refusal is new: an embedder that passes a resource
+handle obtained from one `Interpreter` into another now gets `X0004`
+("resource handle belongs to a different execution context") instead of
+an operation on whichever of the second interpreter's resources shared
+its index. The CLI runs one interpreter per process and never reaches
+it.
+
 The library API changes for anyone embedding the compiler crate:
 
 * `Interpreter::new` takes `&nir::VerifiedModule` rather than
@@ -290,6 +297,11 @@ the failure case. That is the change this RFC is for.
 * The seal covers NIR, not runtime values. `Interpreter::call` and
   `Interpreter::call_item` accept caller-built argument values, which
   the interpreter re-checks itself at run time; no verifier sees them.
+  That includes resource handles: a handle carries the identity of the
+  interpreter that minted it, and any other interpreter refuses it with
+  `X0004` before resolving it. Without that, two interpreters' first
+  resources had identical handles, and one interpreter's handle passed
+  to the other's `take` parameter destroyed the other's resource.
 * A seal does not guarantee the absence of runtime failures:
   `X0001`–`X0003` remain ordinary failures of verified programs.
 * A seal does not guarantee native compilability: capability
@@ -316,6 +328,19 @@ the failure case. That is the change this RFC is for.
     `rfcs/0015`'s and `spec/0005`'s "never produced by a valid program"
     for `X0004` are read in that light, and alongside the budget
     refusals above;
+  * for the same reason a seal is not a proof that every operand is
+    used the way the interpreter models it. Two more shapes verify and
+    are then refused at run time with `X0004`: an `alloc` slot used
+    directly as a value (`store %1, %1`, `ret %1`; natively `A0018`),
+    and a `drop` of a stale `load` -- one taken before the slot's field
+    was moved out, reinitialized and moved out again. The verifier
+    resolves such a load to the slot's current, empty state and accepts
+    the drop; the interpreter holds the load as the snapshot it was and
+    refuses to destroy a resource that has since been transferred
+    elsewhere. Lowering emits neither shape. A mutation fuzzer over the
+    lowered examples and fixtures found both; every other mutant it saw
+    verify and then be refused was a load of a never-stored slot, as
+    above;
   * with more than one verifier diagnostic, their relative order
     follows function and block storage order. It is identical on every
     run of the same module, but reordering storage can reorder it;
@@ -323,11 +348,22 @@ the failure case. That is the change this RFC is for.
     `limits::MAX_GENERIC_DEPTH` (64) levels of record, variant or
     generic nesting and answer "nothing owned" there, so a hand-built
     module whose resource sits that deep can verify with an unreported
-    leak. Whether lowered source can reach this is not established:
-    resource checking's own affinity query has no such cutoff and plans
-    the cleanup lowering emits, but nothing after it is a backstop --
-    the interpreter's leak check stops at the same depth and would
-    report no leak rather than `X0004`.
+    leak. Lowered source does reach this. Type checking's affinity
+    query stops at the same depth, resource checking's does not, so
+    for a `resource` wrapped in 64 or more distinct nested records the
+    stages disagree about whether the outer value owns anything: an
+    explicit `drop` of it is refused by type checking (`T0061`, "owns no
+    resource"); left to scope-exit cleanup, `check` accepts it, the
+    module verifies, and `run` is refused with the interpreter's
+    nesting-budget `X0004`; at 130 levels the verifier itself refuses
+    the cleanup lowering emitted (`V0086`, `V0074`), so a `V` code
+    reaches a user for a program `check` accepted. Every one of these
+    fails closed -- nothing runs to completion with a resource left
+    undestroyed, nothing panics -- and `tests/cli.rs` holds that
+    property, but the disagreement itself is a defect. Fixing it means
+    changing what the verifier checks or adding a frontend budget
+    diagnostic, both outside this milestone, so it is left to the next
+    one.
 
 ## What this RFC does not do
 

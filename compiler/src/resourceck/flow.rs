@@ -18,7 +18,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBinding, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirObserve, HirPattern, HirStmt, ItemId,
-    LocalId, ObservationId, TypeParamId,
+    LocalId, ObservationId,
 };
 use crate::place::{FieldId, Place, Projection};
 use crate::source::{SourceId, Span};
@@ -283,7 +283,9 @@ struct LoopFrame {
 pub struct FlowChecker<'a> {
     local_types: &'a HashMap<LocalId, Ty>,
     expr_types: &'a HashMap<crate::hir::ExprId, Ty>,
-    affine_items: &'a HashSet<ItemId>,
+    /// Completed affinity classifications (`types::affinity`), shared by
+    /// every query this function's check makes -- see [`Self::is_affine`].
+    affinity_cache: std::cell::RefCell<crate::types::affinity::AffinityCache>,
     /// Every declared variant's own `ItemId` (`rfcs/0012`) -- a
     /// variant's own payload is never individually addressable outside a
     /// pattern match (there is no `.field` syntax for it, unlike a
@@ -456,7 +458,6 @@ impl<'a> FlowChecker<'a> {
     pub fn new(
         local_types: &'a HashMap<LocalId, Ty>,
         expr_types: &'a HashMap<crate::hir::ExprId, Ty>,
-        affine_items: &'a HashSet<ItemId>,
         variant_items: &'a HashSet<ItemId>,
         take_flags: &'a HashMap<ItemId, Vec<bool>>,
         affine: &'a AffineContext<'a>,
@@ -467,7 +468,7 @@ impl<'a> FlowChecker<'a> {
         Self {
             local_types,
             expr_types,
-            affine_items,
+            affinity_cache: std::cell::RefCell::new(crate::types::affinity::AffinityCache::new()),
             variant_items,
             take_flags,
             affine,
@@ -608,53 +609,27 @@ impl<'a> FlowChecker<'a> {
             .is_some_and(|ty| self.is_affine(ty))
     }
 
-    /// `true` iff `ty` is transitively affine (`rfcs/0012`): `self.
-    /// affine_items` already *is* the transitive set for a plain,
-    /// non-generic `Ty::Named` (computed once by `super::check_module`,
-    /// mirroring `typeck::Checker::is_affine`'s own declaration-time
-    /// query); a `Ty::Applied` instead substitutes its own concrete
-    /// arguments into the declaration's field types fresh, the same way
-    /// `typeck`'s own equivalent does, since the same generic
-    /// declaration can be affine for one instantiation and not another.
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`), answered by
+    /// the one classification every stage shares (`types::affinity`)
+    /// over `typeck`'s own exported declarations.
+    ///
+    /// Before Alpha 0.2.3 this stage kept two copies of its own: one with
+    /// no depth bound at all, and one that guarded a generic
+    /// instantiation with the per-declaration cycle set, so
+    /// `Box[Box[File]]` reached through a record would have answered
+    /// "not affine". A type the classification cannot answer for (too
+    /// deep, or containing itself) is treated as affine, so no ownership
+    /// obligation is dropped; type checking has already refused it
+    /// (`T0075`, `T0020`).
+    ///
     /// Place *decomposition* (`resolve_place`/`structural_drop_targets`)
     /// is intentionally narrower than this: a generic instantiation is
-    /// tracked as a single whole-value place only, exactly like Alpha
-    /// 0.1.7's own resources always were, never decomposed field by
-    /// field -- this query alone still needs to answer soundly for one,
-    /// so `take`/observation/whole-move accounting stays correct even
-    /// though per-field tracking does not extend into it.
+    /// tracked as a single whole-value place only, never decomposed field
+    /// by field -- this query alone still needs to answer soundly for one.
     fn is_affine(&self, ty: &Ty) -> bool {
-        match ty {
-            Ty::Named(item, _) => self.affine_items.contains(item),
-            Ty::Applied(item, args) => {
-                if self.affine.declared_resources.contains(item) {
-                    return true;
-                }
-                // Missing or arity-disagreeing generic metadata is never
-                // an *empty* substitution (`rfcs/0008`): an
-                // unsubstituted `Ty::Param` answers `false`, which
-                // would let a genuinely affine instantiation be treated
-                // as a freely-copyable value with no ownership to
-                // track. Fail closed -- treat it as affine, so every
-                // ownership obligation is still demanded.
-                let type_params = self.affine.item_type_params.get(item);
-                let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
-                    return true;
-                };
-                let subst: HashMap<TypeParamId, Ty> = type_params
-                    .iter()
-                    .copied()
-                    .zip(args.iter().cloned())
-                    .collect();
-                self.affine
-                    .aggregate_field_types
-                    .get(item)
-                    .into_iter()
-                    .flatten()
-                    .any(|fty| self.is_affine(&crate::types::substitute(fty, &subst)))
-            }
-            _ => false,
-        }
+        crate::types::affinity::classify(ty, self.affine, &mut self.affinity_cache.borrow_mut())
+            .map(|affinity| affinity.is_affine())
+            .unwrap_or(true)
     }
 
     /// This place's own current structural state (`rfcs/0012`): the
@@ -3821,12 +3796,11 @@ mod tests {
     fn a_resolved_callee_missing_from_take_flags_is_diagnosed_not_silently_observed() {
         let local_types: HashMap<LocalId, Ty> = HashMap::new();
         let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
-        let affine_items: HashSet<ItemId> = HashSet::new();
         let variant_items: HashSet<ItemId> = HashSet::new();
         let take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
         let aggregate_field_types: HashMap<ItemId, Vec<Ty>> = HashMap::new();
         let declared_resources: HashSet<ItemId> = HashSet::new();
-        let item_type_params: HashMap<ItemId, Vec<TypeParamId>> = HashMap::new();
+        let item_type_params: HashMap<ItemId, Vec<crate::hir::TypeParamId>> = HashMap::new();
         let field_projections: HashMap<ExprId, (ItemId, usize)> = HashMap::new();
         let affine = AffineContext {
             aggregate_field_types: &aggregate_field_types,
@@ -3842,7 +3816,6 @@ mod tests {
         let mut checker = FlowChecker::new(
             &local_types,
             &expr_types,
-            &affine_items,
             &variant_items,
             &take_flags,
             &affine,
@@ -3879,13 +3852,12 @@ mod tests {
     fn a_take_flags_length_disagreeing_with_the_call_arity_is_diagnosed() {
         let local_types: HashMap<LocalId, Ty> = HashMap::new();
         let expr_types: HashMap<crate::hir::ExprId, Ty> = HashMap::new();
-        let affine_items: HashSet<ItemId> = HashSet::new();
         let variant_items: HashSet<ItemId> = HashSet::new();
         let mut take_flags: HashMap<ItemId, Vec<bool>> = HashMap::new();
         take_flags.insert(ItemId(0), vec![false, false]);
         let aggregate_field_types: HashMap<ItemId, Vec<Ty>> = HashMap::new();
         let declared_resources: HashSet<ItemId> = HashSet::new();
-        let item_type_params: HashMap<ItemId, Vec<TypeParamId>> = HashMap::new();
+        let item_type_params: HashMap<ItemId, Vec<crate::hir::TypeParamId>> = HashMap::new();
         let field_projections: HashMap<ExprId, (ItemId, usize)> = HashMap::new();
         let affine = AffineContext {
             aggregate_field_types: &aggregate_field_types,
@@ -3901,7 +3873,6 @@ mod tests {
         let mut checker = FlowChecker::new(
             &local_types,
             &expr_types,
-            &affine_items,
             &variant_items,
             &take_flags,
             &affine,

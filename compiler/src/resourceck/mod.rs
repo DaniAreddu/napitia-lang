@@ -72,113 +72,26 @@ pub struct AffineContext<'a> {
     pub field_projections: &'a HashMap<ExprId, (ItemId, usize)>,
 }
 
-/// `true` iff `item` (a record, resource, or variant) is transitively
-/// affine (`rfcs/0012`): a declared `resource` itself, or reachably
-/// containing one -- the same query `typeck::Checker::is_affine` already
-/// computes at declaration time, recomputed here directly from
-/// [`AffineContext`]'s own exported structural data rather than
-/// threading `typeck`'s own boolean answer through as a third
-/// representation of the same fact. Memoized, and guarded against a
-/// genuinely cyclic declaration (already independently rejected as an
-/// infinite-size layout by `typeck::cycles`) the same way: a cycle
-/// back-edge contributes `false` to *that one* occurrence's own
-/// disjunction without ever being cached as the type's own final answer.
-fn is_affine_item(
-    item: ItemId,
-    affine: &AffineContext<'_>,
-    visiting: &mut HashSet<ItemId>,
-    memo: &mut HashMap<ItemId, bool>,
-) -> bool {
-    if let Some(&cached) = memo.get(&item) {
-        return cached;
+/// `typeck`'s exported declarations, as the shared affinity
+/// classification reads them (`types::affinity`). Resource checking asks
+/// that one query rather than keeping its own copy, so it can no longer
+/// disagree with type checking, lowering or the verifier about whether a
+/// type owns a resource.
+impl crate::types::affinity::AggregateShapes for AffineContext<'_> {
+    fn is_declared_resource(&self, item: ItemId) -> bool {
+        self.declared_resources.contains(&item)
     }
-    if affine.declared_resources.contains(&item) {
-        memo.insert(item, true);
-        return true;
-    }
-    if !visiting.insert(item) {
-        return false;
-    }
-    let result = affine
-        .aggregate_field_types
-        .get(&item)
-        .into_iter()
-        .flatten()
-        .any(|ty| is_affine_ty(ty, affine, visiting, memo));
-    visiting.remove(&item);
-    memo.insert(item, result);
-    result
-}
 
-fn is_affine_ty(
-    ty: &Ty,
-    affine: &AffineContext<'_>,
-    visiting: &mut HashSet<ItemId>,
-    memo: &mut HashMap<ItemId, bool>,
-) -> bool {
-    match ty {
-        Ty::Named(item, _) => is_affine_item(*item, affine, visiting, memo),
-        Ty::Applied(item, args) => {
-            if affine.declared_resources.contains(item) {
-                return true;
-            }
-            if !visiting.insert(*item) {
-                return false;
-            }
-            // Missing or arity-disagreeing generic metadata is never an
-            // *empty* substitution (`rfcs/0008`): an unsubstituted
-            // `Ty::Param` answers `false` below, which would let a
-            // genuinely affine instantiation be treated as an ordinary,
-            // freely-copyable value with no ownership to track at all.
-            // Fail closed -- answer *affine*, so every ownership
-            // obligation is still demanded -- exactly as
-            // `flow::FlowChecker::is_affine` and `nir::lower`'s own copy
-            // of this query do.
-            let type_params = affine.item_type_params.get(item);
-            let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
-                visiting.remove(item);
-                return true;
-            };
-            let subst: HashMap<TypeParamId, Ty> = type_params
-                .iter()
-                .copied()
-                .zip(args.iter().cloned())
-                .collect();
-            let result = affine
-                .aggregate_field_types
-                .get(item)
-                .into_iter()
-                .flatten()
-                .any(|fty| {
-                    is_affine_ty(
-                        &crate::types::substitute(fty, &subst),
-                        affine,
-                        visiting,
-                        memo,
-                    )
-                });
-            visiting.remove(item);
-            result
-        }
-        _ => false,
+    fn type_params(&self, item: ItemId) -> Option<Vec<TypeParamId>> {
+        self.item_type_params.get(&item).cloned()
     }
-}
 
-/// The full transitive-affinity set (`rfcs/0012`) over every record and
-/// variant [`AffineContext::aggregate_field_types`] knows about --
-/// mirrors `typeck::Checker`'s own identical declaration-time query
-/// exactly, so `resourceck` never disagrees with `typeck` about which
-/// plain (non-generic) `Ty::Named` is affine. `flow::FlowChecker::
-/// is_affine`'s own fast path for `Ty::Named` trusts this set completely
-/// rather than recomputing it per function.
-fn compute_affine_items(affine: &AffineContext<'_>) -> HashSet<ItemId> {
-    let mut memo = HashMap::new();
-    affine
-        .aggregate_field_types
-        .keys()
-        .copied()
-        .filter(|&item| is_affine_item(item, affine, &mut HashSet::new(), &mut memo))
-        .collect()
+    fn field_types(&self, item: ItemId) -> Vec<Ty> {
+        self.aggregate_field_types
+            .get(&item)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// Checks every function and extend-method body in `hir` for affine
@@ -198,7 +111,6 @@ pub fn check_module(
     interner: &Interner,
     affine: &AffineContext<'_>,
 ) -> ResourceCheckResult {
-    let affine_items = compute_affine_items(affine);
     // Every declared variant's own `ItemId` (`rfcs/0012`) -- a variant's
     // own payload is never individually addressable outside a pattern
     // match (there is no `.field` syntax for it, unlike a record), so an
@@ -229,7 +141,6 @@ pub fn check_module(
         let mut checker = flow::FlowChecker::new(
             local_types,
             expr_types,
-            &affine_items,
             &variant_items,
             &take_flags,
             affine,
@@ -250,7 +161,6 @@ pub fn check_module(
             let mut checker = flow::FlowChecker::new(
                 local_types,
                 expr_types,
-                &affine_items,
                 &variant_items,
                 &take_flags,
                 affine,
@@ -2980,12 +2890,12 @@ mod missing_metadata {
             item_type_params: &tables.params,
             field_projections: &tables.projections,
         };
-        is_affine_ty(
-            &Ty::Applied(BOXY, args),
-            &affine,
-            &mut HashSet::new(),
-            &mut HashMap::new(),
-        )
+        // The shared query, through this stage's own declarations -- a
+        // type it cannot classify fails closed, exactly as `FlowChecker`
+        // treats one.
+        crate::types::affinity::classify_uncached(&Ty::Applied(BOXY, args), &affine)
+            .map(|affinity| affinity.is_affine())
+            .unwrap_or(true)
     }
 
     #[test]

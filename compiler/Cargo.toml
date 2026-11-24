@@ -45,7 +45,7 @@ cranelift-codegen = { version = "0.135.2", features = ["x86"] }
 cranelift-frontend = "0.135.2"
 # The `Module`/`Linkage` abstraction `cranelift-object` implements:
 # declaring every function before any body is emitted.
-cranelift-module = "0.135.2"
+cranelift-module = "0.136.0"
 # Writes the compiled functions out as a real ELF object file. It is
 # handed an ISA the backend has already selected, so the triple
 # parsing that selection needs is declared separately, below, rather

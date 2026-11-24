@@ -15,7 +15,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, HirType,
-    ItemId, ItemRegistry, LocalId, TypeParamId,
+    HirTypeParam, ItemId, ItemRegistry, LocalId, TypeParamId,
 };
 use crate::source::{SourceId, Span};
 use crate::symbol::{Interner, Symbol};
@@ -265,6 +265,14 @@ mod codes {
     /// here, in checking, rather than left to surface as an internal
     /// lowering diagnostic or a fabricated runtime value.
     pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "T0074";
+    /// A record or variant declaration, or a type a program uses, nests
+    /// aggregates more deeply than any stage will walk to decide whether
+    /// it owns a resource (`types::affinity`, `rfcs/0016`). Refused here
+    /// so every later stage can rely on every type it meets having an
+    /// answer: before Alpha 0.2.3 the stages answered differently past
+    /// the budget, and a program `check` accepted could be refused by
+    /// the verifier, or at run time.
+    pub const AFFINITY_DEPTH_EXCEEDED: &str = "T0075";
 }
 
 /// Which function(s), if any, must satisfy the executable entry
@@ -461,7 +469,9 @@ pub fn check_module_with_registry(
         records: HashMap::new(),
         variants: HashMap::new(),
         variant_display: HashMap::new(),
-        transitively_affine: HashMap::new(),
+        affinity_cache: crate::types::affinity::AffinityCache::new(),
+        expr_spans: HashMap::new(),
+        affinity_overflowing: HashSet::new(),
         loop_depth: 0,
         expr_types: HashMap::new(),
         pattern_case: HashMap::new(),
@@ -483,6 +493,7 @@ pub fn check_module_with_registry(
     checker.collect_generic_params(hir);
     checker.build_aggregate_info(hir);
     checker.check_aggregate_cycles(hir);
+    checker.check_affinity_budget_declarations(hir);
     checker.register_protocols(hir);
     checker.build_signatures(hir);
     checker.register_extends(hir);
@@ -498,6 +509,7 @@ pub fn check_module_with_registry(
     }
     checker.finalize_defaults();
     checker.check_integer_literal_ranges();
+    checker.check_affinity_budget_uses(hir);
 
     let local_types = checker
         .locals
@@ -645,11 +657,17 @@ struct Checker<'a> {
     /// Display-only `(variant name, [case names])` for rendering a
     /// non-exhaustive-match witness back into surface syntax.
     variant_display: HashMap<ItemId, (String, Vec<String>)>,
-    /// Memoized transitive-affinity results (`rfcs/0012`), keyed by the
-    /// plain, unsubstituted declaration -- see [`Self::is_affine`].
-    /// Populated lazily, the first time anything actually asks; a
-    /// record/variant nothing ever queries is simply never computed.
-    transitively_affine: HashMap<ItemId, bool>,
+    /// Completed affinity classifications (`types::affinity`) -- see
+    /// [`Self::is_affine`]. Holds only answers a completed walk produced,
+    /// so reusing one can never change a later query's answer.
+    affinity_cache: crate::types::affinity::AffinityCache,
+    /// Where each checked expression is, so a type that only appears at a
+    /// use site can be reported there (`check_affinity_budget_uses`).
+    expr_spans: HashMap<ExprId, (SourceId, Span)>,
+    /// Every declaration whose own affinity depth exceeds the budget
+    /// (`check_affinity_budget_declarations`). A use of one is not
+    /// reported again: the declaration is the cause.
+    affinity_overflowing: HashSet<ItemId>,
     /// How many `while`/`loop` bodies currently enclose the expression
     /// being checked. `break`/`continue` outside of any loop is a
     /// diagnostic, not something deferred to NIR lowering or the
@@ -814,6 +832,39 @@ struct VariantInfo {
     source: SourceId,
 }
 
+/// This checker's declarations, as the shared affinity classification
+/// reads them (`types::affinity`).
+struct TypeckShapes<'a> {
+    records: &'a HashMap<ItemId, RecordInfo>,
+    variants: &'a HashMap<ItemId, VariantInfo>,
+}
+
+impl crate::types::affinity::AggregateShapes for TypeckShapes<'_> {
+    fn is_declared_resource(&self, item: ItemId) -> bool {
+        self.records.get(&item).is_some_and(|r| r.affine)
+    }
+
+    fn type_params(&self, item: ItemId) -> Option<Vec<TypeParamId>> {
+        self.records
+            .get(&item)
+            .map(|r| r.type_params.clone())
+            .or_else(|| self.variants.get(&item).map(|v| v.type_params.clone()))
+    }
+
+    fn field_types(&self, item: ItemId) -> Vec<Ty> {
+        if let Some(info) = self.records.get(&item) {
+            info.fields.iter().map(|(_, ty, _)| ty.clone()).collect()
+        } else if let Some(info) = self.variants.get(&item) {
+            info.cases
+                .iter()
+                .flat_map(|(_, payload)| payload.iter().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 impl<'a> Checker<'a> {
     /// Collects every function/record/variant's own generic parameter
     /// identities, once, before anything resolves a single type
@@ -917,101 +968,189 @@ impl<'a> Checker<'a> {
 
     /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
     /// `resource` itself, or a `record`/`variant`/`resource` any of
-    /// whose reachable fields/payloads is. Replaces Alpha 0.1.7's
-    /// blanket declaration-time rejection of a resource-typed field in
-    /// any aggregate (formerly `T0064`) -- an aggregate containing an
-    /// affine field is no longer rejected outright; it becomes affine
-    /// itself, tracked structurally, field by field, by `resourceck`/
-    /// `nir::verify`.
+    /// whose reachable fields/payloads is, after substituting a generic
+    /// instantiation's own arguments. Replaces Alpha 0.1.7's blanket
+    /// declaration-time rejection of a resource-typed field in any
+    /// aggregate (formerly `T0064`).
     ///
-    /// Memoized per plain (unsubstituted) declaration in
-    /// `self.transitively_affine`, guarded by `visiting` against a
-    /// genuinely self-referential declaration (already independently
-    /// rejected as an infinite-size layout by `check_aggregate_cycles`)
-    /// -- a cycle back-edge contributes `false` to *that one*
-    /// occurrence's own disjunction without ever being cached as the
-    /// type's own final answer, so revisiting a node still being
-    /// computed can never make a type that is genuinely affine through
-    /// some other, non-cyclic field look non-affine. A `Ty::Applied`
-    /// substitutes its own concrete arguments into the declaration's
-    /// field types before recursing, and is never itself memoized by
-    /// plain `ItemId` (only the declaration's own unsubstituted shape
-    /// is): the same generic record can be affine for one instantiation
-    /// and not for another. A bare, unconstrained `Ty::Param` is always
-    /// `false` here -- never silently treated as non-affine by a caller
-    /// that actually needs to know (`Checker::check_call_at`'s own
-    /// generic-instantiation guard, `check_take_target`, ...): each of
-    /// those rejects a symbolic type outright wherever affinity would
-    /// actually matter, rather than trusting this query's own
-    /// necessarily-approximate "false" for it.
+    /// Answered by the one classification every stage shares
+    /// (`types::affinity`, Alpha 0.2.3), through this checker's own
+    /// declarations. A type the classification cannot answer for -- one
+    /// nested past the affinity budget, or one containing itself -- is
+    /// treated as affine here, so no ownership rule is waived for it;
+    /// the reason it has no answer is reported on its own, by
+    /// `check_affinity_budget_declarations`/`check_affinity_budget_uses`
+    /// (`T0075`) or by the cycle check (`T0020`). A bare, unconstrained
+    /// `Ty::Param` is not affine here -- never silently treated as
+    /// non-affine by a caller that actually needs to know
+    /// (`Checker::check_call_at`'s own generic-instantiation guard,
+    /// `check_take_target`, ...): each of those rejects a symbolic type
+    /// outright wherever affinity would actually matter.
     fn is_affine(&mut self, ty: &Ty) -> bool {
-        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
+        self.classify_affinity(ty)
+            .map(|affinity| affinity.is_affine())
+            .unwrap_or(true)
     }
 
-    fn is_affine_visiting(
+    fn classify_affinity(
         &mut self,
         ty: &Ty,
-        visiting: &mut HashSet<ItemId>,
-        depth: usize,
-    ) -> bool {
-        // The type this checks was already built by `resolve_named_type`/
-        // `substitute`, both already bounded by this same limit -- this
-        // is a defensive backstop against a hand-built or pathological
-        // input, mirroring `deep_resolve_at_depth`'s identical silent
-        // cutoff, never a case ordinary well-typed source can reach.
-        if depth >= crate::limits::MAX_GENERIC_DEPTH {
+    ) -> Result<crate::types::affinity::Affinity, crate::types::affinity::AffinityError> {
+        let shapes = TypeckShapes {
+            records: &self.records,
+            variants: &self.variants,
+        };
+        crate::types::affinity::classify(ty, &shapes, &mut self.affinity_cache)
+    }
+
+    /// The type a declaration names when used as itself: `Named` for a
+    /// non-generic one, its own parameters applied for a generic one.
+    fn declaration_self_ty(id: ItemId, name: Symbol, type_params: &[HirTypeParam]) -> Ty {
+        if type_params.is_empty() {
+            Ty::Named(id, name)
+        } else {
+            Ty::Applied(
+                id,
+                type_params
+                    .iter()
+                    .map(|p| Ty::Param(p.id, p.name))
+                    .collect(),
+            )
+        }
+    }
+
+    /// Refuses every record or variant declaration whose own affinity
+    /// depth exceeds the budget (`T0075`), before any function body is
+    /// checked -- the declaration, not the code that uses it, is what is
+    /// too deep.
+    ///
+    /// In a chain of declarations that are all too deep, only the
+    /// innermost is reported: the ones wrapping it are too deep because
+    /// of it, and one diagnostic at the cause is more use than one per
+    /// level. A declaration that contains itself has no depth at all and
+    /// is the cycle check's to report (`T0020`), not this one's.
+    fn check_affinity_budget_declarations(&mut self, hir: &HirModule) {
+        let declarations: Vec<(ItemId, SourceId, Span, Ty)> = hir
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    r.id,
+                    r.source,
+                    r.span,
+                    Self::declaration_self_ty(r.id, r.name, &r.type_params),
+                )
+            })
+            .chain(hir.variants.iter().map(|v| {
+                (
+                    v.id,
+                    v.source,
+                    v.span,
+                    Self::declaration_self_ty(v.id, v.name, &v.type_params),
+                )
+            }))
+            .collect();
+        let mut overflowing = Vec::new();
+        for (id, source, span, ty) in &declarations {
+            if let Err(crate::types::affinity::AffinityError::DepthExceeded { limit }) =
+                self.classify_affinity(ty)
+            {
+                self.affinity_overflowing.insert(*id);
+                overflowing.push((*id, *source, *span, ty.clone(), limit));
+            }
+        }
+        for (id, source, span, ty, limit) in overflowing {
+            let caused_by_another = self
+                .item_field_types(id)
+                .iter()
+                .any(|field| self.mentions_overflowing(field, 0));
+            if !caused_by_another {
+                self.report_affinity_depth(source, span, &ty, limit);
+            }
+        }
+    }
+
+    /// Refuses every type the program uses at a function boundary or in
+    /// an expression whose affinity depth exceeds the budget (`T0075`),
+    /// once per distinct type, at its first use in source order. A type
+    /// built from a declaration already refused for its own depth is not
+    /// reported again. Runs after every body is checked, over the final
+    /// resolved types every later stage reads.
+    fn check_affinity_budget_uses(&mut self, hir: &HirModule) {
+        let mut uses: Vec<(SourceId, Span, Ty)> = Vec::new();
+        for function in hir
+            .functions
+            .iter()
+            .chain(hir.extends.iter().flat_map(|e| e.methods.iter()))
+        {
+            let Some(sig) = self.functions.get(&function.id) else {
+                continue;
+            };
+            for (param, ty) in function.params.iter().zip(&sig.params) {
+                uses.push((function.source, param.span, ty.clone()));
+            }
+            let ret_span = function
+                .return_type
+                .as_ref()
+                .map(|t| t.span())
+                .unwrap_or(function.name_span);
+            uses.push((function.source, ret_span, sig.ret.clone()));
+        }
+        for (id, (source, span)) in &self.expr_spans {
+            if let Some(ty) = self.expr_types.get(id) {
+                uses.push((*source, *span, deep_resolve(&self.ctx, ty)));
+            }
+        }
+        uses.sort_by_key(|(source, span, _)| (*source, span.start, span.end));
+        let mut reported: HashSet<Ty> = HashSet::new();
+        for (source, span, ty) in uses {
+            if reported.contains(&ty) || self.mentions_overflowing(&ty, 0) {
+                continue;
+            }
+            if let Err(crate::types::affinity::AffinityError::DepthExceeded { limit }) =
+                self.classify_affinity(&ty)
+            {
+                self.report_affinity_depth(source, span, &ty, limit);
+                reported.insert(ty);
+            }
+        }
+    }
+
+    /// Whether `ty` names, anywhere in its arguments, a declaration
+    /// already refused for its own depth.
+    fn mentions_overflowing(&self, ty: &Ty, depth: usize) -> bool {
+        if depth > crate::limits::MAX_GENERIC_DEPTH {
             return false;
         }
         match ty {
-            Ty::Named(item, _) => {
-                if let Some(cached) = self.transitively_affine.get(item) {
-                    return *cached;
-                }
-                if !visiting.insert(*item) {
-                    return false;
-                }
-                let declared_resource = self.records.get(item).is_some_and(|r| r.affine);
-                let field_types = self.item_field_types(*item);
-                let result = declared_resource
-                    || field_types
-                        .iter()
-                        .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
-                visiting.remove(item);
-                self.transitively_affine.insert(*item, result);
-                result
-            }
+            Ty::Named(item, _) => self.affinity_overflowing.contains(item),
             Ty::Applied(item, args) => {
-                if self.records.get(item).is_some_and(|r| r.affine) {
-                    return true;
-                }
-                // Deliberately *not* guarded by `visiting`: that set is
-                // keyed by bare `ItemId`, so it cannot tell a genuine
-                // cycle apart from a legitimately nested instantiation
-                // of the same declaration -- `Box[Box[File]]` reaches
-                // `Box` twice with different arguments and must answer
-                // from the inner one, not be cut off as if it were
-                // self-referential. `depth` (checked at the top of this
-                // function) is the correct termination guard here: it
-                // bounds a genuinely cyclic generic, which
-                // `check_aggregate_cycles` independently rejects as an
-                // infinite-size layout before any body is checked.
-                let Some(subst) = self.checked_substitution(*item, args) else {
-                    // Missing or arity-disagreeing generic metadata
-                    // fails *closed*, to affine: a partial `zip` leaves
-                    // an unsubstituted `Ty::Param`, which answers "not
-                    // affine" and would silently drop every ownership
-                    // obligation this instantiation carries. An
-                    // over-demand is recoverable; a dropped obligation
-                    // is a leak.
-                    return true;
-                };
-                let field_types = self.item_field_types(*item);
-                field_types.iter().any(|fty| {
-                    self.is_affine_visiting(&substitute(fty, &subst), visiting, depth + 1)
-                })
+                self.affinity_overflowing.contains(item)
+                    || args.iter().any(|a| self.mentions_overflowing(a, depth + 1))
             }
             _ => false,
         }
+    }
+
+    fn report_affinity_depth(&mut self, source: SourceId, span: Span, ty: &Ty, limit: usize) {
+        let name = self.display_for_diagnostic(ty);
+        self.diagnostics.push(
+            Diagnostic::error(
+                codes::AFFINITY_DEPTH_EXCEEDED,
+                source,
+                span,
+                format!(
+                    "`{name}` nests records and variants more than {limit} levels deep, \
+                     too deep to decide whether it owns a resource"
+                ),
+            )
+            .with_primary_label("nested too deeply")
+            .with_note(format!(
+                "the depth counts the records and variants on the longest path from this type \
+                 to a field that holds none; a declared `resource` counts as one level, and \
+                 {limit} is the most any stage of this compiler walks"
+            )),
+        );
     }
 
     /// `item`'s own declared type parameters paired with `args`
@@ -1666,6 +1805,8 @@ impl<'a> Checker<'a> {
     /// expression can reach NIR lowering "unseen".
     fn check_expr(&mut self, expr: &HirExpr) -> Ty {
         let ty = self.check_expr_kind(expr);
+        self.expr_spans
+            .insert(expr.id(), (self.source, expr.span()));
         self.expr_types.insert(expr.id(), ty.clone());
         ty
     }
@@ -5437,7 +5578,9 @@ mod tests {
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
-            transitively_affine: HashMap::new(),
+            affinity_cache: crate::types::affinity::AffinityCache::new(),
+            expr_spans: HashMap::new(),
+            affinity_overflowing: HashSet::new(),
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
@@ -5499,7 +5642,9 @@ mod tests {
             records: HashMap::new(),
             variants: HashMap::new(),
             variant_display: HashMap::new(),
-            transitively_affine: HashMap::new(),
+            affinity_cache: crate::types::affinity::AffinityCache::new(),
+            expr_spans: HashMap::new(),
+            affinity_overflowing: HashSet::new(),
             loop_depth: 0,
             expr_types: HashMap::new(),
             pattern_case: HashMap::new(),
@@ -9184,6 +9329,175 @@ mod integer_literal_ranges {
         assert!(
             !found.contains(&codes::INTEGER_LITERAL_OUT_OF_RANGE),
             "a type mismatch is not a range error: {found:?}"
+        );
+    }
+}
+
+/// `T0075` (`types::affinity`, Alpha 0.2.3): a declaration or a used type
+/// nested past the affinity budget is refused here, once, at its cause.
+#[cfg(test)]
+mod affinity_budget {
+    use super::codes;
+    use super::tests::check;
+
+    /// `depth` records, each wrapping the next, around `leaf`, built one
+    /// level per statement; `drop` destroys the outermost explicitly.
+    fn chain(depth: usize, leaf: &str, drop: bool, reversed: bool) -> String {
+        let mut decls = Vec::new();
+        for level in 0..depth {
+            let inner = if level + 1 < depth {
+                format!("R{}", level + 1)
+            } else {
+                leaf.to_string()
+            };
+            decls.push(format!("record R{level} {{ inner: {inner} }}\n"));
+        }
+        if reversed {
+            decls.reverse();
+        }
+        let mut source = String::from("resource File { descriptor: i64 }\n");
+        source.extend(decls);
+        let leaf_value = if leaf == "File" {
+            "File { descriptor: 7 }"
+        } else {
+            "7"
+        };
+        source.push_str(&format!(
+            "func main() -> i64 {{\n    value x{depth} = {leaf_value};\n"
+        ));
+        for level in (0..depth).rev() {
+            source.push_str(&format!(
+                "    value x{level} = R{level} {{ inner: x{} }};\n",
+                level + 1
+            ));
+        }
+        if drop {
+            source.push_str("    drop x0;\n");
+        }
+        source.push_str("    return 7;\n}\n");
+        source
+    }
+
+    fn found(text: &str) -> Vec<&'static str> {
+        check(text).iter().map(|d| d.code).collect()
+    }
+
+    #[test]
+    fn a_declaration_at_the_budget_is_accepted_and_can_be_dropped() {
+        for drop in [false, true] {
+            assert_eq!(found(&chain(63, "File", drop, false)), Vec::<&str>::new());
+        }
+    }
+
+    #[test]
+    fn one_level_past_the_budget_is_refused_once_at_the_declaration() {
+        for drop in [false, true] {
+            let diagnostics = check(&chain(64, "File", drop, false));
+            let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+            // Never the misleading "owns no resource" the cut-off walk
+            // produced before.
+            assert_eq!(codes, vec![codes::AFFINITY_DEPTH_EXCEEDED], "drop: {drop}");
+            assert!(
+                diagnostics[0].message.contains("`R0`"),
+                "{:?}",
+                diagnostics[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_chain_is_reported_only_at_its_innermost_overflowing_declaration() {
+        let diagnostics = check(&chain(130, "File", true, false));
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![codes::AFFINITY_DEPTH_EXCEEDED]);
+        // R66 is 65 deep; R67 is exactly at the budget.
+        assert!(
+            diagnostics[0].message.contains("`R66`"),
+            "{:?}",
+            diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn a_deep_type_that_owns_nothing_is_refused_the_same_way() {
+        assert_eq!(found(&chain(64, "i64", false, false)), Vec::<&str>::new());
+        assert_eq!(
+            found(&chain(65, "i64", false, false)),
+            vec![codes::AFFINITY_DEPTH_EXCEEDED]
+        );
+    }
+
+    #[test]
+    fn declaration_order_does_not_change_the_diagnostics() {
+        for depth in [63, 64, 130] {
+            let forward = check(&chain(depth, "File", true, false));
+            let backward = check(&chain(depth, "File", true, true));
+            let render = |ds: &[crate::diagnostics::Diagnostic]| -> Vec<(String, String)> {
+                ds.iter()
+                    .map(|d| (d.code.to_string(), d.message.clone()))
+                    .collect()
+            };
+            assert_eq!(render(&forward), render(&backward), "depth {depth}");
+        }
+    }
+
+    /// A type that is only too deep where it is used -- a generic
+    /// instantiation around a declaration that is fine on its own -- is
+    /// refused at that use, once.
+    #[test]
+    fn an_instantiation_too_deep_at_its_use_is_refused_there_once() {
+        let mut ty = String::from("R0");
+        for _ in 0..60 {
+            ty = format!("Box[{ty}]");
+        }
+        let source = format!(
+            "resource File {{ descriptor: i64 }}\n\
+             record Box[T] {{ item: T }}\n\
+             record R0 {{ inner: R1 }}\nrecord R1 {{ inner: R2 }}\n\
+             record R2 {{ inner: R3 }}\nrecord R3 {{ inner: File }}\n\
+             func keep(x: {ty}) -> i64 {{ return 0; }}\n\
+             func also(x: {ty}) -> i64 {{ return 1; }}\n\
+             func main() -> i64 {{ return 0; }}\n"
+        );
+        let diagnostics = check(&source);
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![codes::AFFINITY_DEPTH_EXCEEDED]);
+        // At the first use, the first parameter.
+        let first = source.find("x: Box").expect("the parameter is written");
+        assert!(diagnostics[0].primary_span.start as usize >= first);
+        assert!((diagnostics[0].primary_span.start as usize) < source.find("func also").unwrap());
+    }
+
+    /// The same instantiation one level shallower is fine.
+    #[test]
+    fn an_instantiation_at_the_budget_is_accepted() {
+        let mut ty = String::from("R0");
+        for _ in 0..59 {
+            ty = format!("Box[{ty}]");
+        }
+        let source = format!(
+            "resource File {{ descriptor: i64 }}\n\
+             record Box[T] {{ item: T }}\n\
+             record R0 {{ inner: R1 }}\nrecord R1 {{ inner: R2 }}\n\
+             record R2 {{ inner: R3 }}\nrecord R3 {{ inner: File }}\n\
+             func keep(x: {ty}) -> i64 {{ return 0; }}\n\
+             func main() -> i64 {{ return 0; }}\n"
+        );
+        assert_eq!(found(&source), Vec::<&str>::new());
+    }
+
+    /// A declaration that contains itself has no depth; the cycle check
+    /// reports it and this one stays silent.
+    #[test]
+    fn a_cyclic_declaration_is_left_to_the_cycle_check() {
+        let codes = found(
+            "record Node { data: i64, next: Node }\n\
+             func main() -> i64 { return 0; }\n",
+        );
+        assert!(codes.contains(&"T0020"), "{codes:?}");
+        assert!(
+            !codes.contains(&codes::AFFINITY_DEPTH_EXCEEDED),
+            "{codes:?}"
         );
     }
 }

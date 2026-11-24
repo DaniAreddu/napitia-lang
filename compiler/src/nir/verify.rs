@@ -648,6 +648,39 @@ mod codes {
     /// which is what "operands of incompatible widths or signedness"
     /// reduces to when exactly one integer width exists.
     pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "V0112";
+    /// A `load` reads an `alloc` slot that is not written on every
+    /// reachable path from the entry block to it (Alpha 0.2.3). Covers
+    /// every slot `INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED` (an `invoke`'s
+    /// own result slots) and `RESOURCE_LOCATION_NOT_DEFINITELY_
+    /// INITIALIZED` (a resource-typed slot) do not, so a single cause
+    /// produces a single code. Until Alpha 0.2.2 such a load verified and
+    /// was refused only at run time (`X0004`) or natively (`A0017`).
+    pub const SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0113";
+    /// An `alloc` result is used somewhere a value is required (Alpha
+    /// 0.2.3). A slot names storage, not a value: it may only be the
+    /// operand of a `load`, the slot of a `store`, or a slot an `invoke`
+    /// writes -- never an arithmetic operand, a call argument, a stored
+    /// value, a returned value or the root of a place. Mirrors the native
+    /// backend's `A0018`, which now only guards against a verifier defect.
+    pub const SLOT_USED_AS_VALUE: &str = "V0114";
+    /// A `load` of an affine slot is used after the slot it was loaded
+    /// from changed (Alpha 0.2.3) -- something was stored into it, moved,
+    /// transferred or dropped out of it, reinitialized in it or decomposed,
+    /// through this load or any other. A load is a snapshot of the slot at
+    /// the moment it runs; for an affine value the snapshot names
+    /// ownership the slot may since have given away. A field change only
+    /// stales snapshots of an ordinary record or variant, whose fields are
+    /// copied inline; a declared `resource` is a handle that sees it. A
+    /// copy of a non-affine value stays valid.
+    pub const STALE_LOAD_USE: &str = "V0115";
+    /// A type this module uses cannot be classified as owning a resource
+    /// or not (`types::affinity`, Alpha 0.2.3): it nests records and
+    /// variants past the affinity depth budget, or contains itself.
+    /// Every check that depends on the answer treats it as affine, so
+    /// nothing is waived; this is the reason those checks had no real
+    /// answer. Type checking refuses the same types in source (`T0075`,
+    /// `T0020`), so this is reached only by hand-built NIR.
+    pub const AFFINITY_UNDECIDABLE: &str = "V0116";
     // `V0094` is deliberately not assigned. It claimed a structural
     // ownership state invariant -- "a control-flow edge named a block
     // this function does not declare" -- that no `.npt` source and no
@@ -701,6 +734,67 @@ struct AggregateContext<'a> {
     /// Read by `check_evidence` to resolve an `Evidence::Extension`
     /// against its own declared extend.
     extends: HashMap<ItemId, &'a ExtendLayout>,
+    /// Completed affinity classifications (`types::affinity`), shared by
+    /// every check in this module -- see [`is_affine_in`].
+    affinity_cache: std::cell::RefCell<crate::types::affinity::AffinityCache>,
+    /// Every type a check asked about that has no classification, with
+    /// why, in the order they were first met -- reported once each as
+    /// `AFFINITY_UNDECIDABLE` when verification ends.
+    affinity_failures: std::cell::RefCell<Vec<(Ty, crate::types::affinity::AffinityError)>>,
+}
+
+impl super::LayoutLookup for AggregateContext<'_> {
+    fn record_layout(&self, item: ItemId) -> Option<&RecordLayout> {
+        self.records.get(&item).copied()
+    }
+
+    fn variant_layout(&self, item: ItemId) -> Option<&VariantLayout> {
+        self.variants.get(&item).copied()
+    }
+}
+
+/// One `AFFINITY_UNDECIDABLE` per distinct type `agg` could not classify,
+/// in a canonical order -- by the rendered type, then the cause -- so
+/// which function or block asked first cannot reorder them.
+fn affinity_diagnostics(
+    agg: &AggregateContext,
+    source: SourceId,
+    interner: &Interner,
+) -> Vec<Diagnostic> {
+    let mut failures: Vec<(String, String)> = agg
+        .affinity_failures
+        .borrow()
+        .iter()
+        .map(|(ty, error)| {
+            let why = match error {
+                crate::types::affinity::AffinityError::DepthExceeded { limit } => {
+                    format!("it nests records and variants more than {limit} levels deep")
+                }
+                crate::types::affinity::AffinityError::CyclicLayout { item } => format!(
+                    "it contains itself (through item {}), so it has no finite layout",
+                    item.0
+                ),
+            };
+            (crate::types::display_ty(ty, interner), why)
+        })
+        .collect();
+    failures.sort();
+    failures.dedup();
+    failures
+        .into_iter()
+        .map(|(ty, why)| {
+            Diagnostic::error(
+                codes::AFFINITY_UNDECIDABLE,
+                source,
+                Span::dummy(),
+                format!("cannot decide whether `{ty}` owns a resource: {why}"),
+            )
+            .with_note(
+                "every check that needed the answer treated the type as owning one, so nothing \
+                 was waived; this module still cannot be verified",
+            )
+        })
+        .collect()
 }
 
 /// Verifies every function in `module`, collecting every diagnostic it
@@ -842,6 +936,8 @@ pub fn verify_module(
         variants: module.variants.iter().map(|(id, v)| (*id, v)).collect(),
         protocols: module.protocols.iter().map(|(id, p)| (*id, p)).collect(),
         extends: module.extends.iter().map(|(id, e)| (*id, e)).collect(),
+        affinity_cache: Default::default(),
+        affinity_failures: Default::default(),
     };
 
     // Every record field's and every variant case payload's own
@@ -1178,7 +1274,13 @@ pub fn verify_module(
         }
     }
 
-    for function in &module.functions {
+    // In `ItemId` order, not storage order: which order a module happens
+    // to store its functions in is not something its diagnostics may
+    // depend on (Alpha 0.2.3). Ties -- a duplicate id, already reported
+    // above -- keep their storage order.
+    let mut ordered: Vec<&Function> = module.functions.iter().collect();
+    ordered.sort_by_key(|function| function.id);
+    for function in ordered {
         verify_function(
             function,
             &known_functions,
@@ -1190,6 +1292,7 @@ pub fn verify_module(
         );
     }
 
+    diagnostics.extend(affinity_diagnostics(&agg, source, interner));
     diagnostics
 }
 
@@ -2180,7 +2283,9 @@ fn verify_function(
     }
 
     verify_payload_refinement(function, agg, source, &name, diagnostics);
-    verify_invoke_slot_initialization(function, source, &name, diagnostics);
+    verify_slot_operands(function, source, &name, diagnostics);
+    verify_slot_initialization(function, agg, source, &name, diagnostics);
+    verify_stale_loads(function, agg, known_functions, source, &name, diagnostics);
     verify_drop_state(function, source, &name, diagnostics);
     verify_resource_ownership(
         function,
@@ -4215,97 +4320,34 @@ impl PlaceError {
     }
 }
 
-/// `true` iff `ty` is transitively affine (`rfcs/0012`) -- independently
-/// recomputed from `agg`'s own declared record/variant layouts,
-/// mirroring `resourceck`'s/`nir::lower`'s identical query, never
-/// trusted from either. Guarded against a genuinely cyclic declaration
-/// the same way every other stage's identical query is: a cycle
-/// back-edge contributes `false` to that one occurrence alone, never
-/// cached (this file's own resource checks are not called densely
-/// enough per module to need memoizing).
+/// `true` iff `ty` is transitively affine (`rfcs/0012`), answered by the
+/// one classification every stage shares (`types::affinity`) over
+/// `agg`'s own declared record and variant layouts -- recomputed here,
+/// never trusted from lowering, but by the same rule. The copy this
+/// replaced stopped at `MAX_GENERIC_DEPTH` answering "not affine" and
+/// walked shared substructure once per path.
+///
+/// A type the classification cannot answer for is treated as affine, so
+/// no ownership check is waived, and is recorded in
+/// `agg.affinity_failures`: verification then refuses the module with
+/// `AFFINITY_UNDECIDABLE` naming it, so no module is sealed on the
+/// strength of a check that had no real answer.
 fn is_affine_in(ty: &Ty, agg: &AggregateContext) -> bool {
-    is_affine_in_visiting(ty, agg, &mut HashSet::new(), 0)
-}
-
-fn is_affine_in_visiting(
-    ty: &Ty,
-    agg: &AggregateContext,
-    visiting: &mut HashSet<ItemId>,
-    depth: usize,
-) -> bool {
-    // Bounds a genuinely cyclic declaration, which `typeck::cycles`
-    // independently rejects as an infinite layout long before anything
-    // reaches NIR -- and, for a `Ty::Applied`, is the *only* guard, see
-    // below.
-    if depth >= MAX_GENERIC_DEPTH {
-        return false;
-    }
-    // A generic instantiation's own affinity is decided by what it was
-    // instantiated *with* (`rfcs/0008`, `rfcs/0012`): `Box[File]` is
-    // affine, `Box[i64]` is not, and the same declaration answers both
-    // -- so its own arguments are substituted into the declaration's
-    // field types before recursing. Answering `false` for every
-    // `Ty::Applied` (as this once did) is what let a `Box[File]` reach
-    // `Drop`/`PlaceRead` looking like an ordinary, freely-copyable
-    // value.
-    let (item, args): (&ItemId, &[Ty]) = match ty {
-        Ty::Named(item, _) => (item, &[]),
-        Ty::Applied(item, args) => (item, args.as_slice()),
-        _ => return false,
-    };
-    if agg.records.get(item).is_some_and(|r| r.affine) {
-        return true;
-    }
-    // `visiting` guards a *non-generic* cycle only. It is keyed by bare
-    // `ItemId`, so it cannot tell a genuine cycle apart from a
-    // legitimately nested instantiation of the same declaration --
-    // `Box[Box[Box[File]]]` reaches `Box` three times with different
-    // arguments and must answer from the innermost one. For an
-    // instantiation, `depth` above is the termination guard, matching
-    // `typeck::Checker::is_affine`.
-    let generic = matches!(ty, Ty::Applied(..));
-    if !generic && !visiting.insert(*item) {
-        return false;
-    }
-    let subst = match item_substitution(*item, args, agg) {
-        Ok(subst) => subst,
-        // A malformed arity is reported as its own structured
-        // diagnostic wherever a *place* projects through it
-        // (`PLACE_GENERIC_ARITY_MISMATCH`). This pure query has no
-        // diagnostic channel of its own, so it fails *closed*, to
-        // affine -- matching every other stage. Answering `false` from
-        // a substitution nobody could build is the one direction that
-        // silently drops an ownership obligation.
-        Err(()) => {
-            if !generic {
-                visiting.remove(item);
+    let outcome = crate::types::affinity::classify(
+        ty,
+        &super::LayoutShapes(agg),
+        &mut agg.affinity_cache.borrow_mut(),
+    );
+    match outcome {
+        Ok(affinity) => affinity.is_affine(),
+        Err(error) => {
+            let mut failures = agg.affinity_failures.borrow_mut();
+            if !failures.iter().any(|(seen, _)| seen == ty) {
+                failures.push((ty.clone(), error));
             }
-            return true;
+            true
         }
-    };
-    let field_types: Vec<Ty> = if let Some(record) = agg.records.get(item) {
-        record.fields.iter().map(|(_, t)| t.clone()).collect()
-    } else if let Some(variant) = agg.variants.get(item) {
-        variant
-            .cases
-            .iter()
-            .flat_map(|c| c.payload.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let result = field_types.iter().any(|fty| {
-        is_affine_in_visiting(
-            &crate::types::substitute(fty, &subst),
-            agg,
-            visiting,
-            depth + 1,
-        )
-    });
-    if !generic {
-        visiting.remove(item);
     }
-    result
 }
 
 /// `item`'s own declared type parameters paired with `args`
@@ -9767,28 +9809,414 @@ fn in_state_for_places(
     }
 }
 
-fn verify_invoke_slot_initialization(
+/// Refuses every use of a `load` of an affine slot after that slot has
+/// changed (`STALE_LOAD_USE`, Alpha 0.2.3).
+///
+/// A `load` is a snapshot: the interpreter copies the slot's value into
+/// the load's result at the moment the load runs, and every later place
+/// operation through that result is applied to the *slot*, not to the
+/// snapshot. So only a use of the load's *value* -- an operand, an
+/// argument, a stored, moved, dropped or returned value -- can see a
+/// stale snapshot; the load as the root of a place cannot, and is not
+/// a use here. For a non-affine value the snapshot is a copy and stays
+/// valid forever. For an affine one it names ownership, and once the
+/// slot changes -- something is stored into it, moved, transferred or
+/// dropped out of it, reinitialized in it, decomposed, or written by an
+/// `invoke`, through this load or any other -- the snapshot may name a
+/// resource something else now owns. Before Alpha 0.2.3 the ownership
+/// analysis resolved every load to the slot's *current* state and
+/// accepted, for instance, a `drop` of a load taken before the slot's
+/// field was moved out, reinitialized and moved out again; the
+/// interpreter then refused to destroy a resource already transferred
+/// elsewhere (`X0004`). Lowering loads a slot afresh for every use and
+/// never emits this.
+///
+/// What changes a slot is exactly what [`consumed_places`] already
+/// reports for every other ownership check, canonicalized through each
+/// load's origin, plus the `invoke` terminator's own transferring
+/// arguments and written slots -- and which snapshots a change makes
+/// stale follows the interpreter's representation exactly:
+///
+/// * a change to the slot's *whole* value (a store into it, a move, drop
+///   or transfer of it) makes every other load of it stale; the load
+///   that was consumed is the ownership analysis's to report if it is
+///   used again;
+/// * a change to one *field* makes every load of the slot stale --
+///   including the one it went through -- when the slot holds an
+///   ordinary record or variant, whose fields a snapshot copies inline;
+///   when the slot holds a declared `resource`, a snapshot is a handle
+///   to the same table record and sees the change, so none is stale.
+///   Lowering emits `move.place %4.f; drop %4` through one load of a
+///   resource slot, and that is correct.
+///
+/// A forward may-analysis: the facts are the affine loads that may be
+/// stale, joined by union over reachable predecessors, solved by a
+/// worklist from the empty set; sets only grow, over a finite domain, so
+/// it terminates. A load becomes fresh again when it is re-executed (a
+/// loop). Each stale load is reported once, at its first stale use in
+/// block-id order.
+fn verify_stale_loads(
+    function: &Function,
+    agg: &AggregateContext,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut value_types: HashMap<ValueId, Ty> = function
+        .params
+        .iter()
+        .map(|p| (p.value, p.ty.clone()))
+        .collect();
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for instruction in function.blocks.iter().flat_map(|b| b.instructions.iter()) {
+        if let Instruction::Value { result, ty, kind } = instruction {
+            value_types.insert(*result, ty.clone());
+            if let ValueKind::Load(slot) = kind {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let is_affine =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
+    // The loads this analysis tracks, grouped by the slot they read.
+    let mut by_slot: HashMap<ValueId, BTreeSet<ValueId>> = HashMap::new();
+    for (load, slot) in &load_origin {
+        if is_affine(*load) {
+            by_slot.entry(*slot).or_default().insert(*load);
+        }
+    }
+    if by_slot.is_empty() {
+        return;
+    }
+    let origin = |v: ValueId| load_origin.get(&v).copied().unwrap_or(v);
+    let canonical = |place: &Place<ValueId>| Place {
+        root: origin(place.root),
+        projections: place.projections.clone(),
+    };
+    let invalidate = |slot: ValueId, stale: &mut BTreeSet<ValueId>| {
+        if let Some(loads) = by_slot.get(&slot) {
+            stale.extend(loads.iter().copied());
+        }
+    };
+    let is_declared_resource_slot = |slot: ValueId| -> bool {
+        matches!(
+            value_types.get(&slot),
+            Some(Ty::Named(item, _)) if agg.records.get(item).is_some_and(|r| r.affine)
+        )
+    };
+
+    // One block, from `stale` on entry; every stale use found, in order.
+    let transfer = |block: &BasicBlock, mut stale: BTreeSet<ValueId>| {
+        let mut uses: Vec<ValueId> = Vec::new();
+        for instruction in &block.instructions {
+            // Only a use of the load's own *value* can see a stale
+            // snapshot. As the root of a place the load is just a name
+            // for its slot -- every place operation is applied to the
+            // slot's current contents -- so `move.place %8.f` followed
+            // by `store.place %8.f, ..` through the same load (what
+            // lowering emits for `x.f = x.f`) reads nothing stale.
+            let reads = match instruction {
+                Instruction::Value {
+                    kind:
+                        ValueKind::Load(_)
+                        | ValueKind::PlaceRead { .. }
+                        | ValueKind::ObservePlace { .. },
+                    ..
+                } => Vec::new(),
+                Instruction::StorePlace { value, .. } => vec![*value],
+                other => instruction_operands(other),
+            };
+            uses.extend(reads.into_iter().filter(|v| stale.contains(v)));
+            let operands_here = instruction_operands(instruction);
+            for (place, _, _) in consumed_places(
+                instruction,
+                known_functions,
+                &is_affine,
+                &origin,
+                &canonical,
+            ) {
+                if place.projections.is_empty() {
+                    // The slot's whole value is replaced, moved, dropped
+                    // or transferred: every *other* snapshot of it is
+                    // stale. The consumed load itself is not -- using it
+                    // again is a use after a move or a drop, which the
+                    // ownership analysis already reports.
+                    let before = stale.clone();
+                    invalidate(place.root, &mut stale);
+                    for operand in &operands_here {
+                        if origin(*operand) == place.root
+                            && *operand != place.root
+                            && !before.contains(operand)
+                        {
+                            stale.remove(operand);
+                        }
+                    }
+                } else if !is_declared_resource_slot(place.root) {
+                    // One field changed. A declared `resource` is a handle
+                    // into the interpreter's resource table, so every
+                    // snapshot of it sees the change and none is stale.
+                    // Any other aggregate holds its fields inline, so
+                    // every snapshot of it -- including the load the
+                    // change went through -- is now out of date.
+                    invalidate(place.root, &mut stale);
+                }
+            }
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(_),
+                ..
+            } = instruction
+            {
+                stale.remove(result);
+            }
+        }
+        uses.extend(
+            terminator_operands(&block.terminator)
+                .into_iter()
+                .filter(|v| stale.contains(v)),
+        );
+        if let Terminator::Invoke {
+            callee,
+            args,
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            let take = known_functions.get(callee).map(|f| f.take.as_slice());
+            for (index, arg) in args.iter().enumerate() {
+                if is_affine(*arg) && argument_transfers(take, args.len(), index) {
+                    invalidate(origin(*arg), &mut stale);
+                }
+            }
+            invalidate(*ok_slot, &mut stale);
+            for target in err_targets {
+                invalidate(target.slot, &mut stale);
+            }
+        }
+        (stale, uses)
+    };
+
+    let entry = BlockId(0);
+    let blocks: BTreeMap<BlockId, &BasicBlock> =
+        function.blocks.iter().map(|b| (b.id, b)).collect();
+    if !blocks.contains_key(&entry) {
+        return;
+    }
+    let mut reachable: BTreeSet<BlockId> = BTreeSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for succ in terminator_targets(&blocks[&id].terminator) {
+            if blocks.contains_key(&succ) && reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+    let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    for id in &reachable {
+        for succ in terminator_targets(&blocks[id].terminator) {
+            if reachable.contains(&succ) {
+                predecessors.entry(succ).or_default().insert(*id);
+            }
+        }
+    }
+    let in_facts = |id: BlockId, out: &BTreeMap<BlockId, BTreeSet<ValueId>>| {
+        let mut facts = BTreeSet::new();
+        for pred in predecessors.get(&id).into_iter().flatten() {
+            if let Some(stale) = out.get(pred) {
+                facts.extend(stale.iter().copied());
+            }
+        }
+        facts
+    };
+
+    let mut out: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    let mut worklist: VecDeque<BlockId> = reachable.iter().copied().collect();
+    let mut queued: BTreeSet<BlockId> = reachable.clone();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let facts = if id == entry {
+            BTreeSet::new()
+        } else {
+            in_facts(id, &out)
+        };
+        let (stale, _) = transfer(blocks[&id], facts);
+        if out.get(&id) != Some(&stale) {
+            out.insert(id, stale);
+            for succ in terminator_targets(&blocks[&id].terminator) {
+                if reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    let mut reported: BTreeSet<ValueId> = BTreeSet::new();
+    for (id, block) in &blocks {
+        let facts = if *id == entry || !reachable.contains(id) {
+            BTreeSet::new()
+        } else {
+            in_facts(*id, &out)
+        };
+        let (_, uses) = transfer(block, facts);
+        for load in uses {
+            if !reported.insert(load) {
+                continue;
+            }
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::STALE_LOAD_USE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` uses %{} in bb{} after the slot %{} it was loaded from changed",
+                        load.0,
+                        id.0,
+                        origin(load).0
+                    ),
+                )
+                .with_note(
+                    "a `load` of an affine slot is a snapshot; once something is stored into the \
+                     slot, or moved, dropped or reinitialized out of it, load it again",
+                ),
+            );
+        }
+    }
+}
+
+/// Refuses every use of an `alloc` slot where a value is required
+/// (`SLOT_USED_AS_VALUE`, Alpha 0.2.3).
+///
+/// A slot is storage. The only operands that name one are a `load`'s
+/// operand, a `store`'s slot and the slots an `invoke` writes -- none of
+/// which [`instruction_operands`]/[`terminator_operands`] report as a
+/// value read, except the `load` operand, which is skipped here. Every
+/// other position wants a value: an arithmetic or comparison operand, a
+/// call or constructor argument, a stored value, a dropped or moved
+/// value, a place root, a returned or raised value, a branch condition.
+/// Before Alpha 0.2.3 a slot in one of those positions verified -- the
+/// slot's declared type matched -- and the interpreter then read the
+/// slot's storage cell as if it were the value, while the native backend
+/// refused it (`A0018`).
+///
+/// Visited in block-id order, so block storage order cannot reorder the
+/// diagnostics.
+fn verify_slot_operands(
     function: &Function,
     source: SourceId,
     function_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Every `ValueId` some `Terminator::Invoke` in this function writes
-    // conditionally on one of its own edges -- an ordinary mutable
-    // binding (always written unconditionally immediately after its own
-    // `alloc`, `rfcs/0002`) never needs this analysis at all, and
-    // restricting the fact domain to exactly this finite set is what
-    // keeps the fixpoint below guaranteed to terminate.
+    let slots: HashSet<ValueId> = function
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|instruction| match instruction {
+            Instruction::Value {
+                result,
+                kind: ValueKind::Alloc,
+                ..
+            } => Some(*result),
+            _ => None,
+        })
+        .collect();
+    if slots.is_empty() {
+        return;
+    }
+    let mut ordered: Vec<&BasicBlock> = function.blocks.iter().collect();
+    ordered.sort_by_key(|block| block.id);
+    for block in ordered {
+        let mut misused: Vec<ValueId> = Vec::new();
+        for instruction in &block.instructions {
+            if matches!(
+                instruction,
+                Instruction::Value {
+                    kind: ValueKind::Load(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            misused.extend(
+                instruction_operands(instruction)
+                    .into_iter()
+                    .filter(|v| slots.contains(v)),
+            );
+        }
+        misused.extend(
+            terminator_operands(&block.terminator)
+                .into_iter()
+                .filter(|v| slots.contains(v)),
+        );
+        for slot in misused {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::SLOT_USED_AS_VALUE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` uses the slot %{} as a value in bb{}",
+                        slot.0, block.id.0
+                    ),
+                )
+                .with_note(
+                    "a slot is only ever loaded from, stored into, or written by an `invoke`; \
+                     `load` it to get its value",
+                ),
+            );
+        }
+    }
+}
+
+fn verify_slot_initialization(
+    function: &Function,
+    agg: &AggregateContext,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // The fact domain: every slot this function allocates, plus every
+    // slot a `Terminator::Invoke` writes on one of its own edges. Until
+    // Alpha 0.2.3 only the second set was analysed here (an ordinary
+    // mutable binding is always written right after its own `alloc` when
+    // lowering builds it), so hand-built NIR that loaded any other
+    // never-written slot verified and was refused only at run time. The
+    // domain is finite and fixed before the fixpoint starts, which is
+    // what keeps the fixpoint below guaranteed to terminate.
+    let mut invoke_slots: HashSet<ValueId> = HashSet::new();
+    let mut resource_slots: HashSet<ValueId> = HashSet::new();
     let mut guarded_slots: HashSet<ValueId> = HashSet::new();
     for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                ty,
+                kind: ValueKind::Alloc,
+            } = instruction
+            {
+                guarded_slots.insert(*result);
+                // A slot of a declared `resource` type is the ownership
+                // analysis's to report when read uninitialized
+                // (`RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`); it
+                // stays in the domain so its facts are tracked, but is
+                // not reported twice for one cause.
+                if matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine))
+                {
+                    resource_slots.insert(*result);
+                }
+            }
+        }
         if let Terminator::Invoke {
             ok_slot,
             err_targets,
             ..
         } = &block.terminator
         {
+            invoke_slots.insert(*ok_slot);
             guarded_slots.insert(*ok_slot);
             for target in err_targets {
+                invoke_slots.insert(target.slot);
                 guarded_slots.insert(target.slot);
             }
         }
@@ -9973,8 +10401,12 @@ fn verify_invoke_slot_initialization(
     // A reachable block (entry included) reads its IN from the
     // fixpoint's own `out` map; an unreachable block is always checked
     // independently, from an empty IN, ignoring any (dead) incoming
-    // edge `incoming_edges` recorded for it.
-    for block in &function.blocks {
+    // edge `incoming_edges` recorded for it. Blocks are visited in id
+    // order, so how a function stores its blocks cannot reorder these
+    // diagnostics.
+    let mut ordered: Vec<&BasicBlock> = function.blocks.iter().collect();
+    ordered.sort_by_key(|block| block.id);
+    for block in ordered {
         let in_facts = if reachable.contains(&block.id) {
             invoke_slot_in_facts(block.id, entry, &incoming_edges, &reachable, &out)
         } else {
@@ -9982,15 +10414,34 @@ fn verify_invoke_slot_initialization(
         };
         let (_, violations) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
         for slot in violations {
-            diagnostics.push(Diagnostic::error(
-                codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
-                source,
-                Span::dummy(),
-                format!(
-                    "function `{function_name}` loads %{} in bb{}, which is not definitely initialized on every path reaching it",
-                    slot.0, block.id.0
-                ),
-            ));
+            let diagnostic = if invoke_slots.contains(&slot) {
+                Diagnostic::error(
+                    codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` loads %{} in bb{}, which is not definitely initialized on every path reaching it",
+                        slot.0, block.id.0
+                    ),
+                )
+            } else if resource_slots.contains(&slot) {
+                continue;
+            } else {
+                Diagnostic::error(
+                    codes::SLOT_NOT_DEFINITELY_INITIALIZED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` loads the slot %{} in bb{}, which is not written on every path from the entry block to it",
+                        slot.0, block.id.0
+                    ),
+                )
+                .with_note(
+                    "an `alloc` reserves a slot without giving it a value; a `store` must reach \
+                     every `load` of it, on every path",
+                )
+            };
+            diagnostics.push(diagnostic);
         }
     }
 }
@@ -13397,6 +13848,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let evidence = Evidence::Extension {
             extend: extend_id,
@@ -13429,6 +13882,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends: HashMap::new(),
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let caller_requirements = vec![CapabilityRequirement::new(
             protocol_id,
@@ -13779,6 +14234,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         let mut evidence = Evidence::Extension {
             extend: extend_id,
@@ -13837,6 +14294,8 @@ mod tests {
             variants: HashMap::new(),
             protocols: HashMap::new(),
             extends,
+            affinity_cache: Default::default(),
+            affinity_failures: Default::default(),
         };
         // Shallow (well within the depth limit) but wide enough at every
         // level to blow well past a small work budget: `WIDTH^levels`
@@ -28256,5 +28715,947 @@ mod numeric_ir {
         for _ in 0..8 {
             assert_eq!(rendered(several_defects()), first);
         }
+    }
+}
+
+/// The verifier's affinity answers come from the shared classification
+/// (`types::affinity`, Alpha 0.2.3): a type it cannot classify refuses the
+/// module with `AFFINITY_UNDECIDABLE` instead of being silently treated
+/// as owning nothing, and function storage order does not reorder
+/// diagnostics.
+#[cfg(test)]
+mod affinity_classification {
+    use super::*;
+    use crate::nir::Param;
+    use crate::source::SourceMap;
+
+    const FILE: u32 = 1;
+    const MAIN: u32 = 2;
+    const FIRST_RECORD: u32 = 100;
+
+    /// `resource File { descriptor: i64 }` plus `depth` records, each
+    /// wrapping the next, the innermost wrapping `File`; and
+    /// `func main(take x: R0) -> i64 { drop x; return 1 }`.
+    fn chain_module(depth: u32, interner: &mut Interner) -> Module {
+        let file = interner.intern("File");
+        let field = interner.intern("inner");
+        let mut records = vec![(
+            ItemId(FILE),
+            RecordLayout {
+                name: file,
+                type_params: Vec::new(),
+                fields: vec![(interner.intern("descriptor"), Ty::I64)],
+                affine: true,
+            },
+        )];
+        let mut inner = Ty::Named(ItemId(FILE), file);
+        for k in (0..depth).rev() {
+            let name = interner.intern(&format!("R{k}"));
+            records.push((
+                ItemId(FIRST_RECORD + k),
+                RecordLayout {
+                    name,
+                    type_params: Vec::new(),
+                    fields: vec![(field, inner)],
+                    affine: false,
+                },
+            ));
+            inner = Ty::Named(ItemId(FIRST_RECORD + k), name);
+        }
+        Module {
+            functions: vec![drop_and_return(
+                ItemId(MAIN),
+                interner.intern("main"),
+                inner,
+            )],
+            records,
+            ..Module::default()
+        }
+    }
+
+    fn drop_and_return(id: ItemId, name: Symbol, ty: Ty) -> Function {
+        Function {
+            id,
+            name,
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: vec![Param {
+                value: ValueId(0),
+                ty,
+                take: true,
+            }],
+            return_type: Ty::I64,
+            raises: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::Drop { value: ValueId(0) },
+                    Instruction::Value {
+                        result: ValueId(1),
+                        ty: Ty::I64,
+                        kind: ValueKind::Const(Const::Int(1)),
+                    },
+                ],
+                terminator: Terminator::Return(Some(ValueId(1))),
+            }],
+        }
+    }
+
+    fn verified(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+    }
+
+    #[test]
+    fn a_resource_inside_the_budget_is_dropped_cleanly() {
+        let mut interner = Interner::new();
+        let module = chain_module(63, &mut interner);
+        assert_eq!(verified(&module, &interner), Vec::new());
+    }
+
+    /// Before Alpha 0.2.3 the walk stopped at the budget and answered
+    /// "not affine", so this `drop` was refused as a drop of a
+    /// non-resource (`V0074`) -- or, without the `drop`, verified with
+    /// the resource unaccounted for.
+    #[test]
+    fn a_resource_past_the_budget_refuses_the_module_with_its_own_code() {
+        let mut interner = Interner::new();
+        let module = chain_module(64, &mut interner);
+        let diagnostics = verified(&module, &interner);
+        let codes: Vec<&str> = diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![codes::AFFINITY_UNDECIDABLE], "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("`R0`"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("64 levels"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_that_contains_itself_refuses_the_module() {
+        let mut interner = Interner::new();
+        let node = interner.intern("Node");
+        let ty = Ty::Named(ItemId(FIRST_RECORD), node);
+        let module = Module {
+            functions: vec![drop_and_return(
+                ItemId(MAIN),
+                interner.intern("main"),
+                ty.clone(),
+            )],
+            records: vec![(
+                ItemId(FIRST_RECORD),
+                RecordLayout {
+                    name: node,
+                    type_params: Vec::new(),
+                    fields: vec![(interner.intern("next"), ty)],
+                    affine: false,
+                },
+            )],
+            ..Module::default()
+        };
+        let codes: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(codes.contains(&codes::AFFINITY_UNDECIDABLE), "{codes:?}");
+    }
+
+    /// Each refused type is reported once, however many checks asked.
+    #[test]
+    fn one_undecidable_type_is_reported_once() {
+        let mut interner = Interner::new();
+        let mut module = chain_module(64, &mut interner);
+        let ty = module.functions[0].params[0].ty.clone();
+        module.functions.push(drop_and_return(
+            ItemId(MAIN + 1),
+            interner.intern("again"),
+            ty,
+        ));
+        let codes: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert_eq!(codes, vec![codes::AFFINITY_UNDECIDABLE]);
+    }
+
+    /// Two functions, each with its own defect: the diagnostics come out
+    /// in the same order whichever order the functions are stored in.
+    #[test]
+    fn function_storage_order_does_not_reorder_diagnostics() {
+        let mut interner = Interner::new();
+        let broken = |id: u32, name: &str, interner: &mut Interner| Function {
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(ValueId(7))),
+            }],
+            params: Vec::new(),
+            ..drop_and_return(ItemId(id), interner.intern(name), Ty::I64)
+        };
+        let forward = Module {
+            functions: vec![
+                broken(MAIN, "first", &mut interner),
+                broken(MAIN + 1, "second", &mut interner),
+            ],
+            ..Module::default()
+        };
+        let mut backward = forward.clone();
+        backward.functions.reverse();
+        let render = |module: &Module| -> Vec<String> {
+            verified(module, &interner)
+                .iter()
+                .map(|d| format!("{} {}", d.code, d.message))
+                .collect()
+        };
+        let forward_text = render(&forward);
+        assert_eq!(forward_text.len(), 2, "{forward_text:?}");
+        assert_eq!(forward_text, render(&backward));
+    }
+}
+
+/// Every `alloc` slot must be written on every reachable path to each
+/// `load` of it (`SLOT_NOT_DEFINITELY_INITIALIZED`, Alpha 0.2.3) -- the
+/// same forward must-analysis `invoke` slots already had, over every
+/// slot. Each test is built so the valid counterpart differs by one
+/// store.
+#[cfg(test)]
+mod slot_initialization {
+    use super::*;
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const SLOT: ValueId = ValueId(0);
+    const UNINIT: &str = codes::SLOT_NOT_DEFINITELY_INITIALIZED;
+
+    fn alloc(slot: ValueId, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: slot,
+            ty,
+            kind: ValueKind::Alloc,
+        }
+    }
+
+    fn int(result: u32, literal: i128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(literal)),
+        }
+    }
+
+    fn truth(result: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        }
+    }
+
+    fn store(slot: ValueId, value: u32) -> Instruction {
+        Instruction::Store {
+            slot,
+            value: ValueId(value),
+            mode: OwnershipMode::Observe,
+        }
+    }
+
+    fn load(result: u32, slot: ValueId, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::Load(slot),
+        }
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn branch(condition: u32, then_block: u32, else_block: u32) -> Terminator {
+        Terminator::CondBranch {
+            condition: ValueId(condition),
+            then_block: BlockId(then_block),
+            else_block: BlockId(else_block),
+        }
+    }
+
+    fn function(return_type: Ty, blocks: Vec<BasicBlock>, interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(1),
+            name: interner.intern("main"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn verified(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+    }
+
+    fn rendered(blocks: Vec<BasicBlock>) -> Vec<String> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![function(Ty::I64, blocks, &mut interner)],
+            ..Module::default()
+        };
+        verified(&module, &interner)
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect()
+    }
+
+    fn codes(blocks: Vec<BasicBlock>) -> Vec<&'static str> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![function(Ty::I64, blocks, &mut interner)],
+            ..Module::default()
+        };
+        verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn a_load_before_the_first_store_is_refused_and_after_it_is_not() {
+        let before = vec![block(
+            0,
+            vec![
+                alloc(SLOT, Ty::I64),
+                load(1, SLOT, Ty::I64),
+                int(2, 5),
+                store(SLOT, 2),
+            ],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        let after = vec![block(
+            0,
+            vec![
+                alloc(SLOT, Ty::I64),
+                int(2, 5),
+                store(SLOT, 2),
+                load(1, SLOT, Ty::I64),
+            ],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        assert_eq!(codes(before), vec![UNINIT]);
+        assert_eq!(codes(after), Vec::<&str>::new());
+    }
+
+    /// `bb0 -> bb1 | bb2 -> bb3`; `bb3` loads. Stored in both arms: fine.
+    /// Stored in one: the other path reaches the load without a store.
+    fn diamond(store_then: bool, store_else: bool) -> Vec<BasicBlock> {
+        let arm = |id: u32, stores: bool, value: u32| {
+            let mut instructions = vec![int(value, value as i128)];
+            if stores {
+                instructions.push(store(SLOT, value));
+            }
+            block(id, instructions, Terminator::Branch(BlockId(3)))
+        };
+        vec![
+            block(0, vec![alloc(SLOT, Ty::I64), truth(1)], branch(1, 1, 2)),
+            arm(1, store_then, 2),
+            arm(2, store_else, 3),
+            block(
+                3,
+                vec![load(4, SLOT, Ty::I64)],
+                Terminator::Return(Some(ValueId(4))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_join_needs_the_store_on_every_incoming_path() {
+        assert_eq!(codes(diamond(true, true)), Vec::<&str>::new());
+        assert_eq!(codes(diamond(true, false)), vec![UNINIT]);
+        assert_eq!(codes(diamond(false, true)), vec![UNINIT]);
+        assert_eq!(codes(diamond(false, false)), vec![UNINIT]);
+    }
+
+    #[test]
+    fn a_unit_slot_is_not_exempt() {
+        let mut interner = Interner::new();
+        let never_stored = vec![block(
+            0,
+            vec![alloc(SLOT, Ty::Unit), load(1, SLOT, Ty::Unit)],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        let module = Module {
+            functions: vec![function(Ty::Unit, never_stored, &mut interner)],
+            ..Module::default()
+        };
+        let found: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert_eq!(found, vec![UNINIT]);
+    }
+
+    /// `bb0 -> bb1 (header) -> bb2 (body) -> bb1 | bb3 (exit)`. A store
+    /// only in the body does not reach the exit -- the loop may run zero
+    /// times -- nor the header on its first entry.
+    fn looped(store_before: bool, load_in_header: bool) -> Vec<BasicBlock> {
+        let mut entry = vec![alloc(SLOT, Ty::I64)];
+        if store_before {
+            entry.extend([int(1, 0), store(SLOT, 1)]);
+        }
+        let mut header = vec![truth(2)];
+        if load_in_header {
+            header.push(load(3, SLOT, Ty::I64));
+        }
+        vec![
+            block(0, entry, Terminator::Branch(BlockId(1))),
+            block(1, header, branch(2, 2, 3)),
+            block(
+                2,
+                vec![int(4, 1), store(SLOT, 4)],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![load(5, SLOT, Ty::I64)],
+                Terminator::Return(Some(ValueId(5))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_store_only_inside_a_loop_reaches_neither_its_exit_nor_its_header() {
+        // The exit is reached when the body never ran.
+        assert_eq!(codes(looped(false, false)), vec![UNINIT]);
+        // The header is reached first from the entry, then along the
+        // backedge; only the second path has stored. Both loads refused.
+        assert_eq!(codes(looped(false, true)), vec![UNINIT, UNINIT]);
+        // A store before the loop covers both, across the backedge.
+        assert_eq!(codes(looped(true, true)), Vec::<&str>::new());
+        assert_eq!(codes(looped(true, false)), Vec::<&str>::new());
+    }
+
+    /// `bb3` joins a reachable path and a dead block that also branches
+    /// to it. The dead block contributes no facts, in either direction.
+    #[test]
+    fn an_unreachable_predecessor_neither_supplies_nor_removes_a_store() {
+        let join = |reachable_stores: bool, dead_stores: bool| {
+            let mut entry = vec![alloc(SLOT, Ty::I64), int(1, 1)];
+            if reachable_stores {
+                entry.push(store(SLOT, 1));
+            }
+            let mut dead = vec![int(2, 2)];
+            if dead_stores {
+                dead.push(store(SLOT, 2));
+            }
+            vec![
+                block(0, entry, Terminator::Branch(BlockId(3))),
+                // Nothing branches to bb7.
+                block(7, dead, Terminator::Branch(BlockId(3))),
+                block(
+                    3,
+                    vec![load(4, SLOT, Ty::I64)],
+                    Terminator::Return(Some(ValueId(4))),
+                ),
+            ]
+        };
+        // `bb7` uses the slot `bb0` allocates, which dominance already
+        // refuses in dead code; only the verdict at `bb3` is under test.
+        let at_join = |blocks: Vec<BasicBlock>| -> Vec<&'static str> {
+            codes(blocks).into_iter().filter(|c| *c == UNINIT).collect()
+        };
+        assert_eq!(at_join(join(true, false)), Vec::<&str>::new());
+        assert_eq!(at_join(join(false, true)), vec![UNINIT]);
+    }
+
+    /// Dead code is still checked, on its own terms: a cycle nothing
+    /// reaches that allocates and loads its own slot without a store is
+    /// refused, and with a store it is not.
+    #[test]
+    fn an_unreachable_cycle_is_checked_from_nothing() {
+        let dead_cycle = |stores: bool| {
+            let mut first = vec![alloc(ValueId(10), Ty::I64)];
+            if stores {
+                first.extend([int(11, 3), store(ValueId(10), 11)]);
+            }
+            first.push(load(12, ValueId(10), Ty::I64));
+            vec![
+                block(0, vec![int(1, 1)], Terminator::Return(Some(ValueId(1)))),
+                block(5, first, Terminator::Branch(BlockId(6))),
+                block(6, Vec::new(), Terminator::Branch(BlockId(5))),
+            ]
+        };
+        assert_eq!(codes(dead_cycle(false)), vec![UNINIT]);
+        assert_eq!(codes(dead_cycle(true)), Vec::<&str>::new());
+    }
+
+    /// Storage order is not semantics: the entry stored last, and every
+    /// rotation of a function's blocks, forward and reversed, give the
+    /// same diagnostics.
+    #[test]
+    fn block_storage_order_changes_nothing() {
+        for blocks in [
+            diamond(true, false),
+            looped(false, true),
+            diamond(true, true),
+        ] {
+            let expected = rendered(blocks.clone());
+            let n = blocks.len();
+            for start in 0..n {
+                for reverse in [false, true] {
+                    let mut order: Vec<BasicBlock> =
+                        (0..n).map(|i| blocks[(start + i) % n].clone()).collect();
+                    if reverse {
+                        order.reverse();
+                    }
+                    assert_eq!(rendered(order), expected);
+                }
+            }
+        }
+    }
+
+    /// A slot of a declared resource is the ownership analysis's to
+    /// report (`RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`); it is not
+    /// reported a second time. A record that only holds a resource is
+    /// not a declared resource, and is this analysis's.
+    #[test]
+    fn one_cause_produces_one_code() {
+        let mut interner = Interner::new();
+        let file = interner.intern("File");
+        let holder = interner.intern("Holder");
+        let field = interner.intern("f");
+        let file_ty = Ty::Named(ItemId(10), file);
+        let holder_ty = Ty::Named(ItemId(11), holder);
+        let records = vec![
+            (
+                ItemId(10),
+                RecordLayout {
+                    name: file,
+                    type_params: Vec::new(),
+                    fields: vec![(field, Ty::I64)],
+                    affine: true,
+                },
+            ),
+            (
+                ItemId(11),
+                RecordLayout {
+                    name: holder,
+                    type_params: Vec::new(),
+                    fields: vec![(field, file_ty.clone())],
+                    affine: false,
+                },
+            ),
+        ];
+        let reads = |ty: Ty, interner: &mut Interner| Module {
+            functions: vec![function(
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![alloc(SLOT, ty.clone()), load(1, SLOT, ty), int(2, 0)],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+                interner,
+            )],
+            records: records.clone(),
+            ..Module::default()
+        };
+        let resource = reads(file_ty, &mut interner);
+        let found: Vec<&str> = verified(&resource, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(
+            found.contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "{found:?}"
+        );
+        assert!(!found.contains(&UNINIT), "{found:?}");
+
+        let held = reads(holder_ty, &mut interner);
+        let found: Vec<&str> = verified(&held, &interner).iter().map(|d| d.code).collect();
+        assert!(found.contains(&UNINIT), "{found:?}");
+    }
+}
+
+/// An `alloc` slot is storage, never a value (`SLOT_USED_AS_VALUE`,
+/// Alpha 0.2.3). The first test is the shape the 0.2.2 mutation campaign
+/// found sealing and then reaching `X0004`; each refused shape has a
+/// valid counterpart that loads the slot instead.
+#[cfg(test)]
+mod slot_operands {
+    use super::*;
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const SLOT: ValueId = ValueId(1);
+    const MISUSED: &str = codes::SLOT_USED_AS_VALUE;
+
+    fn alloc() -> Instruction {
+        Instruction::Value {
+            result: SLOT,
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, literal: i128) -> Instruction {
+        value(result, Ty::I64, ValueKind::Const(Const::Int(literal)))
+    }
+
+    fn store(slot: ValueId, stored: ValueId) -> Instruction {
+        Instruction::Store {
+            slot,
+            value: stored,
+            mode: OwnershipMode::Observe,
+        }
+    }
+
+    fn rendered(instructions: Vec<Instruction>, terminator: Terminator) -> Vec<String> {
+        rendered_blocks(vec![BasicBlock {
+            id: BlockId(0),
+            instructions,
+            terminator,
+        }])
+    }
+
+    fn rendered_blocks(blocks: Vec<BasicBlock>) -> Vec<String> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(1),
+                name: interner.intern("main"),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks,
+            }],
+            ..Module::default()
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(&module, source, &interner, &ItemRegistry::default())
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect()
+    }
+
+    fn codes(instructions: Vec<Instruction>, terminator: Terminator) -> Vec<String> {
+        rendered(instructions, terminator)
+            .into_iter()
+            .map(|line| line.split(' ').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// `store %1, %1; ret %1`: the slot stored into itself, then returned.
+    #[test]
+    fn the_campaign_shape_is_refused_at_both_misuses() {
+        assert_eq!(
+            codes(
+                vec![alloc(), store(SLOT, SLOT)],
+                Terminator::Return(Some(SLOT))
+            ),
+            vec![MISUSED, MISUSED]
+        );
+    }
+
+    #[test]
+    fn the_same_program_through_a_load_verifies() {
+        assert_eq!(
+            codes(
+                vec![
+                    alloc(),
+                    int(2, 7),
+                    store(SLOT, ValueId(2)),
+                    value(3, Ty::I64, ValueKind::Load(SLOT)),
+                ],
+                Terminator::Return(Some(ValueId(3)))
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_slot_is_refused_as_an_operand_a_condition_or_a_stored_value() {
+        let initialized = vec![alloc(), int(2, 1), store(SLOT, ValueId(2))];
+        let arithmetic = {
+            let mut i = initialized.clone();
+            i.push(value(3, Ty::I64, ValueKind::Add(SLOT, ValueId(2))));
+            codes(i, Terminator::Return(Some(ValueId(3))))
+        };
+        assert!(arithmetic.contains(&MISUSED.to_string()), "{arithmetic:?}");
+
+        let other = ValueId(4);
+        let stored_elsewhere = {
+            let mut i = initialized.clone();
+            i.push(Instruction::Value {
+                result: other,
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            });
+            i.push(store(other, SLOT));
+            codes(i, Terminator::Return(Some(ValueId(2))))
+        };
+        assert!(
+            stored_elsewhere.contains(&MISUSED.to_string()),
+            "{stored_elsewhere:?}"
+        );
+
+        let condition = codes(
+            initialized,
+            Terminator::CondBranch {
+                condition: SLOT,
+                then_block: BlockId(0),
+                else_block: BlockId(0),
+            },
+        );
+        assert!(condition.contains(&MISUSED.to_string()), "{condition:?}");
+    }
+
+    /// Block storage order does not reorder the diagnostics.
+    #[test]
+    fn block_order_does_not_change_the_refusal() {
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: vec![alloc(), store(SLOT, SLOT)],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(SLOT)),
+            },
+        ];
+        let forward = rendered_blocks(blocks.clone());
+        let mut backward = blocks;
+        backward.reverse();
+        assert_eq!(forward.len(), 2, "{forward:?}");
+        assert_eq!(forward, rendered_blocks(backward));
+    }
+}
+
+/// A `load` of an affine slot is a snapshot that goes stale once the
+/// slot changes (`STALE_LOAD_USE`, Alpha 0.2.3).
+#[cfg(test)]
+mod stale_loads {
+    use super::*;
+    use crate::driver::{self, IrOutput};
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const STALE: &str = codes::STALE_LOAD_USE;
+
+    /// `examples/resource_generic_aggregate.npt`, lowered: its `main`
+    /// loads the `refill` slot, moves the field out through that load,
+    /// reinitializes the field through a second load and moves it out
+    /// again through a third -- the module the 0.2.2 mutation campaign
+    /// started from.
+    fn lowered() -> (Module, Interner) {
+        let mut map = SourceMap::new();
+        let source = map.add_file(
+            "resource_generic_aggregate.npt",
+            include_str!("../../../examples/resource_generic_aggregate.npt"),
+        );
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, .. } = driver::ir(&map, source, &mut interner) else {
+            panic!("the example compiles");
+        };
+        (nir.module().clone(), interner)
+    }
+
+    fn main_index(module: &Module, interner: &Interner) -> usize {
+        module
+            .functions
+            .iter()
+            .position(|f| interner.resolve(f.name) == "main")
+            .expect("the example declares `main`")
+    }
+
+    fn found(module: &Module, interner: &Interner) -> Vec<&'static str> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// The first load whose result a field is moved out through, and the
+    /// slot it reads.
+    fn first_moved_through(function: &Function) -> (ValueId, ValueId) {
+        let instructions: Vec<&Instruction> = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .collect();
+        for instruction in &instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                let moved = instructions.iter().any(|i| {
+                    matches!(i, Instruction::Value {
+                        kind: ValueKind::PlaceRead { place, mode: OwnershipMode::Transfer },
+                        ..
+                    } if place.root == *result)
+                });
+                if moved {
+                    return (*result, *slot);
+                }
+            }
+        }
+        panic!("the example moves a field out through a load");
+    }
+
+    fn fresh_id(function: &Function) -> ValueId {
+        let highest = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                Instruction::Value { result, .. } => Some(result.0),
+                _ => None,
+            })
+            .chain(function.params.iter().map(|p| p.value.0))
+            .max()
+            .unwrap_or(0);
+        ValueId(highest + 1)
+    }
+
+    #[test]
+    fn the_unmodified_example_verifies() {
+        let (module, interner) = lowered();
+        assert_eq!(found(&module, &interner), Vec::<&str>::new());
+    }
+
+    /// The campaign shape: a `drop` of the first load, after the slot's
+    /// field was moved out, reinitialized and moved out again. It sealed
+    /// in 0.2.2 and the interpreter then refused to destroy a resource
+    /// already transferred elsewhere.
+    #[test]
+    fn a_drop_of_a_load_taken_before_the_slot_changed_is_refused() {
+        let (mut module, interner) = lowered();
+        let main = main_index(&module, &interner);
+        let (stale, _) = first_moved_through(&module.functions[main]);
+        module.functions[main].blocks[0]
+            .instructions
+            .push(Instruction::Drop { value: stale });
+        let codes = found(&module, &interner);
+        assert_eq!(codes, vec![STALE], "{codes:?}");
+    }
+
+    /// The same `drop` of a load taken now, after every change: the
+    /// snapshot is current, and the stale-load rule has nothing to say.
+    #[test]
+    fn the_same_drop_of_a_fresh_load_is_not_a_stale_use() {
+        let (mut module, interner) = lowered();
+        let main = main_index(&module, &interner);
+        let (old, slot) = first_moved_through(&module.functions[main]);
+        let fresh = fresh_id(&module.functions[main]);
+        let ty = module.functions[main]
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .find_map(|i| match i {
+                Instruction::Value { result, ty, .. } if *result == old => Some(ty.clone()),
+                _ => None,
+            })
+            .expect("the load has a type");
+        let block = &mut module.functions[main].blocks[0].instructions;
+        block.push(Instruction::Value {
+            result: fresh,
+            ty,
+            kind: ValueKind::Load(slot),
+        });
+        block.push(Instruction::Drop { value: fresh });
+        let codes = found(&module, &interner);
+        assert!(!codes.contains(&STALE), "{codes:?}");
+    }
+
+    /// `session.input = session.input` lowers to a move out of the field
+    /// and a reinitialization of it, both through the same load. As a
+    /// place root a load names its slot, not its snapshot, so neither is
+    /// a stale use -- the first draft of this rule refused it.
+    #[test]
+    fn a_load_used_only_as_a_place_root_after_a_change_is_not_stale() {
+        let mut map = SourceMap::new();
+        let source = map.add_file(
+            "resource_self_assignment.npt",
+            include_str!("../../../examples/resource_self_assignment.npt"),
+        );
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, .. } = driver::ir(&map, source, &mut interner) else {
+            panic!("the example compiles and verifies");
+        };
+        assert_eq!(found(nir.module(), &interner), Vec::<&str>::new());
+    }
+
+    /// A load of a non-affine slot is a copy, valid whatever happens to
+    /// the slot afterwards.
+    #[test]
+    fn a_copy_of_a_plain_value_never_goes_stale() {
+        let mut interner = Interner::new();
+        let slot = ValueId(0);
+        let int = |id: u32, n: i128| Instruction::Value {
+            result: ValueId(id),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(n)),
+        };
+        let store = |value: u32| Instruction::Store {
+            slot,
+            value: ValueId(value),
+            mode: OwnershipMode::Observe,
+        };
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(1),
+                name: interner.intern("main"),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: slot,
+                            ty: Ty::I64,
+                            kind: ValueKind::Alloc,
+                        },
+                        int(1, 1),
+                        store(1),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Load(slot),
+                        },
+                        int(3, 2),
+                        store(3),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            }],
+            ..Module::default()
+        };
+        assert_eq!(found(&module, &interner), Vec::<&str>::new());
     }
 }

@@ -169,3 +169,65 @@ pub struct Param {
     /// re-deriving it from HIR.
     pub take: bool,
 }
+
+/// Where a stage that holds NIR finds one declaration's layout. Lowering,
+/// the verifier and the interpreter each keep the same
+/// [`RecordLayout`]/[`VariantLayout`] values in a different container;
+/// this is the one question all three answer, so the shared affinity
+/// classification ([`crate::types::affinity`]) can read any of them
+/// through [`LayoutShapes`].
+pub(crate) trait LayoutLookup {
+    fn record_layout(&self, item: ItemId) -> Option<&RecordLayout>;
+    fn variant_layout(&self, item: ItemId) -> Option<&VariantLayout>;
+}
+
+impl LayoutLookup for Module {
+    fn record_layout(&self, item: ItemId) -> Option<&RecordLayout> {
+        self.records
+            .iter()
+            .find(|(id, _)| *id == item)
+            .map(|(_, layout)| layout)
+    }
+
+    fn variant_layout(&self, item: ItemId) -> Option<&VariantLayout> {
+        self.variants
+            .iter()
+            .find(|(id, _)| *id == item)
+            .map(|(_, layout)| layout)
+    }
+}
+
+/// NIR layouts, as the shared affinity classification reads them. A
+/// `resource` is a record layout marked `affine`; a variant's fields are
+/// every payload of every case.
+pub(crate) struct LayoutShapes<'a, L: ?Sized>(pub(crate) &'a L);
+
+impl<L: LayoutLookup + ?Sized> crate::types::affinity::AggregateShapes for LayoutShapes<'_, L> {
+    fn is_declared_resource(&self, item: ItemId) -> bool {
+        self.0.record_layout(item).is_some_and(|r| r.affine)
+    }
+
+    fn type_params(&self, item: ItemId) -> Option<Vec<TypeParamId>> {
+        if let Some(record) = self.0.record_layout(item) {
+            Some(record.type_params.iter().map(|(id, _)| *id).collect())
+        } else {
+            self.0
+                .variant_layout(item)
+                .map(|v| v.type_params.iter().map(|(id, _)| *id).collect())
+        }
+    }
+
+    fn field_types(&self, item: ItemId) -> Vec<Ty> {
+        if let Some(record) = self.0.record_layout(item) {
+            record.fields.iter().map(|(_, ty)| ty.clone()).collect()
+        } else if let Some(variant) = self.0.variant_layout(item) {
+            variant
+                .cases
+                .iter()
+                .flat_map(|c| c.payload.iter().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+}

@@ -1,5 +1,6 @@
 //! The Napitia type representation.
 
+pub mod affinity;
 pub mod generics;
 pub mod numeric;
 pub mod primitive;

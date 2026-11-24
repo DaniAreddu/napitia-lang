@@ -17,7 +17,7 @@
 //! never reference a function that lowering silently left out, because
 //! there is no way to leave one out and still get a `Module` back.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     BasicBlock, CaseLayout, Const, ExtendLayout, Function, InvokeErrTarget, Module, Param,
@@ -28,7 +28,7 @@ use crate::diagnostics::Diagnostic;
 use crate::hir::{
     ExprId, HirBlock, HirElse, HirExpr, HirFailurePattern, HirFieldInit, HirFunction, HirHandleArm,
     HirHandleArmKind, HirMatchArm, HirMatchArmBody, HirModule, HirPattern, HirStmt, ItemId,
-    LocalId, PatternId, TypeParamId,
+    LocalId, PatternId,
 };
 use crate::limits::MAX_PATTERN_DEPTH;
 use crate::place::{FieldId, Place, Projection};
@@ -406,6 +406,7 @@ fn lower_module_impl(
         module_path_mode,
         records: record_layouts,
         variants: variant_layouts,
+        affinity_cache: Default::default(),
         variant_source,
         function_sigs,
         function_requirements,
@@ -784,6 +785,9 @@ struct Lowering<'a> {
     module_path_mode: ModulePathMode<'a>,
     records: HashMap<ItemId, RecordLayout>,
     variants: HashMap<ItemId, VariantLayout>,
+    /// Completed affinity classifications (`types::affinity`) -- see
+    /// [`Self::is_affine`].
+    affinity_cache: std::cell::RefCell<crate::types::affinity::AffinityCache>,
     /// Every declared variant's own declaring `SourceId`, by `ItemId` --
     /// read back by `canonical_raises` (together with `module_path_mode`)
     /// to resolve each raised variant's own stable qualified identity.
@@ -1507,101 +1511,25 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `true` iff `ty` is transitively affine (`rfcs/0012`): a declared
-    /// `resource` itself, or a record/variant/resource reachably
-    /// containing one -- independently recomputed from this stage's own
-    /// `records`/`variants` layouts, mirroring `resourceck`'s identical
-    /// query (`resourceck::is_affine_item`/`is_affine_ty`) rather than
-    /// trusting its verdict passed through unchecked, exactly like every
-    /// other fact `nir::lower` re-derives from checked metadata instead
-    /// of assuming. Guarded against a genuinely cyclic declaration
-    /// (already independently rejected elsewhere as an infinite-size
-    /// layout) the same way both of those do: a cycle back-edge
-    /// contributes `false` to *that one* occurrence's own disjunction,
-    /// never cached (this stage does not memoize at all, unlike
-    /// `resourceck`'s own per-module query, since it is not called
-    /// densely enough per module to need to).
+    /// `true` iff `ty` is transitively affine (`rfcs/0012`), answered by
+    /// the one classification every stage shares (`types::affinity`)
+    /// over this stage's own `records`/`variants` layouts -- recomputed
+    /// here rather than trusting `resourceck`'s verdict passed through,
+    /// but by the same rule, so the two cannot disagree. The copy this
+    /// replaced stopped at `MAX_GENERIC_DEPTH` answering "not affine"
+    /// and walked shared substructure once per path: a 24-level chain of
+    /// records each holding the next twice did not finish lowering. A
+    /// type the classification cannot answer for is treated as affine,
+    /// so the ownership machinery still demands an owner; type checking
+    /// has already refused it (`T0075`, `T0020`).
     fn is_affine(&self, ty: &Ty) -> bool {
-        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
-    }
-
-    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>, depth: usize) -> bool {
-        // Bounds a genuinely cyclic generic, which `typeck::cycles`
-        // independently rejects as an infinite layout before anything
-        // reaches this stage (`rfcs/0008`).
-        if depth >= crate::limits::MAX_GENERIC_DEPTH {
-            return false;
-        }
-        let field_types = |item: &ItemId| -> Vec<Ty> {
-            if let Some(record) = self.records.get(item) {
-                record.fields.iter().map(|(_, t)| t.clone()).collect()
-            } else if let Some(variant) = self.variants.get(item) {
-                variant
-                    .cases
-                    .iter()
-                    .flat_map(|c| c.payload.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-        match ty {
-            Ty::Named(item, _) => {
-                if self.records.get(item).is_some_and(|r| r.affine) {
-                    return true;
-                }
-                if !visiting.insert(*item) {
-                    return false;
-                }
-                let result = field_types(item)
-                    .iter()
-                    .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
-                visiting.remove(item);
-                result
-            }
-            // Deliberately *not* guarded by `visiting`: that set is keyed
-            // by bare `ItemId`, so it cannot tell a genuine cycle apart
-            // from a legitimately nested instantiation of the same
-            // declaration -- `Box[Box[Box[File]]]` reaches `Box` three
-            // times with different arguments and must answer from the
-            // innermost one. `depth` is the correct termination guard
-            // here, and matches what `typeck::Checker::is_affine` does.
-            Ty::Applied(item, args) => {
-                if self.records.get(item).is_some_and(|r| r.affine) {
-                    return true;
-                }
-                let type_params: Option<Vec<TypeParamId>> = self
-                    .records
-                    .get(item)
-                    .map(|r| r.type_params.iter().map(|(id, _)| *id).collect())
-                    .or_else(|| {
-                        self.variants
-                            .get(item)
-                            .map(|v| v.type_params.iter().map(|(id, _)| *id).collect())
-                    });
-                // Missing or arity-disagreeing generic metadata is
-                // never an *empty* substitution: an unsubstituted
-                // `Ty::Param` answers `false` here, which would let a
-                // genuinely affine instantiation be lowered as a
-                // freely-copyable value. Fail closed instead -- treat
-                // it as affine, so the ownership machinery demands an
-                // explicit owner and the mismatch surfaces as a
-                // structured diagnostic rather than a silent leak.
-                let Some(type_params) = type_params.filter(|p| p.len() == args.len()) else {
-                    return true;
-                };
-                let subst: HashMap<TypeParamId, Ty> =
-                    type_params.into_iter().zip(args.iter().cloned()).collect();
-                field_types(item).iter().any(|fty| {
-                    self.is_affine_visiting(
-                        &crate::types::substitute(fty, &subst),
-                        visiting,
-                        depth + 1,
-                    )
-                })
-            }
-            _ => false,
-        }
+        crate::types::affinity::classify(
+            ty,
+            &super::LayoutShapes(self),
+            &mut self.affinity_cache.borrow_mut(),
+        )
+        .map(|affinity| affinity.is_affine())
+        .unwrap_or(true)
     }
 
     /// Mirrors `resourceck::flow::FlowChecker::resolve_place`: `expr`
@@ -5042,6 +4970,16 @@ fn literal_eq(a: &LiteralTest, b: &LiteralTest) -> bool {
         (LiteralTest::Char(x), LiteralTest::Char(y)) => x == y,
         (LiteralTest::Bool(x), LiteralTest::Bool(y)) => x == y,
         _ => false,
+    }
+}
+
+impl super::LayoutLookup for Lowering<'_> {
+    fn record_layout(&self, item: ItemId) -> Option<&RecordLayout> {
+        self.records.get(&item)
+    }
+
+    fn variant_layout(&self, item: ItemId) -> Option<&VariantLayout> {
+        self.variants.get(&item)
     }
 }
 
@@ -8574,7 +8512,7 @@ mod tests {
         expr_types.insert(ExprId(0), Ty::I64);
         let empty_affine = crate::resourceck::AffineContext {
             aggregate_field_types: &HashMap::new(),
-            declared_resources: &HashSet::new(),
+            declared_resources: &std::collections::HashSet::new(),
             item_type_params: &HashMap::new(),
             field_projections: &HashMap::new(),
         };
@@ -9099,6 +9037,7 @@ mod tests {
             module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
+            affinity_cache: Default::default(),
             variant_source: HashMap::new(),
             function_sigs: HashMap::new(),
             call_type_args: Box::leak(Box::new(HashMap::new())),
@@ -9140,6 +9079,7 @@ mod tests {
             module_path_mode: ModulePathMode::SingleFile,
             records,
             variants,
+            affinity_cache: Default::default(),
             variant_source: HashMap::new(),
             function_sigs,
             call_type_args,

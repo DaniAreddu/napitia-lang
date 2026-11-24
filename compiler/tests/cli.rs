@@ -2303,3 +2303,107 @@ fn no_command_ever_leaks_a_verifier_code_or_a_panic() {
         }
     }
 }
+
+// -- Nominal nesting at the affinity depth budget (`rfcs/0016`) ---------
+
+/// `depth` distinct records, each wrapping the next, with a `resource`
+/// innermost -- built one level per statement, so no single expression
+/// is deep and the parser's own nesting budget never applies. The
+/// outermost value is destroyed by an explicit `drop` or, without one,
+/// by scope-exit cleanup.
+fn nominal_resource_chain(depth: usize, explicit_drop: bool) -> String {
+    let mut source = String::from("resource File {\n    descriptor: i64,\n}\n\n");
+    for level in 0..depth {
+        let inner = if level + 1 < depth {
+            format!("R{}", level + 1)
+        } else {
+            "File".to_string()
+        };
+        source.push_str(&format!("record R{level} {{\n    inner: {inner},\n}}\n\n"));
+    }
+    source.push_str(&format!(
+        "func main() -> i64 {{\n    value x{depth} = File {{ descriptor: 7 }};\n"
+    ));
+    for level in (0..depth).rev() {
+        source.push_str(&format!(
+            "    value x{level} = R{level} {{ inner: x{} }};\n",
+            level + 1
+        ));
+    }
+    if explicit_drop {
+        source.push_str("    drop x0;\n");
+    }
+    source.push_str("    return 7;\n}\n");
+    source
+}
+
+fn run_nominal_chain(depth: usize, explicit_drop: bool, command: &str) -> Output {
+    let path = std::env::temp_dir().join(format!(
+        "napitia_nominal_chain_{depth}_{explicit_drop}_{command}_{}.npt",
+        std::process::id()
+    ));
+    std::fs::write(&path, nominal_resource_chain(depth, explicit_drop))
+        .expect("failed to write the temp fixture");
+    let output = napitia(&[command, &path.to_string_lossy()]);
+    let _ = std::fs::remove_file(&path);
+    output
+}
+
+/// Below the depth at which the affinity walks stop, every stage agrees
+/// the outer value owns a resource, and both ways of destroying it run.
+#[test]
+fn a_resource_nested_inside_the_affinity_budget_checks_lowers_and_runs() {
+    for explicit_drop in [true, false] {
+        for command in ["check", "ir", "run"] {
+            let output = run_nominal_chain(63, explicit_drop, command);
+            assert!(
+                output.status.success(),
+                "`{command}` (drop: {explicit_drop}) failed at 63 levels: {}",
+                stderr(&output)
+            );
+        }
+        let output = run_nominal_chain(63, explicit_drop, "run");
+        assert_eq!(stdout(&output).trim(), "7");
+    }
+}
+
+/// At and past 64 levels the stages do not agree on whether the outer
+/// value owns a resource: type checking's and the verifier's affinity
+/// walks stop at `MAX_GENERIC_DEPTH` and answer "owns nothing", resource
+/// checking's does not stop and plans its cleanup, and the interpreter
+/// refuses to walk a value that deep. That disagreement is a known
+/// defect (`rfcs/0016`, Limitations), and which stage reports it is
+/// expected to change when it is fixed.
+///
+/// What may not change is that it fails closed: such a program never
+/// runs to completion -- so never with a resource silently left
+/// undestroyed -- never panics, and always ends with ordinary
+/// diagnostics and status 1.
+#[test]
+fn a_resource_nested_past_the_affinity_budget_never_runs_to_completion() {
+    for depth in [64, 65, 130] {
+        for explicit_drop in [true, false] {
+            for command in ["ir", "run"] {
+                let output = run_nominal_chain(depth, explicit_drop, command);
+                let what = format!("`{command}` at {depth} levels (drop: {explicit_drop})");
+                assert_no_panic(&output, &what);
+                if command == "run" {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(1),
+                        "{what} must refuse: {}",
+                        stderr(&output)
+                    );
+                    assert!(stdout(&output).is_empty(), "{what} printed a result");
+                    assert!(stderr(&output).contains("error["), "{what} said nothing");
+                } else {
+                    assert!(
+                        matches!(output.status.code(), Some(0 | 1)),
+                        "{what} exited {:?}",
+                        output.status.code()
+                    );
+                }
+            }
+        }
+    }
+}

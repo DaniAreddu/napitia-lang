@@ -23,7 +23,7 @@ path = "src/main.rs"
 # `toml::Value` tree, which this crate then validates field-by-field
 # itself (no `serde` derive, no schema magic) so every diagnostic stays
 # in Napitia's own error model.
-toml = "0.8"
+toml = "1.1"
 
 # The native AOT backend (`src/native`, `rfcs/0014`). Cranelift is a
 # code generator, not a compiler framework: it takes a typed CFG that

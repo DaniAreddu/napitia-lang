@@ -77,8 +77,35 @@ enum RuntimeOwnershipRole {
     Observer,
 }
 
+/// Which [`ResourceTable`] -- and therefore which [`Interpreter`] -- a
+/// [`ResourceHandle`] was minted by.
+///
+/// A handle's `id` and `generation` only mean something inside the
+/// table that minted them: every table numbers its resources from zero
+/// and every resource starts at generation zero, so the first resource
+/// two different interpreters construct would otherwise carry identical
+/// handles. Handles cross the public API (`Interpreter::call` returns
+/// values and accepts caller-supplied ones, `rfcs/0016`), so without
+/// this a handle obtained from one interpreter could be handed to
+/// another and act there on whichever unrelated resource happened to
+/// share its index -- including destroying it. Allocated from one
+/// process-wide counter, never reused, and never printed or otherwise
+/// observable, so it cannot make any output depend on how many
+/// interpreters ran before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableId(u64);
+
+impl TableId {
+    fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        TableId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceHandle {
+    /// The table this handle indexes into; see [`TableId`].
+    table: TableId,
     id: ResourceId,
     generation: u64,
     role: RuntimeOwnershipRole,
@@ -161,8 +188,10 @@ struct ResourceRecord {
 /// slot is kept, marked `Dropped`, so a stale handle referencing it
 /// later still resolves to *something* to check the generation/status
 /// of, rather than silently going out of bounds).
-#[derive(Default)]
 struct ResourceTable {
+    /// This table's own identity, stamped on every handle it mints and
+    /// required of every handle it resolves (see [`TableId`]).
+    table: TableId,
     records: Vec<ResourceRecord>,
     /// Every observation lease taken during this run, indexed by
     /// [`RuntimeObservationId`] (`rfcs/0013`). Never shrinks: an ended
@@ -186,6 +215,16 @@ struct ResourceTable {
 }
 
 impl ResourceTable {
+    /// An empty table with an identity no other table has.
+    fn new() -> Self {
+        ResourceTable {
+            table: TableId::fresh(),
+            records: Vec::new(),
+            leases: Vec::new(),
+            active: Vec::new(),
+        }
+    }
+
     fn construct(&mut self, item: ItemId, fields: Vec<Value>) -> ResourceHandle {
         let id = ResourceId(self.records.len() as u32);
         self.records.push(ResourceRecord {
@@ -195,6 +234,7 @@ impl ResourceTable {
             fields,
         });
         ResourceHandle {
+            table: self.table,
             id,
             generation: 0,
             role: RuntimeOwnershipRole::Owner,
@@ -327,6 +367,15 @@ impl ResourceTable {
     }
 
     fn record(&self, handle: ResourceHandle) -> Result<&ResourceRecord, InterpreterError> {
+        // Checked before anything is looked up: a foreign handle's id,
+        // generation and lease are all numbers from some other table,
+        // and resolving any of them here would act on an unrelated
+        // resource that merely shares an index (see `TableId`).
+        if handle.table != self.table {
+            return Err(invalid(
+                "resource handle belongs to a different execution context",
+            ));
+        }
         // A handle minted under an observation stops working the moment
         // that observation ends (`rfcs/0013`) -- checked here, at the
         // one place every read and every ownership operation resolves a
@@ -380,6 +429,7 @@ impl ResourceTable {
     fn to_observer(&self, handle: ResourceHandle) -> Result<ResourceHandle, InterpreterError> {
         self.observe(handle)?;
         Ok(ResourceHandle {
+            table: handle.table,
             id: handle.id,
             generation: handle.generation,
             role: RuntimeOwnershipRole::Observer,
@@ -401,6 +451,7 @@ impl ResourceTable {
     ) -> Result<ResourceHandle, InterpreterError> {
         self.observe(handle)?;
         Ok(ResourceHandle {
+            table: handle.table,
             id: handle.id,
             generation: handle.generation,
             role: RuntimeOwnershipRole::Observer,
@@ -445,6 +496,7 @@ impl ResourceTable {
         let record = &mut self.records[id.0 as usize];
         record.generation += 1;
         Ok(ResourceHandle {
+            table: handle.table,
             id,
             generation: record.generation,
             role: RuntimeOwnershipRole::Owner,
@@ -948,7 +1000,7 @@ impl<'a> Interpreter<'a> {
     fn over(module: &'a Module) -> Self {
         Interpreter {
             module,
-            resources: RefCell::new(ResourceTable::default()),
+            resources: RefCell::new(ResourceTable::new()),
             #[cfg(test)]
             event_log: RefCell::new(Vec::new()),
             call_depth: std::cell::Cell::new(0),
@@ -1810,6 +1862,7 @@ impl<'a> Interpreter<'a> {
                     self.collect_owned_identities(field, &mut plan.reachable, 1)?;
                 }
                 Ok(Value::Resource(ResourceHandle {
+                    table: handle.table,
                     id: handle.id,
                     generation,
                     role: RuntimeOwnershipRole::Owner,
@@ -19367,5 +19420,101 @@ mod stateful_termination {
         assert!(first.contains("V0112"), "{first}");
         assert_eq!(first, rendered());
         assert_eq!(first, rendered());
+    }
+}
+
+/// A resource handle means something only to the interpreter that
+/// minted it (`rfcs/0016`: caller-built argument values are re-checked
+/// at run time).
+///
+/// Every table numbers resources from zero, so before handles carried
+/// their table's identity, the first resource two interpreters
+/// constructed had identical handles. Handing one interpreter's handle
+/// to the other then acted on the *other* interpreter's resource: a
+/// `take` parameter consumed it and its real owner's handle went stale.
+#[cfg(test)]
+mod foreign_handles {
+    use super::*;
+
+    const PROGRAM: &str = "
+resource File {
+    descriptor: i64,
+}
+
+func open(descriptor: i64) -> File {
+    return File { descriptor: descriptor };
+}
+
+func sink(take file: File) -> i64 {
+    value d = file.descriptor;
+    drop file;
+    return d;
+}
+
+func read(file: File) -> i64 {
+    return file.descriptor;
+}
+
+func main() -> i64 {
+    return 0;
+}
+";
+
+    fn status_of_first_resource(interpreter: &Interpreter<'_>) -> ResourceStatus {
+        interpreter.resources.borrow().records[0].status.clone()
+    }
+
+    #[test]
+    fn a_handle_from_another_interpreter_cannot_consume_this_ones_resource() {
+        let (nir, interner) = tests::compiled(PROGRAM);
+        let a = Interpreter::new(&nir);
+        let b = Interpreter::new(&nir);
+        let _own = b.call("open", &interner, vec![Value::Int(3)]).unwrap();
+        let foreign = a.call("open", &interner, vec![Value::Int(5)]).unwrap();
+
+        let refused = b.call("sink", &interner, vec![foreign.clone()]);
+        assert_eq!(
+            refused,
+            Err(InterpreterError::InvalidOperation(
+                "resource handle belongs to a different execution context".into()
+            ))
+        );
+        assert_eq!(refused.unwrap_err().code(), codes::INVALID_OPERATION);
+        // `b`'s own resource was never touched, and neither was `a`'s.
+        assert_eq!(status_of_first_resource(&b), ResourceStatus::Alive);
+        assert_eq!(status_of_first_resource(&a), ResourceStatus::Alive);
+        assert_eq!(a.call("read", &interner, vec![foreign]), Ok(Value::Int(5)));
+    }
+
+    #[test]
+    fn a_handle_from_another_interpreter_cannot_be_read_through_this_one() {
+        let (nir, interner) = tests::compiled(PROGRAM);
+        let a = Interpreter::new(&nir);
+        let b = Interpreter::new(&nir);
+        let _own = b.call("open", &interner, vec![Value::Int(3)]).unwrap();
+        let foreign = a.call("open", &interner, vec![Value::Int(5)]).unwrap();
+
+        // Without the check this read answered 3: `b`'s resource, read
+        // through `a`'s handle.
+        assert_eq!(
+            b.call("read", &interner, vec![foreign]),
+            Err(InterpreterError::InvalidOperation(
+                "resource handle belongs to a different execution context".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn handles_keep_working_in_the_interpreter_that_minted_them() {
+        let (nir, interner) = tests::compiled(PROGRAM);
+        let a = Interpreter::new(&nir);
+        let _other = Interpreter::new(&nir);
+        let file = a.call("open", &interner, vec![Value::Int(5)]).unwrap();
+        assert_eq!(
+            a.call("read", &interner, vec![file.clone()]),
+            Ok(Value::Int(5))
+        );
+        assert_eq!(a.call("sink", &interner, vec![file]), Ok(Value::Int(5)));
+        assert_eq!(status_of_first_resource(&a), ResourceStatus::Dropped);
     }
 }

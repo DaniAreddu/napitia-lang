@@ -39,7 +39,7 @@ toml = "0.8"
 # from a host that is not one (an aarch64 macOS CI runner, say), so the
 # backend that target needs has to be compiled in regardless of what
 # the host happens to be.
-cranelift-codegen = { version = "0.135.2", features = ["x86"] }
+cranelift-codegen = { version = "0.136.0", features = ["x86"] }
 # Builds Cranelift IR from a CFG that is not already in SSA form --
 # which NIR, whose locals are `alloc`/`load`/`store` slots, is not.
 cranelift-frontend = "0.135.2"

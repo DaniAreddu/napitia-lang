@@ -648,6 +648,14 @@ mod codes {
     /// which is what "operands of incompatible widths or signedness"
     /// reduces to when exactly one integer width exists.
     pub const UNIMPLEMENTED_NUMERIC_TYPE: &str = "V0112";
+    /// A `load` reads an `alloc` slot that is not written on every
+    /// reachable path from the entry block to it (Alpha 0.2.3). Covers
+    /// every slot `INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED` (an `invoke`'s
+    /// own result slots) and `RESOURCE_LOCATION_NOT_DEFINITELY_
+    /// INITIALIZED` (a resource-typed slot) do not, so a single cause
+    /// produces a single code. Until Alpha 0.2.2 such a load verified and
+    /// was refused only at run time (`X0004`) or natively (`A0017`).
+    pub const SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0113";
     /// A type this module uses cannot be classified as owning a resource
     /// or not (`types::affinity`, Alpha 0.2.3): it nests records and
     /// variants past the affinity depth budget, or contains itself.
@@ -2258,7 +2266,7 @@ fn verify_function(
     }
 
     verify_payload_refinement(function, agg, source, &name, diagnostics);
-    verify_invoke_slot_initialization(function, source, &name, diagnostics);
+    verify_slot_initialization(function, agg, source, &name, diagnostics);
     verify_drop_state(function, source, &name, diagnostics);
     verify_resource_ownership(
         function,
@@ -9782,28 +9790,54 @@ fn in_state_for_places(
     }
 }
 
-fn verify_invoke_slot_initialization(
+fn verify_slot_initialization(
     function: &Function,
+    agg: &AggregateContext,
     source: SourceId,
     function_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Every `ValueId` some `Terminator::Invoke` in this function writes
-    // conditionally on one of its own edges -- an ordinary mutable
-    // binding (always written unconditionally immediately after its own
-    // `alloc`, `rfcs/0002`) never needs this analysis at all, and
-    // restricting the fact domain to exactly this finite set is what
-    // keeps the fixpoint below guaranteed to terminate.
+    // The fact domain: every slot this function allocates, plus every
+    // slot a `Terminator::Invoke` writes on one of its own edges. Until
+    // Alpha 0.2.3 only the second set was analysed here (an ordinary
+    // mutable binding is always written right after its own `alloc` when
+    // lowering builds it), so hand-built NIR that loaded any other
+    // never-written slot verified and was refused only at run time. The
+    // domain is finite and fixed before the fixpoint starts, which is
+    // what keeps the fixpoint below guaranteed to terminate.
+    let mut invoke_slots: HashSet<ValueId> = HashSet::new();
+    let mut resource_slots: HashSet<ValueId> = HashSet::new();
     let mut guarded_slots: HashSet<ValueId> = HashSet::new();
     for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Value {
+                result,
+                ty,
+                kind: ValueKind::Alloc,
+            } = instruction
+            {
+                guarded_slots.insert(*result);
+                // A slot of a declared `resource` type is the ownership
+                // analysis's to report when read uninitialized
+                // (`RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`); it
+                // stays in the domain so its facts are tracked, but is
+                // not reported twice for one cause.
+                if matches!(ty, Ty::Named(item, _) if agg.records.get(item).is_some_and(|r| r.affine))
+                {
+                    resource_slots.insert(*result);
+                }
+            }
+        }
         if let Terminator::Invoke {
             ok_slot,
             err_targets,
             ..
         } = &block.terminator
         {
+            invoke_slots.insert(*ok_slot);
             guarded_slots.insert(*ok_slot);
             for target in err_targets {
+                invoke_slots.insert(target.slot);
                 guarded_slots.insert(target.slot);
             }
         }
@@ -9988,8 +10022,12 @@ fn verify_invoke_slot_initialization(
     // A reachable block (entry included) reads its IN from the
     // fixpoint's own `out` map; an unreachable block is always checked
     // independently, from an empty IN, ignoring any (dead) incoming
-    // edge `incoming_edges` recorded for it.
-    for block in &function.blocks {
+    // edge `incoming_edges` recorded for it. Blocks are visited in id
+    // order, so how a function stores its blocks cannot reorder these
+    // diagnostics.
+    let mut ordered: Vec<&BasicBlock> = function.blocks.iter().collect();
+    ordered.sort_by_key(|block| block.id);
+    for block in ordered {
         let in_facts = if reachable.contains(&block.id) {
             invoke_slot_in_facts(block.id, entry, &incoming_edges, &reachable, &out)
         } else {
@@ -9997,15 +10035,34 @@ fn verify_invoke_slot_initialization(
         };
         let (_, violations) = invoke_slot_block_transfer(block, &guarded_slots, &in_facts);
         for slot in violations {
-            diagnostics.push(Diagnostic::error(
-                codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
-                source,
-                Span::dummy(),
-                format!(
-                    "function `{function_name}` loads %{} in bb{}, which is not definitely initialized on every path reaching it",
-                    slot.0, block.id.0
-                ),
-            ));
+            let diagnostic = if invoke_slots.contains(&slot) {
+                Diagnostic::error(
+                    codes::INVOKE_SLOT_NOT_DEFINITELY_INITIALIZED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` loads %{} in bb{}, which is not definitely initialized on every path reaching it",
+                        slot.0, block.id.0
+                    ),
+                )
+            } else if resource_slots.contains(&slot) {
+                continue;
+            } else {
+                Diagnostic::error(
+                    codes::SLOT_NOT_DEFINITELY_INITIALIZED,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` loads the slot %{} in bb{}, which is not written on every path from the entry block to it",
+                        slot.0, block.id.0
+                    ),
+                )
+                .with_note(
+                    "an `alloc` reserves a slot without giving it a value; a `store` must reach \
+                     every `load` of it, on every path",
+                )
+            };
+            diagnostics.push(diagnostic);
         }
     }
 }
@@ -28475,5 +28532,374 @@ mod affinity_classification {
         let forward_text = render(&forward);
         assert_eq!(forward_text.len(), 2, "{forward_text:?}");
         assert_eq!(forward_text, render(&backward));
+    }
+}
+
+/// Every `alloc` slot must be written on every reachable path to each
+/// `load` of it (`SLOT_NOT_DEFINITELY_INITIALIZED`, Alpha 0.2.3) -- the
+/// same forward must-analysis `invoke` slots already had, over every
+/// slot. Each test is built so the valid counterpart differs by one
+/// store.
+#[cfg(test)]
+mod slot_initialization {
+    use super::*;
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const SLOT: ValueId = ValueId(0);
+    const UNINIT: &str = codes::SLOT_NOT_DEFINITELY_INITIALIZED;
+
+    fn alloc(slot: ValueId, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: slot,
+            ty,
+            kind: ValueKind::Alloc,
+        }
+    }
+
+    fn int(result: u32, literal: i128) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(literal)),
+        }
+    }
+
+    fn truth(result: u32) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty: Ty::Bool,
+            kind: ValueKind::Const(Const::Bool(true)),
+        }
+    }
+
+    fn store(slot: ValueId, value: u32) -> Instruction {
+        Instruction::Store {
+            slot,
+            value: ValueId(value),
+            mode: OwnershipMode::Observe,
+        }
+    }
+
+    fn load(result: u32, slot: ValueId, ty: Ty) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind: ValueKind::Load(slot),
+        }
+    }
+
+    fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(id),
+            instructions,
+            terminator,
+        }
+    }
+
+    fn branch(condition: u32, then_block: u32, else_block: u32) -> Terminator {
+        Terminator::CondBranch {
+            condition: ValueId(condition),
+            then_block: BlockId(then_block),
+            else_block: BlockId(else_block),
+        }
+    }
+
+    fn function(return_type: Ty, blocks: Vec<BasicBlock>, interner: &mut Interner) -> Function {
+        Function {
+            id: ItemId(1),
+            name: interner.intern("main"),
+            type_params: Vec::new(),
+            requirements: Vec::new(),
+            params: Vec::new(),
+            return_type,
+            raises: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn verified(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+    }
+
+    fn rendered(blocks: Vec<BasicBlock>) -> Vec<String> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![function(Ty::I64, blocks, &mut interner)],
+            ..Module::default()
+        };
+        verified(&module, &interner)
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect()
+    }
+
+    fn codes(blocks: Vec<BasicBlock>) -> Vec<&'static str> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![function(Ty::I64, blocks, &mut interner)],
+            ..Module::default()
+        };
+        verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn a_load_before_the_first_store_is_refused_and_after_it_is_not() {
+        let before = vec![block(
+            0,
+            vec![
+                alloc(SLOT, Ty::I64),
+                load(1, SLOT, Ty::I64),
+                int(2, 5),
+                store(SLOT, 2),
+            ],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        let after = vec![block(
+            0,
+            vec![
+                alloc(SLOT, Ty::I64),
+                int(2, 5),
+                store(SLOT, 2),
+                load(1, SLOT, Ty::I64),
+            ],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        assert_eq!(codes(before), vec![UNINIT]);
+        assert_eq!(codes(after), Vec::<&str>::new());
+    }
+
+    /// `bb0 -> bb1 | bb2 -> bb3`; `bb3` loads. Stored in both arms: fine.
+    /// Stored in one: the other path reaches the load without a store.
+    fn diamond(store_then: bool, store_else: bool) -> Vec<BasicBlock> {
+        let arm = |id: u32, stores: bool, value: u32| {
+            let mut instructions = vec![int(value, value as i128)];
+            if stores {
+                instructions.push(store(SLOT, value));
+            }
+            block(id, instructions, Terminator::Branch(BlockId(3)))
+        };
+        vec![
+            block(0, vec![alloc(SLOT, Ty::I64), truth(1)], branch(1, 1, 2)),
+            arm(1, store_then, 2),
+            arm(2, store_else, 3),
+            block(
+                3,
+                vec![load(4, SLOT, Ty::I64)],
+                Terminator::Return(Some(ValueId(4))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_join_needs_the_store_on_every_incoming_path() {
+        assert_eq!(codes(diamond(true, true)), Vec::<&str>::new());
+        assert_eq!(codes(diamond(true, false)), vec![UNINIT]);
+        assert_eq!(codes(diamond(false, true)), vec![UNINIT]);
+        assert_eq!(codes(diamond(false, false)), vec![UNINIT]);
+    }
+
+    #[test]
+    fn a_unit_slot_is_not_exempt() {
+        let mut interner = Interner::new();
+        let never_stored = vec![block(
+            0,
+            vec![alloc(SLOT, Ty::Unit), load(1, SLOT, Ty::Unit)],
+            Terminator::Return(Some(ValueId(1))),
+        )];
+        let module = Module {
+            functions: vec![function(Ty::Unit, never_stored, &mut interner)],
+            ..Module::default()
+        };
+        let found: Vec<&str> = verified(&module, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert_eq!(found, vec![UNINIT]);
+    }
+
+    /// `bb0 -> bb1 (header) -> bb2 (body) -> bb1 | bb3 (exit)`. A store
+    /// only in the body does not reach the exit -- the loop may run zero
+    /// times -- nor the header on its first entry.
+    fn looped(store_before: bool, load_in_header: bool) -> Vec<BasicBlock> {
+        let mut entry = vec![alloc(SLOT, Ty::I64)];
+        if store_before {
+            entry.extend([int(1, 0), store(SLOT, 1)]);
+        }
+        let mut header = vec![truth(2)];
+        if load_in_header {
+            header.push(load(3, SLOT, Ty::I64));
+        }
+        vec![
+            block(0, entry, Terminator::Branch(BlockId(1))),
+            block(1, header, branch(2, 2, 3)),
+            block(
+                2,
+                vec![int(4, 1), store(SLOT, 4)],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![load(5, SLOT, Ty::I64)],
+                Terminator::Return(Some(ValueId(5))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_store_only_inside_a_loop_reaches_neither_its_exit_nor_its_header() {
+        // The exit is reached when the body never ran.
+        assert_eq!(codes(looped(false, false)), vec![UNINIT]);
+        // The header is reached first from the entry, then along the
+        // backedge; only the second path has stored. Both loads refused.
+        assert_eq!(codes(looped(false, true)), vec![UNINIT, UNINIT]);
+        // A store before the loop covers both, across the backedge.
+        assert_eq!(codes(looped(true, true)), Vec::<&str>::new());
+        assert_eq!(codes(looped(true, false)), Vec::<&str>::new());
+    }
+
+    /// `bb3` joins a reachable path and a dead block that also branches
+    /// to it. The dead block contributes no facts, in either direction.
+    #[test]
+    fn an_unreachable_predecessor_neither_supplies_nor_removes_a_store() {
+        let join = |reachable_stores: bool, dead_stores: bool| {
+            let mut entry = vec![alloc(SLOT, Ty::I64), int(1, 1)];
+            if reachable_stores {
+                entry.push(store(SLOT, 1));
+            }
+            let mut dead = vec![int(2, 2)];
+            if dead_stores {
+                dead.push(store(SLOT, 2));
+            }
+            vec![
+                block(0, entry, Terminator::Branch(BlockId(3))),
+                // Nothing branches to bb7.
+                block(7, dead, Terminator::Branch(BlockId(3))),
+                block(
+                    3,
+                    vec![load(4, SLOT, Ty::I64)],
+                    Terminator::Return(Some(ValueId(4))),
+                ),
+            ]
+        };
+        // `bb7` uses the slot `bb0` allocates, which dominance already
+        // refuses in dead code; only the verdict at `bb3` is under test.
+        let at_join = |blocks: Vec<BasicBlock>| -> Vec<&'static str> {
+            codes(blocks).into_iter().filter(|c| *c == UNINIT).collect()
+        };
+        assert_eq!(at_join(join(true, false)), Vec::<&str>::new());
+        assert_eq!(at_join(join(false, true)), vec![UNINIT]);
+    }
+
+    /// Dead code is still checked, on its own terms: a cycle nothing
+    /// reaches that allocates and loads its own slot without a store is
+    /// refused, and with a store it is not.
+    #[test]
+    fn an_unreachable_cycle_is_checked_from_nothing() {
+        let dead_cycle = |stores: bool| {
+            let mut first = vec![alloc(ValueId(10), Ty::I64)];
+            if stores {
+                first.extend([int(11, 3), store(ValueId(10), 11)]);
+            }
+            first.push(load(12, ValueId(10), Ty::I64));
+            vec![
+                block(0, vec![int(1, 1)], Terminator::Return(Some(ValueId(1)))),
+                block(5, first, Terminator::Branch(BlockId(6))),
+                block(6, Vec::new(), Terminator::Branch(BlockId(5))),
+            ]
+        };
+        assert_eq!(codes(dead_cycle(false)), vec![UNINIT]);
+        assert_eq!(codes(dead_cycle(true)), Vec::<&str>::new());
+    }
+
+    /// Storage order is not semantics: the entry stored last, and every
+    /// rotation of a function's blocks, forward and reversed, give the
+    /// same diagnostics.
+    #[test]
+    fn block_storage_order_changes_nothing() {
+        for blocks in [
+            diamond(true, false),
+            looped(false, true),
+            diamond(true, true),
+        ] {
+            let expected = rendered(blocks.clone());
+            let n = blocks.len();
+            for start in 0..n {
+                for reverse in [false, true] {
+                    let mut order: Vec<BasicBlock> =
+                        (0..n).map(|i| blocks[(start + i) % n].clone()).collect();
+                    if reverse {
+                        order.reverse();
+                    }
+                    assert_eq!(rendered(order), expected);
+                }
+            }
+        }
+    }
+
+    /// A slot of a declared resource is the ownership analysis's to
+    /// report (`RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED`); it is not
+    /// reported a second time. A record that only holds a resource is
+    /// not a declared resource, and is this analysis's.
+    #[test]
+    fn one_cause_produces_one_code() {
+        let mut interner = Interner::new();
+        let file = interner.intern("File");
+        let holder = interner.intern("Holder");
+        let field = interner.intern("f");
+        let file_ty = Ty::Named(ItemId(10), file);
+        let holder_ty = Ty::Named(ItemId(11), holder);
+        let records = vec![
+            (
+                ItemId(10),
+                RecordLayout {
+                    name: file,
+                    type_params: Vec::new(),
+                    fields: vec![(field, Ty::I64)],
+                    affine: true,
+                },
+            ),
+            (
+                ItemId(11),
+                RecordLayout {
+                    name: holder,
+                    type_params: Vec::new(),
+                    fields: vec![(field, file_ty.clone())],
+                    affine: false,
+                },
+            ),
+        ];
+        let reads = |ty: Ty, interner: &mut Interner| Module {
+            functions: vec![function(
+                Ty::I64,
+                vec![block(
+                    0,
+                    vec![alloc(SLOT, ty.clone()), load(1, SLOT, ty), int(2, 0)],
+                    Terminator::Return(Some(ValueId(2))),
+                )],
+                interner,
+            )],
+            records: records.clone(),
+            ..Module::default()
+        };
+        let resource = reads(file_ty, &mut interner);
+        let found: Vec<&str> = verified(&resource, &interner)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert!(
+            found.contains(&codes::RESOURCE_LOCATION_NOT_DEFINITELY_INITIALIZED),
+            "{found:?}"
+        );
+        assert!(!found.contains(&UNINIT), "{found:?}");
+
+        let held = reads(holder_ty, &mut interner);
+        let found: Vec<&str> = verified(&held, &interner).iter().map(|d| d.code).collect();
+        assert!(found.contains(&UNINIT), "{found:?}");
     }
 }

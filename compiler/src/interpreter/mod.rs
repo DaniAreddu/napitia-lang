@@ -965,6 +965,10 @@ pub struct Interpreter<'a> {
     /// interpreter already terminated. Those change nothing, so they
     /// leave the interpreter usable.
     terminated: std::cell::Cell<bool>,
+    /// Completed affinity classifications (`types::affinity`) -- see
+    /// [`Self::is_affine`]. Holds only answers a completed walk produced,
+    /// so reusing one never changes an answer.
+    affinity_cache: RefCell<crate::types::affinity::AffinityCache>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -1005,6 +1009,7 @@ impl<'a> Interpreter<'a> {
             event_log: RefCell::new(Vec::new()),
             call_depth: std::cell::Cell::new(0),
             terminated: std::cell::Cell::new(false),
+            affinity_cache: RefCell::new(crate::types::affinity::AffinityCache::new()),
         }
     }
 
@@ -1037,74 +1042,37 @@ impl<'a> Interpreter<'a> {
             .any(|(id, layout)| *id == item && layout.affine)
     }
 
-    /// `true` iff `ty` is transitively affine (`rfcs/0012`) -- mirrors
-    /// `nir::lower`'s/`resourceck`'s identical query, independently
-    /// recomputed from this module's own `records`/`variants` layouts
-    /// (never a generic-instantiation-aware substitution here: this is
-    /// only ever consulted while destroying an *already-constructed*
-    /// runtime `Variant` value's own active-case payload, whose payload
-    /// types come from that one concrete case's own declared shape).
-    /// Guarded against a genuinely cyclic declaration the same way every
-    /// other stage's identical query is: a cycle back-edge contributes
-    /// `false` to that one occurrence alone, never cached (this is not
-    /// called densely enough to need memoizing).
-    fn is_affine(&self, ty: &Ty) -> bool {
-        self.is_affine_visiting(ty, &mut HashSet::new(), 0)
-    }
-
-    fn is_affine_visiting(&self, ty: &Ty, visiting: &mut HashSet<ItemId>, depth: usize) -> bool {
-        // For a `Ty::Applied` this is the *only* termination guard:
-        // `visiting` is keyed by bare `ItemId` and so cannot tell a
-        // genuine cycle apart from a legitimately nested instantiation
-        // of the same declaration -- `Box[Box[Box[File]]]` reaches
-        // `Box` three times with different arguments and must answer
-        // from the innermost one.
-        if depth >= crate::limits::MAX_GENERIC_DEPTH {
-            return false;
-        }
-        let item = match ty {
-            Ty::Named(item, _) => *item,
-            // A generic instantiation's own affinity depends on what it
-            // was instantiated *with* (`Box[File]` is affine, `Box[i64]`
-            // is not), so its own arguments are substituted into the
-            // declaration's field types before recursing -- never
-            // silently answered `false`, which would leave a
-            // `Box[File]` looking freely copyable at runtime.
-            Ty::Applied(item, args) => {
-                if self.is_resource(*item) {
-                    return true;
-                }
-                // Missing or arity-disagreeing generic metadata fails
-                // *closed*, to affine: an unsubstituted `Ty::Param`
-                // would answer `false` below and let a genuinely affine
-                // instantiation be treated as a freely-copyable value
-                // this stage never destroys -- the one direction that
-                // leaks rather than over-demands.
-                let Some(subst) = self.type_substitution(*item, args) else {
-                    return true;
-                };
-                return self.item_field_types(*item).iter().any(|fty| {
-                    self.is_affine_visiting(
-                        &crate::types::substitute(fty, &subst),
-                        visiting,
-                        depth + 1,
-                    )
-                });
+    /// Whether `ty` is transitively affine (`rfcs/0012`), answered by the
+    /// one classification every stage shares (`types::affinity`) over this
+    /// module's own record and variant layouts -- the same rule type
+    /// checking, lowering and the verifier apply, so a value's ownership
+    /// cannot be judged one way when it was checked and another when it
+    /// runs. The copy this replaced stopped at `MAX_GENERIC_DEPTH`
+    /// answering "not affine" and walked shared substructure once per
+    /// path.
+    ///
+    /// A type the classification cannot answer for is not guessed at:
+    /// it is this engine's nesting budget, refused with `X0004` like a
+    /// value nested too deeply. Verification refuses every such type a
+    /// module declares or uses (`AFFINITY_UNDECIDABLE`); one can still be
+    /// built at run time by instantiating a generic body.
+    fn is_affine(&self, ty: &Ty) -> Result<bool, InterpreterError> {
+        let outcome = crate::types::affinity::classify(
+            ty,
+            &crate::nir::LayoutShapes(self.module),
+            &mut self.affinity_cache.borrow_mut(),
+        );
+        match outcome {
+            Ok(affinity) => Ok(affinity.is_affine()),
+            Err(crate::types::affinity::AffinityError::DepthExceeded { limit }) => {
+                Err(invalid(format!(
+                    "a runtime value's type nests records and variants more than {limit} levels deep, more than this milestone supports"
+                )))
             }
-            _ => return false,
-        };
-        if self.is_resource(item) {
-            return true;
+            Err(crate::types::affinity::AffinityError::CyclicLayout { .. }) => Err(invalid(
+                "a runtime value's type contains itself, so it has no finite layout",
+            )),
         }
-        if !visiting.insert(item) {
-            return false;
-        }
-        let result = self
-            .item_field_types(item)
-            .iter()
-            .any(|fty| self.is_affine_visiting(fty, visiting, depth + 1));
-        visiting.remove(&item);
-        result
     }
 
     /// `item`'s own declared type parameters paired with `args`, for
@@ -1161,10 +1129,12 @@ impl<'a> Interpreter<'a> {
         // and is affine for no instantiation at all, while `Box[File]`
         // plainly owns a resource.
         let subst = self.checked_substitution(item, type_args)?;
-        let mut visiting = HashSet::new();
-        Ok(self.item_field_types(item).iter().any(|fty| {
-            self.is_affine_visiting(&crate::types::substitute(fty, &subst), &mut visiting, 0)
-        }))
+        for field in self.item_field_types(item) {
+            if self.is_affine(&crate::types::substitute(&field, &subst))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Reads or removes the value at `place`'s own final projection step
@@ -2464,7 +2434,7 @@ impl<'a> Interpreter<'a> {
         // one.
         if matches!(value, Value::Moved | Value::Dropped) {
             return match expected {
-                Some(ty) if self.is_affine(ty) => Ok(()),
+                Some(ty) if self.is_affine(ty)? => Ok(()),
                 Some(_) => Err(invalid(
                     "a runtime tombstone stands in a position whose declared type owns nothing",
                 )),
@@ -2822,7 +2792,7 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 for index in (0..fields.len()).rev() {
-                    if !self.is_affine(&declared[index]) {
+                    if !self.is_affine(&declared[index])? {
                         continue;
                     }
                     // A child this frame's own NIR already destroyed or
@@ -2849,7 +2819,7 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 for index in (0..fields.len()).rev() {
-                    if !self.is_affine(&declared[index]) {
+                    if !self.is_affine(&declared[index])? {
                         continue;
                     }
                     if matches!(fields[index], Value::Moved | Value::Dropped) {
@@ -2875,7 +2845,7 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 for index in (0..payload.len()).rev() {
-                    if !self.is_affine(&declared[index]) {
+                    if !self.is_affine(&declared[index])? {
                         continue;
                     }
                     if matches!(payload[index], Value::Moved | Value::Dropped) {
@@ -6741,11 +6711,11 @@ mod structural_runtime {
         let module = module_with(vec![(crate::hir::TypeParamId(0), name)]);
         let interpreter = Interpreter::unchecked(&module);
         assert!(
-            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::Named(FILE, name)])),
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::Named(FILE, name)])) == Ok(true),
             "`Box[File]` must be affine at runtime"
         );
         assert!(
-            !interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])) == Ok(false),
             "`Box[i64]` must not be affine at runtime"
         );
     }
@@ -6755,7 +6725,7 @@ mod structural_runtime {
         let module = module_with(Vec::new());
         let interpreter = Interpreter::unchecked(&module);
         assert!(
-            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])),
+            interpreter.is_affine(&Ty::Applied(BOXY, vec![Ty::I64])) == Ok(true),
             "missing generic metadata must never be answered as an empty substitution"
         );
     }
@@ -6765,7 +6735,7 @@ mod structural_runtime {
         let module = module_with(vec![(crate::hir::TypeParamId(0), Symbol(0))]);
         let interpreter = Interpreter::unchecked(&module);
         assert!(
-            interpreter.is_affine(&Ty::Applied(ItemId(9999), vec![Ty::I64])),
+            interpreter.is_affine(&Ty::Applied(ItemId(9999), vec![Ty::I64])) == Ok(true),
             "an item with no recorded layout must never be answered as non-affine"
         );
     }

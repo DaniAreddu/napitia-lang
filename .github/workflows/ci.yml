@@ -138,6 +138,18 @@ jobs:
           --all-features
           --locked
 
+      # `--all-targets` leaves doctests out, and the doctests are where
+      # the verified boundary is proven from outside the crate: the
+      # `compile_fail` examples on `nir::VerifiedModule` (`rfcs/0016`)
+      # only mean something if something compiles them.
+      - name: cargo test (doc)
+        run: >-
+          cargo test
+          --manifest-path compiler/Cargo.toml
+          --doc
+          --all-features
+          --locked
+
       # Release is a separate run, not a duplicate one. `debug_assert!`
       # disappears, overflow checks change, and optimizations reorder
       # work -- so a suite that passes in debug genuinely can fail here,

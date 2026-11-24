@@ -72,6 +72,14 @@ jobs:
           --all-features
           --locked
 
+      - name: cargo test (doc)
+        run: >-
+          cargo test
+          --manifest-path compiler/Cargo.toml
+          --doc
+          --all-features
+          --locked
+
       - name: cargo test (release)
         run: >-
           cargo test

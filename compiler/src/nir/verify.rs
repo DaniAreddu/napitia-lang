@@ -656,6 +656,13 @@ mod codes {
     /// produces a single code. Until Alpha 0.2.2 such a load verified and
     /// was refused only at run time (`X0004`) or natively (`A0017`).
     pub const SLOT_NOT_DEFINITELY_INITIALIZED: &str = "V0113";
+    /// An `alloc` result is used somewhere a value is required (Alpha
+    /// 0.2.3). A slot names storage, not a value: it may only be the
+    /// operand of a `load`, the slot of a `store`, or a slot an `invoke`
+    /// writes -- never an arithmetic operand, a call argument, a stored
+    /// value, a returned value or the root of a place. Mirrors the native
+    /// backend's `A0018`, which now only guards against a verifier defect.
+    pub const SLOT_USED_AS_VALUE: &str = "V0114";
     /// A type this module uses cannot be classified as owning a resource
     /// or not (`types::affinity`, Alpha 0.2.3): it nests records and
     /// variants past the affinity depth budget, or contains itself.
@@ -2266,6 +2273,7 @@ fn verify_function(
     }
 
     verify_payload_refinement(function, agg, source, &name, diagnostics);
+    verify_slot_operands(function, source, &name, diagnostics);
     verify_slot_initialization(function, agg, source, &name, diagnostics);
     verify_drop_state(function, source, &name, diagnostics);
     verify_resource_ownership(
@@ -9787,6 +9795,90 @@ fn in_state_for_places(
     match acc {
         Some(facts) => IncomingState::Ready(facts),
         None => IncomingState::Pending,
+    }
+}
+
+/// Refuses every use of an `alloc` slot where a value is required
+/// (`SLOT_USED_AS_VALUE`, Alpha 0.2.3).
+///
+/// A slot is storage. The only operands that name one are a `load`'s
+/// operand, a `store`'s slot and the slots an `invoke` writes -- none of
+/// which [`instruction_operands`]/[`terminator_operands`] report as a
+/// value read, except the `load` operand, which is skipped here. Every
+/// other position wants a value: an arithmetic or comparison operand, a
+/// call or constructor argument, a stored value, a dropped or moved
+/// value, a place root, a returned or raised value, a branch condition.
+/// Before Alpha 0.2.3 a slot in one of those positions verified -- the
+/// slot's declared type matched -- and the interpreter then read the
+/// slot's storage cell as if it were the value, while the native backend
+/// refused it (`A0018`).
+///
+/// Visited in block-id order, so block storage order cannot reorder the
+/// diagnostics.
+fn verify_slot_operands(
+    function: &Function,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let slots: HashSet<ValueId> = function
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|instruction| match instruction {
+            Instruction::Value {
+                result,
+                kind: ValueKind::Alloc,
+                ..
+            } => Some(*result),
+            _ => None,
+        })
+        .collect();
+    if slots.is_empty() {
+        return;
+    }
+    let mut ordered: Vec<&BasicBlock> = function.blocks.iter().collect();
+    ordered.sort_by_key(|block| block.id);
+    for block in ordered {
+        let mut misused: Vec<ValueId> = Vec::new();
+        for instruction in &block.instructions {
+            if matches!(
+                instruction,
+                Instruction::Value {
+                    kind: ValueKind::Load(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            misused.extend(
+                instruction_operands(instruction)
+                    .into_iter()
+                    .filter(|v| slots.contains(v)),
+            );
+        }
+        misused.extend(
+            terminator_operands(&block.terminator)
+                .into_iter()
+                .filter(|v| slots.contains(v)),
+        );
+        for slot in misused {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::SLOT_USED_AS_VALUE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` uses the slot %{} as a value in bb{}",
+                        slot.0, block.id.0
+                    ),
+                )
+                .with_note(
+                    "a slot is only ever loaded from, stored into, or written by an `invoke`; \
+                     `load` it to get its value",
+                ),
+            );
+        }
     }
 }
 
@@ -28901,5 +28993,172 @@ mod slot_initialization {
         let held = reads(holder_ty, &mut interner);
         let found: Vec<&str> = verified(&held, &interner).iter().map(|d| d.code).collect();
         assert!(found.contains(&UNINIT), "{found:?}");
+    }
+}
+
+/// An `alloc` slot is storage, never a value (`SLOT_USED_AS_VALUE`,
+/// Alpha 0.2.3). The first test is the shape the 0.2.2 mutation campaign
+/// found sealing and then reaching `X0004`; each refused shape has a
+/// valid counterpart that loads the slot instead.
+#[cfg(test)]
+mod slot_operands {
+    use super::*;
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const SLOT: ValueId = ValueId(1);
+    const MISUSED: &str = codes::SLOT_USED_AS_VALUE;
+
+    fn alloc() -> Instruction {
+        Instruction::Value {
+            result: SLOT,
+            ty: Ty::I64,
+            kind: ValueKind::Alloc,
+        }
+    }
+
+    fn value(result: u32, ty: Ty, kind: ValueKind) -> Instruction {
+        Instruction::Value {
+            result: ValueId(result),
+            ty,
+            kind,
+        }
+    }
+
+    fn int(result: u32, literal: i128) -> Instruction {
+        value(result, Ty::I64, ValueKind::Const(Const::Int(literal)))
+    }
+
+    fn store(slot: ValueId, stored: ValueId) -> Instruction {
+        Instruction::Store {
+            slot,
+            value: stored,
+            mode: OwnershipMode::Observe,
+        }
+    }
+
+    fn rendered(instructions: Vec<Instruction>, terminator: Terminator) -> Vec<String> {
+        rendered_blocks(vec![BasicBlock {
+            id: BlockId(0),
+            instructions,
+            terminator,
+        }])
+    }
+
+    fn rendered_blocks(blocks: Vec<BasicBlock>) -> Vec<String> {
+        let mut interner = Interner::new();
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(1),
+                name: interner.intern("main"),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks,
+            }],
+            ..Module::default()
+        };
+        let mut map = SourceMap::new();
+        let source = map.add_file("hand-built.npt", "\n");
+        verify_module(&module, source, &interner, &ItemRegistry::default())
+            .iter()
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect()
+    }
+
+    fn codes(instructions: Vec<Instruction>, terminator: Terminator) -> Vec<String> {
+        rendered(instructions, terminator)
+            .into_iter()
+            .map(|line| line.split(' ').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// `store %1, %1; ret %1`: the slot stored into itself, then returned.
+    #[test]
+    fn the_campaign_shape_is_refused_at_both_misuses() {
+        assert_eq!(
+            codes(
+                vec![alloc(), store(SLOT, SLOT)],
+                Terminator::Return(Some(SLOT))
+            ),
+            vec![MISUSED, MISUSED]
+        );
+    }
+
+    #[test]
+    fn the_same_program_through_a_load_verifies() {
+        assert_eq!(
+            codes(
+                vec![
+                    alloc(),
+                    int(2, 7),
+                    store(SLOT, ValueId(2)),
+                    value(3, Ty::I64, ValueKind::Load(SLOT)),
+                ],
+                Terminator::Return(Some(ValueId(3)))
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_slot_is_refused_as_an_operand_a_condition_or_a_stored_value() {
+        let initialized = vec![alloc(), int(2, 1), store(SLOT, ValueId(2))];
+        let arithmetic = {
+            let mut i = initialized.clone();
+            i.push(value(3, Ty::I64, ValueKind::Add(SLOT, ValueId(2))));
+            codes(i, Terminator::Return(Some(ValueId(3))))
+        };
+        assert!(arithmetic.contains(&MISUSED.to_string()), "{arithmetic:?}");
+
+        let other = ValueId(4);
+        let stored_elsewhere = {
+            let mut i = initialized.clone();
+            i.push(Instruction::Value {
+                result: other,
+                ty: Ty::I64,
+                kind: ValueKind::Alloc,
+            });
+            i.push(store(other, SLOT));
+            codes(i, Terminator::Return(Some(ValueId(2))))
+        };
+        assert!(
+            stored_elsewhere.contains(&MISUSED.to_string()),
+            "{stored_elsewhere:?}"
+        );
+
+        let condition = codes(
+            initialized,
+            Terminator::CondBranch {
+                condition: SLOT,
+                then_block: BlockId(0),
+                else_block: BlockId(0),
+            },
+        );
+        assert!(condition.contains(&MISUSED.to_string()), "{condition:?}");
+    }
+
+    /// Block storage order does not reorder the diagnostics.
+    #[test]
+    fn block_order_does_not_change_the_refusal() {
+        let blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                instructions: vec![alloc(), store(SLOT, SLOT)],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                id: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(SLOT)),
+            },
+        ];
+        let forward = rendered_blocks(blocks.clone());
+        let mut backward = blocks;
+        backward.reverse();
+        assert_eq!(forward.len(), 2, "{forward:?}");
+        assert_eq!(forward, rendered_blocks(backward));
     }
 }

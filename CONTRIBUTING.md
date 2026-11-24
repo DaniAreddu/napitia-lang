@@ -41,6 +41,9 @@ cargo test --manifest-path compiler/Cargo.toml \
   --all-targets --all-features --locked
 
 cargo test --manifest-path compiler/Cargo.toml \
+  --doc --all-features --locked
+
+cargo test --manifest-path compiler/Cargo.toml \
   --release --all-targets --all-features --locked
 
 RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path compiler/Cargo.toml \
@@ -49,6 +52,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path compiler/Cargo.toml \
 
 `--locked` throughout, so a check never quietly resolves a dependency
 graph different from the committed `Cargo.lock`.
+
+`--all-targets` does not include doctests, so they are a run of their
+own. They are not documentation decoration: the `compile_fail` examples
+on `nir::VerifiedModule` are the proof, from outside the crate, that a
+seal cannot be forged, edited or bypassed (`rfcs/0016`).
 
 The release run is not a duplicate of the debug one. `debug_assert!`
 compiles out, overflow checks change, and optimizations reorder work, so
@@ -176,7 +184,7 @@ Each of these fails the release before anything is built or published:
   tagged, and `alpha` is the protected branch everything merges through;
 - a release with that name already exists;
 - any of the ordinary gates fails — formatting, clippy with
-  `--all-features`, debug tests, release tests, docs under
+  `--all-features`, debug tests, doctests, release tests, docs under
   `-D warnings`. These are rerun rather than assumed: a tag can be
   pushed at any commit, including one CI never saw;
 - a runner's real host triple disagrees with the target its artifact

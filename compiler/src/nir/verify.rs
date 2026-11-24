@@ -663,6 +663,16 @@ mod codes {
     /// value, a returned value or the root of a place. Mirrors the native
     /// backend's `A0018`, which now only guards against a verifier defect.
     pub const SLOT_USED_AS_VALUE: &str = "V0114";
+    /// A `load` of an affine slot is used after the slot it was loaded
+    /// from changed (Alpha 0.2.3) -- something was stored into it, moved,
+    /// transferred or dropped out of it, reinitialized in it or decomposed,
+    /// through this load or any other. A load is a snapshot of the slot at
+    /// the moment it runs; for an affine value the snapshot names
+    /// ownership the slot may since have given away. A field change only
+    /// stales snapshots of an ordinary record or variant, whose fields are
+    /// copied inline; a declared `resource` is a handle that sees it. A
+    /// copy of a non-affine value stays valid.
+    pub const STALE_LOAD_USE: &str = "V0115";
     /// A type this module uses cannot be classified as owning a resource
     /// or not (`types::affinity`, Alpha 0.2.3): it nests records and
     /// variants past the affinity depth budget, or contains itself.
@@ -2275,6 +2285,7 @@ fn verify_function(
     verify_payload_refinement(function, agg, source, &name, diagnostics);
     verify_slot_operands(function, source, &name, diagnostics);
     verify_slot_initialization(function, agg, source, &name, diagnostics);
+    verify_stale_loads(function, agg, known_functions, source, &name, diagnostics);
     verify_drop_state(function, source, &name, diagnostics);
     verify_resource_ownership(
         function,
@@ -9795,6 +9806,282 @@ fn in_state_for_places(
     match acc {
         Some(facts) => IncomingState::Ready(facts),
         None => IncomingState::Pending,
+    }
+}
+
+/// Refuses every use of a `load` of an affine slot after that slot has
+/// changed (`STALE_LOAD_USE`, Alpha 0.2.3).
+///
+/// A `load` is a snapshot: the interpreter copies the slot's value into
+/// the load's result at the moment the load runs, and every later place
+/// operation through that result is applied to the *slot*, not to the
+/// snapshot. So only a use of the load's *value* -- an operand, an
+/// argument, a stored, moved, dropped or returned value -- can see a
+/// stale snapshot; the load as the root of a place cannot, and is not
+/// a use here. For a non-affine value the snapshot is a copy and stays
+/// valid forever. For an affine one it names ownership, and once the
+/// slot changes -- something is stored into it, moved, transferred or
+/// dropped out of it, reinitialized in it, decomposed, or written by an
+/// `invoke`, through this load or any other -- the snapshot may name a
+/// resource something else now owns. Before Alpha 0.2.3 the ownership
+/// analysis resolved every load to the slot's *current* state and
+/// accepted, for instance, a `drop` of a load taken before the slot's
+/// field was moved out, reinitialized and moved out again; the
+/// interpreter then refused to destroy a resource already transferred
+/// elsewhere (`X0004`). Lowering loads a slot afresh for every use and
+/// never emits this.
+///
+/// What changes a slot is exactly what [`consumed_places`] already
+/// reports for every other ownership check, canonicalized through each
+/// load's origin, plus the `invoke` terminator's own transferring
+/// arguments and written slots -- and which snapshots a change makes
+/// stale follows the interpreter's representation exactly:
+///
+/// * a change to the slot's *whole* value (a store into it, a move, drop
+///   or transfer of it) makes every other load of it stale; the load
+///   that was consumed is the ownership analysis's to report if it is
+///   used again;
+/// * a change to one *field* makes every load of the slot stale --
+///   including the one it went through -- when the slot holds an
+///   ordinary record or variant, whose fields a snapshot copies inline;
+///   when the slot holds a declared `resource`, a snapshot is a handle
+///   to the same table record and sees the change, so none is stale.
+///   Lowering emits `move.place %4.f; drop %4` through one load of a
+///   resource slot, and that is correct.
+///
+/// A forward may-analysis: the facts are the affine loads that may be
+/// stale, joined by union over reachable predecessors, solved by a
+/// worklist from the empty set; sets only grow, over a finite domain, so
+/// it terminates. A load becomes fresh again when it is re-executed (a
+/// loop). Each stale load is reported once, at its first stale use in
+/// block-id order.
+fn verify_stale_loads(
+    function: &Function,
+    agg: &AggregateContext,
+    known_functions: &HashMap<ItemId, KnownFunction>,
+    source: SourceId,
+    function_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut value_types: HashMap<ValueId, Ty> = function
+        .params
+        .iter()
+        .map(|p| (p.value, p.ty.clone()))
+        .collect();
+    let mut load_origin: HashMap<ValueId, ValueId> = HashMap::new();
+    for instruction in function.blocks.iter().flat_map(|b| b.instructions.iter()) {
+        if let Instruction::Value { result, ty, kind } = instruction {
+            value_types.insert(*result, ty.clone());
+            if let ValueKind::Load(slot) = kind {
+                load_origin.insert(*result, *slot);
+            }
+        }
+    }
+    let is_affine =
+        |v: ValueId| -> bool { value_types.get(&v).is_some_and(|ty| is_affine_in(ty, agg)) };
+    // The loads this analysis tracks, grouped by the slot they read.
+    let mut by_slot: HashMap<ValueId, BTreeSet<ValueId>> = HashMap::new();
+    for (load, slot) in &load_origin {
+        if is_affine(*load) {
+            by_slot.entry(*slot).or_default().insert(*load);
+        }
+    }
+    if by_slot.is_empty() {
+        return;
+    }
+    let origin = |v: ValueId| load_origin.get(&v).copied().unwrap_or(v);
+    let canonical = |place: &Place<ValueId>| Place {
+        root: origin(place.root),
+        projections: place.projections.clone(),
+    };
+    let invalidate = |slot: ValueId, stale: &mut BTreeSet<ValueId>| {
+        if let Some(loads) = by_slot.get(&slot) {
+            stale.extend(loads.iter().copied());
+        }
+    };
+    let is_declared_resource_slot = |slot: ValueId| -> bool {
+        matches!(
+            value_types.get(&slot),
+            Some(Ty::Named(item, _)) if agg.records.get(item).is_some_and(|r| r.affine)
+        )
+    };
+
+    // One block, from `stale` on entry; every stale use found, in order.
+    let transfer = |block: &BasicBlock, mut stale: BTreeSet<ValueId>| {
+        let mut uses: Vec<ValueId> = Vec::new();
+        for instruction in &block.instructions {
+            // Only a use of the load's own *value* can see a stale
+            // snapshot. As the root of a place the load is just a name
+            // for its slot -- every place operation is applied to the
+            // slot's current contents -- so `move.place %8.f` followed
+            // by `store.place %8.f, ..` through the same load (what
+            // lowering emits for `x.f = x.f`) reads nothing stale.
+            let reads = match instruction {
+                Instruction::Value {
+                    kind:
+                        ValueKind::Load(_)
+                        | ValueKind::PlaceRead { .. }
+                        | ValueKind::ObservePlace { .. },
+                    ..
+                } => Vec::new(),
+                Instruction::StorePlace { value, .. } => vec![*value],
+                other => instruction_operands(other),
+            };
+            uses.extend(reads.into_iter().filter(|v| stale.contains(v)));
+            let operands_here = instruction_operands(instruction);
+            for (place, _, _) in consumed_places(
+                instruction,
+                known_functions,
+                &is_affine,
+                &origin,
+                &canonical,
+            ) {
+                if place.projections.is_empty() {
+                    // The slot's whole value is replaced, moved, dropped
+                    // or transferred: every *other* snapshot of it is
+                    // stale. The consumed load itself is not -- using it
+                    // again is a use after a move or a drop, which the
+                    // ownership analysis already reports.
+                    let before = stale.clone();
+                    invalidate(place.root, &mut stale);
+                    for operand in &operands_here {
+                        if origin(*operand) == place.root
+                            && *operand != place.root
+                            && !before.contains(operand)
+                        {
+                            stale.remove(operand);
+                        }
+                    }
+                } else if !is_declared_resource_slot(place.root) {
+                    // One field changed. A declared `resource` is a handle
+                    // into the interpreter's resource table, so every
+                    // snapshot of it sees the change and none is stale.
+                    // Any other aggregate holds its fields inline, so
+                    // every snapshot of it -- including the load the
+                    // change went through -- is now out of date.
+                    invalidate(place.root, &mut stale);
+                }
+            }
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(_),
+                ..
+            } = instruction
+            {
+                stale.remove(result);
+            }
+        }
+        uses.extend(
+            terminator_operands(&block.terminator)
+                .into_iter()
+                .filter(|v| stale.contains(v)),
+        );
+        if let Terminator::Invoke {
+            callee,
+            args,
+            ok_slot,
+            err_targets,
+            ..
+        } = &block.terminator
+        {
+            let take = known_functions.get(callee).map(|f| f.take.as_slice());
+            for (index, arg) in args.iter().enumerate() {
+                if is_affine(*arg) && argument_transfers(take, args.len(), index) {
+                    invalidate(origin(*arg), &mut stale);
+                }
+            }
+            invalidate(*ok_slot, &mut stale);
+            for target in err_targets {
+                invalidate(target.slot, &mut stale);
+            }
+        }
+        (stale, uses)
+    };
+
+    let entry = BlockId(0);
+    let blocks: BTreeMap<BlockId, &BasicBlock> =
+        function.blocks.iter().map(|b| (b.id, b)).collect();
+    if !blocks.contains_key(&entry) {
+        return;
+    }
+    let mut reachable: BTreeSet<BlockId> = BTreeSet::from([entry]);
+    let mut frontier = vec![entry];
+    while let Some(id) = frontier.pop() {
+        for succ in terminator_targets(&blocks[&id].terminator) {
+            if blocks.contains_key(&succ) && reachable.insert(succ) {
+                frontier.push(succ);
+            }
+        }
+    }
+    let mut predecessors: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    for id in &reachable {
+        for succ in terminator_targets(&blocks[id].terminator) {
+            if reachable.contains(&succ) {
+                predecessors.entry(succ).or_default().insert(*id);
+            }
+        }
+    }
+    let in_facts = |id: BlockId, out: &BTreeMap<BlockId, BTreeSet<ValueId>>| {
+        let mut facts = BTreeSet::new();
+        for pred in predecessors.get(&id).into_iter().flatten() {
+            if let Some(stale) = out.get(pred) {
+                facts.extend(stale.iter().copied());
+            }
+        }
+        facts
+    };
+
+    let mut out: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+    let mut worklist: VecDeque<BlockId> = reachable.iter().copied().collect();
+    let mut queued: BTreeSet<BlockId> = reachable.clone();
+    while let Some(id) = worklist.pop_front() {
+        queued.remove(&id);
+        let facts = if id == entry {
+            BTreeSet::new()
+        } else {
+            in_facts(id, &out)
+        };
+        let (stale, _) = transfer(blocks[&id], facts);
+        if out.get(&id) != Some(&stale) {
+            out.insert(id, stale);
+            for succ in terminator_targets(&blocks[&id].terminator) {
+                if reachable.contains(&succ) && queued.insert(succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+    }
+
+    let mut reported: BTreeSet<ValueId> = BTreeSet::new();
+    for (id, block) in &blocks {
+        let facts = if *id == entry || !reachable.contains(id) {
+            BTreeSet::new()
+        } else {
+            in_facts(*id, &out)
+        };
+        let (_, uses) = transfer(block, facts);
+        for load in uses {
+            if !reported.insert(load) {
+                continue;
+            }
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::STALE_LOAD_USE,
+                    source,
+                    Span::dummy(),
+                    format!(
+                        "function `{function_name}` uses %{} in bb{} after the slot %{} it was loaded from changed",
+                        load.0,
+                        id.0,
+                        origin(load).0
+                    ),
+                )
+                .with_note(
+                    "a `load` of an affine slot is a snapshot; once something is stored into the \
+                     slot, or moved, dropped or reinitialized out of it, load it again",
+                ),
+            );
+        }
     }
 }
 
@@ -29160,5 +29447,215 @@ mod slot_operands {
         backward.reverse();
         assert_eq!(forward.len(), 2, "{forward:?}");
         assert_eq!(forward, rendered_blocks(backward));
+    }
+}
+
+/// A `load` of an affine slot is a snapshot that goes stale once the
+/// slot changes (`STALE_LOAD_USE`, Alpha 0.2.3).
+#[cfg(test)]
+mod stale_loads {
+    use super::*;
+    use crate::driver::{self, IrOutput};
+    use crate::nir::OwnershipMode;
+    use crate::source::SourceMap;
+
+    const STALE: &str = codes::STALE_LOAD_USE;
+
+    /// `examples/resource_generic_aggregate.npt`, lowered: its `main`
+    /// loads the `refill` slot, moves the field out through that load,
+    /// reinitializes the field through a second load and moves it out
+    /// again through a third -- the module the 0.2.2 mutation campaign
+    /// started from.
+    fn lowered() -> (Module, Interner) {
+        let mut map = SourceMap::new();
+        let source = map.add_file(
+            "resource_generic_aggregate.npt",
+            include_str!("../../../examples/resource_generic_aggregate.npt"),
+        );
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, .. } = driver::ir(&map, source, &mut interner) else {
+            panic!("the example compiles");
+        };
+        (nir.module().clone(), interner)
+    }
+
+    fn main_index(module: &Module, interner: &Interner) -> usize {
+        module
+            .functions
+            .iter()
+            .position(|f| interner.resolve(f.name) == "main")
+            .expect("the example declares `main`")
+    }
+
+    fn found(module: &Module, interner: &Interner) -> Vec<&'static str> {
+        let mut map = SourceMap::new();
+        let source = map.add_file("t.npt", "\n");
+        verify_module(module, source, interner, &ItemRegistry::default())
+            .iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// The first load whose result a field is moved out through, and the
+    /// slot it reads.
+    fn first_moved_through(function: &Function) -> (ValueId, ValueId) {
+        let instructions: Vec<&Instruction> = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .collect();
+        for instruction in &instructions {
+            if let Instruction::Value {
+                result,
+                kind: ValueKind::Load(slot),
+                ..
+            } = instruction
+            {
+                let moved = instructions.iter().any(|i| {
+                    matches!(i, Instruction::Value {
+                        kind: ValueKind::PlaceRead { place, mode: OwnershipMode::Transfer },
+                        ..
+                    } if place.root == *result)
+                });
+                if moved {
+                    return (*result, *slot);
+                }
+            }
+        }
+        panic!("the example moves a field out through a load");
+    }
+
+    fn fresh_id(function: &Function) -> ValueId {
+        let highest = function
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                Instruction::Value { result, .. } => Some(result.0),
+                _ => None,
+            })
+            .chain(function.params.iter().map(|p| p.value.0))
+            .max()
+            .unwrap_or(0);
+        ValueId(highest + 1)
+    }
+
+    #[test]
+    fn the_unmodified_example_verifies() {
+        let (module, interner) = lowered();
+        assert_eq!(found(&module, &interner), Vec::<&str>::new());
+    }
+
+    /// The campaign shape: a `drop` of the first load, after the slot's
+    /// field was moved out, reinitialized and moved out again. It sealed
+    /// in 0.2.2 and the interpreter then refused to destroy a resource
+    /// already transferred elsewhere.
+    #[test]
+    fn a_drop_of_a_load_taken_before_the_slot_changed_is_refused() {
+        let (mut module, interner) = lowered();
+        let main = main_index(&module, &interner);
+        let (stale, _) = first_moved_through(&module.functions[main]);
+        module.functions[main].blocks[0]
+            .instructions
+            .push(Instruction::Drop { value: stale });
+        let codes = found(&module, &interner);
+        assert_eq!(codes, vec![STALE], "{codes:?}");
+    }
+
+    /// The same `drop` of a load taken now, after every change: the
+    /// snapshot is current, and the stale-load rule has nothing to say.
+    #[test]
+    fn the_same_drop_of_a_fresh_load_is_not_a_stale_use() {
+        let (mut module, interner) = lowered();
+        let main = main_index(&module, &interner);
+        let (old, slot) = first_moved_through(&module.functions[main]);
+        let fresh = fresh_id(&module.functions[main]);
+        let ty = module.functions[main]
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .find_map(|i| match i {
+                Instruction::Value { result, ty, .. } if *result == old => Some(ty.clone()),
+                _ => None,
+            })
+            .expect("the load has a type");
+        let block = &mut module.functions[main].blocks[0].instructions;
+        block.push(Instruction::Value {
+            result: fresh,
+            ty,
+            kind: ValueKind::Load(slot),
+        });
+        block.push(Instruction::Drop { value: fresh });
+        let codes = found(&module, &interner);
+        assert!(!codes.contains(&STALE), "{codes:?}");
+    }
+
+    /// `session.input = session.input` lowers to a move out of the field
+    /// and a reinitialization of it, both through the same load. As a
+    /// place root a load names its slot, not its snapshot, so neither is
+    /// a stale use -- the first draft of this rule refused it.
+    #[test]
+    fn a_load_used_only_as_a_place_root_after_a_change_is_not_stale() {
+        let mut map = SourceMap::new();
+        let source = map.add_file(
+            "resource_self_assignment.npt",
+            include_str!("../../../examples/resource_self_assignment.npt"),
+        );
+        let mut interner = Interner::new();
+        let IrOutput::Ready { nir, .. } = driver::ir(&map, source, &mut interner) else {
+            panic!("the example compiles and verifies");
+        };
+        assert_eq!(found(nir.module(), &interner), Vec::<&str>::new());
+    }
+
+    /// A load of a non-affine slot is a copy, valid whatever happens to
+    /// the slot afterwards.
+    #[test]
+    fn a_copy_of_a_plain_value_never_goes_stale() {
+        let mut interner = Interner::new();
+        let slot = ValueId(0);
+        let int = |id: u32, n: i128| Instruction::Value {
+            result: ValueId(id),
+            ty: Ty::I64,
+            kind: ValueKind::Const(Const::Int(n)),
+        };
+        let store = |value: u32| Instruction::Store {
+            slot,
+            value: ValueId(value),
+            mode: OwnershipMode::Observe,
+        };
+        let module = Module {
+            functions: vec![Function {
+                id: ItemId(1),
+                name: interner.intern("main"),
+                type_params: Vec::new(),
+                requirements: Vec::new(),
+                params: Vec::new(),
+                return_type: Ty::I64,
+                raises: Vec::new(),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction::Value {
+                            result: slot,
+                            ty: Ty::I64,
+                            kind: ValueKind::Alloc,
+                        },
+                        int(1, 1),
+                        store(1),
+                        Instruction::Value {
+                            result: ValueId(2),
+                            ty: Ty::I64,
+                            kind: ValueKind::Load(slot),
+                        },
+                        int(3, 2),
+                        store(3),
+                    ],
+                    terminator: Terminator::Return(Some(ValueId(2))),
+                }],
+            }],
+            ..Module::default()
+        };
+        assert_eq!(found(&module, &interner), Vec::<&str>::new());
     }
 }
